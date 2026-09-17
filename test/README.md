@@ -1,12 +1,28 @@
-# Sample testbench for a Tiny Tapeout project
+# Loom testbench
 
-This is a sample testbench for a Tiny Tapeout project. It uses [cocotb](https://docs.cocotb.org/en/stable/) to drive the DUT and check the outputs.
-See below to get started or for more information, check the [website](https://tinytapeout.com/hdl/testing/).
+cocotb tests for `tt_um_loom`, based on the Tiny Tapeout sample testbench.
+See [the website](https://tinytapeout.com/hdl/testing/) for the flow itself.
 
-## Setting up
+## Layout
 
-1. Edit [Makefile](Makefile) and modify `PROJECT_SOURCES` to point to your Verilog files.
-2. Edit [tb.v](tb.v) and replace `tt_um_example` with your module name.
+- `spi_host.py` — a reusable SPI master for the host port
+  (`docs/HOST_PROTOCOL.md`), plus program-loading and run-control helpers.
+  Everything the tests do goes through the pads, so the same tests run on the
+  gate-level netlist.
+- `test_host.py` — CTRL identification, IMEM, run control, STEP, DEBUG.
+- `test_alu.py` — every ALU, immediate and unary instruction.
+- `test_ctrl.py` — branches, DJNZ, CALL/RET, JP, JMP, CSRs, shared flags,
+  DLY, BADOP.
+- `test_pins.py` — SETP, OEP, OUT, IN, open drain, WAITP, WAITE, timed waits.
+- `test_timing.py` — when pin edges happen: slot grid, jitter, drift.
+- `test_uart.py` — end to end, a UART transmitter written in Loom assembly.
+- `tb.v` — the wrapper, including the Tiny Tapeout pad model that loops
+  `uio_out` back into `uio_in` for the bits the design drives. The testbench
+  drives the outside world's value on `uio_drv`.
+
+Programs are always built through `tools.loomisa` (`isa.encode(...)`), never
+from literal instruction hex, and expected values are computed in the test
+from `docs/SEMANTICS.md`.
 
 ## How to run
 
@@ -14,6 +30,13 @@ To run the RTL simulation:
 
 ```sh
 make -B
+```
+
+The waveform dump is opt-in because dumping the instruction memory dominates
+the run time:
+
+```sh
+make -B PLUSARGS=+dump
 ```
 
 To run gatelevel simulation, first harden your project and copy `../runs/wokwi/results/final/verilog/gl/{your_module_name}.v` to `gate_level_netlist.v`.

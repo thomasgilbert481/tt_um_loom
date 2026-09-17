@@ -127,10 +127,17 @@ same cocotb UART model as M0; first synthesis numbers recorded.
       slot-grid timing property over 101 edges. Its twelve spec questions are
       resolved in `docs/spec-questions/loomsim.md` and folded into SEMANTICS,
       D-016 and D-017.
-- [ ] RTL: `loom_core` (scheduler, fetch, decode, regfile, ALU, branches,
-      CALL/RET, flags), `loom_timer`, `loom_pins` (SETP/OUT/IN/JP/WAITP/WAITE/
-      WAITD/SETD/DLY, OD mode), `loom_imem` FLOPS option, minimal host path
-      (enough to load imem and set RUN; full SPI is M2).
+- [x] 2026-09-17: M1 RTL, written from `docs/SEMANTICS.md` alone (its author
+      was not allowed to read the golden model): `loom_core` (barrel pipeline,
+      SFLAGS forwarding, waits, run control, retire record), `loom_regfile`,
+      `loom_alu`, `loom_timer`, `loom_pins`, `loom_imem` (flops, macro-ready
+      ports), `loom_spi_host`, `loom_host_ctl` (CTRL, IMEM, DEBUG, STEP),
+      `loom_top`, pad-map-only `tt_um_loom`. Every decode signal comes from the
+      generated `loom_decode`. 42 cocotb tests, all driven through the pins
+      over SPI so they also run at gate level; `firmware`-style UART program
+      sends "LOOM" with frame starts exactly 4340 clocks apart. Verilator
+      `-Wall` clean, Yosys `check -assert` clean. Interfaces in
+      `docs/INTERFACES.md`; its spec questions in `docs/spec-questions/rtl.md`.
 - [ ] Verification L1 unit tests for regfile, ALU, timer, pins; L2 directed
       tests generated from `isa.yaml` (at least one per mnemonic) passing on
       Icarus; first constrained-random co-sim run (1000 programs) passing.

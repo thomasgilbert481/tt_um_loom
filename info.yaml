@@ -15,8 +15,20 @@ project:
   top_module:  "tt_um_loom"
 
   # Keep in sync with PROJECT_SOURCES in test/Makefile.
+  # loom_isa.vh is a header for testbenches and formal only, not for synthesis.
   source_files:
     - "tt_um_loom.v"
+    - "loom_top.v"
+    - "loom_sync.v"
+    - "loom_spi_host.v"
+    - "loom_host_ctl.v"
+    - "loom_imem.v"
+    - "loom_core.v"
+    - "loom_decode.v"
+    - "loom_regfile.v"
+    - "loom_alu.v"
+    - "loom_timer.v"
+    - "loom_pins.v"
 
 # Pinout. See docs/ARCHITECTURE.md section 3.1. The host SPI pins are fixed;
 # everything else is a firmware-addressable pin index.

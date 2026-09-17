@@ -2,16 +2,18 @@
  * Loom protocol emulator, Tiny Tapeout top level.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Milestone M0 placeholder: a hard-wired UART transmitter that sends
- * "LOOM\r\n" (8N1) at BAUD on OUT0 (uo_out[0]) while IN0 (ui_in[0]) is high.
- * This proves the flow end to end, as the competition brief suggests
- * ("start by getting a UART transmitter out of a pin"). M1 replaces the body
- * with the Loom core; the port list and pin map do not change.
+ * This module is pad mapping only (docs/ARCHITECTURE.md 3.1); everything else
+ * lives in loom_top.
  *
- * Timing contract: tx changes only on baud ticks; the first start bit begins
- * on the first baud tick after IN0 is sampled high, so every bit is a full
- * bit period. Frames are back to back (start, 8 data LSB first, stop). After
- * the last byte the line idles high for at least one bit period.
+ *   ui_in[4]   HOST_CS_n      ui_in[3:0] IN0..IN3  (pin index 8..11)
+ *   ui_in[5]   HOST_SCK       ui_in[7]   IN4       (pin index 12)
+ *   ui_in[6]   HOST_MOSI      uo_out[5:0] OUT0..5  (pin index 16..21)
+ *   uo_out[7]  HOST_MISO      uio[7:0]   BIDIR0..7 (pin index 0..7)
+ *   uo_out[6]  HOST_IRQ
+ *
+ * Timing contract: none of its own. Every output of loom_top is a register,
+ * so all pads change on a clock edge. `ena` is ignored, as the template
+ * requires, and every unused input appears in the `_unused` wire.
  */
 
 `default_nettype none
@@ -27,92 +29,27 @@ module tt_um_loom (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  parameter integer CLK_HZ = 50_000_000;
-  parameter integer BAUD   = 115_200;
-  localparam integer DIV     = CLK_HZ / BAUD;   // 434 at 50 MHz
-  localparam integer MSG_LEN = 6;
+  parameter integer IMEM_WORDS = 256;
 
-  // ---------------------------------------------------------------- message
-  function [7:0] msg_byte(input [2:0] i);
-    case (i)
-      3'd0:    msg_byte = "L";
-      3'd1:    msg_byte = "O";
-      3'd2:    msg_byte = "O";
-      3'd3:    msg_byte = "M";
-      3'd4:    msg_byte = 8'h0D;
-      default: msg_byte = 8'h0A;
-    endcase
-  endfunction
+  // Retire record: simulation and debug only, reached hierarchically by the
+  // testbench. Nothing above this level consumes it.
+  wire        tr_valid, tr_done, tr_we;
+  wire [1:0]  tr_thread;
+  wire [9:0]  tr_pc, tr_next_pc;
+  wire [15:0] tr_ir, tr_val;
+  wire [2:0]  tr_rd, tr_flags;
 
-  // ------------------------------------------------------------- baud ticks
-  reg [15:0] baud_cnt;
-  reg        baud_tick;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      baud_cnt  <= 16'd0;
-      baud_tick <= 1'b0;
-    end else if ({16'd0, baud_cnt} == DIV - 1) begin
-      baud_cnt  <= 16'd0;
-      baud_tick <= 1'b1;
-    end else begin
-      baud_cnt  <= baud_cnt + 16'd1;
-      baud_tick <= 1'b0;
-    end
-  end
-
-  // ------------------------------------------------------------ transmitter
-  reg       tx;
-  reg       active;
-  reg [3:0] bit_idx;   // 0..7 data bits sent so far, 8 = stop sent
-  reg [2:0] msg_idx;
-  reg [7:0] shreg;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      tx      <= 1'b1;
-      active  <= 1'b0;
-      bit_idx <= 4'd0;
-      msg_idx <= 3'd0;
-      shreg   <= 8'd0;
-    end else if (!active) begin
-      tx <= 1'b1;
-      if (ui_in[0] && baud_tick) begin
-        active  <= 1'b1;
-        bit_idx <= 4'd0;
-        msg_idx <= 3'd0;
-        shreg   <= msg_byte(3'd0);
-        tx      <= 1'b0;                  // start bit
-      end
-    end else if (baud_tick) begin
-      if (bit_idx < 4'd8) begin
-        tx      <= shreg[0];              // data bit, LSB first
-        shreg   <= {1'b0, shreg[7:1]};
-        bit_idx <= bit_idx + 4'd1;
-      end else if (bit_idx == 4'd8) begin
-        tx      <= 1'b1;                  // stop bit
-        bit_idx <= 4'd9;
-      end else begin
-        // stop bit finished
-        if ({29'd0, msg_idx} == MSG_LEN - 1) begin
-          active <= 1'b0;                 // idle high until IN0 restarts us
-          tx     <= 1'b1;
-        end else begin
-          msg_idx <= msg_idx + 3'd1;
-          shreg   <= msg_byte(msg_idx + 3'd1);
-          bit_idx <= 4'd0;
-          tx      <= 1'b0;                // next start bit, back to back
-        end
-      end
-    end
-  end
-
-  // ------------------------------------------------------------------ pins
-  assign uo_out  = {7'b0000000, tx};
-  assign uio_out = 8'b0;
-  assign uio_oe  = 8'b0;
+  loom_top #(.IMEM_WORDS(IMEM_WORDS)) u_loom (
+      .ui_in(ui_in), .uo_out(uo_out),
+      .uio_in(uio_in), .uio_out(uio_out), .uio_oe(uio_oe),
+      .clk(clk), .rst_n(rst_n),
+      .tr_valid(tr_valid), .tr_thread(tr_thread), .tr_pc(tr_pc),
+      .tr_ir(tr_ir), .tr_done(tr_done), .tr_we(tr_we), .tr_rd(tr_rd),
+      .tr_val(tr_val), .tr_flags(tr_flags), .tr_next_pc(tr_next_pc)
+  );
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, ui_in[7:1], uio_in, 1'b0};
+  wire _unused = &{ena, tr_valid, tr_thread, tr_pc, tr_ir, tr_done, tr_we,
+                   tr_rd, tr_val, tr_flags, tr_next_pc, 1'b0};
 
 endmodule

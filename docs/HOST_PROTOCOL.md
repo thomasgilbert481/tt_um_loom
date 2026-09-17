@@ -48,10 +48,11 @@ word (the falling SCK edge of its last bit, as seen in the core clock domain).
 | 0x0003 | HALTED | R | bit t = thread t halted by HALT (cleared by writing RUN bit) |
 | 0x0004 | RESET | W | bit t = reset thread t: PC := RESET_PC[t], flags := 0, TD := NOW, stack cleared; registers untouched |
 | 0x0008..0x000B | RESET_PC[0..3] | RW | 10-bit reset vectors, default t * 0x100 |
-| 0x0010 | IRQ_EN0 | RW | mask over IRQ_STAT0 (M2) |
-| 0x0011 | IRQ_STAT0 | R | {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]} (M2) |
-| 0x0012 | IRQ_STAT1 | R, W1C | {8'b0, SWIRQ[3:0], HALTED[3:0]}; write 1 to a SWIRQ bit to clear it (M2) |
-| 0x001B | IRQ_EN1 | RW | mask over IRQ_STAT1; HOST_IRQ = any enabled bit of either word (M2) |
+| 0x0010 | IRQ_EN | RW | mask over IRQ_STAT |
+| 0x0011 | IRQ_STAT | R | {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}; the FIFO fields read 0 until M2 |
+| 0x0012 | IRQ_STAT2 | R | {12'b0, HALTED[3:0]} |
+| 0x001B | SWIRQ | R, W1C | {12'b0, SWIRQ[3:0]}: set by `CSRW HOST_IRQ` in thread t, write 1 to clear. HOST_IRQ = any(IRQ_STAT & IRQ_EN) or any(SWIRQ) |
+| 0x001C | IRQ_EN2 | RW | mask over IRQ_STAT2 (M2) |
 | 0x0013 | SFLAGS | RW | shared flags; write sets the bits written as 1 |
 | 0x0014 | SFLAGS_CLR | W | write clears the bits written as 1 |
 | 0x0015 | OD_MASK | RW | open-drain mode per BIDIR pin |
@@ -100,17 +101,24 @@ state. (`docs/SEMANTICS.md` section 7.)
 |---|---|
 | 0x00..0x07 | r0..r7 |
 | 0x08 | PC |
-| 0x09 | FLAGS {Z, C, T} |
+| 0x09 | FLAGS: {T, C, Z} in bits 2:0 (bit 0 = Z), as in `docs/SEMANTICS.md` |
 | 0x0A | TD |
 | 0x0B | NOW (read only) |
-| 0x0C | SR |
-| 0x0D | CNT |
-| 0x0E | CRC |
-| 0x0F | RS {RS1[15:8]... see note} |
+| 0x0C | SR (reads 0 until the bit engine is built) |
+| 0x0D | CNT (same) |
+| 0x0E | CRC (same) |
+| 0x0F | RS0 |
 | 0x10..0x1F | CSR 0x00..0x0F of that thread |
-| 0x20 | STEPS: number of instructions retired since reset (16-bit, wraps), for trace alignment |
+| 0x20 | STEPS: valid slots since reset (16-bit, wraps), done or stalled, for trace alignment |
+| 0x21 | {4'b0, DEPTH[1:0], RS1[9:0]} |
+| 0x22 | WAIT_ACTIVE in bit 0 |
+| 0x23 | DT (the hidden target of `DLY`) |
+| 0x24 | TICK_SEEN in bit 0 (M2) |
 
-Note: RS is 20 bits; 0x0F returns RS0, 0x21 returns RS1 and the stack depth.
+`CSRW PIN_OUT`, `CSRW PIN_OE` and the host's PIN_OUT/PIN_OE writes are raw
+register writes and do not apply the open-drain rule; only pin writes (`SETP`,
+`OUT`, the bit engine) do. `PC` is 10 bits whatever the memory size, so with a
+memory smaller than 1024 words fetch addresses alias modulo `IMEM_WORDS`.
 
 ### SPACE 5: STEP
 

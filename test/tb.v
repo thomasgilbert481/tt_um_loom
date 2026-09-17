@@ -7,9 +7,14 @@
 module tb ();
 
   // Dump the signals to a FST file. You can view it with gtkwave or surfer.
+  // Dumping the whole design (including the 256 x 16 instruction memory)
+  // roughly triples the run time of the M1 suite, so it is opt-in:
+  //     make PLUSARGS=+dump
   initial begin
-    $dumpfile("tb.fst");
-    $dumpvars(0, tb);
+    if ($test$plusargs("dump")) begin
+      $dumpfile("tb.fst");
+      $dumpvars(0, tb);
+    end
     #1;
   end
 
@@ -18,10 +23,16 @@ module tb ();
   reg rst_n;
   reg ena;
   reg [7:0] ui_in;
-  reg [7:0] uio_in;
   wire [7:0] uo_out;
   wire [7:0] uio_out;
   wire [7:0] uio_oe;
+
+  // Tiny Tapeout pad model for the bidirectional pins: a bit the design
+  // drives reads back its own value, a bit it releases reads what the
+  // testbench drives (uio_drv, which also carries external pull-ups).
+  // docs/SEMANTICS.md section 3 requires this loopback.
+  reg  [7:0] uio_drv;
+  wire [7:0] uio_in = (uio_out & uio_oe) | (uio_drv & ~uio_oe);
 
   // Replace tt_um_example with your module name:
   tt_um_loom user_project (
