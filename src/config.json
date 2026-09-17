@@ -62,7 +62,7 @@
   "MACROS": {
     "RM_IHPSG13_1P_512x16_c2_bm_bist": {
       "instances": {
-        "sram": {
+        "u_imem.sram": {
           "location": [12, 10],
           "orientation": "N"
         }
@@ -102,8 +102,8 @@
   "//": "(the bit-cell array) and VSS!. Both supplies go to VPWR, as the reference project does;",
   "//": "the macro would allow them to be separate rails but Tiny Tapeout only gives us one.",
   "PDN_MACRO_CONNECTIONS": [
-    "sram VPWR VGND VDD! VSS!",
-    "sram VPWR VGND VDDARRAY! VSS!"
+    "u_imem.sram VPWR VGND VDD! VSS!",
+    "u_imem.sram VPWR VGND VDDARRAY! VSS!"
   ],
 
   "//": "PDN_CFG - custom power grid. On cmos5l FP_PDN_VERTICAL_LAYER is Metal4, which is also the",
