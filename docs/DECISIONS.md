@@ -146,3 +146,34 @@ for Ken's config (may never be public).
 Consequences: two sessions of effort in September; the wrapper written for the
 smoke test becomes the MACRO backend of `loom_imem.v`; `main` stays on the
 untouched template config until the M2 decision.
+
+## D-016 2026-09-17 Fable: deadline-latched pin writes at M2
+
+Finding (golden model, independent of the RTL): a thread acts only every 4
+clocks, so a firmware-driven edge lands 0 to 3 clocks after its `WAITD`
+deadline. There is no drift, and the edges are exactly periodic when
+`k * period` is a multiple of 4 clocks, but at a 434-clock tick UART bit edges
+alternate 432 and 436 clocks. The v0.1 documents claimed "zero jitter"; that
+was wrong and has been corrected in SEMANTICS section 2 and ARCHITECTURE
+section 6.
+Decision: at M2, bit 0 of `SETP` (today a don't-care) becomes `D`. `SETP pin,
+v, D` stages one pin write per thread (valid, pin, value); the hardware applies
+it on the exact clock at which `NOW` becomes the deadline set by the thread's
+next `WAITD` (immediately, if that deadline is already past when the `WAITD`
+is first issued). `SETP TX, v, D` followed by `WAITD 1` then gives clock-exact
+edges for any tick period, fractional ones included. Cost: about 7 flops and
+one 16-bit equality per thread.
+Rejected: making every pin write clock-exact (would need per-clock thread
+execution, which is what the barrel pipeline trades away); a deferred `OUT`
+group (32 more flops per thread; the bit engine covers multi-pin exactness).
+Until M2: firmware that wants exact edges picks a tick period that is a
+multiple of 4 clocks (432 or 436 for 115200 baud at 50 MHz, both within 0.5
+percent).
+
+## D-017 2026-09-17 Fable: default reset vectors are t * IMEM_WORDS / 4
+
+Finding (golden model): `t * 0x100` masked to the memory size puts all four
+threads at address 0 in the 256-word flop build.
+Decision: `RESET_PC[t]` resets to `t * (IMEM_WORDS / 4)`. The assembler's
+`.thread N` default origin follows the same rule through an `--imem-words`
+option (default 1024, so existing programs are unchanged).

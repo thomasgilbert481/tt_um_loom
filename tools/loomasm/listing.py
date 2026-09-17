@@ -33,8 +33,11 @@ def build_listing(program: "Program", stmts: "List[Stmt]", isa: Isa) -> List[str
 
     lines = [
         "; loomasm listing for %s" % program.source,
-        "; ISA %s, one slot = %d clocks" % (
-            program.isa_version, int(isa.meta["slot_clocks"])),
+        "; ISA %s, one slot = %d clocks, %d-word instruction memory "
+        "(thread t starts at t * %d)" % (
+            program.isa_version, int(isa.meta["slot_clocks"]),
+            program.imem_words,
+            program.imem_words // int(isa.meta["threads"])),
         ";",
         HEADER,
         RULE,

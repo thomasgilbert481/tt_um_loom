@@ -33,6 +33,13 @@ def errors_of(text):
     return info.value.diagnostics
 
 
+def errors_of_kw(text, **kwargs):
+    """Like :func:`errors_of`, with assembler options."""
+    with pytest.raises(AsmError) as info:
+        asm(text, **kwargs)
+    return info.value.diagnostics
+
+
 # --------------------------------------------------------------- operands
 def test_register_operands():
     assert words_of(src(".thread 0", "ADD r1, r2, r3")) == [
@@ -368,12 +375,145 @@ def test_unknown_csr_name():
         src(".thread 0", "CSRR r1, NOPE"))[0].message
 
 
+# ------------------------------------- instruction-memory size (D-017, .imem)
+def test_the_default_thread_origins_are_a_quarter_of_1024_apart():
+    program = asm(src(".thread 0", "NOP", ".thread 1", "NOP",
+                      ".thread 2", "NOP", ".thread 3", "NOP"))
+    assert program.imem_words == 1024
+    assert [program.threads[t].entry for t in range(4)] == [0, 256, 512, 768]
+
+
+@pytest.mark.parametrize("words,origins", [
+    (64, [0, 16, 32, 48]),
+    (128, [0, 32, 64, 96]),
+    (256, [0, 64, 128, 192]),          # the 256-word flop build, D-017
+    (512, [0, 128, 256, 384]),
+    (1024, [0, 256, 512, 768]),
+])
+def test_thread_origins_follow_imem_words_over_four(words, origins):
+    text = src(".thread 0", "NOP", ".thread 1", "NOP",
+               ".thread 2", "NOP", ".thread 3", "NOP")
+    program = asm(text, imem_words=words)
+    assert program.imem_words == words
+    assert [program.threads[t].entry for t in range(4)] == origins
+    assert sorted(program.words) == origins
+
+
+def test_two_threads_at_256_words_land_at_0_and_64():
+    program = asm(src(".thread 0", "a: NOP", "NOP",
+                      ".thread 1", "b: NOP"), imem_words=256)
+    assert program.symbols == {"a": 0, "b": 64}
+    assert program.threads[0].entry == 0 and program.threads[0].size == 2
+    assert program.threads[1].entry == 64 and program.threads[1].size == 1
+    assert program.to_image()["imem_words"] == 256
+
+
+def test_an_address_at_or_beyond_imem_words_is_an_error_with_a_line():
+    text = src(".thread 0", ".org 254", "NOP", "NOP", "NOP")
+    assert asm(text).ok                                   # fits in 1024 words
+    with pytest.raises(AsmError) as info:
+        asm(text, imem_words=256)
+    diagnostic = info.value.errors[0]
+    assert diagnostic.line == 5                           # the third NOP
+    assert diagnostic.file == "t.loom"
+    assert "address 0x100 is past the end of instruction memory (256 words)" \
+        in diagnostic.message
+
+
+def test_org_past_imem_words_is_an_error():
+    assert "outside instruction memory" in errors_of_kw(
+        src(".thread 0", ".org 256"), imem_words=256)[0].message
+
+
+def test_a_thread_whose_origin_overflows_a_small_memory_is_caught():
+    # at 64 words thread 3 starts at 48, so 20 words do not fit
+    text = src(".thread 3", *["NOP"] * 20)
+    with pytest.raises(AsmError) as info:
+        asm(text, imem_words=64)
+    assert "past the end of instruction memory (64 words)" \
+        in info.value.errors[0].message
+
+
+@pytest.mark.parametrize("words", [1, 32, 100, 2048, 0, -256])
+def test_an_invalid_imem_words_is_rejected_by_the_api(words):
+    with pytest.raises(ValueError) as info:
+        asm(src(".thread 0", "NOP"), imem_words=words)
+    assert "power of two from 64 to 1024" in str(info.value)
+
+
+def test_the_imem_directive_sets_the_size_from_the_source():
+    program = asm(src(".imem 256", ".thread 1", "here: NOP"))
+    assert program.imem_words == 256
+    assert program.symbols["here"] == 64
+    assert program.to_image()["imem_words"] == 256
+
+
+def test_the_imem_directive_may_follow_a_thread_directive():
+    program = asm(src(".thread 2", ".imem 128", "here: NOP"))
+    assert program.imem_words == 128
+    assert program.symbols["here"] == 64
+
+
+def test_the_imem_directive_emits_no_word():
+    program = asm(src(".imem 512", ".thread 0", "NOP"))
+    assert program.words == {0: ISA.encode("NOP")}
+
+
+def test_the_imem_directive_must_come_before_any_code():
+    diagnostics = errors_of(src(".thread 0", "NOP", ".imem 256"))
+    assert diagnostics[0].line == 3
+    assert "must come before any code" in diagnostics[0].message
+
+
+def test_the_imem_directive_must_come_before_any_label():
+    diagnostics = errors_of(src(".thread 1", "here:", ".imem 256"))
+    assert "must come before any code" in diagnostics[0].message
+
+
+def test_an_invalid_imem_directive_value_is_an_error():
+    diagnostics = errors_of(src(".imem 100", ".thread 0", "NOP"))
+    assert "not a valid memory size" in diagnostics[0].message
+    assert "power of two from 64 to 1024" in diagnostics[0].message
+
+
+def test_the_api_argument_wins_over_the_imem_directive_and_warns():
+    program = asm(src(".imem 256", ".thread 1", "here: NOP"), imem_words=512)
+    assert program.imem_words == 512
+    assert program.symbols["here"] == 128
+    warnings = [d for d in program.warnings if "imem" in d.message]
+    assert len(warnings) == 1 and warnings[0].line == 1
+    assert "--imem-words 512 was given" in warnings[0].message
+
+
+def test_no_warning_when_the_argument_and_the_directive_agree():
+    program = asm(src(".imem 256", ".thread 0", "NOP"), imem_words=256)
+    assert program.imem_words == 256
+    assert program.warnings == []
+
+
+def test_a_branch_at_the_top_of_a_small_memory_uses_the_10_bit_pc():
+    """Branch offsets use the 10-bit PC, not the memory size (SEMANTICS 6.2):
+    the next PC after 0x0FF is 0x100, not 0x000, even in a 256-word build."""
+    diagnostics = errors_of_kw(
+        src(".thread 0", "back: NOP", ".org 255", "BZ back"), imem_words=256)
+    assert "BZ cannot reach 0x000 from 0x0FF" in diagnostics[0].message
+    assert "offset -256" in diagnostics[0].message
+
+
+def test_the_listing_header_names_the_memory_size():
+    text = asm(src(".thread 0", "NOP"), imem_words=256).listing_text()
+    assert "256-word instruction memory" in text
+    assert "thread t starts at t * 64" in text
+
+
 # --------------------------------------------------------- image, listing
 def test_json_image_shape():
     program = asm(src(".thread 0", "start: NOP", ".thread 1", "NOP"))
     image = program.to_image()
-    assert set(image) == {"isa", "words", "symbols", "threads", "source"}
+    assert set(image) == {"isa", "imem_words", "words", "symbols", "threads",
+                          "source"}
     assert image["isa"] == ISA.version
+    assert image["imem_words"] == 1024
     assert image["source"] == "t.loom"
     assert image["words"] == {"0": ISA.encode("NOP"), "256": ISA.encode("NOP")}
     assert image["symbols"] == {"start": 0}

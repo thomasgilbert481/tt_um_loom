@@ -4,9 +4,19 @@
 ;
 ; 50e6 / 115200 = 434.03 clocks per bit, so one tick is one bit period and
 ; every bit boundary is a WAITD 1. Because WAITD advances TD from the previous
-; deadline rather than from "now", the bit edges are exactly one tick apart
-; whatever the instruction path between them was: the 0.03 clock of divider
-; error is the only accumulated jitter, and TICK_FRAC could absorb even that.
+; deadline rather than from "now", the schedule has no accumulated drift
+; whatever the instruction path between two bits was.
+;
+; The edges are not exactly one tick apart, though. A thread gets an X cycle
+; only every 4 clocks (docs/SEMANTICS.md section 2, "Slot grid"), so a wait
+; completes at the first X cycle at or after its deadline and each edge lands
+; 0 to 3 clocks late. At TICK_INT 434 the deadlines fall on 434, 868, 1302 ...
+; while the edges land on the 4-clock grid, so consecutive bit edges alternate
+; 432 and 436 clocks apart. The lateness never accumulates: the 10-bit frame
+; spacing is exactly 4340 clocks, which is what a receiver samples against.
+; Choosing a tick period that is a multiple of 4 clocks makes the lateness
+; constant and the edges exactly periodic; 432 and 436 are both within 0.5 per
+; cent of 115200 baud, well inside what 8N1 tolerates.
 ;
 ; No FIFO instruction appears here. At M1 the FIFOs do not exist, so the byte
 ; to send is loaded into r0 with LDI and send_byte is reached with CALL/RET.
@@ -53,7 +63,8 @@ bit:    SHRI    r0, 1                   ; C = the next bit out, LSB first
         SETP    TX, 0
         BRA     next
 one:    SETP    TX, 1
-next:   WAITD   1                       ; the deadline sets the edge, not the path
+next:   WAITD   1                       ; the deadline sets the edge, not the
+                                        ; length of the path that reached it
         DJNZ    r1, bit
 
         SETP    TX, 1                   ; stop bit

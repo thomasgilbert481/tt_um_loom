@@ -52,6 +52,16 @@ Consequences that both implementations must reproduce:
   of pending commits tagged with their visibility cycle.
 - Pad outputs (`uo_out`, `uio_out`, `uio_oe`) are registers; a pin write in a
   slot with X cycle `x` changes the pad at edge `x+2`.
+- **Slot grid.** A wait completes in the first X cycle at or after its
+  condition becomes true, and a thread has an X cycle only every 4 clocks. So
+  firmware-driven pin edges land on the thread's 4-clock grid. A `WAITD`
+  schedule has **no accumulated drift** (deadlines are absolute in ticks), and
+  each edge is late by 0 to 3 clocks relative to its deadline. When `k * period`
+  is a multiple of 4 clocks the lateness is constant and the edges are exactly
+  periodic; otherwise they dither (at 434 clocks per tick, UART bit edges
+  alternate 432 and 436 clocks while the 10-bit frame spacing is exactly 4340).
+  Clock-exact edges for any period are the job of the bit engine in auto mode
+  (M2/M3) and of deadline-latched pin writes (planned for M2, D-016).
 
 ## 3. What an instruction sees in its X cycle
 
@@ -86,9 +96,10 @@ at every edge:
 - Reset: `ACC = 0`, `NOW = 0`, `TD = 0`, `DT = 0`, `TICK_INT = 1`,
   `TICK_FRAC = 0`, so one tick per clock.
 - The tick generator runs whether or not the thread is running.
-- A committed `CSRW TICK_INT` or `CSRW TICK_FRAC` also sets `ACC <= 0` at the
-  same edge (the clear wins over the accumulate; `NOW` does not tick at that
-  edge).
+- Any write to `TICK_INT` or `TICK_FRAC`, by a committed `CSRW` or by a host
+  debug-space write, also sets `ACC <= 0` at the same edge (the clear wins over
+  the accumulate; `NOW` does not tick at that edge).
+- `TICK_INT = 0` is stored and read back as 0; the divider treats it as 1.
 - `reached(a, b)` is `((a - b) mod 2^16) < 2^15`.
 - `TICK_SEEN` is cleared at the commit edge of every valid slot of the thread
   (unless a tick sets it at the same edge).
@@ -108,9 +119,16 @@ at every edge:
 | `STEPS` | 16 | 0 | +1 at the commit of every valid slot, done or stalled |
 | BE state (`SR, CNT, CRC, BE_*`, `CRC_*`) **[M2/M3]** | | 0 | |
 
-Global: `RUN[3:0] = 0`, `HALTED[3:0] = 0`, `STEP_REQ[3:0] = 0`, `BADOP[3:0] = 0`,
-`RESET_PC[t] = t * 0x100` (masked to the memory size), `SFLAGS = 0`,
-`OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`. Instruction memory is **not** reset.
+Global: `RUN[3:0] = 0`, `HALTED[3:0] = 0`, `STEP_REQ[3:0] = 0`, `SFLAGS = 0`,
+`OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`. `BADOP` is a 16-bit register, reset
+0: bits 3:0 are per thread, bit 15 is the host access error, the rest read 0;
+the host writes 1 to clear a bit. `RESET_PC[t] = t * (IMEM_WORDS / 4)`, so the
+four threads never alias whatever the memory size (0, 64, 128, 192 for 256
+words; `t * 0x100` for 1024). Instruction memory is **not** reset.
+
+`CAPS` (read-only, 16 bits): `[2:0]` log2 of the FIFO depth, `[3]` FIFOs built,
+`[4]` bit engine built, `[5]` data memory built, `[6]` boot ROM built, `[11:7]`
+zero, `[15:12]` log2 of `IMEM_WORDS`. The M1 build with 256 words reads 0x8000.
 
 `PREV_PINS` is updated at the commit of every valid slot with the `pin_in`
 values that slot saw in X, whatever the instruction was.
@@ -174,7 +192,7 @@ All pin commits are bit-masked: a slot changes only the bits it writes.
 - `OUT ra`: for `j` in `0 .. cnt-1`: pin write of `ra[j]` to index
   `(base + j) mod 32`, with `base = OUTGRP[4:0]`, `cnt = min(OUTGRP[9:5], 16)`.
 - `IN rd`: `rd[j] = pin_in((base + j) mod 32)` for `j < cnt`, other bits 0,
-  with `base/cnt` from `INGRP`. No flags.
+  with `base = INGRP[4:0]`, `cnt = min(INGRP[9:5], 16)`. No flags.
 
 ### 6.4 Waits **[M1 except where noted]**
 
@@ -196,13 +214,24 @@ and leaves `PC` unchanged; when it completes it commits `WAIT_ACTIVE <= 0` and
   - `WAITS n`: `SFLAGS[n] == 1` (with forwarding). On `done` by condition,
     commit `SFLAGS[n] <= 0`.
   - `WAITB c` **[M2]**: 0 BE idle, 1 OUTQ not full, 2 INQ not empty,
-    3 `TICK_SEEN == 1`.
+    3 `TICK_SEEN == 1`. `WAITB` is built together with the FIFOs; condition 0
+    additionally needs the bit engine and is `NOP` + `BADOP` without it, so for
+    this one instruction `BADOP` depends on the operand.
   - Completion: if `cond`: `done`, and if the `T` bit of the instruction is set,
     commit `T <= 0`. Else if the `T` bit is set and `reached(NOW, TD)`: `done`,
     commit `T <= 1`. Else stall. Without the `T` bit the `T` flag is untouched.
 
 Pulses shorter than one slot (4 clocks) can be missed by `WAITE`; this is a
 documented property, not a bug.
+
+Programming consequences worth knowing (all follow from the rules above):
+
+- `TD` resets to 0 and `NOW` runs from reset, so the first `WAITD` of a program
+  completes at once unless a `SETD` anchors the schedule first. Always `SETD`
+  before the first deadline and after any unbounded wait.
+- `PREV_PINS` resets to 0 and is refreshed by every valid slot, so a `WAITE`
+  for a rising edge as the very first instruction of a thread fires
+  immediately if the pin is already high. Execute any instruction first.
 
 ### 6.5 Shared flags **[M1]**
 
@@ -214,7 +243,9 @@ bits it touches.
 
 `CSRR rd, n`: `rd <=` the CSR value visible in X, zero-extended; no flags.
 `CSRW n, ra`: the CSR takes `ra` truncated to its width. Read-only CSRs ignore
-writes; write-only and unimplemented CSRs read 0. `NOW` reads `NOW` in X.
+writes; write-only and unimplemented CSRs read 0. CSRs that belong to a feature
+that is not built (`SR`, `CNT`, `CRC`, `BE_*`, `CRC_*`) read 0 and ignore
+writes **without** setting `BADOP`: only instructions set `BADOP`. `NOW` reads `NOW` in X.
 `TID` reads `t`. `CSRW SFLAGS` ORs `ra[7:0]` into `SFLAGS`. `CSRW HOST_IRQ`
 sets `SWIRQ[t]` (host-visible, host-cleared). `CSRW FLAGS` writes `{T, C, Z}`.
 `CSRW TD` writes `TD`. `CSRW PIN_OUT/PIN_OE/OD_MASK` write the whole register.
@@ -237,9 +268,20 @@ sets `SWIRQ[t]` (host-visible, host-cleared). `CSRW FLAGS` writes `{T, C, Z}`.
   cycle. If a host write and a thread commit hit the same register bits at the
   same edge, the thread wins.
 - `CTRL.RUN` write: `RUN <= value`; bits going 0 to 1 clear `HALTED[t]`.
-- `CTRL.RESET` bit `t`: `PC <= RESET_PC[t]`, flags `<= 0`, `TD <= NOW`,
-  `DEPTH <= 0`, `WAIT_ACTIVE <= 0`. Registers and CSRs are untouched. The host
-  must only reset a halted thread; resetting a running thread is undefined.
+- Definitions. Thread `t` is **halted** (for debug access) iff `RUN[t] == 0`,
+  `STEP_REQ[t] == 0` and no valid slot of thread `t` is in F, D, X or W. **No
+  step in flight** (for IMEM access) means `RUN == 0`, `STEP_REQ == 0` and no
+  valid slot anywhere in the pipeline. `HALTED[t]` is only the sticky record
+  that a `HALT` instruction ran; it is not the access condition, so registers
+  can be preloaded before a thread's first run.
+- `CTRL.RESET` bit `t`: `PC <= RESET_PC[t]`, flags `<= 0`, `DEPTH <= 0` (the
+  contents of `RS0`/`RS1` are left alone), `WAIT_ACTIVE <= 0`, and `TD <=` the
+  `NOW` value visible in the cycle in which the host write commits. Registers
+  and CSRs are untouched. The host must only reset a halted thread; resetting a
+  running thread is undefined.
+- A host `STEP` that commits on the same edge at which the thread's F stage
+  consumes an earlier `STEP_REQ` is lost (thread wins). The SPI port needs far
+  more than 4 clocks per command, so this cannot happen through the pins.
 - `STEP` write for thread `t`: `STEP_REQ[t] <= 1`; ignored if `RUN[t] == 1`. The
   next slot of thread `t` is valid and clears `STEP_REQ[t]` in its F cycle. A
   stepped wait that stalls leaves `WAIT_ACTIVE = 1`, exactly as in free

@@ -21,9 +21,12 @@ visible in its listing, and one thread can never disturb another's timing.
 Three things set it apart from a PIO or PRU clone:
 
 1. **Deadline-based timing.** `WAITD k` advances a per-thread deadline by k
-   ticks and waits for it. Bit timing is jitter-free no matter which branch the
-   code took. Every wait can carry a timeout against the same deadline, so
-   "wait for SCL to rise, or give up" is one instruction.
+   ticks and waits for it, so a schedule never drifts no matter which branch
+   the code took, and the assembler proves statically that every deadline can
+   be met. Firmware-driven edges land within one slot (4 clocks) of the
+   deadline; deadline-latched pin writes make them clock-exact. Every wait can
+   carry a timeout against the same deadline, so "wait for SCL to rise, or give
+   up" is one instruction.
 2. **Bit engines.** Each thread owns a shift register with a programmable CRC,
    NRZ/NRZI/Manchester coding and USB/CAN bit-stuffing, usable one bit at a
    time under firmware control or autonomously at tick rate. That is what makes

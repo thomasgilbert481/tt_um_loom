@@ -134,6 +134,7 @@ demo.loom:31: error: BZ cannot reach 0x180 from 0x004: offset 379, rel8 holds -1
 
 | Directive | Meaning |
 |---|---|
+| `.imem W` | The instruction-memory size to lay out for. Must come before any code. |
 | `.thread N` | Switch to thread `N`'s section (`N` in 0..3). |
 | `.org ADDR` | Set the current thread's location counter. |
 | `.equ NAME = expr` | Define a constant. Evaluated where written. |
@@ -143,14 +144,38 @@ demo.loom:31: error: BZ cannot reach 0x180 from 0x004: offset 379, rel8 holds -1
 | `.tick CLOCKS` | Declare the current thread's tick period, for the deadline checker only. Emits nothing. |
 | `.deadline_check on\|off` | Enable or disable the deadline analysis for the current thread. Default `on`. |
 
-**Thread sections.** Each thread's location counter starts at that thread's
-reset vector, `N * 0x100` (`docs/SEMANTICS.md` section 5). Switching away and
-back resumes where the section left off. Two threads writing the same address
-is an error:
+**Thread sections and the memory size.** Each thread's location counter starts
+at that thread's reset vector, which the hardware sets to
+`N * (IMEM_WORDS / 4)` (`docs/DECISIONS.md` D-017, `docs/SEMANTICS.md`
+section 5). The assembler lays out for `IMEM_WORDS = 1024` unless told
+otherwise, so the default origins are 0, 0x100, 0x200, 0x300:
+
+| `IMEM_WORDS` | thread 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| 64 | 0 | 16 | 32 | 48 |
+| 128 | 0 | 32 | 64 | 96 |
+| 256 | 0 | 64 | 128 | 192 |
+| 512 | 0 | 128 | 256 | 384 |
+| **1024** (default) | 0 | 256 | 512 | 768 |
+
+Say which build a program is for with `.imem W` in the source or
+`--imem-words W` on the command line (`imem_words=` on `assemble()`). Valid
+sizes are the powers of two from 64 to 1024, the range the 10-bit PC can
+address. The command-line option wins over `.imem`, and warns if the two
+differ. `.imem` must come before any code, because it moves every thread's
+origin: after the first label or emitted word it is an error.
+
+Switching away from a thread and back resumes where its section left off. An
+address at or past the end of memory, and two threads writing the same address,
+are both errors:
 
 ```
 demo.loom:12: error: address 0x100 is already used by thread 0 (line 7): thread sections overlap
+demo.loom:31: error: address 0x100 is past the end of instruction memory (256 words)
 ```
+
+The **PC still wraps at 2^10** whatever the memory size, so a branch's reach is
+computed from the 10-bit next-PC and not from `IMEM_WORDS`.
 
 **Labels on a `.thread` or `.org` line** bind *after* the directive has moved
 the location counter, which is the reading `entry: .org 0x40` suggests.
@@ -192,7 +217,8 @@ library load:
 
 ```json
 {
-  "isa": "0.2.0",
+  "isa": "0.3.0",
+  "imem_words": 1024,
   "words": {"0": 10162, "1": 12033},
   "symbols": {"bit": 23, "start": 5},
   "threads": {"0": {"entry": 0, "size": 33}},
@@ -201,9 +227,10 @@ library load:
 ```
 
 `words` and `threads` use decimal string keys (JSON object keys are strings);
-values are plain integers. `entry` is the first address the thread's section
-emitted, which is its reset vector unless `.org` moved it, and `size` is how
-many words the thread emitted.
+values are plain integers. `imem_words` is the memory size the program was laid
+out for, so a loader can check it against the build it is loading into. `entry`
+is the first address the thread's section emitted, which is its reset vector
+unless `.org` moved it, and `size` is how many words the thread emitted.
 
 **Listing** (`--listing [FILE]`): address, word, thread, timing class from
 `isa.yaml` (`one_slot`, `wait`, `blocking`), source line number and source text,

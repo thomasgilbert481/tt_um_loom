@@ -91,6 +91,58 @@ def test_no_deadline_check_silences_the_analysis(tmp_path, capsys):
     assert "deadline cannot be met" not in capsys.readouterr().err
 
 
+TWO_THREADS = """\
+        .thread 0
+a:      NOP
+        .thread 1
+b:      NOP
+"""
+
+
+def test_imem_words_defaults_to_1024(tmp_path, capsys):
+    assert main([write(tmp_path, TWO_THREADS)]) == 0
+    image = json.loads(capsys.readouterr().out)
+    assert image["imem_words"] == 1024
+    assert image["symbols"] == {"a": 0, "b": 256}
+
+
+def test_imem_words_moves_the_thread_origins(tmp_path, capsys):
+    assert main([write(tmp_path, TWO_THREADS), "--imem-words", "256"]) == 0
+    image = json.loads(capsys.readouterr().out)
+    assert image["imem_words"] == 256
+    assert image["symbols"] == {"a": 0, "b": 64}
+    assert image["threads"] == {"0": {"entry": 0, "size": 1},
+                                "1": {"entry": 64, "size": 1}}
+
+
+def test_imem_words_rejects_a_size_that_is_not_a_power_of_two(tmp_path):
+    with pytest.raises(SystemExit):
+        main([write(tmp_path, TWO_THREADS), "--imem-words", "100"])
+
+
+def test_the_imem_directive_works_from_the_command_line(tmp_path, capsys):
+    source = write(tmp_path, ".imem 128\n" + TWO_THREADS)
+    assert main([source]) == 0
+    image = json.loads(capsys.readouterr().out)
+    assert image["imem_words"] == 128
+    assert image["symbols"] == {"a": 0, "b": 32}
+
+
+def test_the_option_beats_the_directive_and_warns(tmp_path, capsys):
+    source = write(tmp_path, ".imem 128\n" + TWO_THREADS)
+    assert main([source, "--imem-words", "512"]) == 0
+    captured = capsys.readouterr()
+    assert "--imem-words 512 was given" in captured.err
+    assert json.loads(captured.out)["imem_words"] == 512
+
+
+def test_code_past_the_end_of_a_small_memory_fails(tmp_path, capsys):
+    source = write(tmp_path, ".thread 3\n" + "NOP\n" * 20)
+    assert main([source, "--imem-words", "64"]) == 1
+    assert "past the end of instruction memory (64 words)" \
+        in capsys.readouterr().err
+
+
 def test_a_broken_source_fails_and_reports_every_error(tmp_path, capsys):
     assert main([write(tmp_path, BROKEN)]) == 1
     err = capsys.readouterr().err

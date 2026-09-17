@@ -30,11 +30,28 @@ from .parser import Stmt, parse_source
 
 DIRECTIVES = frozenset({
     ".thread", ".org", ".equ", ".pins", ".word", ".csr", ".tick",
-    ".deadline_check",
+    ".deadline_check", ".imem",
 })
 PSEUDO_OPS = frozenset({"MOV16", "BRA", "INC", "DEC"})
 
 DEFAULT_SCRATCH = 7                    # r7, the .csr / MOV16 scratch register
+
+#: Instruction-memory size the assembler lays out for when nothing says
+#: otherwise. Thread t's section starts at ``t * (IMEM_WORDS / threads)``
+#: (``docs/DECISIONS.md`` D-017, ``docs/SEMANTICS.md`` section 5), so the
+#: default keeps the historical 0x100 spacing.
+DEFAULT_IMEM_WORDS = 1024
+MIN_IMEM_WORDS = 64
+
+
+def imem_choices(pc_bits: int = 10) -> "List[int]":
+    """The instruction-memory sizes the assembler accepts: powers of two from
+    ``MIN_IMEM_WORDS`` up to what the program counter can address."""
+    sizes, size = [], MIN_IMEM_WORDS
+    while size <= (1 << pc_bits):
+        sizes.append(size)
+        size <<= 1
+    return sizes
 
 
 class _Bad(Exception):
@@ -71,6 +88,7 @@ class Program:
 
     isa_version: str
     source: str
+    imem_words: int = DEFAULT_IMEM_WORDS
     words: Dict[int, int] = dataclasses.field(default_factory=dict)
     symbols: Dict[str, int] = dataclasses.field(default_factory=dict)
     threads: Dict[int, ThreadInfo] = dataclasses.field(default_factory=dict)
@@ -99,6 +117,7 @@ class Program:
         """The JSON image the golden model and the host library load."""
         return {
             "isa": self.isa_version,
+            "imem_words": self.imem_words,
             "words": {str(a): self.words[a] for a in sorted(self.words)},
             "symbols": {k: self.symbols[k] for k in sorted(self.symbols)},
             "threads": {
@@ -123,13 +142,25 @@ class Program:
 
 
 class _Assembler:
-    def __init__(self, isa: Isa, filename: str):
+    def __init__(self, isa: Isa, filename: str,
+                 imem_words: "Optional[int]" = None):
         self.isa = isa
         self.filename = filename
         self.threads = int(isa.meta["threads"])
         self.pc_bits = int(isa.meta["pc_bits"])
         self.slot_clocks = int(isa.meta["slot_clocks"])
-        self.imem_words = 1 << self.pc_bits
+        self.pc_mask = (1 << self.pc_bits) - 1      # PC wraps at 2^pc_bits
+        #: True when the caller fixed the size, so a ``.imem`` only warns.
+        self.imem_forced = imem_words is not None
+        self.imem_words = (imem_words if imem_words is not None
+                           else DEFAULT_IMEM_WORDS)
+        if self.imem_words not in imem_choices(self.pc_bits):
+            raise ValueError(
+                "imem_words=%r is not a power of two from %d to %d"
+                % (imem_words, MIN_IMEM_WORDS, 1 << self.pc_bits))
+        #: Set once an address has been committed, after which ``.imem`` would
+        #: move code that is already placed.
+        self.layout_locked = False
         self.pins = pin_table(isa)
         self.csrs = csr_table(isa)
         self.enums = enum_tables(isa)          # operand base -> {NAME: value}
@@ -149,8 +180,12 @@ class _Assembler:
         self.count: Dict[int, int] = {t: 0 for t in range(self.threads)}
 
         self.thread = 0
-        self.pcs: Dict[int, int] = {t: (t << 8) & (self.imem_words - 1)
+        self.pcs: Dict[int, int] = {t: self.thread_origin(t)
                                     for t in range(self.threads)}
+
+    def thread_origin(self, thread: int) -> int:
+        """Thread t's reset vector: ``t * (IMEM_WORDS / threads)`` (D-017)."""
+        return thread * (self.imem_words // self.threads)
 
     # ------------------------------------------------------------ diagnostics
     def error(self, stmt: Stmt, message: str, token: "Optional[Token]" = None,
@@ -246,12 +281,18 @@ class _Assembler:
             stmt.thread = self.thread
             stmt.addr = self.pcs[self.thread]
             for label in stmt.labels:
+                # A label fixes an address, so the memory size can no longer move.
+                self.layout_locked = True
                 self.define(label, stmt.addr, stmt, "label")
 
             if stmt.head is None or lower in (".thread", ".org"):
                 continue
             try:
-                if lower == ".equ":
+                if lower == ".imem":
+                    self.do_imem(stmt)
+                    stmt.thread = self.thread
+                    stmt.addr = self.pcs[self.thread]
+                elif lower == ".equ":
                     self.do_equ(stmt)
                 elif lower == ".pins":
                     self.do_pins(stmt)
@@ -289,6 +330,7 @@ class _Assembler:
                 return
             self.owner[addr] = (stmt.thread, stmt.line)
         if stmt.size:
+            self.layout_locked = True
             self.first_addr.setdefault(stmt.thread, stmt.addr)
             self.count[stmt.thread] += stmt.size
         self.pcs[self.thread] = stmt.addr + stmt.size
@@ -312,7 +354,33 @@ class _Assembler:
         if not 0 <= value < self.imem_words:
             raise _Bad(".org 0x%X is outside instruction memory (0..0x%X)"
                        % (value, self.imem_words - 1), stmt.head, RANGE)
+        self.layout_locked = True
         self.pcs[self.thread] = value
+
+    def do_imem(self, stmt: Stmt) -> None:
+        """``.imem W``: the instruction-memory size this program is laid out for.
+
+        It must come before any code, because it moves every thread's default
+        origin. An ``--imem-words`` on the command line wins over it.
+        """
+        value = self.eval_tokens(self.one_arg(stmt, "word count"),
+                                 "the memory size")
+        choices = imem_choices(self.pc_bits)
+        if value not in choices:
+            raise _Bad(".imem %d is not a valid memory size (a power of two "
+                       "from %d to %d)" % (value, choices[0], choices[-1]),
+                       stmt.head, RANGE)
+        if self.imem_forced:
+            if value != self.imem_words:
+                self.warn(stmt, ".imem %d ignored: --imem-words %d was given on "
+                                "the command line" % (value, self.imem_words),
+                          LAYOUT)
+            return
+        if self.layout_locked:
+            raise _Bad(".imem must come before any code: it moves every "
+                       "thread's default origin", stmt.head, LAYOUT)
+        self.imem_words = value
+        self.pcs = {t: self.thread_origin(t) for t in range(self.threads)}
 
     def do_equ(self, stmt: Stmt) -> None:
         if len(stmt.args) != 1:
@@ -611,7 +679,7 @@ class _Assembler:
             if not 0 <= target < self.imem_words:
                 raise _Bad("branch target 0x%X is outside instruction memory"
                            % target, group[0], RANGE)
-            offset = target - ((addr + 1) & (self.imem_words - 1))
+            offset = target - ((addr + 1) & self.pc_mask)   # PC wraps, not IMEM
             if not low <= offset <= high:
                 raise _Bad(
                     "%s cannot reach 0x%03X from 0x%03X: offset %d, %s "
@@ -627,7 +695,8 @@ class _Assembler:
     # ------------------------------------------------------------------ result
     def finish(self, stmts: List[Stmt], source: str,
                run_deadline_check: bool) -> Program:
-        program = Program(isa_version=self.isa.version, source=source)
+        program = Program(isa_version=self.isa.version, source=source,
+                          imem_words=self.imem_words)
         program.words = dict(self.words)
         program.symbols = dict(self.equs)
         program.symbols.update(self.labels)
@@ -656,13 +725,14 @@ class _Assembler:
 
 # ---------------------------------------------------------------- entry points
 def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" = None,
-                  strict: bool = False, deadline_check: bool = True) -> Program:
+                  strict: bool = False, deadline_check: bool = True,
+                  imem_words: "Optional[int]" = None) -> Program:
     """Assemble source text. See :func:`assemble` for the argument meanings."""
     from .listing import build_listing
 
     isa = isa if isa is not None else load()
     stmts, diagnostics = parse_source(text, filename)
-    asm = _Assembler(isa, filename)
+    asm = _Assembler(isa, filename, imem_words)
     asm.diagnostics.extend(diagnostics)
     asm.pass1(stmts)
     # Pass 2 always runs: statements that failed to size emit nothing, so every
@@ -677,32 +747,38 @@ def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" =
 
 
 def assemble_file(path, *, isa: "Optional[Isa]" = None, strict: bool = False,
-                  deadline_check: bool = True) -> Program:
+                  deadline_check: bool = True,
+                  imem_words: "Optional[int]" = None) -> Program:
     path = pathlib.Path(path)
     text = path.read_text(encoding="utf-8")
     return assemble_text(text, str(path).replace(os.sep, "/"), isa=isa,
-                         strict=strict, deadline_check=deadline_check)
+                         strict=strict, deadline_check=deadline_check,
+                         imem_words=imem_words)
 
 
 def assemble(text_or_path, *, filename: "Optional[str]" = None,
              isa: "Optional[Isa]" = None, strict: bool = False,
-             deadline_check: bool = True) -> Program:
+             deadline_check: bool = True,
+             imem_words: "Optional[int]" = None) -> Program:
     """Assemble a file or a block of source text.
 
     A :class:`pathlib.Path` is always read from disk. A ``str`` is treated as
     source text, unless it holds no newline and names a file that exists.
     ``strict`` also turns deadline errors into an :class:`AsmError`.
+
+    ``imem_words`` is the instruction-memory size the program is laid out for:
+    thread ``t``'s section starts at ``t * (imem_words / 4)`` (D-017). It
+    defaults to 1024 and overrides a ``.imem`` in the source.
     """
+    kwargs = dict(isa=isa, strict=strict, deadline_check=deadline_check,
+                  imem_words=imem_words)
     if isinstance(text_or_path, pathlib.Path):
-        return assemble_file(text_or_path, isa=isa, strict=strict,
-                             deadline_check=deadline_check)
+        return assemble_file(text_or_path, **kwargs)
     text = str(text_or_path)
     if "\n" not in text and text.strip() and len(text) < 4096:
         try:
             if os.path.isfile(text):
-                return assemble_file(text, isa=isa, strict=strict,
-                                     deadline_check=deadline_check)
+                return assemble_file(text, **kwargs)
         except OSError:
             pass
-    return assemble_text(text, filename or "<text>", isa=isa, strict=strict,
-                         deadline_check=deadline_check)
+    return assemble_text(text, filename or "<text>", **kwargs)

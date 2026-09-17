@@ -163,6 +163,25 @@ def test_firmware_round_trips_through_the_disassembler(path):
 
 
 @pytest.mark.parametrize("path", [UART_HELLO, UART_TX])
+def test_firmware_is_laid_out_for_the_default_1024_word_memory(path):
+    program = assemble_file(path, isa=ISA)
+    assert program.imem_words == 1024
+    assert program.to_image()["imem_words"] == 1024
+
+
+@pytest.mark.parametrize("path", [UART_HELLO, UART_TX])
+def test_firmware_also_fits_the_256_word_m1_build(path):
+    """Thread 0's reset vector is 0 whatever IMEM_WORDS is (D-017), so the
+    image is identical in the flop build SEMANTICS section 5 describes."""
+    big = assemble_file(path, isa=ISA)
+    small = assemble_file(path, isa=ISA, imem_words=256)
+    assert small.errors == []
+    assert small.words == big.words
+    assert small.imem_words == 256
+    assert max(small.words) < 256
+
+
+@pytest.mark.parametrize("path", [UART_HELLO, UART_TX])
 def test_firmware_listing_and_image_are_produced(path):
     program = assemble_file(path, isa=ISA)
     listing = program.listing_text()

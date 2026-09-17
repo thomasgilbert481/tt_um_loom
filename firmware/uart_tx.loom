@@ -39,9 +39,20 @@ next:   WAITD   1                       ; both paths land here; the deadline, no
 ; Timing notes for the deadline checker: the longest path between two WAITD
 ; instructions is the data-bit loop taken the long way round, DJNZ, SHRI, BC,
 ; SETP, JMP, WAITD = 6 slots = 24 clocks, far under the 434-clock tick, so the
-; schedule is met with 410 clocks of margin. Each data-bit SETP
-; executes 3 slots after its deadline on both paths, so bit edges are spaced
-; exactly one tick apart (zero jitter), offset by a constant 12 clocks.
+; schedule is met with 410 clocks of margin. Each data-bit SETP executes the
+; same 3 slots after its deadline on both paths, so the path a bit takes
+; through the loop does not move its edge.
+;
+; What the edges actually look like: a thread gets an X cycle only every 4
+; clocks (docs/SEMANTICS.md section 2, "Slot grid"), so a WAITD completes at
+; the first X cycle at or after its deadline and each edge lands 0 to 3 clocks
+; late. That lateness never accumulates, because WAITD advances TD from the
+; previous deadline and not from "now". At TICK_INT 434 consecutive bit edges
+; therefore alternate 432 and 436 clocks apart while the 10-bit frame spacing
+; is exactly 4340 clocks, which is what a receiver samples against. A tick
+; period that is a multiple of 4 clocks makes the lateness constant and the
+; edges exactly periodic; 432 and 436 are both within 0.5 per cent of 115200
+; baud, well inside what 8N1 tolerates.
 ;
 ; Bit-engine variant (M2): replace the bit loop with
 ;       LDSR r0 ; CSRW CNT, r1 (8) ; loop: SHO ; WAITD 1 ; DJNZ r1, loop

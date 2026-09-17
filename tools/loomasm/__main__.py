@@ -13,7 +13,7 @@ import pathlib
 import sys
 from typing import List
 
-from .assembler import assemble_file
+from .assembler import assemble_file, imem_choices
 from .diag import DEADLINE, ERROR, Diagnostic, AsmError
 
 
@@ -31,6 +31,11 @@ def main(argv=None) -> int:
                         help="write the JSON image here (default: stdout)")
     parser.add_argument("--listing", nargs="?", const="-", metavar="FILE",
                         help="write the listing here ('-' or no value: stdout)")
+    parser.add_argument("--imem-words", type=int, metavar="W",
+                        choices=imem_choices(),
+                        help="instruction-memory size to lay out for; thread t "
+                             "starts at t * (W / 4). Overrides a .imem in the "
+                             "source. Default 1024")
     parser.add_argument("--strict", action="store_true",
                         help="treat deadline errors as a failure")
     parser.add_argument("--no-deadline-check", action="store_true",
@@ -41,7 +46,8 @@ def main(argv=None) -> int:
 
     try:
         program = assemble_file(args.source, strict=False,
-                                deadline_check=not args.no_deadline_check)
+                                deadline_check=not args.no_deadline_check,
+                                imem_words=args.imem_words)
     except AsmError as exc:
         _report(exc.diagnostics, sys.stderr)
         return 1

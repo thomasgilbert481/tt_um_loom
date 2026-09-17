@@ -118,8 +118,15 @@ same cocotb UART model as M0; first synthesis numbers recorded.
       `WAITD 0` transparent; limits in `tools/loomasm/README.md`). 232 tests.
       `firmware/uart_hello.loom` (M1 acceptance program) and `uart_tx.loom`
       both prove feasible with 410 clocks of worst-case slack.
-- [ ] `tools/loomsim`: Python golden model, slot-accurate at the thread level,
-      with the same debug-state dump format the RTL exposes.
+- [x] 2026-09-17: `tools/loomsim`: cycle-accurate Python golden model written
+      from `docs/SEMANTICS.md` alone (its author was not allowed to read the
+      RTL): pipeline and slot validity, shared-state visibility with a pending
+      commit list, SFLAGS forwarding, tick generators, waits and timeouts, pin
+      index space and synchroniser, run control, host actions, retire record,
+      FIFOs behind a feature flag, CLI. 318 tests, including four that pin the
+      slot-grid timing property over 101 edges. Its twelve spec questions are
+      resolved in `docs/spec-questions/loomsim.md` and folded into SEMANTICS,
+      D-016 and D-017.
 - [ ] RTL: `loom_core` (scheduler, fetch, decode, regfile, ALU, branches,
       CALL/RET, flags), `loom_timer`, `loom_pins` (SETP/OUT/IN/JP/WAITP/WAITE/
       WAITD/SETD/DLY, OD mode), `loom_imem` FLOPS option, minimal host path

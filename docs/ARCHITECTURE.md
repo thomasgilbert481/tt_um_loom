@@ -193,10 +193,18 @@ Reserved CSR numbers read 0 and ignore writes.
 - `NOW` increments on every tick and wraps at 2^16.
 - `WAITD k`: `TD <= TD + k`, then stall until `NOW` has reached `TD`. "Reached" is
   the wrap-safe test `(NOW - TD) mod 2^16 < 2^15`. Because the deadline advances
-  from the previous deadline and not from "now", the interval between consecutive
-  pin writes bracketed by `WAITD` is exactly k ticks regardless of how many
-  instructions ran in between (as long as fewer than k ticks' worth). This is
-  what makes a UART written in five lines have zero accumulated jitter.
+  from the previous deadline and not from "now", a schedule built from `WAITD`
+  never drifts, regardless of how many instructions ran in between (as long as
+  fewer than k ticks' worth) or which branch was taken. This is what makes a
+  UART written in five lines have zero accumulated jitter.
+- Resolution of a firmware-driven edge is one slot: a thread acts only every 4
+  clocks, so each edge lands 0 to 3 clocks after its deadline. It is exactly
+  periodic when `k * period` is a multiple of 4 clocks, and dithers by one slot
+  otherwise (432/436 clocks at a 434-clock tick, 0.5 percent of a 115200 baud
+  bit). Two mechanisms give clock-exact edges for any period: the bit engine in
+  auto mode, and deadline-latched pin writes, where `SETP pin, v, D` stages the
+  write and the hardware applies it on the exact clock the next `WAITD`
+  deadline is reached (M2, decision D-016).
 - `SETD k`: `TD <= NOW + k`. Use it to re-anchor the schedule to an external
   event (for example right after `WAITE` sees the start-bit edge; then
   `WAITD` of 1.5 bit times lands the first sample mid-bit).
