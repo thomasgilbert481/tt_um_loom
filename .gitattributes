@@ -1,0 +1,6 @@
+# Keep line endings stable between Windows, WSL and CI: LF everywhere.
+* text=auto eol=lf
+*.gds binary
+*.oas binary
+*.png binary
+*.pdf binary
