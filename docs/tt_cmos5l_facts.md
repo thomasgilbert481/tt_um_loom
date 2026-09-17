@@ -588,3 +588,101 @@ yet. Consequence: acceptance is not the open question, the precheck is, and nobo
 TT's side has run it on cmos5l. Thomas asked Ken for his config on 2026-09-15 (no answer
 yet). The plan now has an M0.5 SRAM smoke test (branch `sram-smoke`, due 2026-09-28) so
 the first precheck result exists in September; see `docs/PLAN.md` and D-015.
+
+---
+
+## 10. cmos5l PDN layers and the TT precheck, read from source 2026-09-17
+
+Gathered while building the M0.5 smoke test (branch `sram-smoke`). All primary sources at
+the pinned PDK commit `2bbec755dc67ca3db0261c3d6163e15735d66710` and the
+`ihp-sg13cmos5l` / `ihp-cmos5l` branches of the TT repos.
+
+### The PDN layers are one step lower than on SG13G2
+
+`ihp-sg13cmos5l/libs.tech/librelane/config.tcl`, header comment
+*"Metal stack: M1-M4-TM1 (5 layers, no Metal5/TopMetal2)"*:
+
+```tcl
+set ::env(FP_PDN_RAIL_LAYER)       Metal1      ; set ::env(FP_PDN_RAIL_OFFSET) 0
+set ::env(FP_PDN_VERTICAL_LAYER)   Metal4      ; # vertical stripes
+set ::env(FP_PDN_HORIZONTAL_LAYER) TopMetal1   ; # horizontal stripes
+set ::env(FP_PDN_VWIDTH) 1.0 ; VSPACING 2.0 ; VPITCH 50.0 ; VOFFSET 10.0
+set ::env(FP_PDN_HWIDTH) 2.0 ; HSPACING 4.0 ; HPITCH 50.0 ; HOFFSET 10.0
+set ::env(MACRO_BLOCKAGES_LAYER) "Metal1 Metal2 Metal3 Metal4 TopMetal1"
+set ::env(FP_TAPCELL_DIST) 0 ; set ::env(PRIMARY_GDSII_STREAMOUT_TOOL) "klayout"
+```
+
+versus `ihp-sg13g2/.../config.tcl`, which has `PDN_VERTICAL_LAYER TopMetal1`,
+`PDN_HORIZONTAL_LAYER TopMetal2`, `VPITCH/HPITCH 75.6`, `VOFFSET/HOFFSET 13.6`.
+(cmos5l uses the `FP_PDN_*` spellings, sg13g2 the `PDN_*` ones; LibreLane declares
+`FP_PDN_*` as deprecated aliases in `librelane/steps/common_variables.py`, so both work.)
+
+**Consequence for macros.** `tt_um_urish_sram_test`'s fix — `add_pdn_connect -grid macro
+-layers "Metal4 $::env(PDN_VERTICAL_LAYER)"` — is a Metal4-to-TopMetal1 via on SG13G2.
+On cmos5l `PDN_VERTICAL_LAYER` *is* Metal4, so there is no second layer to come down
+from, and with TT's `FP_PDN_MULTILAYER: 0` there are no TopMetal1 stripes in a user block
+at all. The stripes have to land *inside* the macro's Metal4 power pins. That is what the
+section 9 report about aligning stripes to the macro's power pins means on this PDK.
+
+### TopMetal1 belongs to tt_top, and the precheck enforces it
+
+`tt-multiplexer/ol2/tt_top/pdn.tcl` (branch `ihp-sg13cmos5l`) builds the chip grid from
+`FP_PDN_HORIZONTAL_LAYER` (TopMetal1) stripes, adds a Metal4+TopMetal1 core ring, and
+connects down to each user block with
+`define_pdn_grid -macro -cells "^tt_(ctrl|mux|pg|um)(_.*)?"` plus
+`add_pdn_connect -grid macro -layers "Metal4 TopMetal1"`.
+So a user block must present **Metal4** power pins, and must not put TopMetal1 in its own
+GDS: `tt-support-tools/precheck/tech_data.py` has
+
+```python
+forbidden_layers["ihp-sg13cmos5l"] = ["TopMetal1.drawing", "TopMetal1.pin", "TopMetal1.label"]
+valid_lef_port_layers["ihp-sg13cmos5l"] = {Metal1.pin (8,2), Metal2.pin (10,2),
+                                           Metal3.pin (30,2), Metal4.pin (50,2)}
+```
+
+### What the precheck actually runs on cmos5l
+
+`tt-support-tools/precheck/precheck.py`, filtered by the `techs` key of each check:
+
+| Check | Runs on cmos5l? |
+|---|---|
+| Magic DRC | **no** (sky130A, gf180mcuD only) |
+| KLayout FEOL / BEOL / offgrid | no (sky130A only) |
+| KLayout pin label overlapping drawing | yes (all techs) |
+| **KLayout SG13CMOS5L DRC** (`libs.tech/klayout/tech/drc/ihp-sg13cmos5l.drc`) | yes |
+| KLayout zero area | yes |
+| KLayout checks (top-cell name, forbidden layers) | yes |
+| Pin check, Boundary check | yes |
+| Power pin check | no (sky130A, gf180mcuD only) |
+| **Layer check** (`valid_layers`), **Cell name check** (no `#` or `/`) | yes |
+| urpm/nwell | no |
+| Analog pin check | yes |
+
+`ERROR_ON_MAGIC_DRC` and `MAGIC_MACRO_STD_CELL_SOURCE` therefore have no effect on the
+cmos5l precheck; keep them only because hardening may still invoke Magic.
+`valid_layers["ihp-sg13cmos5l"]` already contains `SRAM.drawing` and `DigiBnd.drawing`,
+so TT anticipated SRAM macros.
+
+### Checked locally against `RM_IHPSG13_1P_512x16_c2_bm_bist.gds` alone
+
+Parsing the vendored GDS and applying the precheck's own rules and layer map:
+
+- 27 (layer, datatype) pairs used, **every one of them in `valid_layers`** — Activ,
+  GatPoly, Cont, Metal1..Metal4 with their `.pin`/`.text`/`.res` purposes, Via1..Via3,
+  pSD, NWell, `SRAM.drawing` (25/0), `DigiBnd.drawing` (16/0), `TEXT.drawing`,
+  `prBoundary.boundary` (189/4). **Layer check: pass.**
+- 139 cells, none containing `#` or `/`. **Cell name check: pass.**
+- No TopMetal1 anywhere. **Forbidden layer check: pass.**
+- Note the macro GDS *does* carry `prBoundary.boundary`, which contradicts the reference
+  project's comment *"SRAM GDS has no PR boundary layer"*.
+
+So the residual precheck risk is the sign-off **KLayout SG13CMOS5L DRC deck run over the
+merged GDS**, not the layer/name bookkeeping.
+
+### Reference project status, 2026-09-17
+
+`urish/ttihp-sram-test` on `main`, last run 2026-03-03 (`fix: blackbox SRAM macros during
+LVS`): jobs `gds` **success**, `gl_test` **success**, `viewer` **success**,
+`precheck` **failure**. The logs have expired, so the failing check is unknown. This
+matches Matt Venn's statement in section 9: hardening a macro works, the precheck is the
+open problem.
