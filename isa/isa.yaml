@@ -1,0 +1,203 @@
+# Loom ISA, single source of truth.
+# Version 0.1 seed (2026-09-15, Fable). Frozen as 1.0 at milestone M1.
+#
+# Everything that knows an encoding is generated from this file by tools/gen:
+#   src/loom_isa.vh            opcode/field localparams for the decoder
+#   tools/loomasm/tables.py    assembler tables
+#   tools/loomsim/tables.py    golden model dispatch
+#   docs/ISA.md                human-readable reference
+#   formal/isa_decode.sv       decode-completeness properties (ISA-1)
+#
+# Format strings are 16 characters, MSB first. Digits are fixed bits. A letter
+# names a field; repeated letters are that field's bits, MSB first. '-' is a
+# don't-care that the assembler emits as 0 and the decoder ignores.
+
+meta:
+  name: loom
+  version: "0.1.0"
+  word_bits: 16
+  registers: 8
+  register_bits: 16
+  pc_bits: 10
+  threads: 4
+  slot_clocks: 4
+  flags: [Z, C, T]
+
+field_types:
+  d: {name: rd,   bits: 3, kind: reg,   doc: destination register}
+  a: {name: ra,   bits: 3, kind: reg,   doc: source register A}
+  b: {name: rb,   bits: 3, kind: reg,   doc: source register B}
+  f: {name: funct, bits: 3, kind: enum, doc: sub-operation}
+  i: {name: imm,  bits: var, kind: uimm, doc: unsigned immediate}
+  r: {name: rel,  bits: var, kind: simm, doc: signed PC-relative offset in instructions, from the next PC}
+  A: {name: abs,  bits: 10, kind: addr, doc: absolute instruction address}
+  p: {name: pin,  bits: 5, kind: pin,   doc: pin index 0..31, see pins section}
+  v: {name: val,  bits: 1, kind: bit,   doc: pin level}
+  e: {name: edge, bits: 2, kind: enum,  doc: 0 rise, 1 fall, 2 any}
+  n: {name: flag, bits: 3, kind: uimm,  doc: shared flag number 0..7}
+  c: {name: cond, bits: var, kind: enum, doc: condition code}
+  T: {name: tmo,  bits: 1, kind: bit,   doc: 1 = abort at deadline and set T}
+  C: {name: csr,  bits: 5, kind: csr,   doc: CSR number}
+  w: {name: wr,   bits: 1, kind: bit,   doc: 1 = write}
+  s: {name: set,  bits: 1, kind: bit,   doc: 1 = set, 0 = clear}
+
+timing_classes:
+  one_slot: every execution costs exactly one slot
+  wait: re-issues each slot until the condition holds (or the deadline, if T=1); each re-issue is one slot
+  blocking: re-issues each slot while the FIFO cannot serve the request
+
+instructions:
+  # ---------------------------------------------------------------- ALU
+  - {name: ADD,  fmt: "0000fffdddaaabbb", fixed: {f: 0}, ops: [rd, ra, rb], sem: "rd = ra + rb", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: SUB,  fmt: "0000fffdddaaabbb", fixed: {f: 1}, ops: [rd, ra, rb], sem: "rd = ra - rb; C = (ra >= rb)", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: AND,  fmt: "0000fffdddaaabbb", fixed: {f: 2}, ops: [rd, ra, rb], sem: "rd = ra & rb; C = 0", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: OR,   fmt: "0000fffdddaaabbb", fixed: {f: 3}, ops: [rd, ra, rb], sem: "rd = ra | rb; C = 0", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: XOR,  fmt: "0000fffdddaaabbb", fixed: {f: 4}, ops: [rd, ra, rb], sem: "rd = ra ^ rb; C = 0", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: SHL,  fmt: "0000fffdddaaabbb", fixed: {f: 5}, ops: [rd, ra, rb], sem: "rd = ra << rb[3:0]; C = last bit shifted out (0 if amount 0)", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: SHR,  fmt: "0000fffdddaaabbb", fixed: {f: 6}, ops: [rd, ra, rb], sem: "rd = ra >> rb[3:0] (logical); C = last bit shifted out", flags: [Z, C], timing: one_slot, class: alu}
+  - {name: ROR,  fmt: "0000fffdddaaabbb", fixed: {f: 7}, ops: [rd, ra, rb], sem: "rd = rotate_right(ra, rb[3:0]); C = last bit rotated", flags: [Z, C], timing: one_slot, class: alu}
+
+  - {name: ADDI, fmt: "0001fffdddiiiiii", fixed: {f: 0}, ops: [rd, imm6], sem: "rd = rd + imm6", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: SUBI, fmt: "0001fffdddiiiiii", fixed: {f: 1}, ops: [rd, imm6], sem: "rd = rd - imm6; C = (rd >= imm6)", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: ANDI, fmt: "0001fffdddiiiiii", fixed: {f: 2}, ops: [rd, imm6], sem: "rd = rd & imm6; C = 0", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: ORI,  fmt: "0001fffdddiiiiii", fixed: {f: 3}, ops: [rd, imm6], sem: "rd = rd | imm6; C = 0", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: XORI, fmt: "0001fffdddiiiiii", fixed: {f: 4}, ops: [rd, imm6], sem: "rd = rd ^ imm6; C = 0", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: SHLI, fmt: "0001fffdddiiiiii", fixed: {f: 5}, ops: [rd, imm6], sem: "rd = rd << imm6[3:0]; C = last bit out", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: SHRI, fmt: "0001fffdddiiiiii", fixed: {f: 6}, ops: [rd, imm6], sem: "rd = rd >> imm6[3:0]; C = last bit out", flags: [Z, C], timing: one_slot, class: alui}
+  - {name: CMPI, fmt: "0001fffdddiiiiii", fixed: {f: 7}, ops: [rd, imm6], sem: "flags of rd - imm6; rd unchanged", flags: [Z, C], timing: one_slot, class: alui}
+
+  - {name: LDI,  fmt: "00100dddiiiiiiii", ops: [rd, imm8], sem: "rd = zero_extend(imm8)", flags: [], timing: one_slot, class: ldi}
+  - {name: LDIH, fmt: "00101dddiiiiiiii", ops: [rd, imm8], sem: "rd[15:8] = imm8; rd[7:0] unchanged", flags: [], timing: one_slot, class: ldi}
+
+  - {name: MOV,  fmt: "0011fffdddaaa---", fixed: {f: 0}, ops: [rd, ra], sem: "rd = ra", flags: [], timing: one_slot, class: unary}
+  - {name: NOT,  fmt: "0011fffdddaaa---", fixed: {f: 1}, ops: [rd, ra], sem: "rd = ~ra; C = 0", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: NEG,  fmt: "0011fffdddaaa---", fixed: {f: 2}, ops: [rd, ra], sem: "rd = 0 - ra; C = (ra == 0)", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: CMP,  fmt: "0011fffdddaaa---", fixed: {f: 3}, ops: [rd, ra], sem: "flags of rd - ra; nothing written", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: TEST, fmt: "0011fffdddaaa---", fixed: {f: 4}, ops: [rd, ra], sem: "Z = ((rd & ra) == 0); C = 0; nothing written", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: REV,  fmt: "0011fffdddaaa---", fixed: {f: 5}, ops: [rd, ra], sem: "rd = bit_reverse16(ra); C = 0", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: PAR,  fmt: "0011fffdddaaa---", fixed: {f: 6}, ops: [rd, ra], sem: "rd = ra; C = even parity of ra (1 if the number of 1s is odd)", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: SWAP, fmt: "0011fffdddaaa---", fixed: {f: 7}, ops: [rd, ra], sem: "rd = {ra[7:0], ra[15:8]}; C = 0", flags: [Z, C], timing: one_slot, class: unary}
+
+  # ------------------------------------------------------------ control
+  - {name: JMP,  fmt: "010000AAAAAAAAAA", ops: [abs10], sem: "PC = abs10", flags: [], timing: one_slot, class: jump}
+  - {name: CALL, fmt: "010001AAAAAAAAAA", ops: [abs10], sem: "push PC+1 on the 2-entry return stack (oldest dropped on overflow); PC = abs10", flags: [], timing: one_slot, class: jump}
+  - {name: RET,  fmt: "010010----------", ops: [], sem: "PC = pop return stack (PC+1 if empty)", flags: [], timing: one_slot, class: jump}
+  - {name: HALT, fmt: "010011----------", ops: [], sem: "RUN[t] = 0; HALTED[t] = 1; PC = PC+1", flags: [], timing: one_slot, class: jump}
+
+  - {name: BZ,   fmt: "0101ccc0rrrrrrrr", fixed: {c: 0}, ops: [rel8], sem: "if Z: PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: BNZ,  fmt: "0101ccc0rrrrrrrr", fixed: {c: 1}, ops: [rel8], sem: "if !Z: PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: BC,   fmt: "0101ccc0rrrrrrrr", fixed: {c: 2}, ops: [rel8], sem: "if C: PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: BNC,  fmt: "0101ccc0rrrrrrrr", fixed: {c: 3}, ops: [rel8], sem: "if !C: PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: BT,   fmt: "0101ccc0rrrrrrrr", fixed: {c: 4}, ops: [rel8], sem: "if T: PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: BNT,  fmt: "0101ccc0rrrrrrrr", fixed: {c: 5}, ops: [rel8], sem: "if !T: PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: DJNZ, fmt: "01100dddrrrrrrrr", ops: [rd, rel8], sem: "rd = rd - 1; if rd != 0 (after decrement): PC = PC+1+rel8", flags: [], timing: one_slot, class: branch}
+  - {name: JP,   fmt: "0111vppppprrrrrr", ops: [pin, val, rel6], sem: "if pin_in(pin) == val: PC = PC+1+rel6", flags: [], timing: one_slot, class: branch}
+
+  # --------------------------------------------------------------- pins
+  - {name: SETP, fmt: "100000vppppp----", ops: [pin, val], sem: "drive pin to val (open-drain rule applies to BIDIR pins with OD_MASK set); writes to read-only indices are ignored", flags: [], timing: one_slot, class: pin}
+  - {name: OEP,  fmt: "100001vppppp----", ops: [pin, val], sem: "PIN_OE[pin] = val; pin must be 0..7, others ignored", flags: [], timing: one_slot, class: pin}
+  - {name: OUT,  fmt: "100010---aaa----", ops: [ra], sem: "write ra[OUTGRP.cnt-1:0] to pins OUTGRP.base .. base+cnt-1", flags: [], timing: one_slot, class: pin}
+  - {name: IN,   fmt: "100011---ddd----", ops: [rd], sem: "rd = zero_extend(pins INGRP.base .. base+cnt-1)", flags: [], timing: one_slot, class: pin}
+
+  # --------------------------------------------------------------- wait
+  - {name: WAITD, fmt: "1001000-iiiiiiii", ops: [imm8], sem: "TD = TD + imm8; stall until reached(NOW, TD)", flags: [], timing: wait, class: wait}
+  - {name: WAITP, fmt: "1001001vpppppT--", ops: [pin, val, tmo], sem: "stall until pin_in(pin) == val; if T and reached(NOW, TD): stop and set T flag, else clear T", flags: [T], timing: wait, class: wait}
+  - {name: WAITE, fmt: "1001010eepppppT-", ops: [pin, edge, tmo], sem: "stall until the selected edge is seen on pin since the previous slot; timeout as WAITP", flags: [T], timing: wait, class: wait}
+  - {name: WAITS, fmt: "1001011nnnT-----", ops: [flag, tmo], sem: "stall until SFLAGS[n] == 1, then clear it atomically; timeout as WAITP", flags: [T], timing: wait, class: wait}
+  - {name: WAITB, fmt: "1001100ccT------", ops: [cond2, tmo], sem: "stall until BE condition: 0 BE idle, 1 OUTQ not full, 2 INQ not empty, 3 a tick occurred since the previous slot; timeout as WAITP", flags: [T], timing: wait, class: wait}
+  - {name: DLY,   fmt: "1001101-iiiiiiii", ops: [imm8], sem: "stall imm8 ticks counted from this slot; TD unchanged", flags: [], timing: wait, class: wait}
+  - {name: SETD,  fmt: "1001110-iiiiiiii", ops: [imm8], sem: "TD = NOW + imm8", flags: [], timing: one_slot, class: wait}
+  - {name: NOP,   fmt: "1001111---------", ops: [], sem: "nothing", flags: [], timing: one_slot, class: wait}
+
+  # --------------------------------------------------- data and bit engine
+  - {name: PUSH,  fmt: "101000000aaa----", ops: [ra], sem: "OUTQ.push(ra); stalls while full", flags: [], timing: blocking, class: fifo}
+  - {name: POP,   fmt: "101000001ddd----", ops: [rd], sem: "rd = INQ.pop(); stalls while empty", flags: [], timing: blocking, class: fifo}
+  - {name: SHO,   fmt: "101001000-------", ops: [], sem: "emit one bit from SR (per DIR) through the encoder to BE_PINS.out; CRC update if CRC_EN; CNT = CNT-1 unless a stuff bit was emitted instead", flags: [], timing: one_slot, class: be}
+  - {name: SHI,   fmt: "101001001-------", ops: [], sem: "sample BE_PINS.in through the decoder into SR (per DIR); CRC update; CNT = CNT-1 unless the bit was a stuff bit; T = stuffing violation", flags: [T], timing: one_slot, class: be}
+  - {name: LDSR,  fmt: "101010000aaa----", ops: [ra], sem: "SR = ra", flags: [], timing: one_slot, class: be}
+  - {name: STSR,  fmt: "101010001ddd----", ops: [rd], sem: "rd = SR", flags: [], timing: one_slot, class: be}
+  - {name: CRCI,  fmt: "101011000-------", ops: [], sem: "CRC = CRC_INIT; stuffing state reset", flags: [], timing: one_slot, class: be}
+  - {name: STCRC, fmt: "101011001ddd----", ops: [rd], sem: "rd = CRC", flags: [], timing: one_slot, class: be}
+
+  # ---------------------------------------------------------------- CSR
+  - {name: CSRR, fmt: "10110CCCCCddd---", ops: [rd, csr], sem: "rd = CSR[csr]", flags: [], timing: one_slot, class: csr}
+  - {name: CSRW, fmt: "10111CCCCCaaa---", ops: [csr, ra], sem: "CSR[csr] = ra (read-only CSRs ignore the write)", flags: [], timing: one_slot, class: csr}
+
+  # -------------------------------------------------------------- flags
+  - {name: CLR,  fmt: "11000nnn--------", ops: [flag], sem: "SFLAGS[n] = 0", flags: [], timing: one_slot, class: sflag}
+  - {name: SIG,  fmt: "11001nnn--------", ops: [flag], sem: "SFLAGS[n] = 1", flags: [], timing: one_slot, class: sflag}
+
+  # ------------------------------------------------ data memory (optional)
+  - {name: LD,   fmt: "11010dddaaaiiiii", ops: [rd, ra, imm5], sem: "rd = DMEM[ra + imm5]; NOP with BADOP if DMEM not built", flags: [], timing: one_slot, class: mem, optional: DMEM}
+  - {name: ST,   fmt: "11011dddaaaiiiii", ops: [rd, ra, imm5], sem: "DMEM[ra + imm5] = rd; NOP with BADOP if DMEM not built", flags: [], timing: one_slot, class: mem, optional: DMEM}
+
+reserved:
+  - {pattern: "0101ccc1rrrrrrrr", note: "branch with bit 8 set"}
+  - {pattern: "0101110-rrrrrrrr", note: "cond 6"}
+  - {pattern: "0101111-rrrrrrrr", note: "cond 7"}
+  - {pattern: "01101-----------", note: "DJNZ variant"}
+  - {pattern: "1110------------", note: "class E"}
+  - {pattern: "1111------------", note: "class F"}
+  # Any pattern not matched by an instruction executes as NOP and sets BADOP[t].
+
+csrs:
+  0x00: {name: TICK_INT,  rw: RW, bits: 16, doc: integer tick divider, minimum 1}
+  0x01: {name: TICK_FRAC, rw: RW, bits: 8,  doc: fractional tick divider in 1/256 clocks}
+  0x02: {name: OUTGRP,    rw: RW, bits: 10, doc: "base[4:0], cnt[9:5] for OUT"}
+  0x03: {name: INGRP,     rw: RW, bits: 10, doc: "base[4:0], cnt[9:5] for IN"}
+  0x04: {name: BE_CFG,    rw: RW, bits: 13, doc: see ARCHITECTURE 8.1}
+  0x05: {name: BE_PINS,   rw: RW, bits: 10, doc: "out[4:0], in[9:5]"}
+  0x06: {name: BE_RELOAD, rw: RW, bits: 5,  doc: CNT reload in auto mode}
+  0x07: {name: CRC_POLY,  rw: RW, bits: 16, doc: left-aligned polynomial}
+  0x08: {name: CRC_INIT,  rw: RW, bits: 16, doc: loaded by CRCI}
+  0x09: {name: NOW,       rw: R,  bits: 16, doc: local time}
+  0x0A: {name: TD,        rw: RW, bits: 16, doc: deadline}
+  0x0B: {name: FLAGS,     rw: RW, bits: 3,  doc: "{T, C, Z}"}
+  0x0C: {name: TID,       rw: R,  bits: 2,  doc: thread id}
+  0x0D: {name: SR,        rw: RW, bits: 16, doc: shift register}
+  0x0E: {name: CNT,       rw: RW, bits: 5,  doc: remaining bits}
+  0x0F: {name: CRC,       rw: RW, bits: 16, doc: accumulator}
+  0x10: {name: OD_MASK,   rw: RW, bits: 8,  doc: global open-drain mode per BIDIR pin}
+  0x11: {name: PIN_OUT,   rw: RW, bits: 16, doc: global raw output register}
+  0x12: {name: PIN_OE,    rw: RW, bits: 8,  doc: global raw OE register}
+  0x13: {name: PIN_IN,    rw: R,  bits: 16, doc: synchronised inputs}
+  0x14: {name: SFLAGS,    rw: RW, bits: 8,  doc: shared flags; write sets}
+  0x15: {name: HOST_IRQ,  rw: W,  bits: 1,  doc: pulse HOST_IRQ}
+
+pins:
+  # index: name, direction (from the chip's point of view), TT pad
+  0:  {name: BIDIR0, dir: bidir, pad: "uio[0]"}
+  1:  {name: BIDIR1, dir: bidir, pad: "uio[1]"}
+  2:  {name: BIDIR2, dir: bidir, pad: "uio[2]"}
+  3:  {name: BIDIR3, dir: bidir, pad: "uio[3]"}
+  4:  {name: BIDIR4, dir: bidir, pad: "uio[4]"}
+  5:  {name: BIDIR5, dir: bidir, pad: "uio[5]"}
+  6:  {name: BIDIR6, dir: bidir, pad: "uio[6]"}
+  7:  {name: BIDIR7, dir: bidir, pad: "uio[7]"}
+  8:  {name: IN0,    dir: in,    pad: "ui[0]"}
+  9:  {name: IN1,    dir: in,    pad: "ui[1]"}
+  10: {name: IN2,    dir: in,    pad: "ui[2]"}
+  11: {name: IN3,    dir: in,    pad: "ui[3]"}
+  12: {name: IN4,    dir: in,    pad: "ui[7]"}   # ui[4..6] are the host SPI pins
+  16: {name: OUT0,   dir: out,   pad: "uo[0]"}
+  17: {name: OUT1,   dir: out,   pad: "uo[1]"}
+  18: {name: OUT2,   dir: out,   pad: "uo[2]"}
+  19: {name: OUT3,   dir: out,   pad: "uo[3]"}
+  20: {name: OUT4,   dir: out,   pad: "uo[4]"}
+  21: {name: OUT5,   dir: out,   pad: "uo[5]"}
+
+crc_presets:
+  usb5:   {poly: 0x0500, init: 0xF800, width: 5,  doc: "USB token CRC5 x^5+x^2+1, left-aligned"}
+  usb16:  {poly: 0x8005, init: 0xFFFF, width: 16, doc: "USB data CRC16 x^16+x^15+x^2+1"}
+  can15:  {poly: 0x4599, init: 0x0000, width: 15, doc: "CAN CRC15, left-aligned as 0x8B32"}
+  smbus8: {poly: 0x0700, init: 0x0000, width: 8,  doc: "CRC-8 x^8+x^2+x+1, left-aligned"}
+  # The generator computes the left-aligned poly from width automatically; the
+  # values above are the canonical polynomials, alignment is a codegen detail
+  # that L1-BE-CRC checks against a Python reference.
+
+pseudo_ops:
+  - {name: MOV16, expands: "LDI rd, lo8; LDIH rd, hi8", doc: 16-bit immediate}
+  - {name: BRA,   expands: "JMP label", doc: unconditional branch}
+  - {name: INC,   expands: "ADDI rd, 1"}
+  - {name: DEC,   expands: "SUBI rd, 1"}
+  - {name: CLRF,  expands: "CSRW FLAGS, rz (a register holding 0)", doc: assembler tracks a zero register if declared with .zero}

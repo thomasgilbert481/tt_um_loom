@@ -1,0 +1,47 @@
+; uart_tx.loom
+; 8N1 UART transmitter on OUT0. Bytes come from the host through this
+; thread's INQ (host writes FIFO space, thread 0). One tick = one bit period.
+;
+; This is the M1 acceptance program (docs/PLAN.md): it must produce the same
+; byte stream the M0 hard-wired transmitter produced, decoded by the same
+; cocotb model (test L3-UART-TX).
+;
+; Assembler syntax (tools/loomasm, M1): one instruction per line, labels end
+; with ':', ';' starts a comment, '.thread', '.pins', '.csr' are directives.
+; Pin names come from isa/isa.yaml (OUT0 = index 16).
+
+        .thread 0
+        .pins   TX = OUT0
+        .csr    TICK_INT,  434          ; 50 MHz / 115200 = 434.03 clocks per bit
+        .csr    TICK_FRAC, 0
+
+start:  SETP    TX, 1                   ; line idles high
+
+byte:   POP     r0                      ; block until the host pushes a byte
+        SETD    0                       ; re-anchor: deadline = now (POP took an unknown time)
+        SETP    TX, 0                   ; start bit
+        WAITD   1                       ; hold exactly one bit period
+        LDI     r1, 8
+
+bit:    SHRI    r0, 1                   ; C = the bit to send (LSB first)
+        BC      one
+        SETP    TX, 0
+        JMP     next
+one:    SETP    TX, 1
+next:   WAITD   1                       ; both paths land here; the deadline, not the
+                                        ; path length, sets the bit boundary
+        DJNZ    r1, bit
+
+        SETP    TX, 1                   ; stop bit
+        WAITD   1
+        JMP     byte
+
+; Timing notes for the deadline checker: the longest path between two WAITD
+; instructions is SHRI, BC, SETP, JMP, WAITD = 5 slots = 20 clocks, far under
+; the 434-clock tick, so the schedule is met with margin. Each data-bit SETP
+; executes 3 slots after its deadline on both paths, so bit edges are spaced
+; exactly one tick apart (zero jitter), offset by a constant 12 clocks.
+;
+; Bit-engine variant (M2): replace the bit loop with
+;       LDSR r0 ; CSRW CNT, r1 (8) ; loop: SHO ; WAITD 1 ; DJNZ r1, loop
+; which is 2 slots per bit and lets the same code run at 1 Mbaud and above.

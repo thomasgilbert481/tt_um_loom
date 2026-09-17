@@ -1,56 +1,55 @@
 # Tiny Tapeout project information
 project:
-  title:        ""      # Project title
-  author:       ""      # Your name
-  discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  ""      # One line description of what your project does
-  language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  title:        "Loom protocol emulator"
+  author:       "Thomas Gilbert"
+  discord:      ""
+  description:  "Barrel-threaded 4-thread protocol emulator: deadline timing, bit engines with CRC/NRZI/Manchester, SPI host port"
+  language:     "Verilog"
+  clock_hz:     50000000
 
-  # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  # Jane Street competition allocation. The cmos5l flow's largest valid size today
+  # is 6x4 (1289.28 x 710.64 um); "8x4" is not in tile_sizes.yaml yet and fails
+  # validation. Switch to 8x4 only when Tiny Tapeout adds it (see docs/tt_cmos5l_facts.md).
+  tiles: "6x4"
 
-  # Your top module name must start with "tt_um_". Make it unique by including your github username:
-  top_module:  "tt_um_example"
+  top_module:  "tt_um_loom"
 
-  # List your project's source files here.
-  # Source files must be in ./src and you must list each source file separately, one per line.
-  # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
+  # Keep in sync with PROJECT_SOURCES in test/Makefile.
   source_files:
-    - "project.v"
+    - "tt_um_loom.v"
 
-# The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
-# This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
+# Pinout. See docs/ARCHITECTURE.md section 3.1. The host SPI pins are fixed;
+# everything else is a firmware-addressable pin index.
 pinout:
   # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  ui[0]: "IN0 (pin index 8)"
+  ui[1]: "IN1 (pin index 9)"
+  ui[2]: "IN2 (pin index 10)"
+  ui[3]: "IN3 (pin index 11)"
+  ui[4]: "HOST_CS_n (RP2040 SPI0 CSn on the TT demo board)"
+  ui[5]: "HOST_SCK (RP2040 SPI0 SCK)"
+  ui[6]: "HOST_MOSI (RP2040 SPI0 TX)"
+  ui[7]: "IN4 (pin index 12)"
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[0]: "OUT0 (pin index 16)"
+  uo[1]: "OUT1 (pin index 17)"
+  uo[2]: "OUT2 (pin index 18)"
+  uo[3]: "OUT3 (pin index 19)"
+  uo[4]: "OUT4 (pin index 20)"
+  uo[5]: "OUT5 (pin index 21)"
+  uo[6]: "HOST_IRQ"
+  uo[7]: "HOST_MISO"
 
   # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
-  uio[2]: ""
-  uio[3]: ""
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
-  uio[7]: ""
+  uio[0]: "BIDIR0 (pin index 0, open-drain capable)"
+  uio[1]: "BIDIR1 (pin index 1, open-drain capable)"
+  uio[2]: "BIDIR2 (pin index 2, open-drain capable)"
+  uio[3]: "BIDIR3 (pin index 3, open-drain capable)"
+  uio[4]: "BIDIR4 (pin index 4, open-drain capable)"
+  uio[5]: "BIDIR5 (pin index 5, open-drain capable)"
+  uio[6]: "BIDIR6 (pin index 6, open-drain capable)"
+  uio[7]: "BIDIR7 (pin index 7, open-drain capable)"
 
 # Do not change!
 yaml_version: 6

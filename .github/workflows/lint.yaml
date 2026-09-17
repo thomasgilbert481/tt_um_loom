@@ -1,0 +1,18 @@
+name: lint
+
+on: [push, workflow_dispatch]
+
+jobs:
+  verilator-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install Verilator
+        run: sudo apt-get update && sudo apt-get install -y verilator
+
+      # L0-LINT (docs/VERIFICATION.md): the TT flow runs its own linter, but we
+      # hold the stricter -Wall bar on every push so that warnings never pile up.
+      - name: Verilator lint (-Wall)
+        run: verilator --lint-only -Wall -Isrc --top-module tt_um_loom src/*.v
