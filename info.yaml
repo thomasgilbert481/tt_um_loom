@@ -33,7 +33,6 @@ project:
   source_files:
     - "tt_um_loom.v"
     - "loom_imem_macro.v"
-    - "RM_IHPSG13_1P_512x16_c2_bm_bist.v"
 
 # Pinout. Full protocol in docs/info.md and in the header of src/tt_um_loom.v.
 pinout:

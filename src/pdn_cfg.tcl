@@ -104,6 +104,29 @@
 source $::env(SCRIPTS_DIR)/openroad/common/set_global_connections.tcl
 set_global_connections
 
+# -----------------------------------------------------------------------------
+# DEBUG (smoke test): print what the macro's power pins are connected to, and
+# where the macro sits. CI run 2 stopped at PDN-0232/0233 ("macro grid has no
+# shapes") while every global_connect call reported "0 connections made"; if
+# the pins below print UNCONNECTED, pdngen sees all of the macro's pin metal
+# as foreign obstruction and removes every stripe over it.
+# -----------------------------------------------------------------------------
+foreach loom_inst [[ord::get_db_block] getInsts] {
+    if { [[$loom_inst getMaster] isBlock] } {
+        set loom_bb [$loom_inst getBBox]
+        puts "LOOMDBG macro [$loom_inst getName] master [[$loom_inst getMaster] getName] bbox_dbu [$loom_bb xMin] [$loom_bb yMin] [$loom_bb xMax] [$loom_bb yMax]"
+        foreach loom_it [$loom_inst getITerms] {
+            set loom_mt [$loom_it getMTerm]
+            set loom_ty [$loom_mt getSigType]
+            if { $loom_ty eq "POWER" || $loom_ty eq "GROUND" } {
+                set loom_net [$loom_it getNet]
+                if { $loom_net eq "NULL" } { set loom_nn "UNCONNECTED" } else { set loom_nn [$loom_net getName] }
+                puts "LOOMDBG   pin [$loom_mt getName] sigtype $loom_ty -> $loom_nn"
+            }
+        }
+    }
+}
+
 set secondary []
 foreach vdd $::env(VDD_NETS) gnd $::env(GND_NETS) {
     if { $vdd != $::env(VDD_NET)} {
