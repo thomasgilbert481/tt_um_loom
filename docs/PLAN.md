@@ -110,9 +110,14 @@ same cocotb UART model as M0; first synthesis numbers recorded.
       decode, overlap check, and generators for `src/loom_decode.v` (the
       decoder module itself, so RTL never hand-decodes), `src/loom_isa.vh` and
       `docs/ISA.md`. 29 tests. CI job `isa-and-tools` fails on stale files.
-- [ ] `tools/loomasm`: two-pass assembler, labels, `.thread`, `.pins`, pseudo-ops,
-      listing output with slot counts, deadline check (warn when code between
-      two `WAITD`s cannot fit the tick interval).
+- [x] 2026-09-17: `tools/loomasm`: two-pass assembler (labels, expressions,
+      `.thread/.org/.equ/.pins/.word/.csr/.tick/.deadline_check`, pseudo-ops,
+      symbolic operand names taken from `isa.yaml` enums), JSON image, listing,
+      disassembler, and the deadline checker (interprocedural through
+      CALL/RET; infeasible = error, unbounded = warning; `SETD m` credited;
+      `WAITD 0` transparent; limits in `tools/loomasm/README.md`). 232 tests.
+      `firmware/uart_hello.loom` (M1 acceptance program) and `uart_tx.loom`
+      both prove feasible with 410 clocks of worst-case slack.
 - [ ] `tools/loomsim`: Python golden model, slot-accurate at the thread level,
       with the same debug-state dump format the RTL exposes.
 - [ ] RTL: `loom_core` (scheduler, fetch, decode, regfile, ALU, branches,
@@ -287,3 +292,12 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   +13.2 ns setup slack at 20 ns, DRC/LVS/antenna 0, precheck pass. Remaining
   M0 items are Thomas's: sign-up form and the Jane Street email. Next session
   (Opus): M0.5 SRAM smoke test branch, then M1 from `isa/isa.yaml`.
+- 2026-09-17, Fable 5.1: Thomas submitted the sign-up form and sent the Jane
+  Street email, and asked Fable to continue the work. Wrote
+  `docs/SEMANTICS.md` and `tools/loomisa` with the generated decoder (commit
+  97a508a). Launched four Opus agents in parallel, each confined to its own
+  paths: golden model (`tools/loomsim`), assembler (`tools/loomasm` plus
+  `firmware/uart_hello.loom`), M1 RTL (`src/`, `test/`), and the M0.5 SRAM
+  smoke test in the worktree `../tt_um_loom_sram` on branch `sram-smoke`. The
+  model and RTL agents may not read each other's code. Director integrates,
+  reviews and commits; spec questions land in `docs/spec-questions/`.

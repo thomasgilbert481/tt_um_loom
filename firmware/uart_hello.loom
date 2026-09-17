@@ -1,0 +1,61 @@
+; uart_hello.loom
+; The M1 acceptance program: thread 0 sends "LOOM\r\n" on OUT0 as 8N1 UART at
+; 115200 baud from a 50 MHz clock, then halts.
+;
+; 50e6 / 115200 = 434.03 clocks per bit, so one tick is one bit period and
+; every bit boundary is a WAITD 1. Because WAITD advances TD from the previous
+; deadline rather than from "now", the bit edges are exactly one tick apart
+; whatever the instruction path between them was: the 0.03 clock of divider
+; error is the only accumulated jitter, and TICK_FRAC could absorb even that.
+;
+; No FIFO instruction appears here. At M1 the FIFOs do not exist, so the byte
+; to send is loaded into r0 with LDI and send_byte is reached with CALL/RET.
+; uart_tx.loom is the same transmitter fed from INQ, which is the M2 form.
+;
+; Assemble:  python -m tools.loomasm firmware/uart_hello.loom \
+;                -o firmware/build/uart_hello.json --listing
+
+        .thread 0
+        .pins   TX = OUT0
+
+        .csr    TICK_INT,  434          ; one tick = one 115200 baud bit
+        .csr    TICK_FRAC, 0            ; (clobbers r7, the .csr scratch)
+
+start:  SETP    TX, 1                   ; the line idles high
+        SETD    0                       ; anchor the schedule: TD = NOW
+
+        LDI     r0, 'L'
+        CALL    send_byte
+        LDI     r0, 'O'
+        CALL    send_byte
+        LDI     r0, 'O'
+        CALL    send_byte
+        LDI     r0, 'M'
+        CALL    send_byte
+        LDI     r0, '\r'
+        CALL    send_byte
+        LDI     r0, '\n'
+        CALL    send_byte
+        HALT                            ; stops thread 0 after the last stop bit
+
+; ---------------------------------------------------------------------------
+; send_byte: transmit r0 as one 8N1 frame, LSB first. Clobbers r0 and r1.
+; TD is already on a bit boundary on entry and is left on the boundary at the
+; end of the stop bit, so consecutive calls produce a gapless byte stream.
+; ---------------------------------------------------------------------------
+send_byte:
+        SETP    TX, 0                   ; start bit
+        WAITD   1
+        LDI     r1, 8                   ; eight data bits
+
+bit:    SHRI    r0, 1                   ; C = the next bit out, LSB first
+        BC      one
+        SETP    TX, 0
+        BRA     next
+one:    SETP    TX, 1
+next:   WAITD   1                       ; the deadline sets the edge, not the path
+        DJNZ    r1, bit
+
+        SETP    TX, 1                   ; stop bit
+        WAITD   1
+        RET

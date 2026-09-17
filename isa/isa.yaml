@@ -1,12 +1,11 @@
-# Loom ISA, single source of truth.
-# Version 0.1 seed (2026-09-15, Fable). Frozen as 1.0 at milestone M1.
+# Loom ISA, single source of truth. Frozen as 1.0 at milestone M1.
 #
-# Everything that knows an encoding is generated from this file by tools/gen:
-#   src/loom_isa.vh            opcode/field localparams for the decoder
-#   tools/loomasm/tables.py    assembler tables
-#   tools/loomsim/tables.py    golden model dispatch
+# tools/loomisa is the only code that parses this file. Python tools (assembler,
+# golden model, tests) call loomisa.load()/encode()/decode() at run time and
+# hold no tables of their own. `python -m tools.loomisa gen` writes:
+#   src/loom_decode.v          the instruction decoder module (synthesised)
+#   src/loom_isa.vh            constants for testbenches and formal (not synthesised)
 #   docs/ISA.md                human-readable reference
-#   formal/isa_decode.sv       decode-completeness properties (ISA-1)
 #
 # Format strings are 16 characters, MSB first. Digits are fixed bits. A letter
 # names a field; repeated letters are that field's bits, MSB first. '-' is a
@@ -14,7 +13,7 @@
 
 meta:
   name: loom
-  version: "0.2.0"
+  version: "0.3.0"
   word_bits: 16
   registers: 8
   register_bits: 16
@@ -75,7 +74,7 @@ instructions:
   - {name: CMP,  fmt: "0011fffdddaaa---", fixed: {f: 3}, ops: [rd, ra], sem: "flags of rd - ra; nothing written", flags: [Z, C], timing: one_slot, class: unary}
   - {name: TEST, fmt: "0011fffdddaaa---", fixed: {f: 4}, ops: [rd, ra], sem: "Z = ((rd & ra) == 0); C = 0; nothing written", flags: [Z, C], timing: one_slot, class: unary}
   - {name: REV,  fmt: "0011fffdddaaa---", fixed: {f: 5}, ops: [rd, ra], sem: "rd = bit_reverse16(ra); C = 0", flags: [Z, C], timing: one_slot, class: unary}
-  - {name: PAR,  fmt: "0011fffdddaaa---", fixed: {f: 6}, ops: [rd, ra], sem: "rd = ra; C = even parity of ra (1 if the number of 1s is odd)", flags: [Z, C], timing: one_slot, class: unary}
+  - {name: PAR,  fmt: "0011fffdddaaa---", fixed: {f: 6}, ops: [rd, ra], sem: "rd = ra; C = XOR of all 16 bits of ra (1 when the number of 1s is odd)", flags: [Z, C], timing: one_slot, class: unary}
   - {name: SWAP, fmt: "0011fffdddaaa---", fixed: {f: 7}, ops: [rd, ra], sem: "rd = {ra[7:0], ra[15:8]}; C = 0", flags: [Z, C], timing: one_slot, class: unary}
 
   # ------------------------------------------------------------ control
@@ -195,9 +194,13 @@ crc_presets:
   # values above are the canonical polynomials, alignment is a codegen detail
   # that L1-BE-CRC checks against a Python reference.
 
+# Symbolic operand values. The assembler takes these spellings from here.
+enums:
+  edge:  {RISE: 0, FALL: 1, ANY: 2}                       # WAITE edge operand
+  cond:  {BE_IDLE: 0, OUTQ_NF: 1, INQ_NE: 2, TICK: 3}     # WAITB condition operand
+
 pseudo_ops:
-  - {name: MOV16, expands: "LDI rd, lo8; LDIH rd, hi8", doc: 16-bit immediate}
-  - {name: BRA,   expands: "JMP label", doc: unconditional branch}
+  - {name: MOV16, expands: "LDI rd, lo8; LDIH rd, hi8", doc: "16-bit immediate; one word when the value is known in pass 1 and fits 8 bits"}
+  - {name: BRA,   expands: "JMP label", doc: unconditional absolute jump to a label}
   - {name: INC,   expands: "ADDI rd, 1"}
   - {name: DEC,   expands: "SUBI rd, 1"}
-  - {name: CLRF,  expands: "CSRW FLAGS, rz (a register holding 0)", doc: assembler tracks a zero register if declared with .zero}

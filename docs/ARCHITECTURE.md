@@ -205,10 +205,14 @@ Reserved CSR numbers read 0 and ignore writes.
   ends when `NOW` reaches `TD`; the T flag is set if that is why it ended and
   cleared otherwise. "Wait for SCL to rise, but give up at the deadline" is one
   instruction, and `BT`/`BNT` branch on the outcome.
-- The assembler checks straight-line code between deadline instructions and
-  warns when the slot count between two `WAITD` instructions exceeds the tick
-  interval (the schedule cannot be met). This static check is a deliverable
-  (`tools/loomasm`, see PLAN M1).
+- The assembler analyses every path between deadline instructions. A schedule
+  that cannot be met (the worst-case slot count between an anchor and the next
+  `WAITD k` exceeds the budget) is an **error**-level diagnostic; a path with
+  an unbounded wait or a loop and no re-anchoring `SETD` is a **warning**. The
+  budget from a `SETD m` anchor to `WAITD k` is `(m + k)` ticks, from a
+  `WAITD` anchor it is `k` ticks, and `WAITD 0` is transparent (it neither
+  starts nor ends an interval). Limits of the analysis are documented in
+  `tools/loomasm/README.md`.
 
 ## 7. Pins
 
@@ -385,11 +389,15 @@ C. Z is set whenever the 16-bit result is zero. Only instructions marked as
 setting flags touch them. `T` is set or cleared only by timed waits and by
 stuffing violations.
 
-### 11.3 Assembler pseudo-ops
+### 11.3 Assembler pseudo-ops and directives
 
-`MOV rd, imm16` (LDI+LDIH), `BRA rel` (JMP), `INC/DEC` (ADDI/SUBI 1),
-`WAITD n.bits` with symbolic tick units, `.thread t` sections, `.pins` symbol
-table, `.crc usb16` presets, `.deadline_check on|off`.
+Not listed here, to avoid a third copy: pseudo-ops (`MOV16`, `BRA`, `INC`,
+`DEC`) and the symbolic operand names (`RISE/FALL/ANY`, `BE_IDLE/OUTQ_NF/
+INQ_NE/TICK`) live in `isa/isa.yaml` and appear in `docs/ISA.md`; directives
+(`.thread`, `.org`, `.equ`, `.pins`, `.word`, `.csr`, `.tick`,
+`.deadline_check`) and the full language are defined in
+`tools/loomasm/README.md`. `.crc <preset>` and tick-unit literals arrive with
+the bit engine at M2.
 
 ## 12. Instruction and data memory: implementation options
 

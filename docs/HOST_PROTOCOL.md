@@ -48,8 +48,10 @@ word (the falling SCK edge of its last bit, as seen in the core clock domain).
 | 0x0003 | HALTED | R | bit t = thread t halted by HALT (cleared by writing RUN bit) |
 | 0x0004 | RESET | W | bit t = reset thread t: PC := RESET_PC[t], flags := 0, TD := NOW, stack cleared; registers untouched |
 | 0x0008..0x000B | RESET_PC[0..3] | RW | 10-bit reset vectors, default t * 0x100 |
-| 0x0010 | IRQ_EN | RW | mask over IRQ_STAT |
-| 0x0011 | IRQ_STAT | R | {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]} plus HALTED in bits 19:16 of a second word at 0x0012 |
+| 0x0010 | IRQ_EN0 | RW | mask over IRQ_STAT0 (M2) |
+| 0x0011 | IRQ_STAT0 | R | {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]} (M2) |
+| 0x0012 | IRQ_STAT1 | R, W1C | {8'b0, SWIRQ[3:0], HALTED[3:0]}; write 1 to a SWIRQ bit to clear it (M2) |
+| 0x001B | IRQ_EN1 | RW | mask over IRQ_STAT1; HOST_IRQ = any enabled bit of either word (M2) |
 | 0x0013 | SFLAGS | RW | shared flags; write sets the bits written as 1 |
 | 0x0014 | SFLAGS_CLR | W | write clears the bits written as 1 |
 | 0x0015 | OD_MASK | RW | open-drain mode per BIDIR pin |
@@ -61,10 +63,11 @@ word (the falling SCK edge of its last bit, as seen in the core clock domain).
 
 ### SPACE 1: IMEM
 
-ADDR = instruction address (0..IMEM_WORDS-1). Reads are always allowed. Writes
-are accepted only when the target thread set is halted; concretely, writes are
-accepted when `RUN == 0` (all halted). This keeps the single-port memory
-option simple. A write while running is dropped and sets CTRL BADOP bit 15.
+ADDR = instruction address (0..IMEM_WORDS-1). The memory is single-port and
+the core fetches from it every cycle, so host reads **and** writes are valid
+only while `RUN == 0` and no single-step is in flight. Otherwise a write is
+dropped, a read returns 0, and CTRL BADOP bit 15 (host access error) is set.
+(`docs/SEMANTICS.md` section 7.)
 
 ### SPACE 2: DMEM
 
@@ -85,9 +88,13 @@ bits stay fixed).
 
 ### SPACE 4: DEBUG
 
-ADDR = {thread[9:8], reg[7:0]}. Readable any time (the value is sampled at
-that thread's W stage boundary so it is always a consistent architectural
-state). Writable only while that thread is not running.
+ADDR = {thread[9:8], reg[7:0]}. `r0..r7` are readable and writable only while
+that thread is halted (the register-file ports are borrowed during the
+thread's bubble slots); while it runs, reads return 0 and writes are dropped.
+Every other debug register is a plain flop and is readable at any time, and
+writable only while the thread is not running. Per-thread state changes only
+at that thread's commit edge, so a read is always a consistent architectural
+state. (`docs/SEMANTICS.md` section 7.)
 
 | reg | Name |
 |---|---|

@@ -37,8 +37,9 @@ next:   WAITD   1                       ; both paths land here; the deadline, no
         JMP     byte
 
 ; Timing notes for the deadline checker: the longest path between two WAITD
-; instructions is SHRI, BC, SETP, JMP, WAITD = 5 slots = 20 clocks, far under
-; the 434-clock tick, so the schedule is met with margin. Each data-bit SETP
+; instructions is the data-bit loop taken the long way round, DJNZ, SHRI, BC,
+; SETP, JMP, WAITD = 6 slots = 24 clocks, far under the 434-clock tick, so the
+; schedule is met with 410 clocks of margin. Each data-bit SETP
 ; executes 3 slots after its deadline on both paths, so bit edges are spaced
 ; exactly one tick apart (zero jitter), offset by a constant 12 clocks.
 ;

@@ -179,6 +179,11 @@ class Isa:
         self.pins: Dict[int, dict] = {int(k): v for k, v in raw["pins"].items()}
         self.crc_presets = raw.get("crc_presets", {})
         self.pseudo_ops = raw.get("pseudo_ops", [])
+        # Symbolic operand values by operand base name, e.g.
+        # enums["edge"] == {"RISE": 0, "FALL": 1, "ANY": 2}
+        self.enums: Dict[str, Dict[str, int]] = {
+            str(k): {str(n): int(v) for n, v in table.items()}
+            for k, table in raw.get("enums", {}).items()}
         self.instructions: List[Instr] = []
         self.by_name: Dict[str, Instr] = {}
         for entry in raw["instructions"]:
@@ -331,6 +336,17 @@ def gen_md(isa: Isa) -> str:
     for number in sorted(isa.pins):
         pin = isa.pins[number]
         out.append(f"| {number} | `{pin['name']}` | {pin['dir']} | {pin['pad']} |")
+    if isa.enums:
+        out += ["", "## Symbolic operand values", "", "| Operand | Name | Value |", "|---|---|---|"]
+        for operand, table in isa.enums.items():
+            for name, value in table.items():
+                out.append(f"| {operand} | `{name}` | {value} |")
+    if isa.pseudo_ops:
+        out += ["", "## Pseudo-ops (assembler)", "", "| Name | Expands to | Note |", "|---|---|---|"]
+        for pseudo in isa.pseudo_ops:
+            out.append(f"| `{pseudo['name']}` | `{pseudo['expands']}` | {pseudo.get('doc', '')} |")
+        out += ["", "Directives and the full assembly language are defined in",
+                "`tools/loomasm/README.md`."]
     out += ["", "## CRC presets", "", "| Name | Polynomial | Init | Width | Note |", "|---|---|---|---|---|"]
     for name, preset in isa.crc_presets.items():
         out.append(f"| `{name}` | 0x{preset['poly']:04X} | 0x{preset['init']:04X} | "
