@@ -210,18 +210,16 @@ if { $::env(PDN_ENABLE_RAILS) == 1 } {
 # the PDN layer and the macro's pin layer there is no via to make. The
 # connection is the geometric overlap of stripe and pin.
 # -----------------------------------------------------------------------------
-define_pdn_grid \
-    -macro \
-    -default \
-    -name macro \
-    -starts_with POWER \
-    -halo "0 0"
-
-add_pdn_stripe \
-    -grid macro \
-    -layer $::env(PDN_VERTICAL_LAYER) \
-    -width $::env(PDN_VWIDTH) \
-    -pitch $::env(PDN_VPITCH) \
-    -offset 17.24 \
-    -spacing $::env(PDN_VSPACING) \
-    -starts_with POWER
+#
+# EXPERIMENT 1 (CI run 4): no macro grid at all.
+# Run 3 proved the macro pins are tied to VPWR/VGND, yet pdngen still produced
+# an empty macro grid (PDN-0232) and then failed (PDN-0233). pdngen appears to
+# block the whole macro bbox on every layer the macro itself uses, so Metal4
+# stripes inside an instance grid on a Metal4 macro can never survive. Without
+# an instance grid the macro is only an obstruction to the stdcell grid: the
+# aligned Metal4 stripes should be cut at the macro boundary, collinear with
+# the macro's own pin columns. Whether that in-plane abutment is accepted as a
+# connection is what the rest of the flow (LVS in particular) will tell us.
+#
+# define_pdn_grid -macro -default -name macro -starts_with POWER -halo "0 0"
+# add_pdn_stripe -grid macro -layer $::env(PDN_VERTICAL_LAYER) ... -offset 17.24
