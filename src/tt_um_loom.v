@@ -1,17 +1,68 @@
 /*
- * Loom protocol emulator, Tiny Tapeout top level.
+ * tt_um_loom on branch `sram-smoke`: a pin-level tester for the IHP
+ * RM_IHPSG13_1P_512x16_c2_bm_bist SRAM macro.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Milestone M0 placeholder: a hard-wired UART transmitter that sends
- * "LOOM\r\n" (8N1) at BAUD on OUT0 (uo_out[0]) while IN0 (ui_in[0]) is high.
- * This proves the flow end to end, as the competition brief suggests
- * ("start by getting a UART transmitter out of a pin"). M1 replaces the body
- * with the Loom core; the port list and pin map do not change.
+ * This is milestone M0.5 (docs/PLAN.md, D-015): the smallest design that can
+ * put a hard macro through the Tiny Tapeout cmos5l flow and let a host write
+ * and read every one of the 512 x 16 words. The module name stays tt_um_loom
+ * so info.yaml, the workflows and the testbench are unchanged. The Loom core
+ * is not in this design; `main` still has it.
  *
- * Timing contract: tx changes only on baud ticks; the first start bit begins
- * on the first baud tick after IN0 is sampled high, so every bit is a full
- * bit period. Frames are back to back (start, 8 data LSB first, stop). After
- * the last byte the line idles high for at least one bit period.
+ * ---------------------------------------------------------------------------
+ * PIN PROTOCOL
+ * ---------------------------------------------------------------------------
+ * 25 bits of state (9 address + 16 data) have to be loaded through 8 data
+ * pins, so the host writes four byte registers and then fires a command. All
+ * strobes are level signals, synchronised into the clock domain with a
+ * two-flop synchroniser and then edge-detected, so the host can be an
+ * arbitrarily slow bit-banging RP2040 and never needs to meet setup time.
+ *
+ *   ui_in[1:0]  REGSEL   which byte register uio_in is written to:
+ *                          0  ADDR_LO   addr[7:0]
+ *                          1  ADDR_HI   addr[8]  (bit 0; bits 7:1 ignored)
+ *                          2  WDATA_LO  wdata[7:0]
+ *                          3  WDATA_HI  wdata[15:8]
+ *   ui_in[2]    REG_WR   rising edge: REGSEL's register <= uio_in
+ *   ui_in[3]    RD_OE    level: 1 drives uio (uio_oe = 8'hFF), 0 releases it
+ *   ui_in[4]    MEM_WR   rising edge: SRAM write {WDATA_HI,WDATA_LO} -> [ADDR]
+ *   ui_in[5]    MEM_RD   rising edge: SRAM read  [ADDR] -> RDATA
+ *   ui_in[6]    UIO_SEL  level, only meaningful while RD_OE = 1:
+ *                          0  uio_out = RDATA[15:8]
+ *                          1  uio_out = STATUS
+ *   ui_in[7]    unused
+ *
+ *   uo_out[7:0]          RDATA[7:0], the low byte of the last word read.
+ *                        Always driven, so the host can poll it without
+ *                        touching the bidirectional pins.
+ *   uio[7:0]             input  : data for REG_WR
+ *                        output : RDATA[15:8] or STATUS, per UIO_SEL, and only
+ *                                 while RD_OE = 1
+ *
+ *   STATUS = {6'b0, RD_VALID, BUSY}
+ *     BUSY      1 for the single cycle between a MEM_RD/MEM_WR edge and the
+ *               clock edge that completes it. The macro is a one-access-per-
+ *               clock SRAM, so this is always exactly one cycle; it exists so
+ *               a host that cannot count clocks can poll instead.
+ *     RD_VALID  set once RDATA has been loaded by a completed read, cleared by
+ *               reset. Distinguishes "read back zero" from "never read".
+ *
+ * Read timing, in clocks of `clk`. Call N the cycle in which the synchronised
+ * MEM_RD rising edge is seen:
+ *   N    : loom_imem_macro presents ADDR; the macro samples it on the N -> N+1
+ *          edge
+ *   N+1  : the macro drives A_DOUT; BUSY = 1; RDATA is loaded on the
+ *          N+1 -> N+2 edge
+ *   N+2  : BUSY = 0, RD_VALID = 1, RDATA visible on uo_out / uio
+ * Write timing: the word is stored on the N -> N+1 edge, BUSY is 1 during N+1
+ * and 0 from N+2. In both cases "BUSY has gone low again" means done.
+ *
+ * The host must hold each strobe high for at least two clocks and low for at
+ * least two clocks (the synchroniser), and must not change REGSEL, uio_in or
+ * the address/data registers while a strobe is being recognised.
+ *
+ * Unused-pin hygiene: ena, ui_in[7] and the unused ADDR_HI bits are collected
+ * into _unused, as the Tiny Tapeout template requires.
  */
 
 `default_nettype none
@@ -27,92 +78,95 @@ module tt_um_loom (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  parameter integer CLK_HZ = 50_000_000;
-  parameter integer BAUD   = 115_200;
-  localparam integer DIV     = CLK_HZ / BAUD;   // 434 at 50 MHz
-  localparam integer MSG_LEN = 6;
-
-  // ---------------------------------------------------------------- message
-  function [7:0] msg_byte(input [2:0] i);
-    case (i)
-      3'd0:    msg_byte = "L";
-      3'd1:    msg_byte = "O";
-      3'd2:    msg_byte = "O";
-      3'd3:    msg_byte = "M";
-      3'd4:    msg_byte = 8'h0D;
-      default: msg_byte = 8'h0A;
-    endcase
-  endfunction
-
-  // ------------------------------------------------------------- baud ticks
-  reg [15:0] baud_cnt;
-  reg        baud_tick;
+  // ------------------------------------------------------ input synchronisers
+  // Two flops per asynchronous strobe, then a rising-edge detector. reg_wr_q2
+  // etc. are the synchronised levels; *_edge is one clock wide.
+  reg [2:0] reg_wr_sync;
+  reg [2:0] mem_wr_sync;
+  reg [2:0] mem_rd_sync;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      baud_cnt  <= 16'd0;
-      baud_tick <= 1'b0;
-    end else if ({16'd0, baud_cnt} == DIV - 1) begin
-      baud_cnt  <= 16'd0;
-      baud_tick <= 1'b1;
+      reg_wr_sync <= 3'b0;
+      mem_wr_sync <= 3'b0;
+      mem_rd_sync <= 3'b0;
     end else begin
-      baud_cnt  <= baud_cnt + 16'd1;
-      baud_tick <= 1'b0;
+      reg_wr_sync <= {reg_wr_sync[1:0], ui_in[2]};
+      mem_wr_sync <= {mem_wr_sync[1:0], ui_in[4]};
+      mem_rd_sync <= {mem_rd_sync[1:0], ui_in[5]};
     end
   end
 
-  // ------------------------------------------------------------ transmitter
-  reg       tx;
-  reg       active;
-  reg [3:0] bit_idx;   // 0..7 data bits sent so far, 8 = stop sent
-  reg [2:0] msg_idx;
-  reg [7:0] shreg;
+  wire reg_wr_edge = reg_wr_sync[1] & ~reg_wr_sync[2];
+  wire mem_wr_edge = mem_wr_sync[1] & ~mem_wr_sync[2];
+  wire mem_rd_edge = mem_rd_sync[1] & ~mem_rd_sync[2];
+
+  // --------------------------------------------------------- byte registers
+  reg [8:0]  addr_reg;
+  reg [15:0] wdata_reg;
 
   always @(posedge clk) begin
     if (!rst_n) begin
-      tx      <= 1'b1;
-      active  <= 1'b0;
-      bit_idx <= 4'd0;
-      msg_idx <= 3'd0;
-      shreg   <= 8'd0;
-    end else if (!active) begin
-      tx <= 1'b1;
-      if (ui_in[0] && baud_tick) begin
-        active  <= 1'b1;
-        bit_idx <= 4'd0;
-        msg_idx <= 3'd0;
-        shreg   <= msg_byte(3'd0);
-        tx      <= 1'b0;                  // start bit
-      end
-    end else if (baud_tick) begin
-      if (bit_idx < 4'd8) begin
-        tx      <= shreg[0];              // data bit, LSB first
-        shreg   <= {1'b0, shreg[7:1]};
-        bit_idx <= bit_idx + 4'd1;
-      end else if (bit_idx == 4'd8) begin
-        tx      <= 1'b1;                  // stop bit
-        bit_idx <= 4'd9;
-      end else begin
-        // stop bit finished
-        if ({29'd0, msg_idx} == MSG_LEN - 1) begin
-          active <= 1'b0;                 // idle high until IN0 restarts us
-          tx     <= 1'b1;
-        end else begin
-          msg_idx <= msg_idx + 3'd1;
-          shreg   <= msg_byte(msg_idx + 3'd1);
-          bit_idx <= 4'd0;
-          tx      <= 1'b0;                // next start bit, back to back
-        end
+      addr_reg  <= 9'b0;
+      wdata_reg <= 16'b0;
+    end else if (reg_wr_edge) begin
+      case (ui_in[1:0])
+        2'd0: addr_reg[7:0]   <= uio_in;
+        2'd1: addr_reg[8]     <= uio_in[0];
+        2'd2: wdata_reg[7:0]  <= uio_in;
+        default: wdata_reg[15:8] <= uio_in;
+      endcase
+    end
+  end
+
+  // ------------------------------------------------------------ SRAM access
+  // A command edge drives the macro for exactly one clock. Because the macro
+  // registers its output internally, the read result is captured one clock
+  // after the access cycle.
+  wire        sram_we = mem_wr_edge;
+  wire [15:0] sram_q;
+
+  reg         busy;
+  reg         rd_pending;
+  reg         rd_valid;
+  reg  [15:0] rdata_reg;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      busy       <= 1'b0;
+      rd_pending <= 1'b0;
+      rd_valid   <= 1'b0;
+      rdata_reg  <= 16'b0;
+    end else begin
+      busy       <= mem_wr_edge | mem_rd_edge;
+      rd_pending <= mem_rd_edge;
+      if (rd_pending) begin
+        rdata_reg <= sram_q;
+        rd_valid  <= 1'b1;
       end
     end
   end
 
-  // ------------------------------------------------------------------ pins
-  assign uo_out  = {7'b0000000, tx};
-  assign uio_out = 8'b0;
-  assign uio_oe  = 8'b0;
+  loom_imem_macro u_imem (
+      .clk   (clk),
+      .rst_n (rst_n),
+      .addr  (addr_reg),
+      .rdata (sram_q),
+      .we    (sram_we),
+      .waddr (addr_reg),
+      .wdata (wdata_reg)
+  );
+
+  // ------------------------------------------------------------------- pins
+  wire [7:0] status = {6'b0, rd_valid, busy};
+
+  assign uo_out  = rdata_reg[7:0];
+  assign uio_out = ui_in[6] ? status : rdata_reg[15:8];
+  assign uio_oe  = {8{ui_in[3]}};
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, ui_in[7:1], uio_in, 1'b0};
+  wire _unused = &{ena, ui_in[7], 1'b0};
 
 endmodule
+
+`default_nettype wire

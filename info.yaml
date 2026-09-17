@@ -1,55 +1,71 @@
 # Tiny Tapeout project information
+#
+# BRANCH sram-smoke: milestone M0.5, the IHP SRAM macro smoke test (D-015).
+# The module name stays tt_um_loom so the workflows and the testbench are
+# unchanged, but the design on this branch is a pin-level SRAM tester, not the
+# Loom core.
 project:
-  title:        "Loom protocol emulator"
+  title:        "Loom SRAM macro smoke test"
   author:       "Thomas Gilbert"
   discord:      ""
-  description:  "Barrel-threaded 4-thread protocol emulator: deadline timing, bit engines with CRC/NRZI/Manchester, SPI host port"
+  description:  "Writes and reads every word of an IHP RM_IHPSG13_1P_512x16_c2_bm_bist SRAM macro through the TT pins: first hard macro on sg13cmos5l"
   language:     "Verilog"
   clock_hz:     50000000
 
-  # Jane Street competition allocation. The cmos5l flow's largest valid size today
-  # is 6x4 (1289.28 x 710.64 um); "8x4" is not in tile_sizes.yaml yet and fails
-  # validation. Switch to 8x4 only when Tiny Tapeout adds it (see docs/tt_cmos5l_facts.md).
-  tiles: "6x4"
+  # 2x2 = 419.52 x 313.74 um. The macro alone is 236.80 x 191.34 um (45.3K um2),
+  # so 2x2 is the smallest tile size with a floorplan DEF that takes the macro
+  # plus the PDN straps plus room for the tester logic; 1x2 (202.08 x 313.74) is
+  # too narrow and 2x1 has no DEF. It is also what the reference project
+  # tt_um_urish_sram_test used for a physically larger macro, which keeps the
+  # comparison honest, and it keeps the CI run short. See
+  # docs/tt_cmos5l_facts.md section 2 for the DEF list.
+  # `main` stays at 6x4.
+  tiles: "2x2"
 
   top_module:  "tt_um_loom"
 
   # Keep in sync with PROJECT_SOURCES in test/Makefile.
+  # The macro's behavioural model is NOT a source file: it is referenced from
+  # the MACROS block in src/config.json, and the port-only blackbox below
+  # stands in for it during synthesis (same arrangement as the reference
+  # project). The model itself lives under macro/ and is only compiled by
+  # test/Makefile.
   source_files:
     - "tt_um_loom.v"
+    - "loom_imem_macro.v"
+    - "RM_IHPSG13_1P_512x16_c2_bm_bist.v"
 
-# Pinout. See docs/ARCHITECTURE.md section 3.1. The host SPI pins are fixed;
-# everything else is a firmware-addressable pin index.
+# Pinout. Full protocol in docs/info.md and in the header of src/tt_um_loom.v.
 pinout:
   # Inputs
-  ui[0]: "IN0 (pin index 8)"
-  ui[1]: "IN1 (pin index 9)"
-  ui[2]: "IN2 (pin index 10)"
-  ui[3]: "IN3 (pin index 11)"
-  ui[4]: "HOST_CS_n (RP2040 SPI0 CSn on the TT demo board)"
-  ui[5]: "HOST_SCK (RP2040 SPI0 SCK)"
-  ui[6]: "HOST_MOSI (RP2040 SPI0 TX)"
-  ui[7]: "IN4 (pin index 12)"
+  ui[0]: "REGSEL[0] - byte register select"
+  ui[1]: "REGSEL[1] - 0 ADDR_LO, 1 ADDR_HI, 2 WDATA_LO, 3 WDATA_HI"
+  ui[2]: "REG_WR - rising edge writes uio into the selected register"
+  ui[3]: "RD_OE - high drives uio with the read-back byte"
+  ui[4]: "MEM_WR - rising edge writes WDATA to SRAM[ADDR]"
+  ui[5]: "MEM_RD - rising edge reads SRAM[ADDR] into RDATA"
+  ui[6]: "UIO_SEL - with RD_OE: 0 = RDATA[15:8], 1 = STATUS"
+  ui[7]: ""
 
   # Outputs
-  uo[0]: "OUT0 (pin index 16)"
-  uo[1]: "OUT1 (pin index 17)"
-  uo[2]: "OUT2 (pin index 18)"
-  uo[3]: "OUT3 (pin index 19)"
-  uo[4]: "OUT4 (pin index 20)"
-  uo[5]: "OUT5 (pin index 21)"
-  uo[6]: "HOST_IRQ"
-  uo[7]: "HOST_MISO"
+  uo[0]: "RDATA[0]"
+  uo[1]: "RDATA[1]"
+  uo[2]: "RDATA[2]"
+  uo[3]: "RDATA[3]"
+  uo[4]: "RDATA[4]"
+  uo[5]: "RDATA[5]"
+  uo[6]: "RDATA[6]"
+  uo[7]: "RDATA[7]"
 
   # Bidirectional pins
-  uio[0]: "BIDIR0 (pin index 0, open-drain capable)"
-  uio[1]: "BIDIR1 (pin index 1, open-drain capable)"
-  uio[2]: "BIDIR2 (pin index 2, open-drain capable)"
-  uio[3]: "BIDIR3 (pin index 3, open-drain capable)"
-  uio[4]: "BIDIR4 (pin index 4, open-drain capable)"
-  uio[5]: "BIDIR5 (pin index 5, open-drain capable)"
-  uio[6]: "BIDIR6 (pin index 6, open-drain capable)"
-  uio[7]: "BIDIR7 (pin index 7, open-drain capable)"
+  uio[0]: "register write data [0] / RDATA[8] or STATUS[0]=BUSY"
+  uio[1]: "register write data [1] / RDATA[9] or STATUS[1]=RD_VALID"
+  uio[2]: "register write data [2] / RDATA[10]"
+  uio[3]: "register write data [3] / RDATA[11]"
+  uio[4]: "register write data [4] / RDATA[12]"
+  uio[5]: "register write data [5] / RDATA[13]"
+  uio[6]: "register write data [6] / RDATA[14]"
+  uio[7]: "register write data [7] / RDATA[15]"
 
 # Do not change!
 yaml_version: 6
