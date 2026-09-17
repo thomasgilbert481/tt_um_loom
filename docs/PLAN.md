@@ -28,9 +28,9 @@ Exit: CI green on GitHub for the trivial design, local sim works in WSL.
 
 - [ ] Thomas: fill in the Jane Street sign-up form (link in the blog post). Not
       a commitment, but it gets template and submission updates.
-- [ ] Thomas: create the public GitHub repo `thomasgilbert481/tt_um_loom`
-      (Apache-2.0), push the template import plus these docs, enable GitHub Pages
-      for the `gds` viewer job. See `CLAUDE.md` for the exact commands.
+- [x] 2026-09-17: public repo `thomasgilbert481/tt_um_loom` created and pushed
+      (Apache-2.0; first commit is the untouched template, second is Loom),
+      GitHub Pages enabled with the workflow build type for the viewer job.
 - [x] Template imported from `ttihp-verilog-template@cmos5l`
       (upstream commit b86a2a7). `info.yaml`: tiles **6x4**, top `tt_um_loom`.
       `8x4` is not a valid size in the cmos5l flow yet (largest is 6x4; see
@@ -42,15 +42,19 @@ Exit: CI green on GitHub for the trivial design, local sim works in WSL.
       memory decision needs the second answer. Draft and a matching Tiny
       Tapeout Discord post are in the vault under `60-applications/outreach/`
       (drafted 2026-09-15, follow up 2026-09-25 if no reply).
-- [ ] Opus: `src/tt_um_loom.v` M0 version = hard-wired UART transmitter that
+- [x] `src/tt_um_loom.v` M0 version = hard-wired UART transmitter that
       sends "LOOM\r\n" at 115200 baud on OUT0 whenever IN0 is high, with a
       cocotb test that decodes it. This is the blog's own "start by getting a
       UART transmitter out of a pin" step and it exercises the whole flow.
-- [ ] Thomas: push, confirm `test`, `gds`, `docs` workflows pass. Record the
-      utilisation and cell count of the trivial design in `docs/AREA.md`
-      (baseline for the flow overhead).
-- [ ] Opus: WSL dev loop documented and working (`make -C test`, Verilator
-      lint), `test/requirements.txt` pinned to what WSL has.
+- [x] 2026-09-17, first CI run (35244479499): `test`, `lint`, `docs`, `gds`
+      hardening on 6x4, precheck and viewer all pass. `gl_test` failed on a
+      template bug, not the design: the GL Makefile omitted the PDK primitives
+      file `sg13cmos5l_udp.v` (BUGS #2). Fixed and verified locally at gate
+      level on the CI netlist (2 of 2 pass). Baseline numbers in `docs/AREA.md`.
+- [x] WSL dev loop documented in `CLAUDE.md` and working (`make` in `test/`,
+      Verilator lint, `make GATES=yes` with a scratch copy of the cell models).
+      `test/requirements.txt` stays at the template's cocotb 2.0.1, which CI
+      uses; the tests pass on 2.0.1 (CI) and 2.1-dev (WSL).
 
 ### M0.5: SRAM smoke test on cmos5l (by 2026-09-28, runs alongside the start of M1)
 
@@ -268,3 +272,10 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   remain on SG13G2, CMOS5L untried). Added M0.5 SRAM smoke test and D-013,
   D-014, D-015. Solo entry noted. Repo still has no commits and no GitHub
   remote: M0 push is the next action, due 2026-09-21.
+- 2026-09-17, Fable 5.1: published the repo through Thomas's account at his
+  request. First CI run green except `gl_test` (template Makefile missing the
+  PDK UDP file, BUGS #2); fixed, verified locally at gate level, pushed. M0
+  baseline: 214 synthesised cells, 33 flops, 0.52 percent utilisation on 6x4,
+  +13.2 ns setup slack at 20 ns, DRC/LVS/antenna 0, precheck pass. Remaining
+  M0 items are Thomas's: sign-up form and the Jane Street email. Next session
+  (Opus): M0.5 SRAM smoke test branch, then M1 from `isa/isa.yaml`.
