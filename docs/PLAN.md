@@ -70,21 +70,34 @@ not tried CMOS5L. Any fix on their side takes calendar time, so the first
 failing run has to exist in September, not at the October gate. Being the
 first public cmos5l SRAM example is also worth doing in its own right.
 
-- [ ] Opus: branch `sram-smoke`. Vendor the macro views (GDS, LEF, the three
-      lib corners, CDL, Verilog model) from the pinned IHP-Open-PDK commit named
-      in `docs/tt_cmos5l_facts.md` into `macro/`, with a README naming the
-      commit. Port names come from the macro's Verilog model, not from memory.
-- [ ] Opus: `src/loom_imem_macro.v` wrapping the macro behind the `loom_imem`
-      interface (this file becomes the MACRO backend later), BIST and bit-mask
-      pins tied off as the model requires, plus a pin-level test top that can
-      write and read every word through the TT pins.
-- [ ] Opus: cocotb test against the macro's Verilog model: walking ones,
-      address uniqueness, full 512 x 16 sweep.
-- [ ] Opus: `src/config.json` macro keys from the `tt_um_urish_sram_test` recipe
-      (`MACROS`, `PDN_MACRO_CONNECTIONS`, `PDN_CFG` with the Metal4 connection,
-      `MAGIC_EXT_ABSTRACT_CELLS`, `ERROR_ON_MAGIC_DRC: false`) with the PDN
-      stripe pitch matched to the macro's power pins. Allowed on this branch
-      only, under D-015.
+- [x] 2026-09-17 Opus: branch `sram-smoke`. Vendored the macro views (GDS, LEF,
+      the three lib corners, CDL, Verilog model plus the shared behavioural
+      core it instantiates) from IHP-Open-PDK `2bbec755` into
+      `macro/RM_IHPSG13_1P_512x16_c2_bm_bist/`, 1.1 MB total, every file's git
+      blob hash matching upstream, README naming commit and Apache-2.0 licence.
+      Port names and polarities read out of the vendored model.
+- [x] 2026-09-17 Opus: `src/loom_imem_macro.v` wrapping the macro behind the
+      `loom_imem` interface (this file becomes the MACRO backend later), BIST,
+      bit-mask and `A_DLY` pins tied off as the model requires, plus the
+      pin-level tester in `src/tt_um_loom.v` (byte registers over `uio`, edge
+      strobes on `ui_in`) that can write and read every word through the TT
+      pins. Tiles cut from 6x4 to 2x2 on this branch.
+- [x] 2026-09-17 Opus: cocotb test: reset/pin hygiene, walking ones on all 16
+      data bits, a distinct word written to and read back from all 512
+      addresses, random interleaved access, write-wins-over-read. 5/5 pass on
+      Icarus 14 / cocotb 2.1 in 2.2 s. Verilator `-Wall` clean; Yosys
+      `synth -top tt_um_loom` gives 74 cells, 53 flops and exactly one macro
+      instance.
+- [x] 2026-09-17 Opus: `src/config.json` macro keys from the
+      `tt_um_urish_sram_test` recipe (`MACROS`, `PDN_MACRO_CONNECTIONS`,
+      `PDN_CFG`, `MAGIC_MACRO_STD_CELL_SOURCE`, `MAGIC_EXT_ABSTRACT_CELLS`,
+      `ERROR_ON_MAGIC_DRC: false`) plus `src/pdn_cfg.tcl`. Allowed on this
+      branch only, under D-015. **The reference's Metal4 connection does not
+      transfer from SG13G2**: on cmos5l `FP_PDN_VERTICAL_LAYER` is Metal4
+      itself and TopMetal1 belongs to `tt_top`, so the stripes are pitched
+      (67.44 = 6 x 11.24 um) and offset (26.36) to sit *inside* the macro's
+      Metal4 power pins instead of crossing them from above. Full derivation in
+      `src/pdn_cfg.tcl`.
 - [ ] Thomas: push the branch, collect the `gds` and precheck logs, post them
       in the Discord thread, record the outcome in `docs/AREA.md` and in
       `docs/tt_cmos5l_facts.md` section 9.
@@ -287,3 +300,15 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   +13.2 ns setup slack at 20 ns, DRC/LVS/antenna 0, precheck pass. Remaining
   M0 items are Thomas's: sign-up form and the Jane Street email. Next session
   (Opus): M0.5 SRAM smoke test branch, then M1 from `isa/isa.yaml`.
+- 2026-09-17, Opus 5 (branch `sram-smoke` only, nothing on `main`): M0.5 built.
+  Macro vendored and hash-verified, `loom_imem_macro.v` + pin-level tester,
+  cocotb 5/5, Verilator clean, one macro instance in the Yosys netlist, 2x2
+  tiles, macro keys and a cmos5l-specific `pdn_cfg.tcl` in `src/`. Key finding
+  for the Discord write-up: **the SG13G2 recipe's "Metal4 to TopMetal1" macro
+  connection cannot be used on cmos5l**, because there the PDN's vertical layer
+  is Metal4 (the macro's own pin layer) and TopMetal1 is what `tt_top` uses to
+  feed each user block; the only route is to align the Metal4 stripes inside
+  the macro's Metal4 pins, which is exactly what the community report meant.
+  Next: Thomas pushes `sram-smoke`, collects the `gds` and precheck logs
+  (expect the precheck to be the failure point: the reference project's own
+  `gds` job is green today while its `precheck` job fails), and posts them.
