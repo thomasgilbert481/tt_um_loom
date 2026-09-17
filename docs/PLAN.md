@@ -50,7 +50,9 @@ Exit: CI green on GitHub for the trivial design, local sim works in WSL.
       hardening on 6x4, precheck and viewer all pass. `gl_test` failed on a
       template bug, not the design: the GL Makefile omitted the PDK primitives
       file `sg13cmos5l_udp.v` (BUGS #2). Fixed and verified locally at gate
-      level on the CI netlist (2 of 2 pass). Baseline numbers in `docs/AREA.md`.
+      level on the CI netlist (2 of 2 pass). Second CI run (35248880086) is
+      fully green: gds, precheck, gl_test, viewer, test, lint, docs. Baseline
+      numbers in `docs/AREA.md`.
 - [x] WSL dev loop documented in `CLAUDE.md` and working (`make` in `test/`,
       Verilator lint, `make GATES=yes` with a scratch copy of the cell models).
       `test/requirements.txt` stays at the template's cocotb 2.0.1, which CI
