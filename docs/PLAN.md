@@ -26,8 +26,7 @@ silently.
 
 Exit: CI green on GitHub for the trivial design, local sim works in WSL.
 
-- [ ] Thomas: fill in the Jane Street sign-up form (link in the blog post). Not
-      a commitment, but it gets template and submission updates.
+- [x] 2026-09-17, Thomas: Jane Street sign-up form submitted.
 - [x] 2026-09-17: public repo `thomasgilbert481/tt_um_loom` created and pushed
       (Apache-2.0; first commit is the untouched template, second is Loom),
       GitHub Pages enabled with the workflow build type for the viewer job.
@@ -36,7 +35,8 @@ Exit: CI green on GitHub for the trivial design, local sim works in WSL.
       `8x4` is not a valid size in the cmos5l flow yet (largest is 6x4; see
       `docs/tt_cmos5l_facts.md`), and the live blog post now says 6x4 is the
       current maximum with 8x4 in progress.
-- [ ] Thomas: email asic-competition@janestreet.com with two questions: will
+- [x] 2026-09-17, Thomas: sent; awaiting reply, follow up 2026-09-29. Was:
+      email asic-competition@janestreet.com with two questions: will
       `8x4` be enabled in the cmos5l flow before the deadline, and are IHP SRAM
       macros acceptable in a submission for the March 2027 shuttle. The M2
       memory decision needs the second answer. Draft and a matching Tiny
@@ -99,11 +99,17 @@ the M2 gate rules do not change.
 Exit: a UART TX written in Loom assembly runs on the RTL core, decoded by the
 same cocotb UART model as M0; first synthesis numbers recorded.
 
+- [x] 2026-09-17: `docs/SEMANTICS.md`, the cycle-exact contract for RTL and
+      golden model (slot timing, visibility rules, ticks, waits, pins, run
+      control, retire record).
 - [ ] `isa/isa.yaml` v1.0 frozen. Every mnemonic, encoding, flag effect, and
       timing class from `docs/ARCHITECTURE.md` section 11. Frozen means changes
-      need a `DECISIONS.md` entry.
-- [ ] `tools/gen`: generates `src/loom_isa.vh`, assembler tables, golden-model
-      tables, `docs/ISA.md`. CI fails if generated files are stale.
+      need a `DECISIONS.md` entry. (Now 0.2.0: 64 instructions, no overlaps,
+      75.8 percent of the encoding space used.)
+- [x] 2026-09-17: `tools/loomisa`, the only parser of `isa.yaml`: encode,
+      decode, overlap check, and generators for `src/loom_decode.v` (the
+      decoder module itself, so RTL never hand-decodes), `src/loom_isa.vh` and
+      `docs/ISA.md`. 29 tests. CI job `isa-and-tools` fails on stale files.
 - [ ] `tools/loomasm`: two-pass assembler, labels, `.thread`, `.pins`, pseudo-ops,
       listing output with slot counts, deadline check (warn when code between
       two `WAITD`s cannot fit the tick interval).

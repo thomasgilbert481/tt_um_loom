@@ -14,5 +14,31 @@ jobs:
 
       # L0-LINT (docs/VERIFICATION.md): the TT flow runs its own linter, but we
       # hold the stricter -Wall bar on every push so that warnings never pile up.
-      - name: Verilator lint (-Wall)
+      - name: Verilator lint (-Wall), TT top
         run: verilator --lint-only -Wall -Isrc --top-module tt_um_loom src/*.v
+
+      - name: Verilator lint (-Wall), generated decoder
+        run: verilator --lint-only -Wall --top-module loom_decode src/loom_decode.v
+
+  isa-and-tools:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt
+
+      # L0-GEN: everything generated from isa/isa.yaml must be committed and fresh.
+      - name: ISA encodings and generated files
+        run: |
+          python -m tools.loomisa check
+          python -m tools.loomisa gen --check
+
+      - name: Python tests
+        run: python -m pytest -q tools

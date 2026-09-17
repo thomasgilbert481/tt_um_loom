@@ -8,10 +8,13 @@ the project.
 ## Read order, every session
 
 1. `docs/PLAN.md`: find the current milestone and the first unchecked box.
-2. `docs/ARCHITECTURE.md`: the spec. Sections 4 to 11 are the contract.
-3. `docs/DECISIONS.md`: the last few entries, so you do not relitigate.
-4. `docs/BUGS.md` and `docs/AREA.md` if they exist.
-5. `isa/isa.yaml` when touching anything that decodes or assembles.
+2. `docs/SEMANTICS.md`: the cycle-exact contract that RTL and golden model both
+   implement. It wins over ARCHITECTURE.md where they differ.
+3. `docs/ARCHITECTURE.md`: the design and its rationale.
+4. `docs/DECISIONS.md`: the last few entries, so you do not relitigate.
+5. `docs/BUGS.md` and `docs/AREA.md`.
+6. `isa/isa.yaml` and `docs/ISA.md` when touching anything that decodes or
+   assembles.
 
 Do not read `docs/tt_cmos5l_facts.md` unless you are making the M2 memory
 decision or configuring the flow; it is reference material.
@@ -22,9 +25,14 @@ decision or configuring the flow; it is reference material.
   RTL. If the spec is wrong or impossible, stop, write a `docs/DECISIONS.md`
   entry proposing the change with the reason, and ask Thomas. Do not quietly
   implement something else.
-- **`isa/isa.yaml` is the only place an encoding lives.** Run `tools/gen` after
-  editing it; commit the generated files; never hand-edit generated files
-  (they carry a header saying so).
+- **`isa/isa.yaml` is the only place an encoding lives.** `tools/loomisa` is
+  the only code that parses it. After editing the YAML run
+  `python -m tools.loomisa gen`, which writes `src/loom_decode.v` (the decoder
+  module), `src/loom_isa.vh` (constants for testbenches and formal, not for
+  synthesis) and `docs/ISA.md`; commit them; never hand-edit them. Hand-written
+  RTL takes every decode signal and operand field from `loom_decode` and never
+  compares instruction bits itself. Python code encodes and decodes through
+  `tools.loomisa` (`isa.encode("ADD", rd=1, ra=2, rb=3)`), never with literals.
 - **Golden model and RTL are written from the spec, not from each other.**
   When you write `tools/loomsim`, do not open `src/`. When you write RTL, do not
   open `tools/loomsim`. This independence is a stated part of the methodology
@@ -93,14 +101,23 @@ decision or configuring the flow; it is reference material.
 ## How to run things
 
 ```bash
-# RTL tests (cocotb + Icarus), from WSL
-source /home/homa/oss-cad-suite/environment && cd /mnt/c/Users/Thoma/asic/tt_um_loom/test && make
-# Gate-level tests need the netlist copied in by the gds workflow: make GATES=yes
-# Regenerate ISA artefacts (once tools/gen exists)
-python3 tools/gen/gen.py
-# Assemble a program
-python3 -m tools.loomasm firmware/uart_tx.loom -o firmware/build/uart_tx.bin --listing
+# Everything (ISA check, generated-file freshness, pytest, Verilator lint, cocotb):
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash /mnt/c/Users/Thoma/asic/tt_um_loom/scripts/check_all.sh
+# Same without the simulation:
+MSYS_NO_PATHCONV=1 wsl -d Ubuntu -- bash /mnt/c/Users/Thoma/asic/tt_um_loom/scripts/check_all.sh quick
 ```
+
+Inside a WSL shell: `source scripts/dev_env.sh` first (finds the OSS CAD Suite,
+sets `LOOM_PY` to the Python cocotb runs under, puts PyYAML and pytest in a
+private directory on `PYTHONPATH`), then `"$LOOM_PY" -m tools.loomisa gen`,
+`"$LOOM_PY" -m pytest -q tools`, `make -C test`.
+
+Two traps when driving WSL from the Windows-side Bash tool: `MSYS_NO_PATHCONV=1`
+is required or `/mnt/c/...` arguments are rewritten into Git paths, and shell
+variables inside a `wsl ... bash -c '...'` one-liner are expanded to nothing
+before bash sees them, so put anything with variables in a script file.
+Gate-level simulation needs the netlist from the CI artefact and the three PDK
+cell-model files; the recipe is in `docs/BUGS.md` entry 2 and the project memory.
 
 ## Milestone M0 for a fresh session (if PLAN M0 boxes are still open)
 
