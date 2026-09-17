@@ -9,6 +9,9 @@
 
   "//": "If you get stuck with this config, please open an issue or get in touch via the discord.",
 
+  "//": "BRANCH sram-smoke ONLY. docs/DECISIONS.md D-015 allows the macro keys below on this",
+  "//": "branch; `main` keeps the untouched template config until the M2 memory decision.",
+
   "//": "Here are some of the variables you may want to change:",
 
   "//": "PL_TARGET_DENSITY_PCT - You can increase this if Global Placement fails with error GPL-0302.",
@@ -30,6 +33,96 @@
   "//": "If you need a custom clock configuration, read the following documentation first:",
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
   "CLOCK_PORT": "clk",
+
+  "//": "================= SRAM macro integration (M0.5, D-015) =================",
+
+  "//": "MACROS - the LibreLane way of bringing in a hard macro (NOT EXTRA_LEFS/EXTRA_GDS_FILES).",
+  "//": "https://librelane.readthedocs.io/en/latest/usage/using_macros.html . Key = the macro name,",
+  "//": "not the instance. Everything below is vendored at IHP-Open-PDK commit 2bbec755; see",
+  "//": "macro/RM_IHPSG13_1P_512x16_c2_bm_bist/README.md.",
+  "//": "  instances.sram.location  - lower-left corner in microns, absolute in the DIE_AREA that",
+  "//":                             "tt-support-tools sets from tile_sizes.yaml. 2x2 is",
+  "//":                             "0 0 419.52 313.74 and the rows (core area) run 2.88..416.64 x",
+  "//":                             "3.78..309.96. The macro is 236.80 x 191.34, so at (12, 10) it",
+  "//":                             "occupies x 12..248.8, y 10..201.34: hard against the bottom-left,",
+  "//":                             "leaving one contiguous L of free area (x 248.8..416.64 full",
+  "//":                             "height, plus y 201.34..309.96 full width, about 96000 um2) for",
+  "//":                             "the standard cells. All 43 signal pins sit on the TOP edge of",
+  "//":                             "the block (y = 313.24 in tt_block_2x2_pgvdd.def), so keeping the",
+  "//":                             "macro low leaves 110 um of rows directly under them. The exact x",
+  "//":                             "of 12 is what makes FP_PDN_VOFFSET below land the power stripes",
+  "//":                             "inside the macro's power pins; changing one means recomputing",
+  "//":                             "the other (the arithmetic is in src/pdn_cfg.tcl).",
+  "//": "  instances.sram.orientation - N, i.e. R0, unrotated. On cmos5l the PDN vertical layer is",
+  "//":                             "Metal4, the same layer as the macro's power pins, so the stripes",
+  "//":                             "and the pins have to be PARALLEL for the stripes to sit inside",
+  "//":                             "the pins. The reference project rotates its macro R90 because on",
+  "//":                             "SG13G2 the stripes are TopMetal1 and have to CROSS the pins.",
+  "//": "  nl - the port-only blackbox in src/, not the behavioural model. Same as the reference.",
+  "MACROS": {
+    "RM_IHPSG13_1P_512x16_c2_bm_bist": {
+      "instances": {
+        "sram": {
+          "location": [12, 10],
+          "orientation": "N"
+        }
+      },
+      "gds": [
+        "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.gds"
+      ],
+      "lef": [
+        "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.lef"
+      ],
+      "lib": {
+        "nom_*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_typ_1p20V_25C.lib"
+        ],
+        "min_*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_fast_1p32V_m55C.lib"
+        ],
+        "max_*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_slow_1p08V_125C.lib"
+        ],
+        "*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_typ_1p20V_25C.lib"
+        ]
+      },
+      "nl": [
+        "dir::./RM_IHPSG13_1P_512x16_c2_bm_bist.v"
+      ],
+      "spice": [
+        "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.cdl"
+      ]
+    }
+  },
+
+  "//": "PDN_MACRO_CONNECTIONS - hooks the macro's power pins onto the block's nets without needing",
+  "//": "USE_POWER_PINS in the RTL. Format: <instance> <block power net> <block ground net>",
+  "//": "<macro power pin> <macro ground pin>. The macro has three: VDD! (periphery), VDDARRAY!",
+  "//": "(the bit-cell array) and VSS!. Both supplies go to VPWR, as the reference project does;",
+  "//": "the macro would allow them to be separate rails but Tiny Tapeout only gives us one.",
+  "PDN_MACRO_CONNECTIONS": [
+    "sram VPWR VGND VDD! VSS!",
+    "sram VPWR VGND VDDARRAY! VSS!"
+  ],
+
+  "//": "PDN_CFG - custom power grid. On cmos5l FP_PDN_VERTICAL_LAYER is Metal4, which is also the",
+  "//": "layer the macro's power pins are on, and TopMetal1 belongs to tt_top. The stripes therefore",
+  "//": "have to land inside the macro's pins. src/pdn_cfg.tcl derives every number from the LEF.",
+  "PDN_CFG": "dir::pdn_cfg.tcl",
+
+  "//": "SRAM GDS has no PR boundary layer; read the full GDS instead of a blackbox.",
+  "//": "(cmos5l sets PRIMARY_GDSII_STREAMOUT_TOOL=klayout, so this may end up unused; kept because",
+  "//": "it is harmless and it is what the reference needs.)",
+  "MAGIC_MACRO_STD_CELL_SOURCE": "PDK",
+
+  "//": "SRAM macro internals trigger massive DRC in Magic; skip (KLayout DRC is already off below).",
+  "ERROR_ON_MAGIC_DRC": false,
+
+  "//": "Blackbox the SRAM macro during SPICE extraction for LVS: the IHP macros are not LVS clean.",
+  "MAGIC_EXT_ABSTRACT_CELLS": ["RM_IHPSG13_.*"],
+
+  "//": "======================= end SRAM macro integration =======================",
 
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
@@ -58,8 +151,21 @@
   "FP_IO_HLENGTH": 2,
   "FP_IO_VLENGTH": 2,
 
-  "FP_PDN_VPITCH": 50.0,
+  "//": "PDN geometry. Only VPITCH/VSPACING/VOFFSET differ from the template, and only so that the",
+  "//": "Metal4 stripes sit inside the macro's Metal4 power pins. VWIDTH stays at the template's 2.1",
+  "//": "because these stripes are also the block's power pins, which tt_top connects to.",
+  "//": "  VPITCH   67.44 = 6 x 11.24 um, the macro's same-net power column pitch, chosen so that no",
+  "//":                   "stripe lands in the macro's irregular middle band.",
+  "//": "  VSPACING 3.52: OpenROAD puts the GROUND stripe of a pair at (spacing + width) = 5.62 um",
+  "//":                   "from the POWER stripe centre, which is the macro's POWER-to-GROUND column",
+  "//":                   "distance.",
+  "//": "  VOFFSET  26.36 measured from the core-area xMin of 2.88, giving the first POWER stripe",
+  "//":                   "centre at 29.24 = macro x 12 + 17.24.",
+  "//": "Full derivation and the verified stripe positions are in src/pdn_cfg.tcl.",
+  "FP_PDN_VPITCH": 67.44,
   "FP_PDN_VWIDTH": 2.1,
+  "FP_PDN_VSPACING": 3.52,
+  "FP_PDN_VOFFSET": 26.36,
 
   "//": "Clock",
   "RUN_CTS": 1,
