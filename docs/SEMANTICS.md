@@ -103,6 +103,13 @@ at every edge:
 - `reached(a, b)` is `((a - b) mod 2^16) < 2^15`.
 - `TICK_SEEN` is cleared at the commit edge of every valid slot of the thread
   (unless a tick sets it at the same edge).
+- **Scheduled fix (rtl-m2 question 4, not yet built):** the rule above loses
+  a tick that lands at edge `x + 1`, between a slot's X cycle and its commit,
+  so `WAITB 3` can miss ticks indefinitely. The corrected rule clears only
+  what the slot saw: at the commit edge, `TICK_SEEN <= tick | (TICK_SEEN &
+  ~seen)`, where `seen` is the value the slot read in its X cycle. RTL and
+  golden model switch to it together in one commit; until then both keep the
+  rule above.
 
 ## 5. Per-thread architectural state and reset values
 
@@ -263,7 +270,8 @@ sets `SWIRQ[t]` (host-visible, host-cleared). `CSRW FLAGS` writes `{T, C, Z}`.
 ### 6.7 FIFOs **[M2]**
 
 Per thread `t`: `INQ[t]` (host to thread) and `OUTQ[t]` (thread to host), each
-`FIFO_DEPTH` entries of 16 bits (a build parameter, a power of two, default 4)
+`FIFO_DEPTH` entries of 16 bits (a build parameter, a power of two from 2 to 8,
+default 4, so the counts fit the 4-bit fields of the host status word)
 with occupancy counts `INQ_CNT[t]` and `OUTQ_CNT[t]` in `0 .. FIFO_DEPTH`.
 Counts reset to 0; entry contents are not reset. A push or pop takes effect at
 an edge and is visible from the following cycle, like every other register.
@@ -279,9 +287,15 @@ an edge and is visible from the following cycle, like every other register.
 - Host push to `INQ[t]` (SPI FIFO space): accepted iff `INQ_CNT[t] <
   FIFO_DEPTH` as visible in the cycle before the commit edge; otherwise the
   word is dropped and `BADOP[14]` (host FIFO error) is set. Host pop from
-  `OUTQ[t]`: returns the head iff `OUTQ_CNT[t] > 0` as visible in the cycle
-  before the commit edge and removes it; otherwise returns 0, removes nothing
-  and sets `BADOP[14]`. A thread push or pop committing at the same edge is
+  `OUTQ[t]`: the SPI port must present a word's first bit before it knows the
+  host will clock the word out, so a pop is split in two. When the word is
+  loaded into the shift register (at the end of the dummy byte or of the
+  previous word) it **peeks**: the head if `OUTQ_CNT[t] > 0` then, else 0. The
+  **pop** commits at the edge where the word's last bit has gone out, and only
+  if the peek found an entry; an empty peek sets `BADOP[14]` at that edge. A
+  word cut short by `CS_n` pops nothing. The word loaded at the edge where the
+  previous word is popped is the entry after the head, and needs
+  `OUTQ_CNT[t] >= 2` in that cycle. Nothing is lost or read twice. A thread push or pop committing at the same edge is
   applied too: the new count is `count + pushes - pops`.
 - `CTRL.RESET` of thread `t` also empties `INQ[t]` and `OUTQ[t]`.
 - `WAITB c` conditions (6.4): 1 is `OUTQ_CNT[t] < FIFO_DEPTH`, 2 is

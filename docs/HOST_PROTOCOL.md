@@ -1,6 +1,6 @@
 # Loom host protocol (SPI)
 
-Version 0.1, 2026-09-15. Implemented by `loom_spi_host.v` (bit layer) and
+Version 0.2, 2026-09-18 (M2 FIFO, IRQ and debug additions). Implemented by `loom_spi_host.v` (bit layer) and
 `loom_host_ctl.v` (command layer). Driven by `tools/loomhost` from Python over
 any transport.
 
@@ -46,21 +46,21 @@ word (the falling SCK edge of its last bit, as seen in the core clock domain).
 | 0x0001 | VERSION | R | {major[7:0], minor[7:0]} |
 | 0x0002 | RUN | RW | bit t = thread t running. Writing 1 starts at the current PC; writing 0 halts after the current instruction retires |
 | 0x0003 | HALTED | R | bit t = thread t halted by HALT (cleared by writing RUN bit) |
-| 0x0004 | RESET | W | bit t = reset thread t: PC := RESET_PC[t], flags := 0, TD := NOW, stack cleared; registers untouched |
-| 0x0008..0x000B | RESET_PC[0..3] | RW | 10-bit reset vectors, default t * 0x100 |
+| 0x0004 | RESET | W | bit t = reset thread t: PC := RESET_PC[t], flags := 0, TD := NOW, DEPTH := 0 (RS0/RS1 kept), WAIT_ACTIVE := 0, INQ/OUTQ emptied, staged pin write discarded; registers and CSRs untouched (`docs/SEMANTICS.md` 7) |
+| 0x0008..0x000B | RESET_PC[0..3] | RW | 10-bit reset vectors, default t * (IMEM_WORDS / 4) (D-017) |
 | 0x0010 | IRQ_EN | RW | mask over IRQ_STAT |
 | 0x0011 | IRQ_STAT | R | {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}; the FIFO fields read 0 until M2 |
 | 0x0012 | IRQ_STAT2 | R | {12'b0, HALTED[3:0]} |
-| 0x001B | SWIRQ | R, W1C | {12'b0, SWIRQ[3:0]}: set by `CSRW HOST_IRQ` in thread t, write 1 to clear. HOST_IRQ = any(IRQ_STAT & IRQ_EN) or any(SWIRQ) |
-| 0x001C | IRQ_EN2 | RW | mask over IRQ_STAT2 (M2) |
+| 0x001B | SWIRQ | R, W1C | {12'b0, SWIRQ[3:0]}: set by `CSRW HOST_IRQ` in thread t, write 1 to clear. HOST_IRQ = any(IRQ_STAT & IRQ_EN) or any(IRQ_STAT2 & IRQ_EN2) or any(SWIRQ), registered (`docs/SEMANTICS.md` 6.8) |
+| 0x001C | IRQ_EN2 | RW | mask over IRQ_STAT2, bits 3:0; bits 15:4 read 0 (M2) |
 | 0x0013 | SFLAGS | RW | shared flags; write sets the bits written as 1 |
 | 0x0014 | SFLAGS_CLR | W | write clears the bits written as 1 |
 | 0x0015 | OD_MASK | RW | open-drain mode per BIDIR pin |
 | 0x0016 | PIN_OUT | RW | raw output register (host may drive pins while threads are halted) |
 | 0x0017 | PIN_OE | RW | raw OE register |
 | 0x0018 | PIN_IN | R | synchronised inputs |
-| 0x0019 | CAPS | R | build capabilities: {IMEM_WORDS[11:0]/16, DMEM_PRESENT, FIFO_DEPTH_LOG2[1:0], BOOTROM} |
-| 0x001A | BADOP | RW | bit t = thread t executed a reserved opcode; write 1 to clear |
+| 0x0019 | CAPS | R | build capabilities; layout in `docs/SEMANTICS.md` section 5 |
+| 0x001A | BADOP | RW | bits 3:0: thread t executed a reserved or unbuilt instruction; bit 14: host FIFO error; bit 15: host access error; write 1 to clear |
 
 ### SPACE 1: IMEM
 
@@ -81,11 +81,14 @@ while running (data memory is dual-ported or arbitrated; threads win).
 |---|---|---|
 | 0x0000 + t | W | push one word into INQ[t]; dropped if full, which sets CTRL BADOP bit 14 (check status first or use IRQ) |
 | 0x0000 + t | R | pop one word from OUTQ[t]; returns 0, does not pop and sets BADOP bit 14 if empty |
-| 0x0100 + t | R | status: {OUTQ_COUNT[3:0], INQ_COUNT[3:0], OUTQ_EMPTY, OUTQ_FULL, INQ_EMPTY, INQ_FULL} |
+| 0x0100 + t | R | status: `[11:8]` OUTQ_COUNT, `[7:4]` INQ_COUNT, `[3]` OUTQ_EMPTY, `[2]` OUTQ_FULL, `[1]` INQ_EMPTY, `[0]` INQ_FULL; `[15:12]` read 0 |
 
-Multi-word transactions push or pop consecutive words into the same FIFO (the
-address does not increment across thread boundaries in this space; the low two
-bits stay fixed).
+The address never increments in this space: a multi-word transaction pushes or
+pops consecutive words of the same FIFO, and a multi-word read of the status
+word reads it again. Other addresses read 0 and ignore writes. A pop is split
+into a peek when the word is loaded and the pop itself when the word's last bit
+has gone out, so a word cut short by `CS_n` pops nothing (`docs/SEMANTICS.md`
+6.7).
 
 ### SPACE 4: DEBUG
 
@@ -115,7 +118,7 @@ state. (`docs/SEMANTICS.md` section 7.)
 | 0x23 | DT (the hidden target of `DLY`) |
 | 0x24 | TICK_SEEN in bit 0 (M2) |
 | 0x25 | staged pin write: {8'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]} in bits 6:0 (M2, `docs/SEMANTICS.md` 6.10) |
-| 0x26 | {INQ_CNT, OUTQ_CNT} as {byte, byte} (M2), the same counts the FIFO status word reports |
+| 0x26 | {INQ_CNT, OUTQ_CNT} as {byte, byte} (M2), read-only: a written count would expose entries never pushed |
 
 `CSRW PIN_OUT`, `CSRW PIN_OE` and the host's PIN_OUT/PIN_OE writes are raw
 register writes and do not apply the open-drain rule; only pin writes (`SETP`,
@@ -135,7 +138,7 @@ slot at a time, which is what the co-simulation harness relies on.
 Load a 3-word program at address 0 and run thread 0:
 
 ```
-CS low  81 00 00  12 34  56 78  9A BC   CS high     (write IMEM, addr 0, 3 words)
+CS low  90 00 00  12 34  56 78  9A BC   CS high     (write IMEM, addr 0, 3 words)
 CS low  80 00 02  00 01              CS high     (write CTRL RUN = 0b0001)
 ```
 

@@ -35,6 +35,8 @@ is a thread PUSH that lands while an "empty" word is being shifted out: that
 word still reads 0 and the pushed entry stays for the next read. Nothing is
 ever lost or duplicated.
 
+**Resolution (director, 2026-09-18):** accepted. Written into SEMANTICS 6.7 and HOST_PROTOCOL SPACE 3.
+
 ## 2. FIFO space addresses in multi-word transactions
 
 HOST_PROTOCOL SPACE 3: "Multi-word transactions push or pop consecutive
@@ -45,6 +47,8 @@ boundaries in this space; the low two bits stay fixed)."
 (so a multi-word read of 0x0100+t re-reads the status word). Addresses other
 than 0x0000..0x0003 and 0x0100..0x0103 read 0 and ignore writes.
 
+**Resolution (director, 2026-09-18):** accepted; HOST_PROTOCOL SPACE 3 now says the address never increments there.
+
 ## 3. Status word count fields and FIFO_DEPTH
 
 The status word has 4-bit count fields; CAPS allows `log2(FIFO_DEPTH)` up to
@@ -52,6 +56,8 @@ The status word has 4-bit count fields; CAPS allows `log2(FIFO_DEPTH)` up to
 
 **Reading taken:** `FIFO_DEPTH` is a power of two from 2 to 8 in this RTL
 (the default 4). Debug 0x26 has byte-wide counts and would cope with more.
+
+**Resolution (director, 2026-09-18):** accepted. FIFO_DEPTH is a power of two from 2 to 8; SEMANTICS 6.7 says so.
 
 ## 4. WAITB 3 loses a tick that lands between a slot's X cycle and its commit
 
@@ -71,6 +77,8 @@ model of exactly this rule). Suggested fix for the next SEMANTICS revision:
 clear only what the slot saw, i.e. `TICK_SEEN <= tick | (TICK_SEEN & ~seen_in_X)`
 at the commit edge, which makes "a tick since the previous slot" true.
 
+**Resolution (director, 2026-09-18):** a real spec bug. The fix suggested here is adopted as the rule (SEMANTICS 4), but it is built in ONE coordinated commit for RTL and golden model after the current parallel work lands, because co-simulation compares TICK_SEEN. Until then both sides keep the literal rule.
+
 ## 5. Debug 0x24 to 0x26 writability
 
 HOST_PROTOCOL SPACE 4: "Every other debug register is a plain flop and is
@@ -82,9 +90,13 @@ because a count written without moving the FIFO pointers would expose
 entries that were never pushed. The status word, CTRL.RESET and the
 push/pop paths are the only ways to change the counts.
 
+**Resolution (director, 2026-09-18):** accepted; HOST_PROTOCOL SPACE 4 records 0x26 as read-only.
+
 ## 6. IRQ_EN2 width
 
 CTRL 0x1C IRQ_EN2: "mask over IRQ_STAT2", which has 4 meaningful bits.
 
 **Reading taken:** IRQ_EN2 keeps bits 3:0; bits 15:4 read 0 and ignore
 writes.
+
+**Resolution (director, 2026-09-18):** accepted; HOST_PROTOCOL CTRL 0x1C says 4 bits.
