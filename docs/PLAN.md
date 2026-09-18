@@ -85,9 +85,11 @@ first public cmos5l SRAM example is also worth doing in its own right.
       `MAGIC_EXT_ABSTRACT_CELLS`, `ERROR_ON_MAGIC_DRC: false`) with the PDN
       stripe pitch matched to the macro's power pins. Allowed on this branch
       only, under D-015.
-- [ ] Push the branch and iterate to a hardened, prechecked result (four CI
-      runs so far, see the session log and `docs/tt_cmos5l_facts.md` on the
-      branch), then post the outcome in the Discord thread, record the outcome in `docs/AREA.md` and in
+- [x] 2026-09-18: hardened and prechecked on the eighth CI run (565673f, run
+      35377845679): gds, all nine precheck checks, gl_test and viewer pass.
+      Recipe in `docs/tt_cmos5l_facts.md` section 11, decision D-020.
+- [ ] Thomas: post the outcome in the Discord thread (draft in the vault
+      outreach note), record the outcome in `docs/AREA.md` and in
       `docs/tt_cmos5l_facts.md` section 9.
 - [ ] If Ken's config becomes public, diff it against ours before a second try.
 
@@ -189,7 +191,11 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       error, NACK, clock stretching).
 - [ ] FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
       L3 tests re-run on hardware through `loomhost` (same scripts).
-- [ ] Memory decision gate (2026-10-26): trial hardening of
+- [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,
+      with the latch array as fallback. Remaining conditions: Tiny Tapeout's
+      view of the overlap waiver and power-script wrapper, Jane Street's answer
+      on macros, and a 6x4 hardening of the real core with the macro.
+      Original gate text, kept for the record: trial hardening of
       `RM_IHPSG13_1P_512x16_c2_bm_bist` (16 bits wide, 236.80 x 191.34 um)
       following the `tt_um_urish_sram_test` recipe (`MACROS`, custom
       `pdn_cfg.tcl` with the Metal4 macro connection, `MAGIC_EXT_ABSTRACT_CELLS`,

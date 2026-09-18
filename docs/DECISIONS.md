@@ -212,3 +212,29 @@ no decode because the slot order is fixed, and replicate it per consumer
 per-thread state. Target: +4 ns slack at the typical corner and a slow-corner
 failure under 3 ns before M2 features are added. Re-measure after the change;
 the flop instruction memory's 256:1 read mux is the next suspect.
+
+## D-020 2026-09-18 Opus 5: instruction memory is the 512x16 SRAM macro (early M2 gate)
+
+Evidence: the smoke test on branch `sram-smoke` (commit 565673f, Actions run
+35377845679) takes `RM_IHPSG13_1P_512x16_c2_bm_bist` through the whole Tiny
+Tapeout cmos5l pipeline: hardening, all nine precheck checks (the KLayout
+SG13CMOS5L deck over the full macro hierarchy reports 0 violations), gate-level
+test and viewer. Timing at 20 ns is clean at every corner. The recipe and its
+two non-default pieces are in `docs/tt_cmos5l_facts.md` section 11: a power
+script that releases the macro only while pdngen builds full-height stripes
+through its power columns, and `ERROR_ON_ILLEGAL_OVERLAPS false` for five
+Magic overlaps where those stripes cross a LEF obstruction that has no metal
+behind it in the GDS.
+Decision: the core's instruction memory becomes the macro (512 words, twice
+the M1 flops, 45K um2 instead of about 350K um2 of flops and read mux), taken
+through the existing `loom_imem` interface, as soon as the M2 RTL work frees
+`src/`. The 256x16 latch array (ARCHITECTURE 12, option 3) stays as the
+fallback behind the same interface, not built unless needed.
+Why now rather than on 2026-10-26: the precheck risk the gate was waiting on
+is retired, and every other M2 decision (area, timing, CI time) depends on
+the memory.
+Open conditions, tracked in PLAN: Tiny Tapeout's view of the waiver and the
+power-script wrapper (question in the Discord thread), Jane Street's answer on
+macros (email of 2026-09-17), and one 6x4 hardening of the real core with the
+macro, placed on the stripe grid (macro x = 12 + 67.44k um, pin edge facing
+free rows). If Tiny Tapeout rejects the waiver, the fallback is the latch array.
