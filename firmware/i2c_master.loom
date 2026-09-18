@@ -1,0 +1,187 @@
+; i2c_master.loom
+; I2C master: START, repeated START, STOP, write a byte and report the ACK,
+; read a byte and answer ACK or NACK. Clock stretching is honoured with a
+; timed WAITP on SCL. M2 firmware: needs the FIFOs (POP, PUSH), nothing else.
+;
+; Pins: SCL = BIDIR0, SDA = BIDIR1, both open drain (OD_MASK bits 0 and 1,
+; set here with a read-modify-write so other threads' bits survive). Writing
+; 1 releases a line and 0 pulls it low; the board supplies the pull-ups.
+;
+; Host command format (FIFO space, thread 0): one word per operation.
+;     bits 7:0   the byte to write (ignored for READ and NOBYTE)
+;     bit 8      START: issue a START first (a repeated START if the bus is ours)
+;     bit 9      STOP: issue a STOP afterwards
+;     bit 10     READ: read a byte instead of writing one
+;     bit 11     NACK: with READ, answer NACK (the last byte) instead of ACK
+;     bit 12     NOBYTE: no byte at all, only the START and/or STOP asked for
+; Examples: 0x01A0 START + address 0x50 write; 0x0010 word address 0x10;
+; 0x0222 data 0x22 then STOP; 0x01A1 repeated START + address 0x50 read;
+; 0x0400 read a byte and ACK it; 0x0E00 read the last byte, NACK, then STOP.
+;
+; Result format (FIFO space read): one word per byte transferred.
+;     bits 7:0   the byte as seen on SDA (the data read, or the echo of the
+;                byte written, which shows a stuck or contended line)
+;     bit 15     NACK: the ACK slot was high (the slave refused a written
+;                byte, or the master's own NACK when reading)
+;     bit 14     TIMEOUT: SCL stayed low longer than STRETCH ticks after it
+;                was released; the operation was abandoned, both lines are
+;                released, and the next command is taken
+;
+; Bit rate: 16 ticks per SCL period (Q = 4 ticks per quarter). The host sets
+; TICK_INT/TICK_FRAC before RUN, through the debug space:
+;     50 MHz, 100 kHz SCL:  TICK_INT 31, TICK_FRAC 64 (31.25 clocks per tick)
+;     tests (tools/tests/test_fw_i2c.py): TICK_INT 8, 128 clocks per SCL period
+; The schedule is proved for ticks of 5 clocks or more (.tick below).
+;
+; Timing of one bit: SCL is pulled low at a deadline; SDA changes a few slots
+; later (after SCL is low); LOW ticks after the fall SCL is released; WAITP
+; waits for the line to be high (a slave may hold it low: clock stretching,
+; up to STRETCH ticks); the schedule is re-anchored on the rise with SETD 0;
+; SDA is sampled Q ticks later (within one tick, as the rise is not on a
+; tick boundary) and SCL is pulled low again Q ticks after that. So inside a
+; byte SCL is low for LOW ticks plus one slot (the release sits one slot
+; later after its deadline than the fall), and high for 2Q ticks less up to
+; one tick plus the pin latency of the WAITP: 68 and 76 clocks at TICK 8.
+; Between two host commands the low phase is longer by the command decoding.
+;
+; Registers: r0 transmit shifter, r1 bit count, r3 bits sampled from SDA
+; (the byte in bits 8:1, the ACK slot in bit 0 after nine clocks), r5
+; scratch, r7 the command word.
+
+        .thread 0
+        .pins   SCL = BIDIR0, SDA = BIDIR1
+        .tick   5                       ; the shortest tick the schedule is proved for
+        .equ    Q = 4                   ; ticks per quarter SCL period
+        .equ    LOW = 2 * Q             ; SCL low phase
+        .equ    STRETCH = 255           ; clock-stretch timeout, in ticks
+
+start:  CSRR    r0, OD_MASK
+        ORI     r0, 3                   ; SCL and SDA open drain
+        CSRW    OD_MASK, r0
+        SETP    SCL, 1                  ; release both lines: the bus idles high
+        SETP    SDA, 1
+
+cmd:    POP     r7                      ; next command (blocks while INQ is empty)
+        SETD    1                       ; re-anchor after the unbounded POP
+        MOV     r3, r7
+        SHLI    r3, 8                   ; C = bit 8: START
+        BNC     nostart
+        CALL    i2c_start
+nostart: MOV    r3, r7
+        SHLI    r3, 4                   ; C = bit 12: NOBYTE
+        BC      nobyte
+        MOV     r3, r7
+        SHLI    r3, 6                   ; C = bit 10: READ
+        BC      doread
+        MOV     r0, r7
+        SWAP    r0, r0                  ; the byte to r0[15:8]
+        CALL    wbyte
+        JMP     result
+doread: CALL    rbyte
+result: SHRI    r3, 1                   ; r3 = the byte on SDA, C = the ACK slot
+        BNC     acked
+        LDIH    r3, 0x80                ; bit 15: NACK
+acked:  PUSH    r3                      ; blocks while OUTQ is full: SCL just waits
+nobyte: MOV     r3, r7
+        SHLI    r3, 7                   ; C = bit 9: STOP
+        BNC     cmd
+        CALL    i2c_stop
+        JMP     cmd
+
+; The clock-stretch timeout: give up, let go of the bus, report it.
+stuck:  SETP    SCL, 1
+        SETP    SDA, 1
+        LDI     r3, 0
+        LDIH    r3, 0x40                ; bit 14: TIMEOUT
+        PUSH    r3
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; sclk: one SCL pulse. On entry SCL is low (it fell at the last deadline) and
+; SDA is already set. Shifts the SDA level seen mid-high into r3 bit 0 and
+; returns with SCL low again, at a deadline.
+; ---------------------------------------------------------------------------
+sclk:   WAITD   LOW                     ; end of the low phase
+        SETD    STRETCH                 ; timeout for the stretch wait
+        SETP    SCL, 1                  ; release SCL
+        WAITP   SCL, 1, T               ; wait until SCL is really high
+        BT      stuck                   ; held low too long
+        SETD    0                       ; re-anchor on the rising edge
+        WAITD   Q                       ; middle of the high phase
+        SHLI    r3, 1
+        JP      SDA, 0, sk0
+        ORI     r3, 1                   ; sample SDA
+sk0:    WAITD   Q                       ; end of the high phase
+        SETP    SCL, 0
+        RET
+
+; wbyte: write r0[15:8], MSB first, then clock the slave's ACK slot.
+wbyte:  SETD    0                       ; a fresh schedule (SCL is low)
+        LDI     r3, 0
+        LDI     r1, 8
+wb1:    SHLI    r0, 1                   ; C = the next bit
+        BC      wb_one
+        SETP    SDA, 0
+        JMP     wb_clk
+wb_one: SETP    SDA, 1
+wb_clk: CALL    sclk
+        DJNZ    r1, wb1
+        SETP    SDA, 1                  ; release SDA for the ACK
+        CALL    sclk
+        SETD    0                       ; see "Return paths" below
+        RET
+
+; rbyte: read eight bits, then drive ACK, or NACK if command bit 11 is set.
+rbyte:  SETD    0
+        SETP    SDA, 1                  ; the slave drives SDA
+        LDI     r3, 0
+        LDI     r1, 8
+rb1:    CALL    sclk
+        DJNZ    r1, rb1
+        MOV     r5, r7
+        SHLI    r5, 5                   ; C = bit 11: NACK
+        BC      rb_nack
+        SETP    SDA, 0                  ; ACK
+        JMP     rb_ack
+rb_nack: SETP   SDA, 1                  ; NACK
+rb_ack: CALL    sclk
+        SETP    SDA, 1                  ; let go of SDA
+        SETD    0                       ; see "Return paths" below
+        RET
+
+; Return paths. The deadline checker lets every RET return to every CALL
+; site (tools/loomasm/README.md, limit 3), so a RET that follows a CALL
+; would form a RET-to-RET loop with no anchor and be reported unbounded.
+; The SETD 0 before the RETs of wbyte and rbyte cuts those loops. It costs
+; nothing: SCL is low, and every operation starts by re-anchoring anyway.
+
+; i2c_start: START, or a repeated START when SCL is low.
+i2c_start:
+        SETD    0
+        SETP    SDA, 1                  ; SDA high first (SCL may be low)
+        WAITD   Q
+        SETD    STRETCH
+        SETP    SCL, 1
+        WAITP   SCL, 1, T
+        BT      stuck
+        SETD    0
+        WAITD   Q                       ; set-up: both lines high
+        SETP    SDA, 0                  ; START: SDA falls while SCL is high
+        WAITD   Q                       ; hold
+        SETP    SCL, 0
+        RET
+
+; i2c_stop: STOP, then a bus-free gap.
+i2c_stop:
+        SETD    0
+        SETP    SDA, 0                  ; SCL is low: SDA low first
+        WAITD   Q
+        SETD    STRETCH
+        SETP    SCL, 1
+        WAITP   SCL, 1, T
+        BT      stuck
+        SETD    0
+        WAITD   Q                       ; set-up
+        SETP    SDA, 1                  ; STOP: SDA rises while SCL is high
+        WAITD   LOW                     ; bus free before the next START
+        RET

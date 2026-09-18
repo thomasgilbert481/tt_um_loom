@@ -1,0 +1,49 @@
+; uart_tx_fifo.loom
+; 8N1 UART transmitter on OUT0, fed by the host through INQ[0]. M2 firmware:
+; needs the FIFOs (POP), nothing else.
+;
+; Host command format (FIFO space, thread 0): one word per byte.
+;     bits 7:0   the byte to send (LSB first on the wire)
+;     bits 15:8  ignored
+; Nothing is ever pushed to OUTQ.
+;
+; Bit rate: one tick is one bit. The host sets the rate before RUN through
+; the debug space, TICK_INT = clocks per bit (and TICK_FRAC for the fraction):
+;     50 MHz, 115200 baud:  TICK_INT 434 (0.01 % fast), or 434 + TICK_FRAC 8
+;     tests (tools/tests/test_fw_uart.py): TICK_INT 32, 1.5625 Mbaud at 50 MHz
+; The schedule is proved for TICK_INT >= 24 (.tick below); the reset value 1
+; is far too fast, so always set the rate first.
+;
+; Timing. Every pin write is the first instruction after the WAITD that
+; times it, so every edge lands the same one slot after its deadline (plus
+; 0 to 3 clocks of slot-grid lateness, SEMANTICS 2): with a tick that is a
+; multiple of 4 clocks the edges are exactly periodic, otherwise they dither
+; by one slot and never drift. After an idle period the start bit waits for
+; the next tick boundary (SETD 0 then WAITD 1), so it is always a full bit;
+; words already queued go out back to back with exactly one stop bit.
+
+        .thread 0
+        .pins   TX = OUT0
+        .tick   24                      ; the fastest rate the schedule is proved for
+
+start:  SETP    TX, 1                   ; the line idles high
+
+byte:   POP     r0                      ; next word from the host (blocks while empty)
+        SETD    0                       ; TD = the tick boundary just passed
+        LDI     r1, 8                   ; eight data bits
+        WAITD   1                       ; the next tick boundary
+        SETP    TX, 0                   ; start bit
+
+bit:    SHRI    r0, 1                   ; C = the next data bit, LSB first
+        BC      one
+        WAITD   1
+        SETP    TX, 0
+        DJNZ    r1, bit
+        JMP     stop
+one:    WAITD   1
+        SETP    TX, 1
+        DJNZ    r1, bit
+
+stop:   WAITD   1
+        SETP    TX, 1                   ; stop bit; the next start bit is at
+        JMP     byte                    ; least one tick later

@@ -1,0 +1,109 @@
+; uart_rx.loom
+; 8N1 UART receiver on IN0, delivering bytes to the host through OUTQ[0].
+; M2 firmware: needs the FIFOs (PUSH, WAITB OUTQ_NF), nothing else.
+;
+; Result format (FIFO space read, thread 0): one word per frame.
+;     bits 7:0   the received byte
+;     bit 8      framing error: the stop bit was low (the byte is still given)
+;     bit 9      overrun: OUTQ was full and at least one earlier frame was
+;                dropped before this one
+;     bits 15:10 zero
+; Nothing is read from INQ.
+;
+; Bit rate: 8 ticks per bit (OVS). The host sets TICK_INT/TICK_FRAC to one
+; eighth of a bit before RUN, through the debug space; the program reads
+; TICK_INT once when it starts:
+;     50 MHz, 115200 baud:  TICK_INT 54, TICK_FRAC 64 (54.25 clocks per tick)
+;     tests (tools/tests/test_fw_uart.py): TICK_INT 8, 64 clocks per bit
+; The deadline schedule is proved for ticks of 8 clocks or more (.tick
+; below), and 8 is also the fastest rate at which the code after a stop-bit
+; sample is back at the start-bit wait before a back-to-back frame starts.
+;
+; How a frame is found and sampled. WAITP waits for the line to be low (the
+; start bit) and SETD 0 re-anchors the schedule on that edge: TD becomes the
+; tick boundary just passed, 0 to 1 tick before the edge was seen, which was
+; itself about 12 clocks after the pad changed (synchroniser, slot grid, the
+; SETD's own slot). Every sample is taken by the JP right after its WAITD,
+; so all ten samples of a frame sit at the same offset from the middle of
+; their bits: FIRST * P + 12 - phase - 4 * P clocks, P the tick. With
+; FIRST = OVS/2 - 1 that is within -2P+12 .. -P+12, centred for fast rates;
+; with FIRST = OVS/2 it is within -P+12 .. +12, centred for slow ones. The
+; program picks FIRST once at start from TICK_INT (SLOW below): within
+; -4 .. +4 clocks of mid-bit at 64 clocks per bit, -43 .. +12 of 434 at
+; 115200 baud. A start bit that is high again at its middle is a glitch and
+; is ignored. After a framing error the receiver waits for the line to go
+; high before it looks for the next start bit, so a break is one framing
+; error, not a stream of them. WAITP (a level wait) rather than WAITE (an
+; edge wait) finds the start bit, so an edge that arrives while the previous
+; word is being delivered is not lost.
+;
+; Baud tolerance. Samples drift by the rate error times 9.5 bits by the stop
+; bit, and the start-bit wait is back 16 clocks after the stop-bit sample.
+; At 115200 baud a transmitter within +-3 % is received back to back (tested,
+; about +-4 % is the limit). At the fastest rate, 64 clocks per bit, the
+; 16 clocks are a quarter of a bit: back-to-back streams need the sender
+; within about -2 % .. +4 %, and with one idle bit between frames +-3 % is
+; fine (tested).
+
+        .thread 0
+        .pins   RX = IN0
+        .tick   8                       ; the shortest tick the schedule is proved for
+        .equ    OVS  = 8                ; ticks per bit
+        .equ    SLOW = 12               ; ticks this long or longer: FIRST = OVS / 2
+
+start:  LDI     r2, 0x80                ; a received 1 enters at bit 7
+        LDI     r3, 0
+        LDIH    r3, 1                   ; r3 = 0x0100: the framing-error bit
+        LDI     r4, 0                   ; pending overrun flag (bit 9) for the next word
+        CSRR    r5, TICK_INT            ; the rate: set by the host before RUN
+        CMPI    r5, SLOW                ; C = 1: ticks of SLOW clocks or more
+        LDI     r5, 0                   ; r5 = 0: fast entry (LDI keeps C)
+        BNC     rearm
+        LDI     r5, 1                   ; r5 = 1: slow entry
+
+rearm:  TEST    r5, r5                  ; Z = fast entry
+        BZ      fast
+slow:   WAITP   RX, 0                   ; slow rates: start bit (or already low)
+        SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; middle of the start bit
+        JMP     check
+fast:   WAITP   RX, 0                   ; fast rates: the same, one tick sooner
+        SETD    0
+        WAITD   OVS / 2 - 1
+check:  JP      RX, 1, rearm            ; high again: a glitch, not a start bit
+        LDI     r0, 0
+        LDI     r1, 8
+
+bit:    WAITD   OVS                     ; middle of the next data bit
+        JP      RX, 1, one              ; sample
+        SHRI    r0, 1                   ; a 0 enters at bit 7
+        DJNZ    r1, bit
+        JMP     stop
+one:    SHRI    r0, 1
+        OR      r0, r0, r2
+        DJNZ    r1, bit
+
+; Everything that can be decided before the stop bit is decided during it,
+; so that after the stop-bit sample a good frame is pushed and the start-bit
+; wait is reached in 4 slots (16 clocks), inside the half bit that a
+; back-to-back frame leaves.
+stop:   OR      r0, r0, r4              ; carry the overrun flag (bit 9)
+        WAITB   OUTQ_NF, T              ; room in OUTQ? TD (the last data bit's
+        BT      full                    ; deadline) is reached, so this never
+        LDI     r4, 0                   ; waits: T = 1 means full. The word
+        TEST    r5, r5                  ; will be delivered. Z for the BZ below
+        WAITD   OVS                     ; middle of the stop bit
+        JP      RX, 0, ferr             ; low: framing error
+        PUSH    r0                      ; cannot stall: OUTQ had room, and only
+        BZ      fast                    ; the host takes words out
+        JMP     slow
+
+full:   LDIH    r4, 2                   ; r4 = 0x0200: bit 9 on the next word;
+        WAITD   OVS                     ; this frame is dropped, but a break
+        JP      RX, 0, brk              ; must still end before the next start
+        JMP     rearm
+
+ferr:   OR      r0, r0, r3              ; bit 8: framing error
+        PUSH    r0
+brk:    WAITP   RX, 1                   ; wait for the line to return to idle
+        JMP     rearm

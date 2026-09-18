@@ -1,0 +1,123 @@
+; spi_master.loom
+; Full-duplex SPI master, modes 0 to 3, MSB or LSB first. M2 firmware: needs
+; the FIFOs (POP, PUSH), nothing else.
+;
+; Pins: MOSI = OUT0, SCK = OUT1, CS_n = OUT2 (one OUT group, so MOSI, SCK and
+; CS_n change on the same clock edge), MISO = IN0.
+;
+; Host command format (FIFO space, thread 0): one word per byte.
+;     bits 7:0   the byte to send on MOSI
+;     bit 13     CONFIG: send nothing; bits 1:0 are the SPI mode (CPOL, CPHA),
+;                bit 2 selects LSB first. Only between transactions (CS_n
+;                high); the default after reset is mode 0, MSB first.
+;     bit 14     SKIP: do not push the byte received during this one
+;     bit 15     LAST: raise CS_n after this byte (end of the transaction)
+; The first byte after CS_n is high starts a transaction: CS_n falls, SCK at
+; its idle level, at least half an SCK period before the first edge.
+;
+; Result format (FIFO space read): one word per byte without SKIP, bits 7:0
+; the byte received on MISO during it, bits 15:8 zero.
+;
+; SCK rate: one tick is half an SCK period, SCK = clk / (2 * TICK_INT). The
+; host sets TICK_INT before RUN (debug space). The schedule is proved for
+; TICK_INT >= 28 (.tick below), so at 50 MHz SCK is at most 893 kHz (500 kHz
+; is TICK_INT 50); tests (tools/tests/test_fw_spi.py) use TICK_INT 32,
+; 781 kHz at 50 MHz.
+; The master may stretch any SCK phase while it waits for the host (legal in
+; SPI, which the master clocks); edges inside a byte are one slot after
+; their deadlines, so each half period is exact to the slot grid.
+;
+; How a bit goes out. OUT writes {CS_n, SCK, MOSI} in one go. Each bit is a
+; "shift" step (SCK to A = CPOL ^ CPHA, MOSI = the bit) and half a period
+; later a "sample" step (SCK toggled, MISO sampled). With CPHA 0 the shift
+; step is the trailing edge of the previous bit (or no edge for the first)
+; and the sample step the leading edge; with CPHA 1 the shift step is the
+; leading edge and the sample step the trailing edge. So one loop serves all
+; four modes. Bytes are loaded into r0[15:8] (SWAP, or REV for LSB first)
+; and shifted out of bit 15.
+;
+; Registers: r0 TX shifter, r1 bit count, r2 config word, r3 next MOSI bit,
+; r4 next OUT pattern, r5 RX shifter, r6 shift-step base {0, A, 0},
+; r7 the current command word.
+
+        .thread 0
+        .pins   MOSI = OUT0, SCK = OUT1, CS_N = OUT2, MISO = IN0
+        .tick   28                      ; half an SCK period, at the fastest
+        .equ    H = 1                   ; ticks per half period
+
+start:  .csr    OUTGRP, 16 | (3 << 5)   ; OUT drives OUT0..OUT2 (clobbers r7)
+        LDI     r2, 0                   ; mode 0, MSB first
+        LDI     r6, 0                   ; A = 0: shift steps drive SCK low
+        LDI     r4, 4                   ; CS_n high, SCK low, MOSI low
+        OUT     r4
+
+cmd:    POP     r0                      ; next command (blocks while INQ is empty)
+        SETD    3                       ; re-anchor; covers the byte set-up below
+        MOV     r7, r0
+        MOV     r3, r0
+        SHLI    r3, 3                   ; C = bit 13: CONFIG
+        BC      config
+        JP      CS_N, 0, go             ; CS_n already low: inside a transaction
+        MOV     r4, r2
+        ANDI    r4, 2                   ; SCK idle level (CPOL), CS_n low, MOSI 0
+        OUT     r4                      ; the transaction starts
+
+go:     MOV     r3, r2
+        SHRI    r3, 3                   ; C = config bit 2: LSB first
+        BC      lsb
+        SWAP    r0, r0                  ; MSB first: the byte to r0[15:8]
+        JMP     load
+lsb:    REV     r0, r0                  ; LSB first: bit 0 to bit 15 and so on
+load:   MOV     r3, r0
+        SHRI    r3, 15                  ; the first bit, for MOSI (OUT bit 0)
+        SHLI    r0, 1
+        OR      r4, r3, r6              ; the first shift-step pattern
+        LDI     r1, 8
+        LDI     r5, 0
+
+bit:    WAITD   H                       ; shift step
+        OUT     r4
+        XORI    r4, 2                   ; the sample step toggles SCK only
+        MOV     r3, r0
+        SHRI    r3, 15                  ; the bit after this one
+        SHLI    r0, 1
+        WAITD   H                       ; sample step
+        OUT     r4
+        SHLI    r5, 1
+        JP      MISO, 0, s0             ; sample MISO
+        ORI     r5, 1
+s0:     OR      r4, r3, r6              ; the next shift-step pattern
+        DJNZ    r1, bit
+
+        MOV     r3, r2                  ; the byte is in r5[7:0], first bit in bit 7
+        SHRI    r3, 3                   ; LSB first?
+        BNC     rxok
+        REV     r5, r5                  ; reverse the eight bits
+        SHRI    r5, 8
+rxok:   MOV     r3, r7
+        SHLI    r3, 2                   ; C = bit 14: SKIP
+        BC      nopush
+        PUSH    r5                      ; blocks while OUTQ is full: SCK just waits
+nopush: SETD    1                       ; re-anchor after the (unbounded) PUSH
+        MOV     r3, r7
+        SHLI    r3, 1                   ; C = bit 15: LAST
+        BNC     cmd                     ; no: CS_n stays low for the next byte
+        MOV     r4, r2
+        ANDI    r4, 2                   ; SCK to its idle level, CS_n still low
+        WAITD   H
+        OUT     r4                      ; (the final trailing edge for CPHA 0)
+        ORI     r4, 4
+        WAITD   H
+        OUT     r4                      ; CS_n high: end of the transaction
+        JMP     cmd
+
+config: MOV     r2, r0                  ; bits 1:0 mode, bit 2 LSB first
+        MOV     r4, r0
+        ANDI    r4, 2                   ; CPOL, in the SCK position
+        MOV     r6, r0
+        SHLI    r6, 1                   ; CPHA, in the SCK position
+        XOR     r6, r6, r4
+        ANDI    r6, 2                   ; A = CPOL ^ CPHA
+        ORI     r4, 4                   ; idle: CS_n high, SCK = CPOL
+        OUT     r4
+        JMP     cmd
