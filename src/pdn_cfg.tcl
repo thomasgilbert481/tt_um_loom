@@ -23,9 +23,9 @@
 #
 # Everything below this comment block is LibreLane 3.1.0.dev3's default
 # scripts/openroad/common/pdn_cfg.tcl, verbatim, with ONE change: the
-# default's macro grid (its last ten lines) is replaced by
-# loom_macro_power_bridges at the end of the file. All stripe geometry still
-# comes from the FP_PDN_* keys in src/config.json.
+# default's macro grid (its last ten lines) is replaced by the pdngen wrapper
+# at the end of the file. All stripe geometry still comes from the FP_PDN_*
+# keys in src/config.json.
 #
 # =============================================================================
 # WHY THE DEFAULT MACRO GRID CANNOT WORK ON CMOS5L
@@ -39,44 +39,58 @@
 # pins are on Metal4, the block's only stripe layer, so the only possible
 # connection is same-layer overlap.
 #
-# pdngen will not make that overlap by itself: it treats the macro's Metal4
-# pins and OBS as obstructions and cuts every core-grid stripe a spacing short
-# of the macro (0.48 um in CI run 4). Its same-net exception (shape.cpp,
+# pdngen will not make that overlap by itself: it treats a FIXED macro's
+# Metal4 pins and OBS as obstructions and cuts every core-grid stripe a spacing
+# short of the macro (0.48 um in CI run 4). Its same-net exception (shape.cpp,
 # Shape::cut) only applies when the stripe fully covers the pin in x, and a
 # stripe wider than the 2.81 um pin column would hit the Metal4 OBS that the
-# macro places 0.26 um either side of every column. So in run 4 the macro was
-# an island: PSM's connectivity walk started on the macro's own pin shapes and
-# reported every rail, via stack and stripe of the (internally connected)
-# stdcell grid as "unconnected" (654 x PSM-0038, PSM-0039 on VDDARRAY!).
+# macro places 0.26 um either side of every column. In run 4 the macro was
+# therefore an island, and PSM's connectivity walk, which starts on a
+# top-layer node, started on the macro's own pins and reported the whole
+# (internally connected) stdcell grid as "unconnected" (654 x PSM-0038).
+#
+# Short Metal4 bridges from the cut stripe ends into the pin columns (CI run 5)
+# connect the macro and pass LVS and the cmos5l sign-off DRC, but the stripes
+# are the block's power pins, and the Tiny Tapeout precheck (pin_check.py)
+# requires every Metal4 power port to reach within 10 um of both the top and
+# the bottom block edge. The eight stripes cut by the macro became sixteen
+# half-height ports and failed it.
 #
 # =============================================================================
-# WHAT THIS SCRIPT DOES INSTEAD
+# WHAT THIS SCRIPT DOES INSTEAD: FULL-HEIGHT STRIPES THROUGH THE PIN COLUMNS
 # =============================================================================
 # The stripe grid (FP_PDN_VPITCH 67.44 = 6 x 11.24, VSPACING 3.52, VOFFSET 26.36,
-# macro at x = 12) puts four POWER and four GROUND stripes exactly inside the
-# macro's power columns (x-centres, macro-local: POWER 17.24 84.68 152.12
-# 219.56, GROUND 22.86 90.30 157.74 225.18; derivation in src/config.json and
-# docs/tt_cmos5l_facts.md section 10). pdngen still cuts them at the macro
-# edge. After pdngen has written its shapes, loom_macro_power_bridges adds one
-# short Metal4 rectangle ("bridge") per aligned stripe end: same x-range as the
-# stripe (so it stays inside the pin column, 0.28 um or more from the macro's
-# Metal4 OBS), running from loom_bridge_reach inside the pin to
-# loom_bridge_reach into the stripe. It only bridges when the stripe lies
-# wholly inside a pin column of the SAME net and that column ends at the macro
-# edge the stripe stops at, so it cannot short anything. Which columns are
-# reachable is set by the LEF:
-#     VDD!       local y 0 .. 38.825     touches the signal-pin edge only
-#     VDDARRAY!  local y 45.465 .. 191.34 touches the opposite edge only
-#     VSS!       full height             both edges
-# so VDD! is bridged from one side of the macro and VDDARRAY! from the other,
-# which is why the macro sits with standard-cell rows both above and below it
-# (src/config.json).
+# macro at x = 12) puts every stripe that crosses the macro exactly inside one
+# of the macro's power columns of the same net (x-centres, macro-local: POWER
+# 17.24 84.68 152.12 219.56, GROUND 22.86 90.30 157.74 225.18; the numbers
+# are derived below). So the stripes do not need to stop at the macro at all.
+# pdngen only treats FIXED instances as obstructions (grid.cpp,
+# Grid::makeInitialObstructions skips instances that are not fixed), so the
+# wrapper at the end of this file marks the hard macros PLACED for the
+# duration of the real pdngen call and restores their status afterwards. The
+# rows under and beside the macro are already cut, so no rail or via is made
+# over it; the stripes simply run from the bottom of the core to the top,
+# through the pin columns, and every stripe is one full-height power pin.
 #
-# The wrapper then runs check_power_grid on every supply and lets its error
-# propagate, so a grid that is still not connected stops the run here, a few
-# minutes in, instead of after detailed routing (LibreLane's own call right
+# Nothing then relies on the stripes being aligned by luck. After pdngen the
+# wrapper checks, for every stripe-layer shape that overlaps a macro, that it
+# lies inside power columns of its own net over the whole macro height
+# (except gaps of at most loom_max_pin_gap between two such columns), and that
+# every macro supply pin is overlapped by at least one stripe; otherwise the
+# step fails with the offending shapes listed. Then it runs check_power_grid
+# on every supply and lets its error stop the step (LibreLane's own call right
 # after pdngen only warns, and Checker.PowerGridViolations defers its error to
 # the end of the flow).
+#
+# The one gap: a regular POWER column carries VDD! up to local y 38.825 and
+# VDDARRAY! from 45.465, and the LEF puts a Metal4 OBS rectangle across the
+# column in between (y 39.085 .. 45.205). The POWER stripes cross that band.
+# The macro GDS has no Metal4 at all within 1 um of any of the four POWER
+# stripes' x-ranges in the band (checked with gdstk, 2026-09-18), so the
+# stripe only joins VDD! to VDDARRAY!, which PDN_MACRO_CONNECTIONS ties to
+# VPWR anyway. The OBS is what makes pdngen and the router keep out; the
+# router does not flag it because it skips checks between two fixed shapes
+# (FlexGC_main.cpp), and the cmos5l sign-off DRC sees only the real metal.
 #
 # =============================================================================
 # THE STRIPE NUMBERS (src/config.json FP_PDN_*), FROM THE LEF
@@ -88,8 +102,8 @@
 #   irregular middle band x 88 .. 151 (four full-height VDD!, five VSS!)
 # so same-net pitch 11.24, POWER-to-GROUND centre distance 5.62, and the right
 # half sits +0.67 um off the left half's grid.
-#   VWIDTH   2.1    Tiny Tapeout's value; these stripes are the block's power
-#                   pins, which tt_top reaches with TopMetal1 vias.
+#   VWIDTH   2.1    Tiny Tapeout's value and the precheck's minimum power-port
+#                   width on cmos5l (tech_data.py power_pins_min_width).
 #   VSPACING 3.52   pdngen puts the GROUND stripe at (spacing + width) from the
 #                   POWER stripe centre: 3.52 + 2.1 = 5.62.
 #   VPITCH   67.44  = 6 x 11.24, the smallest multiple that steps over the
@@ -271,25 +285,25 @@ if { $::env(PDN_CORE_RING) == 1 } {
 
 
 # =============================================================================
-# Replacement for the default macro grid: Metal4 bridges, see the header.
+# Replacement for the default macro grid: full-height stripes through the
+# macro's power columns, verified. See the header.
 # =============================================================================
 
-# Longest stripe-end-to-pin gap that is bridged, and how far a bridge runs
-# into the pin and into the stripe. Microns.
-set ::loom_bridge_max_gap 5.0
-set ::loom_bridge_reach   1.5
+# Longest stretch of a macro that a stripe may cross without a same-net pin
+# under it, and only between two same-net pins (the VDD!/VDDARRAY! split is
+# 6.64 um). Microns.
+set ::loom_max_pin_gap 7.0
 
-proc loom_macro_power_bridges {} {
+proc loom_check_macro_stripes {} {
     set block [ord::get_db_block]
-    set tech [ord::get_db_tech]
     set layer_name $::env(PDN_VERTICAL_LAYER)
-    set layer [$tech findLayer $layer_name]
     set dbu [$block getDbUnitsPerMicron]
-    set max_gap [expr {round($::loom_bridge_max_gap * $dbu)}]
-    set reach [expr {round($::loom_bridge_reach * $dbu)}]
+    set max_gap [expr {round($::loom_max_pin_gap * $dbu)}]
+    set um [expr {1.0 / $dbu}]
 
     # --- 1. every power/ground pin rectangle of every hard macro on the stripe
     #        layer, in die coordinates, with the block net it is tied to
+    set macros [list]
     set columns [list]
     set counts [dict create]
     foreach inst [$block getInsts] {
@@ -302,8 +316,12 @@ proc loom_macro_power_bridges {} {
         set bb [$inst getBBox]
         set bx0 [$bb xMin]
         set by0 [$bb yMin]
+        set bx1 [$bb xMax]
         set by1 [$bb yMax]
-        puts "LOOMPDN macro $iname orient $orient bbox_um [expr {$bx0 / double($dbu)}] [expr {$by0 / double($dbu)}] [expr {[$bb xMax] / double($dbu)}] [expr {$by1 / double($dbu)}]"
+        lappend macros [list $iname $bx0 $by0 $bx1 $by1]
+        puts [format "LOOMPDN macro %s orient %s bbox %.3f %.3f %.3f %.3f status %s" $iname $orient \
+            [expr {$bx0 * $um}] [expr {$by0 * $um}] [expr {$bx1 * $um}] [expr {$by1 * $um}] \
+            [$inst getPlacementStatus]]
         foreach iterm [$inst getITerms] {
             set mterm [$iterm getMTerm]
             set sig [$mterm getSigType]
@@ -346,94 +364,118 @@ proc loom_macro_power_bridges {} {
             }
         }
     }
-    if { [llength $columns] == 0 } {
-        puts "LOOMPDN no hard macro with $layer_name power pins; nothing to bridge"
+    if { [llength $macros] == 0 } {
+        puts "LOOMPDN no hard macros; nothing to check"
         return
     }
 
-    # --- 2. the stripe-layer shapes pdngen wrote, listed once before any
-    #        bridge is added
-    set stripes [list]
-    set nets [lsort -unique [lmap c $columns {lindex $c 0}]]
-    foreach net $nets {
+    # --- 2. every stripe-layer shape of every net, checked against every macro
+    set bad [list]
+    foreach net [$block getNets] {
+        if { ![$net isSpecial] } { continue }
         foreach swire [$net getSWires] {
             foreach sbox [$swire getWires] {
                 if { [$sbox isVia] } { continue }
                 if { [[$sbox getTechLayer] getName] ne $layer_name } { continue }
-                lappend stripes [list $net [$sbox xMin] [$sbox yMin] [$sbox xMax] [$sbox yMax]]
+                set sx1 [$sbox xMin]
+                set sy1 [$sbox yMin]
+                set sx2 [$sbox xMax]
+                set sy2 [$sbox yMax]
+                foreach m $macros {
+                    lassign $m iname mx0 my0 mx1 my1
+                    if { $sx2 <= $mx0 || $sx1 >= $mx1 || $sy2 <= $my0 || $sy1 >= $my1 } { continue }
+                    set desc [format "%s x %.3f..%.3f y %.3f..%.3f" [$net getName] \
+                        [expr {$sx1 * $um}] [expr {$sx2 * $um}] [expr {$sy1 * $um}] [expr {$sy2 * $um}]]
+                    set ylo [expr {max($sy1, $my0)}]
+                    set yhi [expr {min($sy2, $my1)}]
+                    # same-net pin rectangles that contain the stripe's x-range
+                    set cover [list]
+                    foreach c $columns {
+                        lassign $c cnet key px1 py1 px2 py2
+                        if { $cnet ne $net } { continue }
+                        if { $px1 > $sx1 || $px2 < $sx2 } { continue }
+                        if { $py2 <= $ylo || $py1 >= $yhi } { continue }
+                        lappend cover [list $py1 $py2 $key]
+                    }
+                    set cover [lsort -integer -index 0 $cover]
+                    set cur $ylo
+                    set keys [list]
+                    set why ""
+                    foreach r $cover {
+                        lassign $r py1 py2 key
+                        if { $py1 > $cur } {
+                            if { $cur == $ylo } {
+                                set why [format "no same-net pin under it from y %.3f to %.3f" [expr {$cur * $um}] [expr {$py1 * $um}]]
+                                break
+                            }
+                            if { $py1 - $cur > $max_gap } {
+                                set why [format "crosses %.3f um without a same-net pin (y %.3f..%.3f)" \
+                                    [expr {($py1 - $cur) * $um}] [expr {$cur * $um}] [expr {$py1 * $um}]]
+                                break
+                            }
+                            puts [format "LOOMPDN   %s crosses a %.3f um gap between same-net pins at y %.3f..%.3f" \
+                                $desc [expr {($py1 - $cur) * $um}] [expr {$cur * $um}] [expr {$py1 * $um}]]
+                        }
+                        set cur [expr {max($cur, $py2)}]
+                        lappend keys $key
+                    }
+                    if { $why eq "" && $cur < $yhi } {
+                        set why [format "no same-net pin under it from y %.3f to %.3f" [expr {$cur * $um}] [expr {$yhi * $um}]]
+                    }
+                    if { $why ne "" } {
+                        lappend bad "$desc over $iname: $why"
+                        continue
+                    }
+                    foreach key [lsort -unique $keys] { dict incr counts $key }
+                    puts "LOOMPDN stripe $desc runs inside [join [lsort -unique $keys] { + }]"
+                }
             }
         }
     }
-
-    # --- 3. bridge every stripe end that stops just short of a same-net column
-    set new_wire [dict create]
-    set made 0
-    foreach s $stripes {
-        lassign $s snet sx1 sy1 sx2 sy2
-        foreach c $columns {
-            lassign $c cnet key px1 py1 px2 py2
-            if { $cnet ne $snet } { continue }
-            if { $sx1 < $px1 || $sx2 > $px2 } { continue }
-            set gap_top [expr {$sy1 - $py2}]
-            set gap_bot [expr {$py1 - $sy2}]
-            if { $gap_top >= 0 && $gap_top <= $max_gap } {
-                # the stripe starts just above the column's top end
-                set b [list $sx1 [expr {$py2 - $reach}] $sx2 [expr {min($sy1 + $reach, $sy2)}]]
-                set gap $gap_top
-            } elseif { $gap_bot >= 0 && $gap_bot <= $max_gap } {
-                # the stripe ends just below the column's bottom end
-                set b [list $sx1 [expr {max($sy2 - $reach, $sy1)}] $sx2 [expr {$py1 + $reach}]]
-                set gap $gap_bot
-            } else {
-                continue
-            }
-            set net_name [$snet getName]
-            if { ![dict exists $new_wire $net_name] } {
-                dict set new_wire $net_name [odb::dbSWire_create $snet "ROUTED"]
-            }
-            lassign $b bx1 by1 bx2 by2
-            set sb [odb::dbSBox_create [dict get $new_wire $net_name] $layer $bx1 $by1 $bx2 $by2 "STRIPE"]
-            if { $sb eq "NULL" || $sb eq "" } {
-                error "LOOMPDN: could not create bridge $b on $net_name"
-            }
-            dict incr counts $key
-            incr made
-            puts [format "LOOMPDN bridge %-5s -> %-22s x %.3f..%.3f y %.3f..%.3f (gap %.3f um)" \
-                $net_name $key [expr {$bx1 / double($dbu)}] [expr {$bx2 / double($dbu)}] \
-                [expr {$by1 / double($dbu)}] [expr {$by2 / double($dbu)}] [expr {$gap / double($dbu)}]]
-        }
+    if { [llength $bad] > 0 } {
+        foreach b $bad { puts "LOOMPDN BAD $b" }
+        error "LOOMPDN: [llength $bad] stripe shape(s) over a macro are not inside same-net power pins (would short or float); fix FP_PDN_V* or the macro location"
     }
 
-    # --- 4. every supply pin of every macro needs at least one bridge
+    # --- 3. every supply pin of every macro needs at least one stripe
     set missing [list]
     dict for {key n} $counts {
-        puts "LOOMPDN $key: $n bridge(s)"
+        puts "LOOMPDN $key: $n stripe(s)"
         if { $n == 0 } { lappend missing $key }
     }
     if { [llength $missing] > 0 } {
-        # List the stripe shapes so the failure can be read off the log.
-        foreach s $stripes {
-            lassign $s snet sx1 sy1 sx2 sy2
-            puts [format "LOOMPDN stripe %-5s x %.3f..%.3f y %.3f..%.3f" [$snet getName] \
-                [expr {$sx1 / double($dbu)}] [expr {$sx2 / double($dbu)}] \
-                [expr {$sy1 / double($dbu)}] [expr {$sy2 / double($dbu)}]]
-        }
-        error "LOOMPDN: no stripe could be bridged to: [join $missing {, }]"
+        error "LOOMPDN: no stripe runs through: [join $missing {, }]"
     }
-    puts "LOOMPDN $made bridge(s) added"
 }
 
-# Run the bridges right after LibreLane's `pdngen` (scripts/openroad/pdn.tcl
-# calls it exactly once, after sourcing this file), then check the grid and
-# let a failure stop the step.
+# Wrap LibreLane's single `pdngen` call (scripts/openroad/pdn.tcl sources this
+# file first): hard macros are un-fixed only while the real pdngen runs, so
+# its core-grid stripes are not cut at them; then the result is verified and
+# the grid is checked with errors that stop the step.
 if { [info commands ::loom_pdngen_unwrapped] eq "" } {
     rename ::pdngen ::loom_pdngen_unwrapped
     proc ::pdngen { args } {
-        ::loom_pdngen_unwrapped {*}$args
         foreach flag {-reset -ripup -report_only -check_only} {
-            if { [lsearch -exact $args $flag] >= 0 } { return }
+            if { [lsearch -exact $args $flag] >= 0 } {
+                return [::loom_pdngen_unwrapped {*}$args]
+            }
         }
-        loom_macro_power_bridges
+        set released [list]
+        foreach inst [[ord::get_db_block] getInsts] {
+            if { [[$inst getMaster] isBlock] && [$inst isFixed] } {
+                lappend released [list $inst [$inst getPlacementStatus]]
+                $inst setPlacementStatus "PLACED"
+            }
+        }
+        set rc [catch { ::loom_pdngen_unwrapped {*}$args } msg opts]
+        foreach r $released {
+            lassign $r inst status
+            $inst setPlacementStatus $status
+        }
+        if { $rc } {
+            return -options $opts $msg
+        }
+        loom_check_macro_stripes
         foreach net_name [concat $::env(VDD_NETS) $::env(GND_NETS)] {
             puts "LOOMPDN check_power_grid -net $net_name"
             check_power_grid -net $net_name
