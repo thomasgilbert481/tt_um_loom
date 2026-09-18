@@ -7,8 +7,26 @@ built on [Tiny Tapeout](https://tinytapeout.com) for IHP's 130 nm CMOS5L
 process, 6x4 tiles (the largest size the cmos5l flow accepts today; 8x4 if
 Tiny Tapeout enables it). Open source, Apache-2.0.
 
-**Status (2026-09-15): architecture set, flow scaffolded, M0 in progress.**
-See `docs/PLAN.md` for milestones.
+**Status (2026-09-18): M1 core hardened; M2 in progress.** See `docs/PLAN.md`
+for milestones and the session log, `docs/DECISIONS.md` for why things are the
+way they are.
+
+## Results so far
+
+| What | Result | Where |
+|---|---|---|
+| M1 core, 6x4 tiles, hardened in CI | DRC, LVS and antenna clean; Tiny Tapeout precheck and gate-level test pass; 78.8% utilisation; setup slack +1.45 ns at 50 MHz (typical corner) | `docs/AREA.md`, D-019 |
+| RTL against an independently written golden model | lockstep co-simulation on random programs, compared every clock cycle: zero divergences; two injected bugs caught in the first seed | `test/test_cosim.py`, `test/README.md` |
+| Directed tests through the pins (SPI host port) | 45 cocotb tests, also run on the gate-level netlist in CI | `test/` |
+| Toolchain | assembler with a static deadline checker, cycle-accurate golden model, ISA generator, random program generator: 740 Python tests | `tools/` |
+| IHP SRAM macro on cmos5l | 512x16 macro passes hardening, all nine precheck checks (0 DRC violations over the macro) and gate-level test; to our knowledge the first public cmos5l SRAM result; recipe written up | branch `sram-smoke`, `docs/tt_cmos5l_facts.md` section 11 |
+
+Two findings changed the design along the way. Firmware-driven edges land on a
+thread's 4-clock slot grid, so the edges dither by up to 3 clocks at arbitrary
+tick periods (no drift); the answer is a deadline-latched pin write,
+`SETP pin, v, D`, which lands on the exact clock of the deadline (D-016). And
+the flop instruction memory was half the chip, which the SRAM macro solves
+(D-020).
 
 ## The idea
 
