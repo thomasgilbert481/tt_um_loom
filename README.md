@@ -75,15 +75,21 @@ Stretch: USB low-speed device, CAN, 10 Mbit Manchester.
 ## Repository layout
 
 ```
-src/        RTL (Verilog-2005 subset), tt_um_loom.v is the Tiny Tapeout top
+src/        RTL (Verilog-2005 subset), tt_um_loom.v is the Tiny Tapeout top;
+            loom_decode.v is generated from isa/isa.yaml
 isa/        isa.yaml, the single source of truth for the instruction set
-tools/      gen (codegen), loomasm (assembler), loomsim (golden model), loomhost (host library), mutate
-firmware/   .loom programs and their build outputs
-test/       cocotb tests, protocol reference models, co-simulation harness
-formal/     SymbiYosys jobs and properties
-fpga/       iCEBreaker build
+tools/      loomisa (ISA loader and code generator), loomasm (assembler and
+            deadline checker), loomsim (golden model), loomgen (random program
+            generator); loomhost (host library) and protomodels (protocol
+            models) arrive with M2
+firmware/   .loom programs
+test/       cocotb tests driven through the pins, and the co-simulation harness
+scripts/    dev_env.sh and check_all.sh for the local loop
 docs/       everything listed above
 ```
+
+Planned and not yet in the tree: `formal/` (SymbiYosys properties, M3),
+`tools/mutate` (mutation testing, M3) and `fpga/` (iCEBreaker build).
 
 ## Building and testing
 
