@@ -167,9 +167,13 @@ same cocotb UART model as M0; first synthesis numbers recorded.
 Exit: UART RX/TX, SPI master and slave, I2C master all pass their L3 tests with
 data moving through the SPI host port; FPGA prototype runs the same tests.
 
-- [ ] Area and timing before features (M1 left 79 percent utilisation and
-      +1.45 ns typical slack): the D-019 one-hot W-stage thread select,
-      replicated per consumer; then re-harden. M2 features (FIFOs, bit
+- [x] 2026-09-18: D-019 built. Four self-rotating one-hot rings replace the
+      decoded W-stage thread (Yosys merges identical flops, so the replicas
+      are independent rings). Generic netlist: thread-select cone depth 22 to
+      5 cells, worst fanout 308 to 33; core 7,807 to 6,512 cells. Co-sim still
+      zero divergences (plus 40 extra seeds). Real slack comes from the next
+      hardening. Area and timing before features (M1 left 79 percent
+      utilisation and +1.45 ns typical slack); then re-harden. M2 features (FIFOs, bit
       engines, about 80-100K um2) do not fit until the memory decision frees
       area, so the memory gate below is also the area gate.
 - [x] 2026-09-18: `docs/SEMANTICS.md` M2 text: FIFOs with blocking PUSH/POP
@@ -180,15 +184,26 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       presets) land together with the M2 RTL. Auto mode, NRZI, Manchester and
       stuffing are specified before M3.
 - [ ] `loom_spi_host` + `loom_host_ctl`: full `docs/HOST_PROTOCOL.md` including
-      the debug space, single-step, IRQ.
-- [ ] `loom_fifo` x 8, `PUSH`/`POP`, `WAITB`, `SIG`/`CLR`/`WAITS`.
+      the debug space, single-step, IRQ. 2026-09-18: FIFO space and IRQ
+      built; `test_irq` 3 of 5 pass, the two failures are a one-clock
+      disagreement about when a host write commits (held out of the default
+      list, see `docs/spec-questions/rtl-m2.md`).
+- [x] 2026-09-18: `loom_fifo` x 8, `PUSH`/`POP`, `WAITB`, host FIFO space
+      (peek at load, pop at word end), BADOP[14], CTRL.RESET emptying: 8 cocotb
+      tests. Generic netlist +2,274 cells, +619 flops.
 - [ ] Bit engine manual mode: `SHO`/`SHI`, SR/CNT, CRC with presets, NRZ only.
-- [ ] `tools/loomhost`: transport-agnostic host library with `SimTransport`
-      (cocotb) and `PicoTransport` (Raspberry Pi Pico as USB-to-SPI bridge;
-      firmware in `tools/loomhost/pico/`).
+- [x] 2026-09-18: `tools/loomhost`: protocol encoder, `Loom` API, transports
+      (`ModelTransport` over the golden model as an executable reference of
+      the host protocol, `PicoTransport`, `TTBoardTransport` using the RP2040's
+      SPI0), MicroPython side in `tools/loomhost/micropython/`, CLI. A cocotb
+      `SimTransport` is still to do.
 - [ ] Firmware: `uart_rx`, `spi_master`, `spi_slave`, `i2c_master`. Each with an
       L3 test against a Python reference model, including error cases (framing
-      error, NACK, clock stretching).
+      error, NACK, clock stretching). 2026-09-18: `uart_tx_fifo`, `uart_rx`,
+      `spi_master`, `i2c_master` pass end to end on the golden model with
+      `tools/protomodels` (framing error, NACK and clock stretching
+      included); `spi_slave` and the same tests on the RTL are open. Fix the
+      short first start bit in `uart_tx.loom` (firmware spec question 8).
 - [ ] FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
       L3 tests re-run on hardware through `loomhost` (same scripts).
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,

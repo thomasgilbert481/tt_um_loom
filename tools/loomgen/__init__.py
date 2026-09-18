@@ -26,8 +26,9 @@ Command line::
     python -m tools.loomgen --replay test/cosim_failures/seed_3.json --trace 1
 """
 
-from .generator import (AVOID_FLAGS, M1_CSR_NAMES, M1_MNEMONICS, PROFILES,
-                        THREADS, UNBUILT_CSR_NAMES, UNBUILT_MNEMONICS,
+from .generator import (AVOID_FLAGS, M1_CSR_NAMES, M1_MNEMONICS,
+                        M2_CSR_NAMES, M2_MNEMONICS, PROFILES, THREADS,
+                        UNBUILT_CSR_NAMES, UNBUILT_MNEMONICS,
                         GeneratedProgram, LoomgenError, check_program,
                         generate, static_target)
 from .runner import LOAD_CYCLE, RUN_CYCLE, host_actions, run_model, trace
@@ -38,7 +39,8 @@ __all__ = [
     "generate", "GeneratedProgram", "LoomgenError", "check_program",
     "static_target",
     "PROFILES", "AVOID_FLAGS", "M1_MNEMONICS", "UNBUILT_MNEMONICS",
-    "M1_CSR_NAMES", "UNBUILT_CSR_NAMES", "THREADS",
+    "M1_CSR_NAMES", "UNBUILT_CSR_NAMES", "M2_MNEMONICS", "M2_CSR_NAMES",
+    "THREADS",
     "LOAD_CYCLE", "RUN_CYCLE", "host_actions", "run_model", "trace",
     "StimulusPlan", "PinWave", "build_plan", "INPUT_PINS", "UI_BIT", "UI_MASK",
 ]

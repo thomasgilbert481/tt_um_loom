@@ -17,6 +17,7 @@
 
 module loom_top #(
     parameter [15:0]  IMEM_WORDS = 16'd256,
+    parameter integer FIFO_DEPTH = 4,
     parameter [15:0]  ID_VALUE   = 16'h4C4D,
     parameter [15:0]  VERSION    = 16'h0001
 ) (
@@ -43,15 +44,19 @@ module loom_top #(
 
   localparam integer IMEM_AW = $clog2(IMEM_WORDS);
   localparam [31:0]  IMEM_LOG2 = $clog2(IMEM_WORDS);
-  // CAPS: [15:12] log2(IMEM_WORDS), [11:7] zero, [6] boot ROM, [5] data
-  // memory, [4] bit engine, [3] FIFOs, [2:0] FIFO_DEPTH_LOG2. An M1 build
-  // with 256 words reads 0x8000: no FIFOs, no bit engine, no DMEM, no ROM.
-  localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 5'd0,
-                                 1'b0,    // boot ROM
-                                 1'b0,    // data memory
-                                 1'b0,    // bit engine
-                                 1'b0,    // FIFOs
-                                 3'd0};   // FIFO_DEPTH_LOG2
+  localparam [31:0]  FIFO_LOG2 = $clog2(FIFO_DEPTH);
+  // CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:9] zero,
+  // [8] bit engine auto mode, [7] deadline-latched SETP, [6] boot ROM,
+  // [5] data memory, [4] bit engine (manual mode), [3] FIFOs,
+  // [2:0] log2(FIFO_DEPTH).
+  localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 3'd0,
+                                 1'b0,    // [8] bit engine auto mode (M3)
+                                 1'b0,    // [7] deadline-latched SETP
+                                 1'b0,    // [6] boot ROM
+                                 1'b0,    // [5] data memory
+                                 1'b0,    // [4] bit engine, manual mode
+                                 1'b1,    // [3] FIFOs
+                                 FIFO_LOG2[2:0]};
 
   // --------------------------------------------------------------- host SPI
   wire       cs_active, byte_done, miso;
@@ -122,8 +127,14 @@ module loom_top #(
   wire [7:0]  sflags;
   wire [39:0] resetpc_all;
   wire        core_busy, irq;
+  wire [3:0]  h_inq_push, h_outq_pop;
+  wire [15:0] h_fifo_wdata;
+  wire        h_badop_set14;
+  wire [47:0] fifo_stat;
+  wire [63:0] outq_head, outq_next;
 
-  loom_core #(.IMEM_AW(IMEM_AW), .IMEM_WORDS(IMEM_WORDS)) u_core (
+  loom_core #(.IMEM_AW(IMEM_AW), .IMEM_WORDS(IMEM_WORDS),
+              .FIFO_DEPTH(FIFO_DEPTH)) u_core (
       .clk(clk), .rst_n(rst_n),
       .imem_addr(core_imem_addr), .imem_en(core_imem_en),
       .imem_rdata(imem_rdata),
@@ -141,6 +152,9 @@ module loom_top #(
       .h_badop_clr_we(h_badop_clr_we), .h_badop_clr(h_badop_clr),
       .h_badop_set15(h_badop_set15),
       .h_swirq_clr_we(h_swirq_clr_we), .h_swirq_clr(h_swirq_clr),
+      .h_inq_push(h_inq_push), .h_fifo_wdata(h_fifo_wdata),
+      .h_outq_pop(h_outq_pop), .h_badop_set14(h_badop_set14),
+      .fifo_stat(fifo_stat), .outq_head(outq_head), .outq_next(outq_next),
       .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
       .h_dbg_thread(h_dbg_thread), .h_dbg_reg(h_dbg_reg),
       .h_dbg_wdata(h_dbg_wdata), .h_dbg_ack(h_dbg_ack),
@@ -170,6 +184,9 @@ module loom_top #(
       .h_badop_clr_we(h_badop_clr_we), .h_badop_clr(h_badop_clr),
       .h_badop_set15(h_badop_set15),
       .h_swirq_clr_we(h_swirq_clr_we), .h_swirq_clr(h_swirq_clr),
+      .h_inq_push(h_inq_push), .h_fifo_wdata(h_fifo_wdata),
+      .h_outq_pop(h_outq_pop), .h_badop_set14(h_badop_set14),
+      .fifo_stat(fifo_stat), .outq_head(outq_head), .outq_next(outq_next),
       .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
       .h_dbg_thread(h_dbg_thread), .h_dbg_reg(h_dbg_reg),
       .h_dbg_wdata(h_dbg_wdata), .h_dbg_ack(h_dbg_ack),

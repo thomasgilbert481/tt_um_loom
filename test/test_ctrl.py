@@ -9,7 +9,7 @@ from spi_host import (
     LoomHost, ISA, asm, run_snippet, SP_CTRL, CTRL_SFLAGS, CTRL_SFLAGS_CLR,
     DBG_PC, DBG_FLAGS, DBG_RS0, DBG_RS1_DEPTH, DBG_WAIT_ACTIVE, DBG_TD, DBG_DT,
     CSR_FLAGS, CSR_NOW, CSR_TD, CSR_TID, CSR_OUTGRP, CSR_INGRP, CSR_SFLAGS,
-    CSR_OD_MASK, CSR_TICK_INT,
+    CSR_OD_MASK, CSR_TICK_INT, CAPS_FIFO, CAPS_BE, CAPS_DMEM,
 )
 
 BCC = {"BZ": ("Z", True), "BNZ": ("Z", False),
@@ -280,10 +280,20 @@ async def test_badop(dut):
     """Reserved words and unbuilt instructions are NOPs that set BADOP[t]."""
     host = LoomHost(dut)
     await host.start()
-    unbuilt = [asm("PUSH", ra=1), asm("POP", rd=1), asm("WAITB", cond=0),
-               asm("SHO"), asm("SHI"), asm("LDSR", ra=1), asm("STSR", rd=1),
-               asm("CRCI"), asm("STCRC", rd=1),
-               asm("LD", rd=1, ra=2, imm=0), asm("ST", rd=1, ra=2, imm=0)]
+    # Which features this build lacks comes from CAPS (SEMANTICS 5 and 9):
+    # FIFOs (PUSH, POP, WAITB), the bit engine (its instructions, and WAITB 0,
+    # which needs it) and the data memory (LD, ST).
+    caps = await host.caps()
+    unbuilt = []
+    if not caps & CAPS_FIFO:
+        unbuilt += [asm("PUSH", ra=1), asm("POP", rd=1),
+                    asm("WAITB", cond=1), asm("WAITB", cond=2), asm("WAITB", cond=3)]
+    if not caps & CAPS_BE:
+        unbuilt += [asm("WAITB", cond=0),
+                    asm("SHO"), asm("SHI"), asm("LDSR", ra=1), asm("STSR", rd=1),
+                    asm("CRCI"), asm("STCRC", rd=1)]
+    if not caps & CAPS_DMEM:
+        unbuilt += [asm("LD", rd=1, ra=2, imm=0), asm("ST", rd=1, ra=2, imm=0)]
     for word in reserved_words(2) + unbuilt:
         await host.clear_badop(0xFFFF)
         assert await host.badop() == 0

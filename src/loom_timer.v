@@ -17,6 +17,9 @@
  *   suppresses the tick at that edge (the clear wins over the accumulate).
  *   TICK_SEEN is cleared at the commit edge of every valid slot of the thread
  *   unless a tick sets it at the same edge (set wins).
+ *   The commit port selects its thread with `cm_sel`, a one-hot vector that
+ *   loom_core builds from its own W-stage ring and w_valid (D-019), so no
+ *   thread number is decoded here.
  *   Writes arriving from the core (W stage) win over host writes on the same
  *   register in the same cycle (SEMANTICS 7).
  *
@@ -31,8 +34,7 @@ module loom_timer (
     input  wire        rst_n,
 
     // Commit port, driven from the W stage of loom_core (one thread per edge).
-    input  wire        cm_valid,      // a valid slot of cm_thread commits now
-    input  wire [1:0]  cm_thread,
+    input  wire [3:0]  cm_sel,        // bit t: a valid slot of thread t commits now
     input  wire        cm_td_we,
     input  wire [15:0] cm_td,
     input  wire        cm_dt_we,
@@ -50,6 +52,7 @@ module loom_timer (
     input  wire        h_dt_we,
     input  wire        h_tint_we,
     input  wire        h_tfrac_we,
+    input  wire        h_tseen_we,    // debug write of TICK_SEEN (0x24)
     input  wire [15:0] h_wdata,
 
     output wire [63:0] now_all,
@@ -71,7 +74,7 @@ module loom_timer (
       reg [15:0] tick_int;
       reg [7:0]  tick_frac;
 
-      wire        mine     = cm_valid && (cm_thread == t[1:0]);
+      wire        mine     = cm_sel[t];
       wire        h_mine   = h_we && (h_thread == t[1:0]);
 
       wire [15:0] tint_eff = (tick_int == 16'd0) ? 16'd1 : tick_int;
@@ -103,6 +106,7 @@ module loom_timer (
 
           if (tick)                 tick_seen <= 1'b1;   // set wins over clear
           else if (mine)            tick_seen <= 1'b0;
+          else if (h_mine && h_tseen_we) tick_seen <= h_wdata[0];
 
           // ------------------------------------------------------- TD / DT
           if (mine && cm_td_we)     td <= cm_td;

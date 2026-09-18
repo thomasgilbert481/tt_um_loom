@@ -19,6 +19,10 @@ from tools.loomisa import load
 
 ISA = load()
 IMEM_WORDS = 256
+FIFO_DEPTH = 4
+VERSION = 0x0001
+#: What this build reports: FIFOs with depth 4 (log2 = 2).
+EXPECT_CAPS = 0x8000 | 0x08 | 0x02
 
 
 @cocotb.test()
@@ -27,20 +31,20 @@ async def test_id_version_caps(dut):
     host = LoomHost(dut)
     await host.start()
     assert await host.read1(SP_CTRL, CTRL_ID) == 0x4C4D
-    assert await host.read1(SP_CTRL, CTRL_VERSION) == 0x0001
-    # CAPS: [15:12] log2(IMEM_WORDS), [6] ROM, [5] DMEM, [4] BE, [3] FIFO,
-    # [2:0] FIFO_DEPTH_LOG2.
+    assert await host.read1(SP_CTRL, CTRL_VERSION) == VERSION
+    # CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:9] zero,
+    # [8] BE auto mode, [7] deadline-latched SETP, [6] ROM, [5] DMEM,
+    # [4] BE manual mode, [3] FIFO, [2:0] log2(FIFO_DEPTH).
     caps = await host.read1(SP_CTRL, CTRL_CAPS)
     assert caps >> 12 == IMEM_WORDS.bit_length() - 1, f"CAPS {caps:#06x}"
-    assert (caps >> 7) & 0x1F == 0, "CAPS bits 11:7 are reserved"
-    assert caps & 0x40 == 0, "no boot ROM at M1"
-    assert caps & 0x20 == 0, "DMEM must report absent at M1"
-    assert caps & 0x10 == 0, "the bit engine must report absent at M1"
-    assert caps & 0x08 == 0, "FIFOs must report absent at M1"
-    assert caps & 0x07 == 0, "FIFO_DEPTH_LOG2 is 0 with no FIFOs"
-    assert caps == 0x8000, f"M1 256-word build must read 0x8000, got {caps:#06x}"
-    # Unbuilt spaces read 0 and ignore writes.
-    assert await host.read1(SP_FIFO, 0) == 0
+    assert (caps >> 9) & 0x7 == 0, "CAPS bits 11:9 are reserved"
+    assert caps & 0x100 == 0, "no bit-engine auto mode before M3"
+    assert caps & 0x40 == 0, "no boot ROM"
+    assert caps & 0x20 == 0, "DMEM must report absent"
+    assert caps & 0x08, "the M2 build has FIFOs"
+    assert caps & 0x07 == FIFO_DEPTH.bit_length() - 1, "log2(FIFO_DEPTH)"
+    assert caps == EXPECT_CAPS, f"256-word build must read {EXPECT_CAPS:#06x}, got {caps:#06x}"
+    # The unbuilt data-memory space reads 0 and ignores writes.
     assert await host.read1(SP_DMEM, 0) == 0
     await host.write(SP_DMEM, 0, 0xBEEF)
     assert await host.read1(SP_DMEM, 0) == 0

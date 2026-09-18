@@ -69,6 +69,14 @@ UNBUILT_MNEMONICS: Tuple[str, ...] = (
     "LD", "ST",
 )
 
+#: Instructions the M2 RTL builds (SEMANTICS 6.7, 6.9): FIFOs, WAITB and the
+#: manual bit engine. With the ``m2_built`` avoid flag they leave the unbuilt
+#: pool as well, so a program means the same thing to an M2 build and to a
+#: golden model that still treats them as unbuilt.
+M2_MNEMONICS: Tuple[str, ...] = (
+    "PUSH", "POP", "WAITB", "SHO", "SHI", "LDSR", "STSR", "CRCI", "STCRC",
+)
+
 #: CSRs built at M1 (SEMANTICS 6.6: 0x00-0x03, 0x09-0x0C, 0x10-0x15), by name.
 M1_CSR_NAMES: Tuple[str, ...] = (
     "TICK_INT", "TICK_FRAC", "OUTGRP", "INGRP", "NOW", "TD", "FLAGS", "TID",
@@ -78,6 +86,9 @@ M1_CSR_NAMES: Tuple[str, ...] = (
 UNBUILT_CSR_NAMES: Tuple[str, ...] = (
     "BE_CFG", "BE_PINS", "BE_RELOAD", "CRC_POLY", "CRC_INIT", "SR", "CNT", "CRC",
 )
+#: The bit-engine CSRs, which an M2 build implements (SEMANTICS 6.9). The
+#: ``m2_built`` avoid flag takes them out of the "reads 0" pool.
+M2_CSR_NAMES: Tuple[str, ...] = UNBUILT_CSR_NAMES
 
 #: Register 7 is the generator's scratch: no random instruction writes it, so
 #: the only values it ever holds are the ones a ``LDI``/``LDIH`` or ``CSRR
@@ -98,8 +109,14 @@ T_BRANCHES = ("BT", "BNT")
 #: Known ``avoid`` flags. Each switches off one construct on which the RTL
 #: and the model disagree where ``docs/SEMANTICS.md`` does not decide the
 #: answer, until the director rules; see ``docs/spec-questions/cosim.md``.
+#:
+#: ``m2_built`` is different in kind: it marks a run against an RTL that
+#: builds M2 features (``CAPS`` says so) while the golden model may not. It
+#: removes :data:`M2_MNEMONICS` from every pool, keeps the bit-engine CSRs
+#: out of the dead-CSR pool, and never sets the ``D`` (lat) bit of ``SETP``.
 AVOID_FLAGS: FrozenSet[str] = frozenset((
     "csrw_pin_out_high_bits",
+    "m2_built",
 ))
 
 
@@ -321,13 +338,16 @@ class _ThreadBuilder:
         self.outputs = tuple(sorted(p for p, d in pins.items() if d["dir"] == "out"))
         self.reserved_pins = tuple(p for p in range(32) if p not in pins)
         self.reserved_words = _reserved_words(isa, rng)
-        self.unbuilt_cycle = list(UNBUILT_MNEMONICS)
+        self.m2_built = "m2_built" in avoid
+        self.unbuilt_cycle = [n for n in UNBUILT_MNEMONICS
+                              if not (self.m2_built and n in M2_MNEMONICS)]
         rng.shuffle(self.unbuilt_cycle)
         self.unbuilt_next = 0
         self.m1_csrs = [csr[n] for n in M1_CSR_NAMES]
         # Unbuilt CSRs plus the CSR numbers isa.yaml does not define at all:
         # both read 0 and ignore writes (SEMANTICS 6.6).
-        self.dead_csrs = [csr[n] for n in UNBUILT_CSR_NAMES] + \
+        self.dead_csrs = [csr[n] for n in UNBUILT_CSR_NAMES
+                          if not (self.m2_built and n in M2_CSR_NAMES)] + \
             [n for n in range(32) if n not in isa.csrs]
         self.csr_cycle = list(self.m1_csrs)
         rng.shuffle(self.csr_cycle)
@@ -522,7 +542,9 @@ class _ThreadBuilder:
         self.one("HALT")
 
     def _emit_setp(self) -> None:
-        self.one("SETP", pin=self.write_pin(), val=self.rng.randrange(2))
+        # lat (the D form, SEMANTICS 6.10) stays 0: a staged write is an M2
+        # feature, and with ``m2_built`` the model may not have it.
+        self.one("SETP", pin=self.write_pin(), val=self.rng.randrange(2), lat=0)
 
     def _emit_oep(self) -> None:
         pin = self.rng.choice(self.bidir) if self.rng.random() < 0.8 \

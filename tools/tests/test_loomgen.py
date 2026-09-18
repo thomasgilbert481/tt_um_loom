@@ -95,3 +95,59 @@ def test_programs_run_in_the_model(seed):
     # Something must actually complete, not only stall in waits.
     assert any(r.done for r in retired)
     assert machine is not None
+
+
+# ------------------------------------------------------------ m2_built flag
+# test/test_cosim.py passes avoid=("m2_built",) whenever the RTL's CAPS says
+# an M2 feature is built, so the random programs mean the same thing to the
+# M2 RTL and to a golden model that still treats those features as unbuilt.
+from tools.loomgen import M2_CSR_NAMES, M2_MNEMONICS, UNBUILT_MNEMONICS  # noqa: E402
+
+
+def _names_and_fields(prog):
+    for word in prog.image.values():
+        decoded = ISA.decode(word)
+        if decoded is not None:
+            yield decoded[0].name, decoded[1]
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_m2_built_leaves_out_every_m2_construct(seed):
+    prog = generate(seed=seed, threads=1 + seed % 4,
+                    profile=sorted(PROFILES)[seed % len(PROFILES)],
+                    avoid=("m2_built",))
+    check_program(prog, ISA)
+    be_csrs = {ISA.csr_by_name[n] for n in M2_CSR_NAMES}
+    for name, fields in _names_and_fields(prog):
+        assert name not in M2_MNEMONICS, f"seed {seed}: {name} generated"
+        if name == "SETP":
+            assert fields["lat"] == 0, f"seed {seed}: SETP with the D bit"
+        if name in ("CSRR", "CSRW"):
+            assert fields["csr"] not in be_csrs, \
+                f"seed {seed}: {name} of bit-engine CSR {fields['csr']:#x}"
+
+
+def test_m2_built_keeps_the_other_unbuilt_words():
+    seen = set()
+    for seed in range(60):
+        prog = generate(seed=seed, threads=4, profile="mixed", avoid=("m2_built",))
+        seen |= {name for name, _ in _names_and_fields(prog)}
+    rest = set(UNBUILT_MNEMONICS) - set(M2_MNEMONICS)
+    assert rest and rest <= seen, f"unbuilt words missing: {sorted(rest - seen)}"
+
+
+def test_without_the_flag_m2_words_are_still_unbuilt_words():
+    seen = set()
+    for seed in range(60):
+        prog = generate(seed=seed, threads=4, profile="mixed")
+        seen |= {name for name, _ in _names_and_fields(prog)}
+    assert set(M2_MNEMONICS) <= seen, sorted(set(M2_MNEMONICS) - seen)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_m2_built_programs_run_in_the_model(seed):
+    prog = generate(seed=seed, threads=4, profile=sorted(PROFILES)[seed],
+                    avoid=("m2_built",))
+    retired = []
+    run_model(prog, cycles=3000, on_record=retired.append)
+    assert any(r.done for r in retired)

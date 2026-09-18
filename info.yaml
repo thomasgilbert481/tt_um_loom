@@ -29,6 +29,7 @@ project:
     - "loom_alu.v"
     - "loom_timer.v"
     - "loom_pins.v"
+    - "loom_fifo.v"
 
 # Pinout. See docs/ARCHITECTURE.md section 3.1. The host SPI pins are fixed;
 # everything else is a firmware-addressable pin index.

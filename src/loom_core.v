@@ -23,17 +23,43 @@
  * Two decoder instances are used: one in D, whose only job is to produce the
  * register file read addresses, and one in X for everything else.
  *
- * M1 does not build the FIFOs, the bit engine, WAITB or LD/ST. Those decode
- * normally and execute as NOP with BADOP[t] set (SEMANTICS section 9); the
- * wait-condition mux has spare inputs so WAITB can be added without a
- * rewrite.
+ * W-stage thread select (D-019). The slot in W during cycle k belongs to
+ * thread (k + 1) mod 4, whatever runs, because the slot order is fixed. So
+ * the W stage does not decode a thread number: every consumer group of
+ * per-thread state (PC and flags; the other per-thread core state; the
+ * register file; the timers) has its own 4-bit one-hot ring that is reset to
+ * 4'b0010 (thread 1 during cycle 0) and rotates every cycle, and w_valid
+ * qualifies it. The rings are independent self-rotating registers, so
+ * synthesis cannot merge them and no single net fans out to all per-thread
+ * state. `w_thread` survives only for the retire record. STEPS is
+ * incremented in X (`w_steps`), so no adder sits behind the thread select,
+ * and the host's "thread is busy" check uses a registered in-flight vector
+ * (`infl`) instead of decoding the W stage.
+ * A thread's commit and a host write to the same thread never coincide
+ * (debug writes need the thread halted, SEMANTICS 7); every per-thread
+ * register is written with the commit as the last mux before the flop, and
+ * the commit wins if a host CTRL.RESET of a running thread (undefined in
+ * SEMANTICS 7) ever hits the same edge, exactly as in M1.
+ *
+ * FIFOs (SEMANTICS 6.7): INQ[t] and OUTQ[t] are loom_fifo instances. PUSH
+ * and POP decide in X from the counts visible there and stall like waits
+ * (WAIT_ACTIVE); the entry moves at the commit edge. WAITB tests OUTQ not
+ * full (1), INQ not empty (2) and TICK_SEEN (3); WAITB 0 needs the bit
+ * engine. A host push into a full INQ is dropped and sets BADOP[14]; the
+ * host's pops arrive already checked from loom_host_ctl, which also reports
+ * a pop from an empty OUTQ on h_badop_set14. CTRL.RESET empties both FIFOs
+ * of the thread.
+ *
+ * Not built: the bit engine and LD/ST. Those decode normally and execute as
+ * NOP with BADOP[t] set (SEMANTICS section 9).
  */
 
 `default_nettype none
 
 module loom_core #(
     parameter integer IMEM_AW    = 8,
-    parameter [15:0]  IMEM_WORDS = 16'd256
+    parameter [15:0]  IMEM_WORDS = 16'd256,
+    parameter integer FIFO_DEPTH = 4
 ) (
     input  wire              clk,
     input  wire              rst_n,
@@ -75,6 +101,15 @@ module loom_core #(
     input  wire              h_badop_set15,
     input  wire              h_swirq_clr_we,
     input  wire [3:0]        h_swirq_clr,
+
+    // ------------------------------------------------------- host FIFO port
+    input  wire [3:0]        h_inq_push,     // pulse: push h_fifo_wdata into INQ[t]
+    input  wire [15:0]       h_fifo_wdata,
+    input  wire [3:0]        h_outq_pop,     // pulse: pop OUTQ[t] (host checked it)
+    input  wire              h_badop_set14,  // pulse: a host pop found OUTQ empty
+    output wire [47:0]       fifo_stat,      // per thread: the FIFO status word
+    output wire [63:0]       outq_head,      // per thread: OUTQ head entry
+    output wire [63:0]       outq_next,      // per thread: the entry after it
 
     input  wire              h_dbg_req,
     input  wire              h_dbg_wr,
@@ -232,36 +267,83 @@ module loom_core #(
   reg        w_od_we;
   reg [7:0]  w_od;
   reg        w_swirq;
+  reg [15:0] w_steps;
+  reg        w_push, w_pop;         // a PUSH / POP completes in this slot
+
+  // ============================================= W-stage thread rings (D-019)
+  // Bit t of every ring is high in exactly the cycles whose W slot belongs to
+  // thread t: the W slot of cycle k was fetched in cycle k - 3, so it is
+  // thread (k + 1) mod 4, thread 1 in cycle 0. One ring per consumer group.
+  reg [3:0] woh_pc;     // PC, flags, WAIT_ACTIVE, RUN/HALTED, BADOP, SWIRQ
+  reg [3:0] woh_aux;    // PREV_PINS, STEPS, return stack, OUTGRP, INGRP
+  reg [3:0] woh_rf;     // register file write port
+  reg [3:0] woh_tmr;    // loom_timer commit port
+  reg [3:0] woh_fifo;   // FIFO push/pop commits
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      woh_pc   <= 4'b0010;
+      woh_aux  <= 4'b0010;
+      woh_rf   <= 4'b0010;
+      woh_tmr  <= 4'b0010;
+      woh_fifo <= 4'b0010;
+    end else begin
+      woh_pc   <= {woh_pc[2:0],   woh_pc[3]};
+      woh_aux  <= {woh_aux[2:0],  woh_aux[3]};
+      woh_rf   <= {woh_rf[2:0],   woh_rf[3]};
+      woh_tmr  <= {woh_tmr[2:0],  woh_tmr[3]};
+      woh_fifo <= {woh_fifo[2:0], woh_fifo[3]};
+    end
+  end
+
+  // Per-thread commit strobes: a valid slot of thread t is in W.
+  wire [3:0] cw_pc  = {4{w_valid}} & woh_pc;
+  wire [3:0] cw_aux = {4{w_valid}} & woh_aux;
 
   // ======================================================= register file
   // A thread counts as halted for host access to r0..r7 and for every debug
   // write iff RUN[t] and STEP_REQ[t] are clear and it has no valid slot in
   // F, D, X or W, so the state the host sees is always architectural.
+  // `infl` is registered from the F, D and X terms, so in every cycle it
+  // holds exactly "a valid slot of thread t is in D, X or W" without any
+  // logic behind the W-stage registers (D-019).
   wire [3:0] busy_f = valid_f  ? (4'd1 << ph)       : 4'd0;
   wire [3:0] busy_d = vd       ? (4'd1 << td_th)    : 4'd0;
   wire [3:0] busy_x = vx       ? (4'd1 << tx_th)    : 4'd0;
-  wire [3:0] busy_w = w_valid  ? (4'd1 << w_thread) : 4'd0;
-  wire [3:0] thread_busy = run_r | step_req_r | busy_f | busy_d | busy_x | busy_w;
+  reg  [3:0] infl;
+  always @(posedge clk) begin
+    if (!rst_n) infl <= 4'd0;
+    else        infl <= busy_f | busy_d | busy_x;
+  end
+  wire [3:0] thread_busy = run_r | step_req_r | busy_f | infl;
 
   wire        dbg_is_reg   = (h_dbg_reg[7:3] == 5'd0);
   wire        dbg_running  = thread_busy[h_dbg_thread];
-  wire        dbg_rf_rd_go = h_dbg_req & ~h_dbg_wr & dbg_is_reg & ~dbg_running & ~vd & ~h_dbg_ack;
   wire        dbg_rf_wr_go = h_dbg_req &  h_dbg_wr & dbg_is_reg & ~dbg_running
                              & ~(w_valid & w_reg_we) & ~h_dbg_ack;
 
-  wire [1:0] rf_ra_thread = dbg_rf_rd_go ? h_dbg_thread : td_th;
-  wire [2:0] rf_ra_addr   = dbg_rf_rd_go ? h_dbg_reg[2:0] : d_f_ra;
+  // Read port A serves the D stage, and the host whenever D holds a bubble
+  // (its operands are then never used), so the select is just `vd`.
+  wire [1:0] rf_ra_thread = vd ? td_th : h_dbg_thread;
+  wire [2:0] rf_ra_addr   = vd ? d_f_ra : h_dbg_reg[2:0];
   wire [2:0] rf_rb_addr   = d_grp_alu ? d_f_rb : d_f_rd;
   wire [15:0] rf_rd_a, rf_rd_b;
+
+  // The W stage owns the write port whenever its slot writes a register and
+  // the host borrows it otherwise (dbg_rf_wr_go already excludes that case),
+  // so the address and data select is the W stage's own write strobe and the
+  // thread select is the one-hot ring, never a decoded thread number.
+  wire       w_rf_write = w_valid & w_reg_we;
+  wire [3:0] rf_we_oh   = ({4{w_rf_write}} & woh_rf)
+                          | ({4{dbg_rf_wr_go}} & (4'd1 << h_dbg_thread));
 
   loom_regfile u_rf (
       .clk(clk), .rst_n(rst_n),
       .ra_thread(rf_ra_thread), .ra_addr(rf_ra_addr), .rd_a(rf_rd_a),
       .rb_thread(td_th),        .rb_addr(rf_rb_addr), .rd_b(rf_rd_b),
-      .we      (dbg_rf_wr_go ? 1'b1          : (w_valid & w_reg_we)),
-      .w_thread(dbg_rf_wr_go ? h_dbg_thread  : w_thread),
-      .w_addr  (dbg_rf_wr_go ? h_dbg_reg[2:0]: w_rd),
-      .wdata   (dbg_rf_wr_go ? h_dbg_wdata   : w_rval)
+      .we_oh (rf_we_oh),
+      .w_addr(w_rf_write ? w_rd   : h_dbg_reg[2:0]),
+      .wdata (w_rf_write ? w_rval : h_dbg_wdata)
   );
 
   // ================================================== X stage decode
@@ -356,11 +438,12 @@ module loom_core #(
   wire [31:0] tick_frac_all;
   wire [3:0]  tick_seen_all;
   wire        tmr_h_we, tmr_h_td_we, tmr_h_dt_we, tmr_h_tint_we, tmr_h_tfrac_we;
+  wire        tmr_h_tseen_we;
   wire [15:0] tmr_h_wdata;
 
   loom_timer u_timer (
       .clk(clk), .rst_n(rst_n),
-      .cm_valid(w_valid), .cm_thread(w_thread),
+      .cm_sel({4{w_valid}} & woh_tmr),
       .cm_td_we(w_td_we), .cm_td(w_td),
       .cm_dt_we(w_dt_we), .cm_dt(w_dt),
       .cm_tint_we(w_tint_we), .cm_tint(w_csr_val),
@@ -369,6 +452,7 @@ module loom_core #(
       .h_we(tmr_h_we), .h_thread(h_dbg_thread),
       .h_td_we(tmr_h_td_we), .h_dt_we(tmr_h_dt_we),
       .h_tint_we(tmr_h_tint_we), .h_tfrac_we(tmr_h_tfrac_we),
+      .h_tseen_we(tmr_h_tseen_we),
       .h_wdata(tmr_h_wdata),
       .now_all(now_all), .td_all(td_all_w), .dt_all(dt_all_w),
       .tick_int_all(tick_int_all), .tick_frac_all(tick_frac_all),
@@ -392,14 +476,75 @@ module loom_core #(
   wire [15:0] x_dt     = dt_all_w[xsel*16 +: 16];
   wire [15:0] x_tint   = tick_int_all[xsel*16 +: 16];
   wire [7:0]  x_tfrac  = tick_frac_all[xsel*8 +: 8];
+  wire        x_tseen  = tick_seen_all[tx_th];
+
+  // ================================================================ FIFOs
+  localparam integer FAW = $clog2(FIFO_DEPTH);
+  localparam [31:0]  FDEPTH32 = FIFO_DEPTH;
+  localparam [FAW:0] FDEPTH = FDEPTH32[FAW:0];
+
+  wire [4*(FAW+1)-1:0] inq_cnt_all, outq_cnt_all;
+  wire [63:0]          inq_head_all, inq_next_unused;
+  wire [3:0]           cw_fifo = {4{w_valid}} & woh_fifo;
+  // A host push is accepted iff INQ is not full in the cycle before the
+  // commit edge (SEMANTICS 6.7); a thread pop at the same edge also applies.
+  wire [3:0]           inq_full;
+  wire [3:0]           h_push_ok  = h_inq_push & ~inq_full;
+  wire                 h_push_bad = |(h_inq_push & inq_full);
+
+  genvar gf;
+  generate
+    for (gf = 0; gf < 4; gf = gf + 1) begin : g_fifo
+      wire [FAW:0] icnt, ocnt;
+      loom_fifo #(.DEPTH(FIFO_DEPTH), .AW(FAW)) u_inq (
+          .clk(clk), .rst_n(rst_n), .clr(h_reset[gf]),
+          .push(h_push_ok[gf]), .wdata(h_fifo_wdata),
+          .pop(cw_fifo[gf] & w_pop),
+          .count(icnt), .head(inq_head_all[16*gf +: 16]),
+          .next(inq_next_unused[16*gf +: 16]));
+      // The host pops only what it saw (loom_host_ctl); the count check
+      // keeps the FIFO consistent whatever arrives.
+      loom_fifo #(.DEPTH(FIFO_DEPTH), .AW(FAW)) u_outq (
+          .clk(clk), .rst_n(rst_n), .clr(h_reset[gf]),
+          .push(cw_fifo[gf] & w_push), .wdata(w_csr_val),
+          .pop(h_outq_pop[gf] & (ocnt != {(FAW+1){1'b0}})),
+          .count(ocnt), .head(outq_head[16*gf +: 16]),
+          .next(outq_next[16*gf +: 16]));
+      assign inq_cnt_all[(FAW+1)*gf +: FAW+1]  = icnt;
+      assign outq_cnt_all[(FAW+1)*gf +: FAW+1] = ocnt;
+      assign inq_full[gf] = (icnt == FDEPTH);
+      // Status word (docs/HOST_PROTOCOL.md SPACE 3): {OUTQ_COUNT[3:0],
+      // INQ_COUNT[3:0], OUTQ_EMPTY, OUTQ_FULL, INQ_EMPTY, INQ_FULL}.
+      wire [7:0] icnt8 = {{(7-FAW){1'b0}}, icnt};
+      wire [7:0] ocnt8 = {{(7-FAW){1'b0}}, ocnt};
+      assign fifo_stat[12*gf +: 12] = {ocnt8[3:0], icnt8[3:0],
+                                       ocnt == {(FAW+1){1'b0}}, ocnt == FDEPTH,
+                                       icnt == {(FAW+1){1'b0}}, icnt == FDEPTH};
+      // The status word has 4-bit count fields (FIFO_DEPTH up to 8).
+      wire _unused_cnt = &{1'b0, icnt8[7:4], ocnt8[7:4]};
+    end
+  endgenerate
+
+  wire [FAW:0] x_inq_cnt  = inq_cnt_all[xsel*(FAW+1) +: FAW+1];
+  wire [FAW:0] x_outq_cnt = outq_cnt_all[xsel*(FAW+1) +: FAW+1];
+  wire [15:0]  x_inq_head = inq_head_all[xsel*16 +: 16];
+  wire         x_inq_ne   = (x_inq_cnt != {(FAW+1){1'b0}});
+  wire         x_outq_nf  = (x_outq_cnt != FDEPTH);
+
+  // STEPS + 1 is formed here and registered, so the commit only loads it.
+  // The host cannot write STEPS between this X cycle and the commit edge,
+  // because the thread has a valid slot in flight (SEMANTICS 7).
+  wire [15:0] x_steps1 = steps_all[xsel*16 +: 16] + 16'd1;
 
   // SFLAGS is forwarded from W to X so that WAITS is an atomic test-and-clear
   // between slots in adjacent cycles (SEMANTICS 2).
   wire [7:0] sflags_x = (sflags_r | (w_valid ? w_sf_set : 8'd0))
                         & ~(w_valid ? w_sf_clr : 8'd0);
 
-  // -------------------------------------------------- not built at M1
-  wire unbuilt = tmg_blocking | grp_be | grp_mem | is_waitb;
+  // ---------------------------------------------------------- not built
+  // The bit engine and LD/ST are not built; WAITB 0 (bit engine idle) needs
+  // the bit engine, so it is the one WAITB condition that is NOP + BADOP.
+  wire unbuilt = grp_be | grp_mem | (is_waitb & (f_cond == 2'd0));
   wire bad_op  = is_reserved | unbuilt;
 
   wire [9:0] x_next = pcx + 10'd1;
@@ -514,21 +659,36 @@ module loom_core #(
   wire reach_dt_new = ~d_dt_new[15];
   wire reach_td     = ~d_td[15];
 
-  // Conditional-wait condition mux. Input 3 (WAITB) is reserved for M2 and is
-  // tied to 0 here; the instruction is treated as unbuilt (BADOP) at M1.
+  // Conditional-wait condition mux. WAITB (6.4, 6.7): 1 OUTQ not full,
+  // 2 INQ not empty, 3 TICK_SEEN; 0 is unbuilt (BADOP) without the bit
+  // engine and never reaches here.
   wire cond_waitp = (pin_sel == f_val);
   wire cond_waite = pin_edge_ok & edge_hit;
   wire cond_waits = sflags_x[f_flag];
+  reg  cond_waitb;
+  always @(*) begin
+    case (f_cond)
+      2'd1:    cond_waitb = x_outq_nf;
+      2'd2:    cond_waitb = x_inq_ne;
+      2'd3:    cond_waitb = x_tseen;
+      default: cond_waitb = 1'b0;
+    endcase
+  end
   wire cond_hit   = (is_waitp & cond_waitp)
                     | (is_waite & cond_waite)
-                    | (is_waits & cond_waits);
-  wire is_cwait   = (is_waitp | is_waite | is_waits) & ~bad_op;
+                    | (is_waits & cond_waits)
+                    | (is_waitb & cond_waitb);
+  wire is_cwait   = (is_waitp | is_waite | is_waits | is_waitb) & ~bad_op;
   wire timeout    = is_cwait & f_tmo & ~cond_hit & reach_td;
 
-  wire wait_class = tmg_wait & ~bad_op;
+  // PUSH and POP block like waits (WAIT_ACTIVE, PC unchanged) and have no
+  // timeout (SEMANTICS 6.7).
+  wire wait_class = (tmg_wait | tmg_blocking) & ~bad_op;
   wire wait_done  = (is_waitd & reach_td_new)
                     | (is_dly  & reach_dt_new)
-                    | (is_cwait & (cond_hit | (f_tmo & reach_td)));
+                    | (is_cwait & (cond_hit | (f_tmo & reach_td)))
+                    | (is_push & x_outq_nf)
+                    | (is_pop  & x_inq_ne);
   wire x_stall    = wait_class & ~wait_done;
   wire x_done     = ~x_stall;
 
@@ -556,7 +716,8 @@ module loom_core #(
                    | (grp_alui & ~is_cmpi)
                    | grp_ldi
                    | (grp_unary & ~is_cmp & ~is_test)
-                   | is_djnz | is_in | is_csrr);
+                   | is_djnz | is_in | is_csrr
+                   | (is_pop & x_inq_ne));
 
   reg [15:0] x_rval;
   always @(*) begin
@@ -565,6 +726,7 @@ module loom_core #(
     else if (is_djnz) x_rval = djnz_val;
     else if (is_in)   x_rval = in_value;
     else if (is_csrr) x_rval = csr_rdata;
+    else if (is_pop)  x_rval = x_inq_head;
     else              x_rval = alu_y;
   end
 
@@ -630,6 +792,7 @@ module loom_core #(
       w_halt <= 1'b0; w_badop <= 1'b0; w_sf_set <= 8'd0; w_sf_clr <= 8'd0;
       w_out_mask <= 14'd0; w_out_data <= 14'd0; w_oe_mask <= 8'd0;
       w_oe_data <= 8'd0; w_od_we <= 1'b0; w_od <= 8'd0; w_swirq <= 1'b0;
+      w_steps <= 16'd0; w_push <= 1'b0; w_pop <= 1'b0;
     end else begin
       w_valid       <= vx;
       w_thread      <= tx_th;
@@ -667,6 +830,9 @@ module loom_core #(
       w_od_we       <= ~bad_op & csrw_od;
       w_od          <= op_a[7:0];
       w_swirq       <= ~bad_op & is_csrw & csr_host_irq;
+      w_steps       <= x_steps1;
+      w_push        <= ~bad_op & is_push & x_outq_nf;
+      w_pop         <= ~bad_op & is_pop  & x_inq_ne;
     end
   end
 
@@ -694,6 +860,11 @@ module loom_core #(
   wire [9:0]  g_ingrp  = ingrp_all[dsel*10 +: 10];
   wire [15:0] g_steps  = steps_all[dsel*16 +: 16];
   wire        g_wa     = wa_all[h_dbg_thread];
+  wire        g_tseen  = tick_seen_all[h_dbg_thread];
+  wire [FAW:0] g_icnt0 = inq_cnt_all[dsel*(FAW+1) +: FAW+1];
+  wire [FAW:0] g_ocnt0 = outq_cnt_all[dsel*(FAW+1) +: FAW+1];
+  wire [7:0]  g_icnt   = {{(7-FAW){1'b0}}, g_icnt0};
+  wire [7:0]  g_ocnt   = {{(7-FAW){1'b0}}, g_ocnt0};
 
   reg [15:0] dbg_rd_other;
   always @(*) begin
@@ -715,6 +886,8 @@ module loom_core #(
       8'h21:   dbg_rd_other = {4'd0, g_depth, g_rs1};
       8'h22:   dbg_rd_other = {15'd0, g_wa};
       8'h23:   dbg_rd_other = g_dt;
+      8'h24:   dbg_rd_other = {15'd0, g_tseen};
+      8'h26:   dbg_rd_other = {g_icnt, g_ocnt};
       default: dbg_rd_other = 16'd0;
     endcase
   end
@@ -741,6 +914,7 @@ module loom_core #(
   assign tmr_h_dt_we    = (h_dbg_reg == 8'h23);
   assign tmr_h_tint_we  = (h_dbg_reg == 8'h10);
   assign tmr_h_tfrac_we = (h_dbg_reg == 8'h11);
+  assign tmr_h_tseen_we = (h_dbg_reg == 8'h24);
   assign tmr_h_wdata    = h_dbg_wdata;
 
   // ============================================ architectural state commit
@@ -752,9 +926,30 @@ module loom_core #(
   localparam [9:0] RPC2 = RPC_STEP + RPC_STEP;
   localparam [9:0] RPC3 = RPC_STEP + RPC_STEP + RPC_STEP;
 
-  wire [31:0] wsel = {30'd0, w_thread};
-  wire [31:0] rsel = {30'd0, h_rpc_sel};
+  // Host-side selects (slow paths): which thread a debug write or a
+  // RESET_PC write addresses, and which debug register it is.
+  wire [3:0] dbg_we   = {4{dbg_wr_go}} & (4'd1 << h_dbg_thread);
+  wire [3:0] rpc_we   = {4{h_rpc_we}} & (4'd1 << h_rpc_sel);
+  wire       dw_pc    = (h_dbg_reg == 8'h08);
+  wire       dw_flags = (h_dbg_reg == 8'h09) | (h_dbg_reg == 8'h1B);
+  wire       dw_rs0   = (h_dbg_reg == 8'h0F);
+  wire       dw_og    = (h_dbg_reg == 8'h12);
+  wire       dw_ig    = (h_dbg_reg == 8'h13);
+  wire       dw_steps = (h_dbg_reg == 8'h20);
+  wire       dw_rs1   = (h_dbg_reg == 8'h21);
+  wire       dw_wa    = (h_dbg_reg == 8'h22);
 
+  // Per-thread commit strobes of the fields a slot writes only sometimes.
+  wire [3:0] cw_rs  = cw_aux & {4{w_rs_we}};
+  wire [3:0] cw_og  = cw_aux & {4{w_outgrp_we}};
+  wire [3:0] cw_ig  = cw_aux & {4{w_ingrp_we}};
+  wire [3:0] cw_hlt = cw_pc  & {4{w_halt}};
+
+  // Every per-thread register below is written thread by thread with a
+  // constant index: the commit of the slot in W (highest priority, the last
+  // mux before the flop), then a host debug write (only while the thread is
+  // halted, so never together with a commit), then CTRL.RESET. This is the
+  // M1 priority order, bit for bit.
   integer i;
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -778,79 +973,77 @@ module loom_core #(
       sflags_r   <= 8'd0;
       swirq_r    <= 4'd0;
     end else begin
-      // ------------------------------------------------ host RESET_PC write
-      if (h_rpc_we) resetpc_r[rsel*10 +: 10] <= h_rpc;
-
-      // ------------------------------------------------ CTRL.RESET (host)
       for (i = 0; i < 4; i = i + 1) begin
-        if (h_reset[i]) begin
-          pc_all[i*10 +: 10]   <= resetpc_r[i*10 +: 10];
-          z_all[i]             <= 1'b0;
-          c_all[i]             <= 1'b0;
-          t_all[i]             <= 1'b0;
-          depth_all[i*2 +: 2]  <= 2'd0;
-          wa_all[i]            <= 1'b0;
+        // ---------------------------------------------- host RESET_PC write
+        if (rpc_we[i]) resetpc_r[i*10 +: 10] <= h_rpc;
+
+        // ------------------------------------------ PC and WAIT_ACTIVE
+        if (cw_pc[i])                   pc_all[i*10 +: 10] <= w_next_pc;
+        else if (dbg_we[i] & dw_pc)     pc_all[i*10 +: 10] <= h_dbg_wdata[9:0];
+        else if (h_reset[i])            pc_all[i*10 +: 10] <= resetpc_r[i*10 +: 10];
+
+        // A debug PC write also clears WAIT_ACTIVE (SEMANTICS 7).
+        if (cw_pc[i])                   wa_all[i] <= w_wait_active;
+        else if (dbg_we[i] & dw_pc)     wa_all[i] <= 1'b0;
+        else if (dbg_we[i] & dw_wa)     wa_all[i] <= h_dbg_wdata[0];
+        else if (h_reset[i])            wa_all[i] <= 1'b0;
+
+        // --------------------------------------------------------- flags
+        if (cw_pc[i]) begin
+          z_all[i] <= w_flags[0];
+          c_all[i] <= w_flags[1];
+          t_all[i] <= w_flags[2];
+        end else if (dbg_we[i] & dw_flags) begin
+          z_all[i] <= h_dbg_wdata[0];
+          c_all[i] <= h_dbg_wdata[1];
+          t_all[i] <= h_dbg_wdata[2];
+        end else if (h_reset[i]) begin
+          z_all[i] <= 1'b0;
+          c_all[i] <= 1'b0;
+          t_all[i] <= 1'b0;
         end
+
+        // -------------------------------------------------- return stack
+        if (cw_rs[i])                   rs0_all[i*10 +: 10] <= w_rs0;
+        else if (dbg_we[i] & dw_rs0)    rs0_all[i*10 +: 10] <= h_dbg_wdata[9:0];
+
+        if (cw_rs[i])                   rs1_all[i*10 +: 10] <= w_rs1;
+        else if (dbg_we[i] & dw_rs1)    rs1_all[i*10 +: 10] <= h_dbg_wdata[9:0];
+
+        if (cw_rs[i])                   depth_all[i*2 +: 2] <= w_depth;
+        else if (dbg_we[i] & dw_rs1)    depth_all[i*2 +: 2] <= h_dbg_wdata[11:10];
+        else if (h_reset[i])            depth_all[i*2 +: 2] <= 2'd0;
+
+        // --------------------------------------- PREV_PINS, STEPS, groups
+        if (cw_aux[i])                  pp_all[i*13 +: 13] <= w_prev_pins;
+
+        if (cw_aux[i])                  steps_all[i*16 +: 16] <= w_steps;
+        else if (dbg_we[i] & dw_steps)  steps_all[i*16 +: 16] <= h_dbg_wdata;
+
+        if (cw_og[i])                   outgrp_all[i*10 +: 10] <= w_csr_val[9:0];
+        else if (dbg_we[i] & dw_og)     outgrp_all[i*10 +: 10] <= h_dbg_wdata[9:0];
+
+        if (cw_ig[i])                   ingrp_all[i*10 +: 10] <= w_csr_val[9:0];
+        else if (dbg_we[i] & dw_ig)     ingrp_all[i*10 +: 10] <= h_dbg_wdata[9:0];
+
+        // ------------------------------------------------- RUN / HALTED
+        // CTRL.RUN write: RUN <= value, bits going 0 -> 1 clear HALTED; a
+        // HALT committing at the same edge wins (the thread always wins).
+        if (cw_hlt[i])                  run_r[i] <= 1'b0;
+        else if (h_run_we)              run_r[i] <= h_run[i];
+
+        if (cw_hlt[i])                  halted_r[i] <= 1'b1;
+        else if (h_run_we & h_run[i] & ~run_r[i]) halted_r[i] <= 1'b0;
       end
 
-      // ------------------------------- host debug writes (thread not running)
-      if (dbg_wr_go) begin
-        case (h_dbg_reg)
-          8'h08: begin
-            pc_all[dsel*10 +: 10] <= h_dbg_wdata[9:0];
-            wa_all[h_dbg_thread]  <= 1'b0;      // a PC write clears WAIT_ACTIVE
-          end
-          8'h09, 8'h1B: begin
-            z_all[h_dbg_thread] <= h_dbg_wdata[0];
-            c_all[h_dbg_thread] <= h_dbg_wdata[1];
-            t_all[h_dbg_thread] <= h_dbg_wdata[2];
-          end
-          8'h0F: rs0_all[dsel*10 +: 10]    <= h_dbg_wdata[9:0];
-          8'h12: outgrp_all[dsel*10 +: 10] <= h_dbg_wdata[9:0];
-          8'h13: ingrp_all[dsel*10 +: 10]  <= h_dbg_wdata[9:0];
-          8'h20: steps_all[dsel*16 +: 16]  <= h_dbg_wdata;
-          8'h21: begin
-            rs1_all[dsel*10 +: 10] <= h_dbg_wdata[9:0];
-            depth_all[dsel*2 +: 2] <= h_dbg_wdata[11:10];
-          end
-          8'h22: wa_all[h_dbg_thread] <= h_dbg_wdata[0];
-          default: ;
-        endcase
-      end
-
-      // ------------------------------------------------------ thread commit
-      if (w_valid) begin
-        pc_all[wsel*10 +: 10]    <= w_next_pc;
-        z_all[w_thread]          <= w_flags[0];
-        c_all[w_thread]          <= w_flags[1];
-        t_all[w_thread]          <= w_flags[2];
-        wa_all[w_thread]         <= w_wait_active;
-        pp_all[wsel*13 +: 13]    <= w_prev_pins;
-        steps_all[wsel*16 +: 16] <= steps_all[wsel*16 +: 16] + 16'd1;
-        if (w_rs_we) begin
-          rs0_all[wsel*10 +: 10] <= w_rs0;
-          rs1_all[wsel*10 +: 10] <= w_rs1;
-          depth_all[wsel*2 +: 2] <= w_depth;
-        end
-        if (w_outgrp_we) outgrp_all[wsel*10 +: 10] <= w_csr_val[9:0];
-        if (w_ingrp_we)  ingrp_all[wsel*10 +: 10]  <= w_csr_val[9:0];
-      end
-
-      // ------------------------------------------------- RUN / HALTED / STEP
-      if (h_run_we) begin
-        run_r    <= h_run;
-        halted_r <= halted_r & ~(h_run & ~run_r);   // 0 -> 1 clears HALTED
-      end
+      // ------------------------------------------------------------ STEP
       if (valid_f && step_req_r[ph]) step_req_r[ph] <= 1'b0;
       if (h_step_we) step_req_r <= step_req_r | (h_step & ~run_r);
-      if (w_valid && w_halt) begin                   // the thread always wins
-        run_r[w_thread]    <= 1'b0;
-        halted_r[w_thread] <= 1'b1;
-      end
 
       // --------------------------------------------------------- BADOP
       badop_r <= (badop_r & ~(h_badop_clr_we ? h_badop_clr : 16'd0))
-                 | {h_badop_set15, 11'd0, (w_valid & w_badop) ? (4'd1 << w_thread) : 4'd0};
+                 | {h_badop_set15, h_badop_set14 | h_push_bad, 10'd0,
+                    cw_pc & {4{w_badop}}};
 
       // -------------------------------------------------------- SFLAGS
       sflags_r <= ((((sflags_r | (h_sfset_we ? h_sfset : 8'd0))
@@ -860,7 +1053,7 @@ module loom_core #(
 
       // --------------------------------------------------------- SWIRQ
       swirq_r <= (swirq_r & ~(h_swirq_clr_we ? h_swirq_clr : 4'd0))
-                 | ((w_valid & w_swirq) ? (4'd1 << w_thread) : 4'd0);
+                 | (cw_pc & {4{w_swirq}});
     end
   end
 
@@ -878,10 +1071,10 @@ module loom_core #(
   assign tr_flags   = w_flags;
   assign tr_next_pc = w_next_pc;
 
-  // TICK_SEEN is architectural state that only WAITB (M2) reads; the counter
-  // and the mask bits above 16 of the group shifters are likewise carried but
-  // not consumed at M1.
-  wire _unused_m2 = &{1'b0, tick_seen_all, og_m17[16], ig_m17[16],
+  // The mask bits above 16 of the group shifters, the high difference bits
+  // of the reached() subtractions and INQ's second read port are carried
+  // but not consumed.
+  wire _unused_m2 = &{1'b0, inq_next_unused, og_m17[16], ig_m17[16],
                       ig_rot[63:16], pinw_mask[31:22], pinw_mask[15:8],
                       pinw_data[31:22], pinw_data[15:8],
                       d_td_new[14:0], d_dt_new[14:0], d_td[14:0]};

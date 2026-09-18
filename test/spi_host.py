@@ -20,7 +20,7 @@ import sys
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge
 
 # Make `tools.loomisa` importable when cocotb is started from test/ without
 # PYTHONPATH (CI runs from the repository root, the WSL dev loop does not).
@@ -41,6 +41,15 @@ CTRL_IRQ_EN, CTRL_IRQ_STAT, CTRL_IRQ_STAT2 = 0x10, 0x11, 0x12
 CTRL_SFLAGS, CTRL_SFLAGS_CLR, CTRL_OD_MASK = 0x13, 0x14, 0x15
 CTRL_PIN_OUT, CTRL_PIN_OE, CTRL_PIN_IN = 0x16, 0x17, 0x18
 CTRL_CAPS, CTRL_BADOP, CTRL_SWIRQ = 0x19, 0x1A, 0x1B
+CTRL_IRQ_EN2 = 0x1C
+
+# CAPS bits (docs/SEMANTICS.md 5)
+CAPS_FIFO, CAPS_BE, CAPS_DMEM = 0x08, 0x10, 0x20
+CAPS_ROM, CAPS_LAT, CAPS_AUTO = 0x40, 0x80, 0x100
+
+# FIFO space (docs/HOST_PROTOCOL.md SPACE 3)
+FIFO_QUEUE = 0x0000                   # + t: write pushes INQ[t], read pops OUTQ[t]
+FIFO_STATUS = 0x0100                  # + t: status word
 
 # DEBUG registers (docs/INTERFACES.md documents the ones above 0x20)
 DBG_R0 = 0x00
@@ -48,11 +57,16 @@ DBG_PC, DBG_FLAGS, DBG_TD, DBG_NOW = 0x08, 0x09, 0x0A, 0x0B
 DBG_RS0 = 0x0F
 DBG_CSR0 = 0x10                       # 0x10..0x1F are CSR 0x00..0x0F
 DBG_STEPS, DBG_RS1_DEPTH, DBG_WAIT_ACTIVE, DBG_DT = 0x20, 0x21, 0x22, 0x23
+DBG_SR, DBG_CNT, DBG_CRC = 0x0C, 0x0D, 0x0E
+DBG_TICK_SEEN, DBG_LATCH, DBG_FIFO_COUNTS = 0x24, 0x25, 0x26
 
 CSR_TICK_INT, CSR_TICK_FRAC, CSR_OUTGRP, CSR_INGRP = 0x00, 0x01, 0x02, 0x03
 CSR_NOW, CSR_TD, CSR_FLAGS, CSR_TID = 0x09, 0x0A, 0x0B, 0x0C
 CSR_OD_MASK, CSR_PIN_OUT, CSR_PIN_OE = 0x10, 0x11, 0x12
 CSR_PIN_IN, CSR_SFLAGS, CSR_HOST_IRQ = 0x13, 0x14, 0x15
+CSR_BE_CFG, CSR_BE_PINS, CSR_BE_RELOAD = 0x04, 0x05, 0x06
+CSR_CRC_POLY, CSR_CRC_INIT = 0x07, 0x08
+CSR_SR, CSR_CNT, CSR_CRC = 0x0D, 0x0E, 0x0F
 
 FLAG_Z, FLAG_C, FLAG_T = 1, 2, 4
 
@@ -65,6 +79,84 @@ def resolve(sig, default=0):
         text = str(sig.value)
         return int("".join("0" if ch not in "01" else ch for ch in text), 2) \
             if text else default
+
+
+class PadMonitor:
+    """Samples every pad in the middle of every clock cycle (falling edge).
+
+    Entry ``c`` describes cycle ``c``, counted from ``start()``: ``ui[c]`` is
+    what the design samples at the rising edge that ends the cycle (the
+    testbench only changes inputs right after rising edges), and ``uo[c]``,
+    ``uio[c]``, ``oe[c]`` are the registered outputs during the cycle. So a
+    pad register loaded at edge ``e`` first shows its new value in entry
+    ``e``, and an input level first seen in entry ``c`` is taken by the first
+    synchroniser flop at edge ``c + 1``. The numbering is this monitor's own;
+    tests use differences, or align on an event they can compute.
+    """
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.ui, self.uo, self.uio, self.oe = [], [], [], []
+        self._task = None
+
+    def start(self):
+        self._task = cocotb.start_soon(self._run())
+        return self
+
+    def stop(self):
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    async def _run(self):
+        dut = self.dut
+        while True:
+            await FallingEdge(dut.clk)
+            self.ui.append(resolve(dut.ui_in))
+            self.uo.append(resolve(dut.uo_out))
+            self.uio.append(resolve(dut.uio_out))
+            self.oe.append(resolve(dut.uio_oe))
+
+    @property
+    def now(self):
+        """Index of the most recent sampled cycle."""
+        return len(self.ui) - 1
+
+    @staticmethod
+    def changes(seq, bit, start=0):
+        """[(cycle, level)] for every change of ``bit`` in ``seq`` from ``start``."""
+        out = []
+        for c in range(max(start, 1), len(seq)):
+            a, b = (seq[c - 1] >> bit) & 1, (seq[c] >> bit) & 1
+            if a != b:
+                out.append((c, b))
+        return out
+
+    def rises(self, seq, bit, start=0):
+        return [c for c, v in self.changes(seq, bit, start) if v]
+
+    def sck_rises(self, start=0):
+        """First cycle of every SCK high phase (ui_in[5]) since ``start``."""
+        return self.rises(self.ui, 5, start)
+
+    @staticmethod
+    def host_commit(sck_rise_cycle):
+        """First cycle in which the effect of a host word is visible, given
+        the cycle in which the SCK level of its last bit first appears.
+
+        Edge c+1: first synchroniser flop; c+2: second; the edge detector
+        fires during cycle c+2 and loom_spi_host raises byte_done at edge
+        c+3; loom_host_ctl registers the pulse at edge c+4; the register it
+        drives loads at edge c+5 (docs/HOST_PROTOCOL.md: a word takes effect
+        at the end of the word).
+        """
+        return sck_rise_cycle + 5
+
+    async def align(self, residue, modulo=4):
+        """Wait (at least one cycle) until ``now % modulo == residue``."""
+        await RisingEdge(self.dut.clk)
+        while (self.now + 1) % modulo != residue % modulo:
+            await RisingEdge(self.dut.clk)
 
 
 class LoomHost:
@@ -235,6 +327,9 @@ class LoomHost:
 
     async def badop(self):
         return await self.read1(SP_CTRL, CTRL_BADOP)
+
+    async def caps(self):
+        return await self.read1(SP_CTRL, CTRL_CAPS)
 
     async def clear_badop(self, mask=0xFFFF):
         await self.write(SP_CTRL, CTRL_BADOP, mask)

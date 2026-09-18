@@ -79,6 +79,16 @@ its commit edge, so seeing it at the falling edge of cycle ``k`` and making the
 same ``host_*`` call before the model steps cycle ``k`` commits both at edge
 ``k + 1``. The lockstep comparison runs through the whole load as well.
 
+M2 features
+-----------
+
+At the start of every seed the harness resets the RTL and reads ``CTRL.CAPS``
+through the SPI host port. If it reports an M2 feature (FIFOs, bit engine,
+deadline-latched ``SETP``), the program is generated with the ``m2_built``
+avoid flag of ``tools/loomgen``, which leaves those instructions, the
+bit-engine CSRs and the ``D`` form of ``SETP`` out: the golden model may still
+treat them as unbuilt (``NOP`` + ``BADOP``) while the RTL builds them.
+
 Environment
 -----------
 
@@ -119,7 +129,8 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from cosim_coverage import Coverage                              # noqa: E402
-from spi_host import CLK_NS, CTRL_RUN, SP_CTRL, LoomHost         # noqa: E402
+from spi_host import (CLK_NS, CTRL_CAPS, CTRL_RUN, SP_CTRL,       # noqa: E402
+                      LoomHost)
 from tools.loomasm.disasm import disassemble                     # noqa: E402
 from tools.loomgen import (GeneratedProgram, LOAD_CYCLE, RUN_CYCLE,  # noqa: E402
                            generate, host_actions)
@@ -149,6 +160,11 @@ PROFILE_ORDER = ("mixed", "timing", "pins", "alu")
 #: changed for them until the director rules, so the random programs leave
 #: them out and the rest of the run stays useful.
 AVOID = ("csrw_pin_out_high_bits",)
+
+#: CAPS bits of M2 features (SEMANTICS 5): [3] FIFOs, [4] bit engine (manual
+#: mode), [7] deadline-latched ``SETP``. If the RTL reports any of them, the
+#: programs are generated with ``m2_built`` as well (see the module notes).
+CAPS_M2_FEATURES = (1 << 3) | (1 << 4) | (1 << 7)
 
 HERE = pathlib.Path(__file__).resolve().parent
 FAILURE_DIR = HERE / "cosim_failures"
@@ -608,6 +624,27 @@ class _Run:
         return k
 
 
+# ------------------------------------------------------------ CAPS probe
+async def _read_caps(dut) -> int:
+    """``CTRL.CAPS`` of the RTL, read through the SPI host port after a reset.
+
+    Every seed starts with its own reset in :meth:`_Run.reset`, so whatever
+    this leaves behind does not matter.
+    """
+    dut.rst_n.value = 0
+    dut.ui_in.value = UI_CS
+    dut.uio_drv.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 4)
+    return await LoomHost(dut).read1(SP_CTRL, CTRL_CAPS)
+
+
+def _avoid_for(caps: int):
+    """The avoid flags for an RTL that reports ``caps``."""
+    return AVOID + (("m2_built",) if caps & CAPS_M2_FEATURES else ())
+
+
 # ------------------------------------------------------------- failures
 def _dump(prog: GeneratedProgram, info) -> pathlib.Path:
     FAILURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -642,11 +679,21 @@ def _seed_plan(count, base):
 
 
 async def _run_programs(dut, programs, spi=False):
+    """``programs``: (program or maker, label, cycles). A maker is called with
+    the avoid flags that the RTL's CAPS, read at the start of the seed, asks
+    for, and returns the program."""
     probe = _Probe(dut)
     failures = []
     total_slots = total_cycles = 0
     started = time.time()
-    for prog, label, cycles in programs:
+    for make, label, cycles in programs:
+        if callable(make):
+            caps = await _read_caps(dut)
+            prog = make(_avoid_for(caps))
+            label = "%s caps=%04X%s" % (label, caps,
+                                         " m2_built" if "m2_built" in prog.avoid else "")
+        else:
+            prog = make
         run = _Run(dut, probe, prog, label, cycles, spi=spi)
         try:
             spent = await run.run()
@@ -685,9 +732,10 @@ async def test_cosim_random_programs(dut):
     else:
         programs = []
         for seed, profile, threads in _seed_plan(SEEDS, SEED_BASE):
-            prog = generate(seed=seed, threads=threads, imem_words=IMEM_WORDS,
-                            profile=profile, cycles=CYCLES, avoid=AVOID, isa=ISA)
-            programs.append((prog, "backdoor profile=%s threads=%d"
+            def make(avoid, seed=seed, profile=profile, threads=threads):
+                return generate(seed=seed, threads=threads, imem_words=IMEM_WORDS,
+                                profile=profile, cycles=CYCLES, avoid=avoid, isa=ISA)
+            programs.append((make, "backdoor profile=%s threads=%d"
                              % (profile, threads), CYCLES))
     try:
         await _run_programs(dut, programs)
@@ -703,9 +751,10 @@ async def test_cosim_over_the_host_port(dut):
     for index in range(SPI_SEEDS):
         seed = SEED_BASE + 5000 + index
         profile = PROFILE_ORDER[(index + 1) % len(PROFILE_ORDER)]
-        prog = generate(seed=seed, threads=2, imem_words=IMEM_WORDS,
-                        profile=profile, cycles=SPI_CYCLES, avoid=AVOID, isa=ISA)
-        programs.append((prog, "spi profile=%s threads=2" % profile, SPI_CYCLES))
+        def make(avoid, seed=seed, profile=profile):
+            return generate(seed=seed, threads=2, imem_words=IMEM_WORDS,
+                            profile=profile, cycles=SPI_CYCLES, avoid=avoid, isa=ISA)
+        programs.append((make, "spi profile=%s threads=2" % profile, SPI_CYCLES))
     try:
         await _run_programs(dut, programs, spi=True)
     finally:
