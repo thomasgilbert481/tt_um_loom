@@ -98,9 +98,16 @@ first public cmos5l SRAM example is also worth doing in its own right.
       (67.44 = 6 x 11.24 um) and offset (26.36) to sit *inside* the macro's
       Metal4 power pins instead of crossing them from above. Full derivation in
       `src/pdn_cfg.tcl`.
-- [ ] Thomas: push the branch, collect the `gds` and precheck logs, post them
-      in the Discord thread, record the outcome in `docs/AREA.md` and in
-      `docs/tt_cmos5l_facts.md` section 9.
+- [x] 2026-09-18 Opus: CI runs 4 to 8 on `sram-smoke`. Run 8 (`565673f`,
+      Actions run 35377845679) passes `gds`, `precheck` (all nine checks,
+      KLayout SG13CMOS5L DRC 0 violations over the full macro), `gl_test`
+      (5/5, all 512 words at gate level) and `viewer`. Recipe, failure table
+      and root causes in `docs/tt_cmos5l_facts.md` section 11: macro FS at
+      (12, 40), stripes full height through the macro's same-net Metal4 power
+      columns (the precheck pin check needs every power port to span the
+      block), one documented Magic illegal-overlap waiver.
+- [ ] Thomas: post the result in the Discord thread (draft ready outside the
+      repo), record the outcome in `docs/AREA.md`.
 - [ ] If Ken's config becomes public, diff it against ours before a second try.
 
 Timebox: two sessions. If it fails for reasons on Tiny Tapeout's side, stop,
@@ -312,3 +319,12 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   Next: Thomas pushes `sram-smoke`, collects the `gds` and precheck logs
   (expect the precheck to be the failure point: the reference project's own
   `gds` job is green today while its `precheck` job fails), and posts them.
+- 2026-09-18, Opus 5 (branch `sram-smoke` only): M0.5 result. The macro passes
+  the whole cmos5l pipeline (run 8, `565673f`): `gds`, `precheck` with the
+  KLayout SG13CMOS5L deck clean over the macro internals, `gl_test`, `viewer`.
+  The blockers were ours, not TT's: the pin edge facing the die floor
+  (routing), a macro that pdngen left unpowered, and the precheck pin check,
+  which needs every Metal4 power port to span the block, so the stripes now run
+  through the macro's own power columns. Details, run table and the placement
+  rule for M2 in `docs/tt_cmos5l_facts.md` section 11. Next: Thomas posts the
+  result on Discord; the M2 memory decision can now treat the macro as viable.

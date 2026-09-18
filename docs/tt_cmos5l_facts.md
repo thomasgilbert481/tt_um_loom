@@ -686,3 +686,106 @@ LVS`): jobs `gds` **success**, `gl_test` **success**, `viewer` **success**,
 `precheck` **failure**. The logs have expired, so the failing check is unknown. This
 matches Matt Venn's statement in section 9: hardening a macro works, the precheck is the
 open problem.
+
+---
+
+## 11. Working recipe: the 512x16 SRAM macro through the cmos5l flow, 2026-09-18
+
+**Result.** Branch `sram-smoke`, commit `565673f`, GitHub Actions run `35377845679`:
+`gds`, `precheck`, `gl_test` and `viewer` all pass. `RM_IHPSG13_1P_512x16_c2_bm_bist` in a
+2x2 tile, with the pin-level tester around it. As far as we know this is the first
+published cmos5l SRAM result that passes the Tiny Tapeout precheck.
+
+- **Precheck: all nine checks pass**, including the **KLayout SG13CMOS5L DRC** over the
+  merged GDS: 333 rules, tables `main`, FEOL, BEOL, OFFGRID, ANGLE, PIN, FORBIDDEN,
+  RECOMMENDED and CONNECTIVITY switched on, 785,170 polygons (the full macro hierarchy:
+  48 `RM_IHPSG13_*` cells, 1.16 M polygons flattened), **0 violations**. So the macro
+  internals are clean against the cmos5l sign-off deck at PDK `2bbec755`; the section 10
+  worry about the macro GDS did not materialise. The pin check was the real obstacle.
+- **gl_test**: 5/5 at gate level, including all 512 words written and read back (the
+  macro itself is simulated by its vendored behavioural model).
+- **Hardening**: about 5 minutes. Detailed routing 94, 12, 18, then 0 violations at
+  iteration 3. LVS 0, antenna 0, PSM "All shapes on net VPWR/VGND are connected",
+  max slew/cap/fanout violations 0.
+- **Timing at 20 ns** (macro libs mapped per corner since run 8): setup WNS +11.07 ns
+  (nom_slow_1p08V_125C), +11.32 (typ), +11.46 (fast); hold WNS +0.124 ns (fast), +0.318
+  (typ), +0.658 (slow); no violations.
+- **Area**: core 126,685 um2, macro 45,309 um2, 494 standard cells at 7,203 um2;
+  utilisation 41.5 %, standard cells alone 8.9 %.
+- Not checked by anything above: silicon, chip-level IR drop, and `tt_top` integration
+  (TT's job at tapeout).
+
+### The recipe (`src/config.json` and `src/pdn_cfg.tcl` on the branch)
+
+1. `MACROS` as in the SG13G2 reference, with three corrections. The instance key is the
+   **flattened path** (`u_imem.sram`, run 1). Orientation **FS** at **(12, 40)**. The lib
+   keys are **`*_typ_*`, `*_fast_*`, `*_slow_*`**: the cmos5l STA corners are all `nom_*`,
+   so the reference's `nom_*`/`min_*`/`max_*`/`*` keys timed the macro with the typ lib at
+   every corner (LibreLane loads every matching key, `common/toolbox.py` `filter_views`).
+2. `PDN_MACRO_CONNECTIONS`: `VDD!` and `VDDARRAY!` to `VPWR`, `VSS!` to `VGND`.
+3. `PDN_CFG`: LibreLane 3.1.0.dev3's default `pdn_cfg.tcl` verbatim, macro grid replaced
+   by a `pdngen` wrapper (details below). Stripe keys: `FP_PDN_VWIDTH 2.1`,
+   `FP_PDN_VPITCH 67.44` (6 x 11.24), `FP_PDN_VSPACING 3.52`, `FP_PDN_VOFFSET 26.36`, with
+   the macro at x = 12: every stripe that crosses the macro lies inside one of its
+   same-net power columns.
+4. `MAGIC_EXT_ABSTRACT_CELLS ["RM_IHPSG13_.*"]` (LVS), `ERROR_ON_MAGIC_DRC false`,
+   `MAGIC_MACRO_STD_CELL_SOURCE PDK`. Magic reports 57,923 DRC errors, every one inside
+   the macro's bounding box (Metal2 minimum area M2.d 30,720; "Can't overlap those
+   layers" 25,944; LU.d 594; subcell overlap 376; SRAM-exception rules NW.d and Cnt.c
+   268): Magic's cmos5l tech lacks the SRAM exceptions the KLayout deck applies, and Magic
+   DRC is not part of the cmos5l precheck.
+5. `ERROR_ON_ILLEGAL_OVERLAPS false`, for one checked case (below).
+6. `DRT_OPT_ITERS 12`: a smoke-test bound only; routing converges at iteration 3.
+
+### Macro facts that drive the recipe (LEF and GDS, `macro/`)
+
+- All **108 signal pins are Metal2 stubs on one edge** (LEF y 0 to 0.26): per data bit a
+  group of five (`A_DIN`, `A_BIST_DIN`, `A_BM`, `A_BIST_BM`, `A_DOUT`) every 11.24 um across
+  the whole width, plus address and control in x 102 to 135. 63 of them are tied off
+  (46 to TIELO, 17 to TIEHI cells, one cell per pin), so that edge needs routing room and
+  nearby rows for the tie cells.
+- Power pins are all Metal4 columns, 2.81 um wide: **`VDD!` touches only the signal-pin
+  edge** (local y 0 to 38.825), **`VDDARRAY!` only the opposite edge** (45.465 to 191.34),
+  `VSS!` and four middle `VDD!` columns run full height. The LEF puts a Metal4 OBS across
+  each split column (y 39.085 to 45.205), but the GDS (flattened) has no Metal4 of any
+  datatype, no Via3 and no TopMetal1 within 1 um of the stripes in that band.
+- Metal4 OBS sits 0.26 um either side of every power column, declared `SPACING 0.21`.
+
+### What failed on the way, and why (runs on `sram-smoke`)
+
+| Run | Commit | Result | Root cause, from the logs |
+|---|---|---|---|
+| 1 | `76c2930` | CheckMacroInstances | instance must be named by its flattened path, `u_imem.sram` |
+| 2, 3 | `05a797f`, `53d0057` | GeneratePDN PDN-0232/0233 | the default-style macro grid connects Metal4 to TopMetal1; with `FP_PDN_MULTILAYER 0` there is nothing to connect, the grid is empty |
+| 4 | `199b1f3` | cancelled at the 6 h limit in DRT | (a) macro N at (12, 10) put all 108 pins 6 um above the core edge: 3,013 DRC at iteration 0, about 2,600 after 50. (b) 654 PSM-0038: pdngen cut every stripe 0.48 um short of the fixed macro, so the macro was an island; PSM's walk starts on a top-layer node, started on the macro's own pins, and reported the whole (connected) stdcell grid as unconnected. `Checker.PowerGridViolations` had deferred an error, so the run could not have passed anyway |
+| 5 | `42f5b10` | gds, gl_test pass; **precheck pin check fails** | FS at (12, 40) fixed routing (98 to 0 in 3 iterations). Metal4 bridges from the cut stripe ends into the columns connected the macro (PSM clean, LVS clean, KLayout cmos5l DRC clean), but `pin_check.py` requires **every Metal4 power port to reach within 10 um of both the top and the bottom edge** (and be at least 2.1 um wide): 16 LEF errors "Port VGND/VDPWR is too far from top/bottom edge of module: 274.22 / 231.82 > 10 um", one per half-stripe |
+| 6 | `c33724a` | GeneratePDN PDN-0234/0235 | releasing the macro for all of `pdngen`: `pdn::check_setup` (`PdnGen::checkDesign`) requires every macro to be placed and fixed |
+| 7 | `f6ec2a5` | fails only on deferred `Checker.IllegalOverlap` | full-height stripes work (PSM, DRT 0, LVS 0, TT `pin_check.py` passes when run locally on the final LEF and GDS). Magic, extracting the macro from its LEF, reports 5 x "Illegal overlap between obsm4 and metal4 (types do not connect)", all where the four POWER stripes cross the OBS at the `VDD!`/`VDDARRAY!` split |
+| 8 | `565673f` | **all jobs pass** | illegal overlap waived with the GDS evidence; lib keys fixed |
+
+### The PDN wrapper, and the constraint it puts on placement
+
+- On cmos5l the macro can only be powered by **Metal4 on Metal4**: the block's stripe
+  layer is the macro's pin layer, and TopMetal1 belongs to `tt_top` (section 10). The
+  stripes must therefore lie inside the macro's power columns, and because of the pin
+  check they must run **full height through the macro**.
+- `pdngen` makes every fixed instance an obstruction (`grid.cpp`
+  `Grid::makeInitialObstructions`) and its same-net exception (`shape.cpp` `Shape::cut`)
+  needs a stripe wider than the pin, which the OBS 0.26 um away forbids. The wrapper runs
+  the four steps of `pdngen` at OpenROAD `dcf36133` itself (`pdn::check_setup`,
+  `pdn::build_grids`, `pdn::write_to_db`, `pdn::reset_shapes`) and marks the macro PLACED
+  only around `build_grids`. It then fails the step unless every stripe shape over a
+  macro lies inside same-net power columns (gaps of at most 7 um between two same-net
+  pins allowed) and every macro supply carries a stripe, and it runs `check_power_grid`
+  with errors enabled, so a broken grid stops the run in minutes, not at the end.
+- The detailed router does not flag stripes over the macro OBS: FlexGC skips checks
+  between two fixed shapes. Only Magic's abstract extraction does (the waived overlap).
+- **Placement rule this implies**: the macro's x must put its power columns under the
+  stripe grid. With pitch 67.44 and offset 26.36 from the core xMin, that is x = 12 +
+  67.44 k; any other x needs `FP_PDN_VOFFSET` recomputed (`src/pdn_cfg.tcl` has the
+  arithmetic). Orientation must keep the columns vertical (N, FS, FN, S). Put the signal
+  edge where there is routing room: FS with the pins facing free rows routed at once,
+  N with the pins 6 um from the core edge never did.
+- A mock of the relevant OpenDB calls in Python's Tcl 8.6 (`tkinter`) ran the real
+  `pdn_cfg.tcl` offline before each push; it caught the geometry but not PDN-0234,
+  which lives in C++ (run 6).
