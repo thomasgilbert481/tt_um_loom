@@ -70,23 +70,24 @@ not tried CMOS5L. Any fix on their side takes calendar time, so the first
 failing run has to exist in September, not at the October gate. Being the
 first public cmos5l SRAM example is also worth doing in its own right.
 
-- [ ] Opus: branch `sram-smoke`. Vendor the macro views (GDS, LEF, the three
+- [x] (2026-09-17, on `sram-smoke`) Opus: branch `sram-smoke`. Vendor the macro views (GDS, LEF, the three
       lib corners, CDL, Verilog model) from the pinned IHP-Open-PDK commit named
       in `docs/tt_cmos5l_facts.md` into `macro/`, with a README naming the
       commit. Port names come from the macro's Verilog model, not from memory.
-- [ ] Opus: `src/loom_imem_macro.v` wrapping the macro behind the `loom_imem`
+- [x] (2026-09-17, on `sram-smoke`) Opus: `src/loom_imem_macro.v` wrapping the macro behind the `loom_imem`
       interface (this file becomes the MACRO backend later), BIST and bit-mask
       pins tied off as the model requires, plus a pin-level test top that can
       write and read every word through the TT pins.
-- [ ] Opus: cocotb test against the macro's Verilog model: walking ones,
+- [x] (2026-09-17, on `sram-smoke`, 5 of 5 pass) Opus: cocotb test against the macro's Verilog model: walking ones,
       address uniqueness, full 512 x 16 sweep.
-- [ ] Opus: `src/config.json` macro keys from the `tt_um_urish_sram_test` recipe
+- [x] (2026-09-17, on `sram-smoke`) Opus: `src/config.json` macro keys from the `tt_um_urish_sram_test` recipe
       (`MACROS`, `PDN_MACRO_CONNECTIONS`, `PDN_CFG` with the Metal4 connection,
       `MAGIC_EXT_ABSTRACT_CELLS`, `ERROR_ON_MAGIC_DRC: false`) with the PDN
       stripe pitch matched to the macro's power pins. Allowed on this branch
       only, under D-015.
-- [ ] Thomas: push the branch, collect the `gds` and precheck logs, post them
-      in the Discord thread, record the outcome in `docs/AREA.md` and in
+- [ ] Push the branch and iterate to a hardened, prechecked result (four CI
+      runs so far, see the session log and `docs/tt_cmos5l_facts.md` on the
+      branch), then post the outcome in the Discord thread, record the outcome in `docs/AREA.md` and in
       `docs/tt_cmos5l_facts.md` section 9.
 - [ ] If Ken's config becomes public, diff it against ours before a second try.
 
@@ -104,8 +105,8 @@ same cocotb UART model as M0; first synthesis numbers recorded.
       control, retire record).
 - [ ] `isa/isa.yaml` v1.0 frozen. Every mnemonic, encoding, flag effect, and
       timing class from `docs/ARCHITECTURE.md` section 11. Frozen means changes
-      need a `DECISIONS.md` entry. (Now 0.2.0: 64 instructions, no overlaps,
-      75.8 percent of the encoding space used.)
+      need a `DECISIONS.md` entry. (Now 0.4.0: 64 instructions, no overlaps,
+      75.8 percent of the encoding space used; 0.4.0 added `SETP ... D`.)
 - [x] 2026-09-17: `tools/loomisa`, the only parser of `isa.yaml`: encode,
       decode, overlap check, and generators for `src/loom_decode.v` (the
       decoder module itself, so RTL never hand-decodes), `src/loom_isa.vh` and
