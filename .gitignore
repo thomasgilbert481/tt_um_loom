@@ -18,3 +18,7 @@ tools/**/__pycache__/
 formal/**/*_work/
 *.pyc
 .venv/
+
+# Co-simulation outputs (test/test_cosim.py)
+test/cosim_failures/
+test/cosim_coverage.json

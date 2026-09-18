@@ -186,7 +186,9 @@ and detailed routing has only Metal1 to Metal4. Every push to any branch
 started that eight-hour pipeline, including documentation and Python-only
 commits.
 Decision: `.github/workflows/gds.yaml` gains a `paths` filter (`src/**`,
-`info.yaml`, `test/**`, `macro/**`, the workflow itself) and a `concurrency`
+`info.yaml`, `macro/**`, the workflow itself; `test/**` was in the first
+version and was dropped the same day, because a test-only commit re-ran the
+whole hardening of an unchanged design) and a `concurrency`
 group that cancels a superseded run on the same branch. The jobs themselves are
 the unchanged Tiny Tapeout template. This is the one sanctioned edit to that
 file; `CLAUDE.md` says so.

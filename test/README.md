@@ -68,3 +68,32 @@ Using Surfer
 ```sh
 surfer tb.fst
 ```
+
+## Co-simulation against the golden model (`test_cosim.py`)
+
+`test_cosim` runs constrained-random programs from `tools/loomgen` on the RTL
+and on the Python golden model `tools/loomsim` in lockstep, one clock at a
+time, and compares the retire record, the pad outputs and a set of guard
+registers on every cycle, plus the full architectural state periodically and at
+the end of each seed. The two sides were written independently from
+`docs/SEMANTICS.md`. The alignment scheme is documented at the top of the file.
+
+Environment knobs:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOOM_COSIM_SEEDS` | 12 | random seeds loaded through the backdoor |
+| `LOOM_COSIM_CYCLES` | 4000 | cycles per seed |
+
+Two further seeds load the program and start the threads through the real SPI
+host port. A divergence fails the test with the seed, cycle, thread, PC,
+disassembly and both records, and writes `cosim_failures/seed_<n>.json`, which
+`python -m tools.loomgen --replay test/cosim_failures/seed_<n>.json --trace 1`
+replays in the model. Functional coverage is printed at the end and written to
+`cosim_coverage.json`. The module skips itself at gate level (no hierarchy).
+
+Fault-injection check (2026-09-18): two deliberate RTL bugs compiled from a
+scratch copy of `src/` through `make SRC_DIR=...`, one inverting the SUB carry
+and one making the tick one 1/256 step late, were both caught within the first
+seed (cycles 133 and 125), so a clean run is evidence, not an absence of
+checking.

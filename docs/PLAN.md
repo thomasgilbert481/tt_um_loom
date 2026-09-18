@@ -141,6 +141,16 @@ same cocotb UART model as M0; first synthesis numbers recorded.
 - [ ] Verification L1 unit tests for regfile, ALU, timer, pins; L2 directed
       tests generated from `isa.yaml` (at least one per mnemonic) passing on
       Icarus; first constrained-random co-sim run (1000 programs) passing.
+      Progress 2026-09-18: co-simulation is in (`tools/loomgen`, 120 generator
+      tests; `test/test_cosim.py` compares RTL and golden model on every cycle:
+      retire record, pads, guards, slot-grid PC rule, periodic full state).
+      Default run: 12 backdoor seeds x 4000 cycles plus 2 SPI-loaded seeds, 24 s,
+      **zero divergences** between the independently written RTL and model.
+      Fault injection: an inverted SUB carry and a one-step-late tick were both
+      caught in the first seed. Still open: 1000-program run, coverage holes
+      (57 reachable bins: per-thread mnemonic bins, ten flag outcomes, BNC not
+      taken, CSRW NOW, WAITS over CLR; unbuilt instructions should be marked
+      unreachable rather than counted).
 - [ ] `firmware/uart_tx.loom` passes the L3 UART test at 115200 and 1 Mbaud.
 - [x] 2026-09-18: first hardening of the M1 core (CI run 35272974272): DRC,
       LVS and antenna clean, precheck and gate-level test pass, but 78.8

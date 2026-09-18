@@ -59,7 +59,7 @@ export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 # proves the netlist end to end (host port, timing, UART). Run the full set at
 # gate level by hand with: make GATES=yes COCOTB_TEST_MODULES=<list>
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_cosim
 else
 COCOTB_TEST_MODULES ?= test_host,test_timing,test_uart
 endif

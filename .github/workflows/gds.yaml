@@ -1,15 +1,15 @@
 name: gds
 
 # D-018: hardening takes hours at 6x4, so it runs only when something that
-# reaches the GDS or the gate-level test changes, and a newer push to the same
-# branch cancels an older run that is still going. Everything below `jobs:` is
+# reaches the GDS changes, and a newer push to the same branch cancels an older
+# run that is still going. After a test-only change, dispatch this workflow by
+# hand to re-run gl_test. Everything below `jobs:` is
 # the Tiny Tapeout template, unchanged.
 on:
   push:
     paths:
       - 'src/**'
       - 'info.yaml'
-      - 'test/**'
       - 'macro/**'
       - '.github/workflows/gds.yaml'
   workflow_dispatch:
