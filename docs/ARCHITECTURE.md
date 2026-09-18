@@ -124,14 +124,15 @@ Register views: `PIN_IN[15:0] = {3'b0, ui_in[7], ui_in[3:0], uio_in[7:0]}`,
 ### 4.2 Reset and run control
 
 After reset all threads are halted with PC = `RESET_PC[t]` (host writable,
-default `t * 0x100`). The host loads instruction memory while threads are
-halted, then sets bits in `RUN`. `HALT` clears the thread's RUN bit and raises
-HOST_IRQ if enabled. The host can also halt, resume and single-step (execute
-exactly one instruction) any thread.
+default `t * IMEM_WORDS / 4`, D-017). The host loads instruction memory while
+threads are halted, then sets bits in `RUN`. `HALT` clears the thread's RUN bit
+and raises HOST_IRQ if enabled. The host can also halt, resume and single-step
+(execute exactly one instruction) any thread.
 
-OPEN (area-gated, M3): a 16-entry boot ROM selected by `ui_in[4]` high at reset
-that transmits a fixed string on OUT0 at 115200 baud, so first silicon can be
-checked with nothing but a scope. Costs about 200 cells.
+OPEN (area-gated, M3): a 16-entry boot ROM selected by IN4 (`ui_in[7]`) high
+at reset that transmits a fixed string on OUT0 at 115200 baud, so first
+silicon can be checked with nothing but a scope. Costs about 200 cells.
+(`ui_in[4]` was the v0.1 choice; it is now the host chip select.)
 
 ## 5. Programmer's model (per thread unless stated)
 
@@ -203,8 +204,9 @@ Reserved CSR numbers read 0 and ignore writes.
   otherwise (432/436 clocks at a 434-clock tick, 0.5 percent of a 115200 baud
   bit). Two mechanisms give clock-exact edges for any period: the bit engine in
   auto mode, and deadline-latched pin writes, where `SETP pin, v, D` stages the
-  write and the hardware applies it on the exact clock the next `WAITD`
-  deadline is reached (M2, decision D-016).
+  write and the hardware applies it on the exact clock the thread's next
+  deadline is reached, normally the one the following `WAITD` sets (M2,
+  decision D-016, cycle-exact rules in `docs/SEMANTICS.md` 6.10).
 - `SETD k`: `TD <= NOW + k`. Use it to re-anchor the schedule to an external
   event (for example right after `WAITE` sees the start-bit edge; then
   `WAITD` of 1.5 bit times lands the first sample mid-bit).
@@ -426,11 +428,19 @@ Instruction memory is the single biggest area item. Decision gate at PLAN M2
    cells for LVS and Magic DRC disabled for the macro, as in that project's
    `src/config.json`. Details and sources: `docs/tt_cmos5l_facts.md` section 3.
    Data memory would be a 256x8 or 512x8 macro, or flops.
-2. **Flip-flop array, 256 x 16.** 4096 DFFs at 52.6 um² each is 215K um², about
-   23 percent of the 6x4 block before the 256:1 x 16 read mux, so this only
-   fits if the rest of the design stays under about 10K cells. Latch cells are
-   an option only if Yosys/OpenROAD handle them cleanly in this PDK (VERIFY).
-3. **Flop array 128 x 16** as the emergency fallback. Enough for UART, SPI, I2C
+2. **Flip-flop array, 256 x 16** (built at M1). Measured: about half of the
+   710K um² of placed cells and 68 percent of the flops, which puts the block
+   at 79 percent utilisation with no M2 features yet (`docs/AREA.md`). Each bit
+   costs a `dfrbpq_1` (49.0 um²) plus a write-enable `mux2_1` (18.1 um²).
+3. **Latch array, 256 x 16**, the way Ibex builds its latch register file:
+   one integrated clock gate (`lgcp_1`, 27.2 um²) per word opens that word's
+   latches while a flop-held write word is stable, and each bit is a
+   `dlhq_1` latch (30.8 um²) with no per-bit mux. Storage drops from about
+   275K um² to about 135K um², roughly 15 percent of the core. Costs: latch
+   timing in STA, a hold-safe write scheme, and Verilator/TT-lint waivers for
+   intentional latches inside `loom_imem.v` only. Fallback if the macro fails
+   the precheck.
+4. **Flop array 128 x 16** as the emergency fallback. Enough for UART, SPI, I2C
    and one stretch protocol at a time.
 
 The macro is the preferred path because it turns the biggest area item into
@@ -443,7 +453,7 @@ power pins, and expects TT to accept DRC-clean macros; macros currently fail
 the TT precheck, so the gate requires a precheck-clean run (D-014,
 `docs/tt_cmos5l_facts.md` section 9).
 
-`loom_imem.v` wraps all three behind one interface (`addr`, `rdata` one cycle
+`loom_imem.v` wraps all four behind one interface (`addr`, `rdata` one cycle
 later, host `we/waddr/wdata`), selected by a parameter, so the choice never
 leaks into the core.
 

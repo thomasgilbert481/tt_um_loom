@@ -159,9 +159,13 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       replicated per consumer; then re-harden. M2 features (FIFOs, bit
       engines, about 80-100K um2) do not fit until the memory decision frees
       area, so the memory gate below is also the area gate.
-- [ ] `docs/SEMANTICS.md` M2 text (director, before any M2 RTL or model work):
-      FIFOs and blocking PUSH/POP, WAITB, bit engine manual and auto mode with
-      encoders, stuffing and CRC, deadline-latched `SETP ... D` (D-016), IRQ.
+- [x] 2026-09-18: `docs/SEMANTICS.md` M2 text: FIFOs with blocking PUSH/POP
+      and host-side rules (6.7), WAITB, the host interrupt (6.8), bit engine
+      manual mode with NRZ, INV, DIR, CNT-as-loop-counter and serial CRC
+      (6.9), deadline-latched `SETP ... D` (6.10), CAPS and BADOP bits. The
+      ISA 0.4.0 edits it needs (SETP `D` field, SHO/SHI set Z, canonical CRC
+      presets) land together with the M2 RTL. Auto mode, NRZI, Manchester and
+      stuffing are specified before M3.
 - [ ] `loom_spi_host` + `loom_host_ctl`: full `docs/HOST_PROTOCOL.md` including
       the debug space, single-step, IRQ.
 - [ ] `loom_fifo` x 8, `PUSH`/`POP`, `WAITB`, `SIG`/`CLR`/`WAITS`.
@@ -183,9 +187,11 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       working on cmos5l; ask "Ken" on the TT Discord for his config once
       public), alongside the FLOPS-256 run. The gate is only passed by a run
       that also clears the TT **precheck**, which macros currently fail; if
-      precheck is still failing at the gate, take FLOPS and keep the macro
-      branch alive until M4. Results in `docs/AREA.md`; Jane Street's answer
-      on macro acceptance in hand; record the pick in `docs/DECISIONS.md`.
+      precheck is still failing at the gate, take the latch array (option 3 in
+      ARCHITECTURE 12, about 140K um2 smaller than the M1 flops) rather than
+      FLOPS, and keep the macro branch alive until M4. Results in
+      `docs/AREA.md`; Jane Street's answer on macro acceptance in hand; record
+      the pick in `docs/DECISIONS.md`.
 - [ ] Fable review: protocol coverage, host protocol, area and timing.
 
 ### M3: bit engines, device emulation, formal (by 2026-11-09)

@@ -117,18 +117,28 @@ at every edge:
 | `NOW, TD, DT, ACC, TICK_SEEN` | section 4 | 0 | |
 | `TICK_INT, TICK_FRAC, OUTGRP, INGRP` | 16, 8, 10, 10 | 1, 0, 0, 0 | |
 | `STEPS` | 16 | 0 | +1 at the commit of every valid slot, done or stalled |
-| BE state (`SR, CNT, CRC, BE_*`, `CRC_*`) **[M2/M3]** | | 0 | |
+| BE state (`SR, CNT, CRC, BE_*`, `CRC_*`) **[M2/M3]** | 16, 5, 16, ... | 0 | 6.9 |
+| `INQ_CNT, OUTQ_CNT` **[M2]** | log2(`FIFO_DEPTH`)+1 each | 0 | 6.7; entries are not reset |
+| `LAT_VALID, LAT_PIN, LAT_VAL` **[M2]** | 1, 5, 1 | 0 | 6.10 |
 
 Global: `RUN[3:0] = 0`, `HALTED[3:0] = 0`, `STEP_REQ[3:0] = 0`, `SFLAGS = 0`,
 `OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`. `BADOP` is a 16-bit register, reset
-0: bits 3:0 are per thread, bit 15 is the host access error, the rest read 0;
-the host writes 1 to clear a bit. `RESET_PC[t] = t * (IMEM_WORDS / 4)`, so the
+0: bits 3:0 are per thread, bit 14 is the host FIFO error (6.7, M2), bit 15 is
+the host access error, the rest read 0; the host writes 1 to clear a bit. `RESET_PC[t] = t * (IMEM_WORDS / 4)`, so the
 four threads never alias whatever the memory size (0, 64, 128, 192 for 256
 words; `t * 0x100` for 1024). Instruction memory is **not** reset.
 
 `CAPS` (read-only, 16 bits): `[2:0]` log2 of the FIFO depth, `[3]` FIFOs built,
-`[4]` bit engine built, `[5]` data memory built, `[6]` boot ROM built, `[11:7]`
-zero, `[15:12]` log2 of `IMEM_WORDS`. The M1 build with 256 words reads 0x8000.
+`[4]` bit engine built (manual mode), `[5]` data memory built, `[6]` boot ROM
+built, `[7]` deadline-latched `SETP` built (M2), `[8]` bit engine auto mode
+built (M3), `[11:9]` zero, `[15:12]` log2 of `IMEM_WORDS`. The M1 build with
+256 words reads 0x8000.
+
+ISA note: the M2 text in 6.7 to 6.10 needs three `isa/isa.yaml` changes that
+land together with the M2 RTL as ISA 0.4.0, so that the generated decoder and
+the RTL change in one commit: bit 0 of `SETP` becomes the `D` field; `SHO` and
+`SHI` list `Z` as a flag they set; the CRC presets are stored in canonical
+`n`-bit form and left-aligned by the assembler.
 
 `PREV_PINS` is updated at the commit of every valid slot with the `pin_in`
 values that slot saw in X, whatever the instruction was.
@@ -250,15 +260,105 @@ writes **without** setting `BADOP`: only instructions set `BADOP`. `NOW` reads `
 sets `SWIRQ[t]` (host-visible, host-cleared). `CSRW FLAGS` writes `{T, C, Z}`.
 `CSRW TD` writes `TD`. `CSRW PIN_OUT/PIN_OE/OD_MASK` write the whole register.
 
-### 6.7 FIFOs **[M2]**, bit engine **[M2/M3]**, data memory **[M2, optional]**
+### 6.7 FIFOs **[M2]**
 
-- `PUSH ra`: if OUTQ not full in X: push at commit, `done`; else stall.
-- `POP rd`: if INQ not empty in X: `rd <=` head, pop at commit, `done`; else
-  stall. Both use `WAIT_ACTIVE` like waits.
-- `SHO, SHI, LDSR, STSR, CRCI, STCRC` and the BE CSRs follow ARCHITECTURE
-  section 8; their cycle-exact text is added to this file before M2 work
-  starts.
-- `LD, ST`: as in `isa.yaml`; one slot.
+Per thread `t`: `INQ[t]` (host to thread) and `OUTQ[t]` (thread to host), each
+`FIFO_DEPTH` entries of 16 bits (a build parameter, a power of two, default 4)
+with occupancy counts `INQ_CNT[t]` and `OUTQ_CNT[t]` in `0 .. FIFO_DEPTH`.
+Counts reset to 0; entry contents are not reset. A push or pop takes effect at
+an edge and is visible from the following cycle, like every other register.
+
+- `PUSH ra`: `done` iff `OUTQ_CNT[t] < FIFO_DEPTH` as visible in X; the entry
+  is appended at the commit edge. Otherwise stall.
+- `POP rd`: `done` iff `INQ_CNT[t] > 0` as visible in X; `rd <=` the head
+  entry and the entry is removed at the commit edge. Otherwise stall.
+- Both use `WAIT_ACTIVE` exactly like the waits of 6.4 and change no flags.
+  Between a thread's X cycle and its commit edge only the host can touch that
+  thread's FIFOs, and the host can only pop OUTQ and push INQ, so the X-cycle
+  decision can never be invalidated.
+- Host push to `INQ[t]` (SPI FIFO space): accepted iff `INQ_CNT[t] <
+  FIFO_DEPTH` as visible in the cycle before the commit edge; otherwise the
+  word is dropped and `BADOP[14]` (host FIFO error) is set. Host pop from
+  `OUTQ[t]`: returns the head iff `OUTQ_CNT[t] > 0` as visible in the cycle
+  before the commit edge and removes it; otherwise returns 0, removes nothing
+  and sets `BADOP[14]`. A thread push or pop committing at the same edge is
+  applied too: the new count is `count + pushes - pops`.
+- `CTRL.RESET` of thread `t` also empties `INQ[t]` and `OUTQ[t]`.
+- `WAITB c` conditions (6.4): 1 is `OUTQ_CNT[t] < FIFO_DEPTH`, 2 is
+  `INQ_CNT[t] > 0`, 3 is `TICK_SEEN[t]`, 0 is "bit engine idle", which is
+  always true until auto mode exists (M3).
+
+### 6.8 Host interrupt **[M2]**
+
+`HOST_IRQ` (pad `uo_out[6]`) is a register, updated at every edge to
+`any(IRQ_STAT & IRQ_EN) | any(IRQ_STAT2 & IRQ_EN2) | any(SWIRQ)` computed from
+the values visible in the cycle before the edge, where `IRQ_STAT =
+{SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}` and `IRQ_STAT2 =
+{12'b0, HALTED[3:0]}` (register addresses in `docs/HOST_PROTOCOL.md`). It is
+level-sensitive: the host clears the cause, not the pin.
+
+### 6.9 Bit engine, manual mode **[M2]**
+
+Per-thread state: `SR` (16), `CNT` (5), `CRC` (16) and the CSRs `BE_CFG`,
+`BE_PINS`, `BE_RELOAD`, `CRC_POLY`, `CRC_INIT`, all reset to 0. At M2 only
+three `BE_CFG` fields exist: `DIR` (bit 1: 0 LSB first, 1 MSB first), `INV`
+(bit 7: invert the pin level) and `CRC_EN` (bit 9). Writes to the other
+`BE_CFG` bits are ignored and they read 0 until M3 builds them, so firmware can
+detect what the engine supports. `BE_PINS = {in[9:5], out[4:0]}` holds two pin
+indices.
+
+- `SHO`: `b = DIR ? SR[15] : SR[0]`. One pin write (6.3 rules, open drain
+  included) of `b ^ INV` to pin index `BE_PINS.out`. `SR <= DIR ? {SR[14:0],
+  1'b0} : {1'b0, SR[15:1]}`. `CNT <= (CNT == 0) ? 0 : CNT - 1`, and `Z = (new
+  CNT == 0)`; `C` and `T` unchanged. If `CRC_EN`, the CRC is updated with `b`.
+- `SHI`: `s = pin_in(BE_PINS.in) ^ INV`. `SR <= DIR ? {SR[14:0], s} : {s,
+  SR[15:1]}`, so after `n` LSB-first bits the value sits in `SR[15:16-n]` and
+  `STSR r` then `SHRI r, 16-n` right-aligns it. `CNT` and `Z` as for `SHO`. If
+  `CRC_EN`, the CRC is updated with `s`.
+- CRC update with bit `x`, serial and MSB-first on a left-aligned register:
+  `fb = CRC[15] ^ x; CRC <= {CRC[14:0], 1'b0} ^ (fb ? CRC_POLY : 16'h0000)`. An
+  `n`-bit CRC lives in `CRC[15:16-n]` with its polynomial and initial value
+  left-aligned the same way (`poly << (16 - n)`); the assembler's `.crc`
+  presets do that alignment. The bits enter the register in transmission order.
+- `LDSR ra`: `SR <= ra`. `STSR rd`: `rd <= SR`. `CRCI`: `CRC <= CRC_INIT`.
+  `STCRC rd`: `rd <= CRC`. None changes flags. `CSRR`/`CSRW` reach `SR`,
+  `CNT`, `CRC` and the configuration CSRs as well.
+- With `CNT` as the loop counter a transmit loop needs no general register:
+  `load: LDSR r0; CSRW CNT, r1; bit: SHO; WAITD 1; BNZ bit` is three slots per
+  bit.
+
+Auto mode, NRZI and Manchester coding, bit stuffing, the RX sample phase and
+the stuffing-violation `T` flag are **[M3]** and get their cycle-exact text
+here before M3 work starts. `SHO`/`SHI` executed while the bit engine is not
+built are `NOP` + `BADOP`, as section 9 says.
+
+### 6.10 Deadline-latched pin write **[M2]** (D-016)
+
+`SETP pin, v, D` (the `D` form, encoding bit 0 set) does not write the pin.
+It stages the write in the thread's latch `LAT = {LAT_VALID, LAT_PIN[4:0],
+LAT_VAL}`: at the commit edge `LAT_VALID <= 1, LAT_PIN <= pin, LAT_VAL <= v`,
+replacing any write already staged. A staged write is applied, and
+`LAT_VALID` cleared, at the first later edge `e` at which either
+
+1. `NOW` ticks at `e` to exactly the value of `TD` (TD not written at `e`), or
+2. `TD` is written at `e` (by a `WAITD` first issue, `SETD`, `CSRW TD` or the
+   host) and `reached(NOW', TD')` holds for the values `NOW'` and `TD'` visible
+   after `e`.
+
+In words: the staged write lands on the thread's next deadline, whichever
+instruction set it. So `SETP TX, v, D` followed by `WAITD k` changes the pad
+on the exact edge at which that deadline is reached, for any tick period,
+integer or fractional;
+case 2 covers a thread that was already late, which then writes at its `WAITD`
+commit edge exactly as an ordinary `SETP` would. The staged write follows the
+pin-write rules of 6.3 (open drain included). At an edge where a staged write
+and a slot's ordinary pin writes both touch a pin, the ordinary write wins.
+`CTRL.RESET` of the thread clears `LAT_VALID`. The latch is readable through
+the debug space (`docs/HOST_PROTOCOL.md`, address 0x25).
+
+### 6.11 Data memory **[optional, not planned before M3]**
+
+`LD`, `ST`: as in `isa.yaml`; one slot. Until built they are `NOP` + `BADOP`.
 
 ## 7. Run control and the host **[M1 subset]**
 

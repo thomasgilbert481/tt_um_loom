@@ -79,8 +79,8 @@ while running (data memory is dual-ported or arbitrated; threads win).
 
 | ADDR | Access | Meaning |
 |---|---|---|
-| 0x0000 + t | W | push one word into INQ[t]; dropped if full (check status first or use IRQ) |
-| 0x0000 + t | R | pop one word from OUTQ[t]; returns 0 and does not pop if empty |
+| 0x0000 + t | W | push one word into INQ[t]; dropped if full, which sets CTRL BADOP bit 14 (check status first or use IRQ) |
+| 0x0000 + t | R | pop one word from OUTQ[t]; returns 0, does not pop and sets BADOP bit 14 if empty |
 | 0x0100 + t | R | status: {OUTQ_COUNT[3:0], INQ_COUNT[3:0], OUTQ_EMPTY, OUTQ_FULL, INQ_EMPTY, INQ_FULL} |
 
 Multi-word transactions push or pop consecutive words into the same FIFO (the
@@ -114,6 +114,8 @@ state. (`docs/SEMANTICS.md` section 7.)
 | 0x22 | WAIT_ACTIVE in bit 0 |
 | 0x23 | DT (the hidden target of `DLY`) |
 | 0x24 | TICK_SEEN in bit 0 (M2) |
+| 0x25 | staged pin write: {8'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]} in bits 6:0 (M2, `docs/SEMANTICS.md` 6.10) |
+| 0x26 | {INQ_CNT, OUTQ_CNT} as {byte, byte} (M2), the same counts the FIFO status word reports |
 
 `CSRW PIN_OUT`, `CSRW PIN_OE` and the host's PIN_OUT/PIN_OE writes are raw
 register writes and do not apply the open-drain rule; only pin writes (`SETP`,
