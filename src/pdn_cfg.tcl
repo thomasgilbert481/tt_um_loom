@@ -66,11 +66,12 @@
 # are derived below). So the stripes do not need to stop at the macro at all.
 # pdngen only treats FIXED instances as obstructions (grid.cpp,
 # Grid::makeInitialObstructions skips instances that are not fixed), so the
-# wrapper at the end of this file marks the hard macros PLACED for the
-# duration of the real pdngen call and restores their status afterwards. The
-# rows under and beside the macro are already cut, so no rail or via is made
-# over it; the stripes simply run from the bottom of the core to the top,
-# through the pin columns, and every stripe is one full-height power pin.
+# wrapper at the end of this file marks the hard macros PLACED while pdngen
+# builds its shapes and restores their status before anything is written (the
+# exact sequence is in the comment above the wrapper). The rows under and
+# beside the macro are already cut, so no rail or via is made over it; the
+# stripes simply run from the bottom of the core to the top, through the pin
+# columns, and every stripe is one full-height power pin.
 #
 # Nothing then relies on the stripes being aligned by luck. After pdngen the
 # wrapper checks, for every stripe-layer shape that overlaps a macro, that it
@@ -449,17 +450,34 @@ proc loom_check_macro_stripes {} {
 }
 
 # Wrap LibreLane's single `pdngen` call (scripts/openroad/pdn.tcl sources this
-# file first): hard macros are un-fixed only while the real pdngen runs, so
-# its core-grid stripes are not cut at them; then the result is verified and
-# the grid is checked with errors that stop the step.
+# file first, then runs `pdngen`, with -skip_trim only if PDN_SKIPTRIM).
+#
+# OpenROAD's pdngen proc (src/pdn/src/pdn.tcl at dcf36133, the revision
+# LibreLane 3.1.0.dev3 pins in nix/openroad.nix) is: parse flags, then
+#     pdn::check_setup ; pdn::build_grids $trim
+#     pdn::write_to_db $add_pins $failed_via_report ; pdn::reset_shapes
+# check_setup insists that every macro is placed AND fixed (PdnGen::checkDesign,
+# PDN-0234/0235: CI run 6 stopped there when the macro was released for the
+# whole call), while build_grids turns only fixed instances into obstructions.
+# So the wrapper runs those same four steps itself and releases the hard
+# macros only around build_grids. Any other flag goes to the original proc.
 if { [info commands ::loom_pdngen_unwrapped] eq "" } {
     rename ::pdngen ::loom_pdngen_unwrapped
     proc ::pdngen { args } {
-        foreach flag {-reset -ripup -report_only -check_only} {
-            if { [lsearch -exact $args $flag] >= 0 } {
+        foreach a $args {
+            if { $a ne "-skip_trim" } {
                 return [::loom_pdngen_unwrapped {*}$args]
             }
         }
+        foreach cmd {pdn::check_setup pdn::build_grids pdn::write_to_db pdn::reset_shapes} {
+            if { [info commands ::$cmd] eq "" } {
+                error "LOOMPDN: $cmd does not exist; this wrapper follows pdngen in OpenROAD dcf36133"
+            }
+        }
+        set trim [expr {[lsearch -exact $args -skip_trim] < 0}]
+
+        ::pdn::check_setup
+
         set released [list]
         foreach inst [[ord::get_db_block] getInsts] {
             if { [[$inst getMaster] isBlock] && [$inst isFixed] } {
@@ -467,7 +485,7 @@ if { [info commands ::loom_pdngen_unwrapped] eq "" } {
                 $inst setPlacementStatus "PLACED"
             }
         }
-        set rc [catch { ::loom_pdngen_unwrapped {*}$args } msg opts]
+        set rc [catch { ::pdn::build_grids $trim } msg opts]
         foreach r $released {
             lassign $r inst status
             $inst setPlacementStatus $status
@@ -475,6 +493,10 @@ if { [info commands ::loom_pdngen_unwrapped] eq "" } {
         if { $rc } {
             return -options $opts $msg
         }
+
+        ::pdn::write_to_db 1 ""
+        ::pdn::reset_shapes
+
         loom_check_macro_stripes
         foreach net_name [concat $::env(VDD_NETS) $::env(GND_NETS)] {
             puts "LOOMPDN check_power_grid -net $net_name"
