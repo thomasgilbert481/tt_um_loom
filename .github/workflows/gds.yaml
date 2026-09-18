@@ -1,8 +1,20 @@
 name: gds
 
+# D-018 (as on main): hardening runs only when something that reaches the GDS
+# changes, and a newer push to the same branch cancels an older run that is
+# still going. Everything below `jobs:` is the Tiny Tapeout template, unchanged.
 on:
   push:
+    paths:
+      - 'src/**'
+      - 'info.yaml'
+      - 'macro/**'
+      - '.github/workflows/gds.yaml'
   workflow_dispatch:
+
+concurrency:
+  group: gds-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   gds:
