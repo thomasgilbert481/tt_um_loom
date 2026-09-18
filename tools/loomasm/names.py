@@ -20,6 +20,11 @@ REGISTER_RE = re.compile(r"^r([0-7])$", re.IGNORECASE)
 #: The optional trailing operand that sets an instruction's deadline-timeout bit.
 TIMEOUT_TOKEN = "T"
 
+#: Optional trailing one-bit operands spelled as a bare token, by operand base
+#: name: ``T`` sets a wait's timeout bit, ``D`` makes ``SETP`` a
+#: deadline-latched write (docs/SEMANTICS.md 6.10). Omitted means 0.
+FLAG_TOKENS = {"tmo": TIMEOUT_TOKEN, "lat": "D"}
+
 
 def register_number(text: str) -> "int | None":
     match = REGISTER_RE.match(text)

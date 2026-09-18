@@ -12,7 +12,7 @@ from typing import Optional
 
 from tools.loomisa import Isa, load, operand_base
 
-from .names import TIMEOUT_TOKEN, enum_by_value
+from .names import FLAG_TOKENS, TIMEOUT_TOKEN, enum_by_value
 
 _ISA_CACHE: "Optional[Isa]" = None
 
@@ -37,8 +37,8 @@ def _render(base: str, value: int, isa: Isa) -> "Optional[str]":
         return csr["name"] if csr else str(value)
     if base in isa.enums:                            # edge, cond, ... see enums:
         return enum_by_value(isa, base).get(value, str(value))
-    if base == "tmo":
-        return TIMEOUT_TOKEN if value else None      # omitted when 0
+    if base in FLAG_TOKENS:                          # T, D: omitted when 0
+        return FLAG_TOKENS[base] if value else None
     return str(value)
 
 

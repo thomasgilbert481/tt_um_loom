@@ -148,7 +148,7 @@ module loom_core #(
   wire [4:0]  d_unused_pin, d_unused_csr;
   wire [2:0]  d_unused_funct, d_unused_flag;
   wire [1:0]  d_unused_edge, d_unused_cond;
-  wire        d_unused_val, d_unused_tmo;
+  wire        d_unused_val, d_unused_tmo, d_unused_lat;
   wire [21:0] d_unused_csrsel;
   wire [11:0] d_unused_grp;
   wire [1:0]  d_unused_tmg;
@@ -187,7 +187,7 @@ module loom_core #(
       .f_imm(d_unused_imm), .f_rel(d_unused_rel), .f_abs(d_unused_abs),
       .f_pin(d_unused_pin), .f_val(d_unused_val), .f_edge(d_unused_edge),
       .f_flag(d_unused_flag), .f_tmo(d_unused_tmo), .f_cond(d_unused_cond),
-      .f_csr(d_unused_csr),
+      .f_csr(d_unused_csr), .f_lat(d_unused_lat),
       .csr_tick_int(d_unused_csrsel[0]),  .csr_tick_frac(d_unused_csrsel[1]),
       .csr_outgrp(d_unused_csrsel[2]),    .csr_ingrp(d_unused_csrsel[3]),
       .csr_be_cfg(d_unused_csrsel[4]),    .csr_be_pins(d_unused_csrsel[5]),
@@ -204,7 +204,8 @@ module loom_core #(
   wire _unused_dec_d = &{1'b0, d_unused_a, d_unused_b, d_unused_rel, d_unused_abs,
                          d_unused_imm, d_unused_pin, d_unused_csr, d_unused_funct,
                          d_unused_flag, d_unused_edge, d_unused_cond, d_unused_val,
-                         d_unused_tmo, d_unused_csrsel, d_unused_grp, d_unused_tmg};
+                         d_unused_tmo, d_unused_lat, d_unused_csrsel, d_unused_grp,
+                         d_unused_tmg};
 
   // ============================================================ X stage regs
   reg        vx;
@@ -281,6 +282,7 @@ module loom_core #(
   wire [9:0]  f_rel, f_abs;
   wire [4:0]  f_pin, f_csr;
   wire        f_val, f_tmo;
+  wire        f_lat;      // SETP D (ISA 0.4.0); built at M2, unused until then
   wire [1:0]  f_edge, f_cond;
   wire csr_tick_int, csr_tick_frac, csr_outgrp, csr_ingrp, csr_be_cfg;
   wire csr_be_pins, csr_be_reload, csr_crc_poly, csr_crc_init, csr_now;
@@ -314,7 +316,7 @@ module loom_core #(
       .f_funct(f_funct), .f_rd(f_rd), .f_ra(f_ra), .f_rb(f_rb), .f_imm(f_imm),
       .f_rel(f_rel), .f_abs(f_abs), .f_pin(f_pin), .f_val(f_val),
       .f_edge(f_edge), .f_flag(f_flag), .f_tmo(f_tmo), .f_cond(f_cond),
-      .f_csr(f_csr),
+      .f_csr(f_csr), .f_lat(f_lat),
       .csr_tick_int(csr_tick_int), .csr_tick_frac(csr_tick_frac),
       .csr_outgrp(csr_outgrp), .csr_ingrp(csr_ingrp), .csr_be_cfg(csr_be_cfg),
       .csr_be_pins(csr_be_pins), .csr_be_reload(csr_be_reload),
@@ -343,7 +345,7 @@ module loom_core #(
       grp_ldi, grp_mem, grp_pin, grp_sflag, grp_unary, grp_wait,
       tmg_wait, tmg_blocking,
       f_funct, f_rd, f_ra, f_rb, f_imm, f_rel, f_abs, f_pin, f_val,
-      f_edge, f_flag, f_tmo, f_cond, f_csr,
+      f_edge, f_flag, f_tmo, f_cond, f_csr, f_lat,
       csr_tick_int, csr_tick_frac, csr_outgrp, csr_ingrp, csr_be_cfg,
       csr_be_pins, csr_be_reload, csr_crc_poly, csr_crc_init, csr_now,
       csr_td, csr_flags, csr_tid, csr_sr, csr_cnt, csr_crc, csr_od_mask,

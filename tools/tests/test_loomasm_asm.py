@@ -585,7 +585,7 @@ def test_deadline_check_can_be_skipped_entirely():
 _SAMPLE = {
     "rd": "r1", "ra": "r2", "rb": "r3", "imm": "1", "rel": "0", "abs": "0",
     "pin": "IN0", "val": "1", "edge": "RISE", "flag": "5", "tmo": "T",
-    "cond": "TICK", "csr": "TD",
+    "cond": "TICK", "csr": "TD", "lat": "D",
 }
 
 

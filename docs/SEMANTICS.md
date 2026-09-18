@@ -134,11 +134,11 @@ built, `[7]` deadline-latched `SETP` built (M2), `[8]` bit engine auto mode
 built (M3), `[11:9]` zero, `[15:12]` log2 of `IMEM_WORDS`. The M1 build with
 256 words reads 0x8000.
 
-ISA note: the M2 text in 6.7 to 6.10 needs three `isa/isa.yaml` changes that
-land together with the M2 RTL as ISA 0.4.0, so that the generated decoder and
-the RTL change in one commit: bit 0 of `SETP` becomes the `D` field; `SHO` and
-`SHI` list `Z` as a flag they set; the CRC presets are stored in canonical
-`n`-bit form and left-aligned by the assembler.
+ISA note: ISA 0.4.0 (2026-09-18) carries the encoding side of the M2 text:
+bit 0 of `SETP` is the `D` field (assembler token `D`), `SHO` and `SHI` list
+`Z` as a flag they set, and the CRC presets are stored in canonical `n`-bit
+form for the assembler to left-align. The M1 RTL decodes `SETP ... D` as an
+ordinary `SETP` until the M2 RTL builds the latch.
 
 `PREV_PINS` is updated at the commit of every valid slot with the `pin_in`
 values that slot saw in X, whatever the instruction was.

@@ -13,7 +13,7 @@
 
 meta:
   name: loom
-  version: "0.3.0"
+  version: "0.4.0"
   word_bits: 16
   registers: 8
   register_bits: 16
@@ -39,6 +39,7 @@ field_types:
   C: {name: csr,  bits: 5, kind: csr,   doc: CSR number}
   w: {name: wr,   bits: 1, kind: bit,   doc: 1 = write}
   s: {name: set,  bits: 1, kind: bit,   doc: 1 = set, 0 = clear}
+  L: {name: lat,  bits: 1, kind: bit,   doc: "1 = stage the write for the thread's next deadline (SEMANTICS 6.10)"}
 
 timing_classes:
   one_slot: every execution costs exactly one slot
@@ -93,7 +94,7 @@ instructions:
   - {name: JP,   fmt: "0111vppppprrrrrr", ops: [pin, val, rel6], sem: "if pin_in(pin) == val: PC = PC+1+rel6", flags: [], timing: one_slot, class: branch}
 
   # --------------------------------------------------------------- pins
-  - {name: SETP, fmt: "100000vppppp----", ops: [pin, val], sem: "drive pin to val (open-drain rule applies to BIDIR pins with OD_MASK set); writes to read-only indices are ignored", flags: [], timing: one_slot, class: pin}
+  - {name: SETP, fmt: "100000vppppp---L", ops: [pin, val, lat], sem: "L=0: drive pin to val (open-drain rule applies to BIDIR pins with OD_MASK set; writes to read-only indices are ignored). L=1 (assembler token D): stage the write; it lands on the exact edge of the thread's next deadline (SEMANTICS 6.10)", flags: [], timing: one_slot, class: pin}
   - {name: OEP,  fmt: "100001vppppp----", ops: [pin, val], sem: "PIN_OE[pin] = val; pin must be 0..7, others ignored", flags: [], timing: one_slot, class: pin}
   - {name: OUT,  fmt: "100010---aaa----", ops: [ra], sem: "write ra[OUTGRP.cnt-1:0] to pins OUTGRP.base .. base+cnt-1", flags: [], timing: one_slot, class: pin}
   - {name: IN,   fmt: "100011---ddd----", ops: [rd], sem: "rd = zero_extend(pins INGRP.base .. base+cnt-1)", flags: [], timing: one_slot, class: pin}
@@ -111,8 +112,8 @@ instructions:
   # --------------------------------------------------- data and bit engine
   - {name: PUSH,  fmt: "101000000aaa----", ops: [ra], sem: "OUTQ.push(ra); stalls while full", flags: [], timing: blocking, class: fifo}
   - {name: POP,   fmt: "101000001ddd----", ops: [rd], sem: "rd = INQ.pop(); stalls while empty", flags: [], timing: blocking, class: fifo}
-  - {name: SHO,   fmt: "101001000-------", ops: [], sem: "emit one bit from SR (per DIR) through the encoder to BE_PINS.out; CRC update if CRC_EN; CNT = CNT-1 unless a stuff bit was emitted instead", flags: [], timing: one_slot, class: be}
-  - {name: SHI,   fmt: "101001001-------", ops: [], sem: "sample BE_PINS.in through the decoder into SR (per DIR); CRC update; CNT = CNT-1 unless the bit was a stuff bit; T = stuffing violation", flags: [T], timing: one_slot, class: be}
+  - {name: SHO,   fmt: "101001000-------", ops: [], sem: "b = DIR ? SR[15] : SR[0]; pin write of b^INV to BE_PINS.out; shift SR; CNT = max(CNT-1, 0); Z = (CNT == 0); CRC update with b if CRC_EN (SEMANTICS 6.9). NRZI, Manchester and stuffing at M3", flags: [Z], timing: one_slot, class: be}
+  - {name: SHI,   fmt: "101001001-------", ops: [], sem: "s = pin_in(BE_PINS.in)^INV shifted into SR (per DIR); CNT = max(CNT-1, 0); Z = (CNT == 0); CRC update with s if CRC_EN (SEMANTICS 6.9). T = stuffing violation at M3", flags: [Z, T], timing: one_slot, class: be}
   - {name: LDSR,  fmt: "101010000aaa----", ops: [ra], sem: "SR = ra", flags: [], timing: one_slot, class: be}
   - {name: STSR,  fmt: "101010001ddd----", ops: [rd], sem: "rd = SR", flags: [], timing: one_slot, class: be}
   - {name: CRCI,  fmt: "101011000-------", ops: [], sem: "CRC = CRC_INIT; stuffing state reset", flags: [], timing: one_slot, class: be}
@@ -186,13 +187,13 @@ pins:
   21: {name: OUT5,   dir: out,   pad: "uo[5]"}
 
 crc_presets:
-  usb5:   {poly: 0x0500, init: 0xF800, width: 5,  doc: "USB token CRC5 x^5+x^2+1, left-aligned"}
-  usb16:  {poly: 0x8005, init: 0xFFFF, width: 16, doc: "USB data CRC16 x^16+x^15+x^2+1"}
-  can15:  {poly: 0x4599, init: 0x0000, width: 15, doc: "CAN CRC15, left-aligned as 0x8B32"}
-  smbus8: {poly: 0x0700, init: 0x0000, width: 8,  doc: "CRC-8 x^8+x^2+x+1, left-aligned"}
-  # The generator computes the left-aligned poly from width automatically; the
-  # values above are the canonical polynomials, alignment is a codegen detail
-  # that L1-BE-CRC checks against a Python reference.
+  usb5:   {poly: 0x05,   init: 0x1F,   width: 5,  doc: "USB token CRC5, x^5+x^2+1"}
+  usb16:  {poly: 0x8005, init: 0xFFFF, width: 16, doc: "USB data CRC16, x^16+x^15+x^2+1"}
+  can15:  {poly: 0x4599, init: 0x0000, width: 15, doc: "CAN CRC15, x^15+x^14+x^10+x^8+x^7+x^4+x^3+1"}
+  smbus8: {poly: 0x07,   init: 0x00,   width: 8,  doc: "CRC-8 (SMBus PEC), x^8+x^2+x+1"}
+  # Canonical n-bit form. The CRC unit works on a left-aligned 16-bit register
+  # (SEMANTICS 6.9), so the assembler's .crc directive loads poly << (16 - width)
+  # and init << (16 - width); L1-BE-CRC checks the result against a Python reference.
 
 # Symbolic operand values. The assembler takes these spellings from here.
 enums:

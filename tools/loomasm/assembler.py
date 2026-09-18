@@ -24,7 +24,7 @@ from .diag import (DEADLINE, ERROR, LAYOUT, PIN, RANGE, SYMBOL, SYNTAX,
 from .disasm import disassemble
 from .expr import ExprError, UnresolvedSymbol, evaluate, symbols_in
 from .lexer import NAME, Token
-from .names import (TIMEOUT_TOKEN, csr_table, enum_tables, pin_table,
+from .names import (FLAG_TOKENS, TIMEOUT_TOKEN, csr_table, enum_tables, pin_table,
                     register_number)
 from .parser import Stmt, parse_source
 
@@ -546,7 +546,7 @@ class _Assembler:
         given: List[Optional[List[Token]]] = list(args)
         if len(given) == 1 and not given[0]:
             given = []
-        if ops and operand_base(ops[-1]) == "tmo" and len(given) == len(ops) - 1:
+        if ops and operand_base(ops[-1]) in FLAG_TOKENS and len(given) == len(ops) - 1:
             given.append(None)
         if len(given) != len(ops):
             raise _Bad("%s takes %d operand%s (%s), %d given" % (
@@ -564,16 +564,17 @@ class _Assembler:
     def operand_value(self, instr: Instr, op: str, base: str,
                       group: "Optional[List[Token]]", addr: int,
                       stmt: "Optional[Stmt]" = None) -> int:
-        if base == "tmo":
+        if base in FLAG_TOKENS:
+            token = FLAG_TOKENS[base]
             if group is None:
                 return 0
             if len(group) == 1 and group[0].kind == NAME and \
-                    group[0].text.upper() == TIMEOUT_TOKEN:
+                    group[0].text.upper() == token:
                 return 1
-            value = self.eval_tokens(group, "the timeout operand")
+            value = self.eval_tokens(group, "the %s operand" % base)
             if value not in (0, 1):
-                raise _Bad("the timeout operand is the bare token T (or 0/1), "
-                           "not %d" % value, group[0], RANGE)
+                raise _Bad("the %s operand is the bare token %s (or 0/1), "
+                           "not %d" % (base, token, value), group[0], RANGE)
             return value
         assert group is not None
         if base in ("rd", "ra", "rb"):

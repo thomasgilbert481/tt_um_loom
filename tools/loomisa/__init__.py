@@ -38,10 +38,10 @@ WORD_BITS = 16
 OPERAND_LETTER = {
     "rd": "d", "ra": "a", "rb": "b", "imm": "i", "rel": "r", "abs": "A",
     "pin": "p", "val": "v", "edge": "e", "flag": "n", "tmo": "T", "cond": "c",
-    "csr": "C",
+    "csr": "C", "lat": "L",
 }
 SIGNED_LETTERS = {"r"}          # PC-relative offsets are two's complement
-OPTIONAL_OPERANDS = {"tmo": 0}  # may be omitted when encoding; default value
+OPTIONAL_OPERANDS = {"tmo": 0, "lat": 0}  # may be omitted when encoding; default value
 
 
 class IsaError(ValueError):
@@ -360,7 +360,7 @@ def gen_md(isa: Isa) -> str:
 _DECODE_OUTPUTS = [
     ("rd", 3), ("ra", 3), ("rb", 3), ("imm", 16), ("rel", None), ("abs", None),
     ("pin", 5), ("val", 1), ("edge", 2), ("flag", 3), ("tmo", 1), ("cond", 2),
-    ("csr", 5),
+    ("csr", 5), ("lat", 1),
 ]
 
 
