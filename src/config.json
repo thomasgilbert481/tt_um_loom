@@ -68,6 +68,11 @@
   "//":                             "(98 violations at iteration 0, none after iteration 3).",
   "//":                             "x = 12 is what makes FP_PDN_VOFFSET land the stripes inside the",
   "//":                             "macro's power columns; change one, recompute the other.",
+  "//": "  lib - keyed by timing-corner wildcard. The cmos5l STA corners are nom_typ_1p20V_25C,",
+  "//":     "nom_fast_1p32V_m40C and nom_slow_1p08V_125C, and LibreLane loads every key that",
+  "//":     "matches (common/toolbox.py filter_views). The reference project's keys (nom_*, min_*,",
+  "//":     "max_*, *) gave the typ lib at all three corners and never used fast or slow (CI runs",
+  "//":     "5 and 7: 'library ... typ ... already exists'), so the keys name the process corner.",
   "//": "  nl - the port-only blackbox in src/, not the behavioural model. Same as the reference.",
   "MACROS": {
     "RM_IHPSG13_1P_512x16_c2_bm_bist": {
@@ -84,17 +89,14 @@
         "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.lef"
       ],
       "lib": {
-        "nom_*": [
+        "*_typ_*": [
           "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_typ_1p20V_25C.lib"
         ],
-        "min_*": [
+        "*_fast_*": [
           "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_fast_1p32V_m55C.lib"
         ],
-        "max_*": [
+        "*_slow_*": [
           "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_slow_1p08V_125C.lib"
-        ],
-        "*": [
-          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_typ_1p20V_25C.lib"
         ]
       },
       "nl": [
@@ -139,6 +141,16 @@
 
   "//": "SRAM macro internals trigger massive DRC in Magic; skip (KLayout DRC is already off below).",
   "ERROR_ON_MAGIC_DRC": false,
+
+  "//": "ERROR_ON_ILLEGAL_OVERLAPS - off for ONE known, checked case. The four POWER stripes cross",
+  "//": "the macro's VDD!/VDDARRAY! split, where the LEF puts a Metal4 OBS across each power column",
+  "//": "(local y 39.085..45.205). Magic extracts the macro from its LEF (MAGIC_EXT_ABSTRACT_CELLS",
+  "//": "below) and reports each crossing as 'Illegal overlap between obsm4 and metal4 (types do not",
+  "//": "connect)': 5 boxes in CI run 7, all at the POWER stripes' x, y 186.135..192.255. The macro",
+  "//": "GDS, flattened, has no Metal4 (any datatype), Via3 or TopMetal1 within 1 um of those",
+  "//": "stripes in that band, LVS passes, and the precheck's KLayout DRC checks the real metal.",
+  "//": "The count is still reported as magic__illegal_overlap__count in the run's metrics.",
+  "ERROR_ON_ILLEGAL_OVERLAPS": false,
 
   "//": "Blackbox the SRAM macro during SPICE extraction for LVS: the IHP macros are not LVS clean.",
   "MAGIC_EXT_ABSTRACT_CELLS": ["RM_IHPSG13_.*"],
