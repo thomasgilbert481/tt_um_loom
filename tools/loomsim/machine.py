@@ -1,8 +1,9 @@
 """The Loom golden model: a cycle-based reference implementation.
 
 This module implements ``docs/SEMANTICS.md`` directly.  It is written from that
-document and from ``isa/isa.yaml`` only; it never reads the RTL, which is what
-makes co-simulation meaningful (``docs/VERIFICATION.md``, METH-1).
+document, ``docs/HOST_PROTOCOL.md`` and ``isa/isa.yaml`` only; it never reads
+the RTL, which is what makes co-simulation meaningful
+(``docs/VERIFICATION.md``, METH-1).
 
 The model is a clock, not an interpreter:
 
@@ -25,28 +26,43 @@ Host actions are methods.  Each one commits at the edge that ends the cycle the
 call was made in and is visible from the next cycle, exactly like a host write
 over SPI; when a host write and a thread commit hit the same bits at the same
 edge the thread wins, which the model gets by applying host commits first.
+Host reads answer from the state visible in the cycle they are made in.
 
-Only the ``[M1]`` feature set is built.  Bit-engine and data-memory
-instructions execute as ``NOP`` and set ``BADOP`` (SEMANTICS section 9) unless
-their feature is named in ``features``; ``FIFO`` enables ``PUSH``/``POP`` and
-``WAITB`` conditions 1, 2 and 3.
+Optional features (SEMANTICS 9: an instruction of an unbuilt feature is a
+``NOP`` that sets ``BADOP``, and its CSRs read 0) are chosen at construction:
+
+* ``"FIFO"``: ``PUSH``, ``POP``, ``WAITB`` and the host FIFO space (6.7);
+* ``"BE"``: the bit engine in manual mode, ``SHO``, ``SHI``, ``LDSR``,
+  ``STSR``, ``CRCI``, ``STCRC`` and its CSRs (6.9), plus ``WAITB 0`` (which
+  needs ``"FIFO"`` as well, because ``WAITB`` is built with the FIFOs);
+* ``"SETPD"``: the deadline-latched ``SETP pin, v, D`` (6.10).  Without it the
+  ``D`` bit is ignored and the instruction is an ordinary ``SETP``.
+
+``Machine(features=())`` is the M1 core: its instruction behaviour, pads and
+retire records are unchanged by everything above.  The host registers of
+``docs/HOST_PROTOCOL.md`` 0.2 (``ID``, ``VERSION``, the interrupt registers,
+the whole DEBUG space) exist in every build.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from tools.loomisa import Isa, Instr
 from tools.loomisa import load as load_isa
 
 from . import alu
+from . import hostmap as H
 from .state import (
     THREADS, SLOT_CLOCKS, PC_MASK, WORD_MASK,
-    CSR_FLAGS, CSR_HOST_IRQ, CSR_INGRP, CSR_NOW, CSR_OD_MASK, CSR_OUTGRP,
-    CSR_PIN_IN, CSR_PIN_OE, CSR_PIN_OUT, CSR_SFLAGS, CSR_TD, CSR_TICK_FRAC,
-    CSR_TICK_INT, CSR_TID,
+    CSR_BE_CFG, CSR_BE_PINS, CSR_BE_RELOAD, CSR_CNT, CSR_CRC, CSR_CRC_INIT,
+    CSR_CRC_POLY, CSR_FLAGS, CSR_HOST_IRQ, CSR_INGRP, CSR_NOW, CSR_OD_MASK,
+    CSR_OUTGRP, CSR_PIN_IN, CSR_PIN_OE, CSR_PIN_OUT, CSR_SFLAGS, CSR_SR,
+    CSR_TD, CSR_TICK_FRAC, CSR_TICK_INT, CSR_TID,
+    BE_CFG_CRC_EN, BE_CFG_DIR, BE_CFG_INV, BE_CFG_M2_MASK, BE_CSRS,
+    BE_PINS_MASK, BE_RELOAD_MASK, CNT_MASK,
     Commit, CycleTrace, PadState, RetireRecord, ThreadState,
 )
 
@@ -59,11 +75,23 @@ SYNC_BITS = 13          # pin_in(0..12) goes through the two-flop synchroniser
 DEFAULT_IMEM_WORDS = 1024
 DEFAULT_FIFO_DEPTH = 4
 
-#: Debug registers of the host DEBUG space that this milestone implements.
+#: The named view of one thread that :meth:`Machine.dump_thread` returns.  It
+#: is kept exactly as the M1 model had it (co-simulation compares it); the
+#: full HOST_PROTOCOL DEBUG space by number is :meth:`Machine.dump_debug_space`.
 DEBUG_REGS = ("r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "PC", "FLAGS",
               "TD", "NOW", "STEPS", "RS0", "RS1", "DEPTH", "WAIT_ACTIVE",
               "TICK_INT", "TICK_FRAC", "OUTGRP", "INGRP", "DT", "ACC",
               "TICK_SEEN", "PREV_PINS")
+
+#: Debug-register names that are model views rather than HOST_PROTOCOL
+#: addresses, and whether the host may write them.
+_DEBUG_VIEWS_WRITABLE = frozenset({"RS1", "DEPTH"})
+_DEBUG_VIEWS_READ_ONLY = frozenset({"ACC", "PREV_PINS", "LAT_VALID", "LAT_PIN",
+                                    "LAT_VAL", "INQ_CNT", "OUTQ_CNT"})
+#: HOST_PROTOCOL debug registers (by name) that are read-only.
+_DEBUG_READ_ONLY_NAMES = frozenset({"NOW", "TID", "FIFO_CNT"})
+
+RegRef = Union[int, str]
 
 
 class LoomsimError(RuntimeError):
@@ -118,22 +146,27 @@ class Machine:
     Args:
         image: instruction memory contents, ``{address: word}``.  Instruction
             memory is not reset, so anything not given reads 0.
-        features: optional features that are built in this configuration.
-            ``"FIFO"`` enables ``PUSH``/``POP`` and ``WAITB`` 1..3.  The default
-            (nothing) is the M1 RTL build: every instruction of an unbuilt
-            feature is a ``NOP`` that sets ``BADOP``.
+        features: optional features that are built in this configuration,
+            any of ``"FIFO"``, ``"BE"``, ``"SETPD"`` (and ``"DMEM"``,
+            ``"BOOTROM"``, which only set their ``CAPS`` bits).  The default
+            (nothing) is the M1 build: every instruction of an unbuilt feature
+            is a ``NOP`` that sets ``BADOP``.
         imem_words: instruction memory size; addresses wrap within it.
-        fifo_depth: INQ and OUTQ depth per thread.
+        fifo_depth: INQ and OUTQ depth per thread, a power of two from 2 to 8
+            (SEMANTICS 6.7); checked when ``"FIFO"`` is built.
         loopback: drive ``uio_in`` from ``uio_out`` for bits with ``uio_oe`` set,
             as the Tiny Tapeout pad does.
         on_cycle: optional callable invoked once per cycle with a
             :class:`~tools.loomsim.state.CycleTrace`.
         isa: a preloaded :class:`tools.loomisa.Isa` (one is loaded if omitted).
+        version: what ``CTRL.VERSION`` reads (default: HOST_PROTOCOL 0.2).
 
     The public state is :attr:`threads` (a list of
     :class:`~tools.loomsim.state.ThreadState`) plus the global registers
     :attr:`run`, :attr:`halted`, :attr:`step_req`, :attr:`badop`,
-    :attr:`sflags`, :attr:`od_mask`, :attr:`pin_out` and :attr:`pin_oe`.
+    :attr:`sflags`, :attr:`od_mask`, :attr:`pin_out`, :attr:`pin_oe`,
+    :attr:`swirq`, :attr:`irq_en`, :attr:`irq_en2` and the registered output
+    :attr:`host_irq`.
     """
 
     def __init__(self, image: Optional[Mapping[int, int]] = None,
@@ -142,16 +175,29 @@ class Machine:
                  fifo_depth: int = DEFAULT_FIFO_DEPTH,
                  loopback: bool = False,
                  on_cycle: Optional[Callable[[CycleTrace], None]] = None,
-                 isa: Optional[Isa] = None):
+                 isa: Optional[Isa] = None,
+                 version: int = H.DEFAULT_VERSION):
         if imem_words & (imem_words - 1) or not 1 <= imem_words <= 1024:
             raise LoomsimError("imem_words must be a power of two up to 1024")
+        built = frozenset(str(f).upper() for f in features)
+        unknown = built - H.FEATURES
+        if unknown:
+            raise LoomsimError("unknown feature(s) %s; known: %s"
+                               % (", ".join(sorted(unknown)), ", ".join(sorted(H.FEATURES))))
+        if "FIFO" in built and fifo_depth not in H.FIFO_DEPTHS:
+            raise LoomsimError("fifo_depth must be 2, 4 or 8 (SEMANTICS 6.7), not %r"
+                               % (fifo_depth,))
         self.isa = isa if isa is not None else load_isa()
-        self.features = frozenset(str(f).upper() for f in features)
+        self.features = built
+        self._fifo = "FIFO" in built
+        self._be = "BE" in built
+        self._setpd = "SETPD" in built
         self.imem_words = imem_words
         self.imem_mask = imem_words - 1
         self.fifo_depth = fifo_depth
         self.loopback = loopback
         self.on_cycle = on_cycle
+        self.version = version & WORD_MASK
         self.imem: Dict[int, int] = {}
         if image:
             self.load_image(image)
@@ -174,6 +220,9 @@ class Machine:
         self.step_req = 0
         self.badop = 0
         self.swirq = 0
+        self.irq_en = 0
+        self.irq_en2 = 0
+        self.host_irq = 0
         self.sflags = 0
         self.od_mask = 0
         self.pin_out = 0
@@ -210,7 +259,11 @@ class Machine:
     # ------------------------------------------------------------------ views
     @property
     def uo_out(self) -> int:
-        """``uo_out[5:0]``, i.e. ``PIN_OUT[13:8]``, during the current cycle."""
+        """``uo_out[5:0]``, i.e. ``PIN_OUT[13:8]``, during the current cycle.
+
+        ``uo_out[6]`` is :attr:`host_irq`; ``uo_out[7]`` (HOST_MISO) belongs to
+        the SPI port, which the model does not contain.
+        """
         return (self.pin_out >> 8) & 0x3F
 
     @property
@@ -251,21 +304,51 @@ class Machine:
         """``CTRL.CAPS`` as fixed by SEMANTICS 5.
 
         ``[2:0]`` log2 of the FIFO depth (0 when the FIFOs are not built),
-        ``[3]`` FIFOs, ``[4]`` bit engine, ``[5]`` data memory, ``[6]`` boot
-        ROM, ``[11:7]`` zero, ``[15:12]`` log2 of ``IMEM_WORDS``.  The M1 build
-        with 256 words reads 0x8000.
+        ``[3]`` FIFOs, ``[4]`` bit engine (manual mode), ``[5]`` data memory,
+        ``[6]`` boot ROM, ``[7]`` deadline-latched ``SETP``, ``[8]`` bit engine
+        auto mode (M3, never set here), ``[11:9]`` zero, ``[15:12]`` log2 of
+        ``IMEM_WORDS``.  The M1 build with 256 words reads 0x8000.
         """
         value = ((self.imem_words.bit_length() - 1) & 0xF) << 12
-        if "FIFO" in self.features:
+        if self._fifo:
             value |= max(self.fifo_depth.bit_length() - 1, 0) & 0x7
-            value |= 1 << 3
-        if "BE" in self.features:
-            value |= 1 << 4
+            value |= H.CAPS_FIFO
+        if self._be:
+            value |= H.CAPS_BE
         if "DMEM" in self.features:
-            value |= 1 << 5
+            value |= H.CAPS_DMEM
         if "BOOTROM" in self.features:
-            value |= 1 << 6
+            value |= H.CAPS_BOOTROM
+        if self._setpd:
+            value |= H.CAPS_SETPD
         return value & 0xFFFF
+
+    @property
+    def irq_stat(self) -> int:
+        """``CTRL.IRQ_STAT = {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}``.
+
+        ``SFLAGS`` is the register (not the W-to-X forwarded value).  The two
+        FIFO fields read 0 when the FIFOs are not built (HOST_PROTOCOL).
+        """
+        inq_not_full = outq_not_empty = 0
+        if self._fifo:
+            for t, th in enumerate(self.threads):
+                if len(th.inq) < self.fifo_depth:
+                    inq_not_full |= 1 << t
+                if th.outq:
+                    outq_not_empty |= 1 << t
+        return H.pack_irq_stat(self.sflags, inq_not_full, outq_not_empty)
+
+    @property
+    def irq_stat2(self) -> int:
+        """``CTRL.IRQ_STAT2 = {12'b0, HALTED[3:0]}``."""
+        return self.halted & 0xF
+
+    def _irq_level(self) -> int:
+        """SEMANTICS 6.8: the value ``HOST_IRQ`` takes at the coming edge."""
+        return int(bool((self.irq_stat & self.irq_en)
+                        or (self.irq_stat2 & self.irq_en2)
+                        or (self.swirq & 0xF)))
 
     # ------------------------------------------------------------- the clock
     def step_cycle(self) -> Optional[RetireRecord]:
@@ -306,7 +389,7 @@ class Machine:
             self.on_cycle(CycleTrace(cycle=c, ph=t, uo_out=self.uo_out,
                                      uio_out=self.uio_out, uio_oe=self.uio_oe,
                                      ui_in=self.ui_in, uio_in=self.uio_in,
-                                     retire=record))
+                                     retire=record, host_irq=self.host_irq))
 
         self._edge(c)
         self._stage_w, self._stage_x, self._stage_d = self._stage_x, self._stage_d, f_slot
@@ -349,6 +432,11 @@ class Machine:
         self._pending.append(commit)
         return commit
 
+    @staticmethod
+    def _check_thread(thread: int) -> None:
+        if not isinstance(thread, int) or not 0 <= thread < THREADS:
+            raise LoomsimError("thread %r outside 0..3" % (thread,))
+
     def host_write_imem(self, addr: int, word: int) -> None:
         """Write one instruction word.  Dropped (and ``BADOP[15]`` set) while running."""
         self._host(imem_write=(addr & PC_MASK, word & WORD_MASK))
@@ -356,7 +444,7 @@ class Machine:
     def host_read_imem(self, addr: int) -> int:
         """Read one instruction word; returns 0 and sets ``BADOP[15]`` while running."""
         if self._imem_host_blocked():
-            self._host(badop_set=1 << 15)
+            self._host(badop_set=H.BADOP_ACCESS)
             return 0
         return self.imem.get(addr & self.imem_mask, 0)
 
@@ -365,7 +453,13 @@ class Machine:
         self._host(run_set=mask & 0xF)
 
     def host_reset_thread(self, thread: int) -> None:
-        """``CTRL.RESET`` bit: PC to ``RESET_PC``, flags 0, ``TD <= NOW``, stack empty."""
+        """``CTRL.RESET`` bit (SEMANTICS 7, 6.7, 6.10).
+
+        ``PC <= RESET_PC[t]``, flags 0, ``DEPTH <= 0`` (``RS0``/``RS1`` kept),
+        ``WAIT_ACTIVE <= 0``, ``TD <=`` the ``NOW`` visible in this cycle, both
+        FIFOs of the thread emptied and its staged pin write discarded.
+        Registers and CSRs are untouched.
+        """
         self._host(thread=thread, thread_reset=True)
 
     def host_step(self, thread: int) -> None:
@@ -400,12 +494,118 @@ class Machine:
         """Host write of ``OD_MASK``."""
         self._host(od_mask=value & 0xFF)
 
+    def host_write_irq_en(self, value: int) -> None:
+        """``CTRL.IRQ_EN <= value``: the mask over ``IRQ_STAT`` (SEMANTICS 6.8)."""
+        self._host(irq_en=value & WORD_MASK)
+
+    def host_write_irq_en2(self, value: int) -> None:
+        """``CTRL.IRQ_EN2 <= value[3:0]``: the mask over ``IRQ_STAT2``."""
+        self._host(irq_en2=value & H.IRQ_EN2_MASK)
+
+    def host_clear_swirq(self, mask: int = 0xF) -> None:
+        """``CTRL.SWIRQ`` write-1-to-clear.  A ``CSRW HOST_IRQ`` of the same
+        thread committing at the same edge wins (SEMANTICS 7)."""
+        self._host(swirq_clr=mask & 0xF)
+
+    # ---- the CTRL space by address or name (HOST_PROTOCOL space 0)
+    @staticmethod
+    def _ctrl_name(reg: RegRef, for_write: bool) -> Optional[str]:
+        if isinstance(reg, str):
+            name = reg.strip().upper()
+            if name not in H.CTRL:
+                raise LoomsimError("no CTRL register " + reg)
+            if for_write and name in H.CTRL_READ_ONLY:
+                raise LoomsimError("CTRL register %s is read-only" % name)
+            return name
+        return H.CTRL_NAMES.get(reg & WORD_MASK)
+
+    def host_read_ctrl(self, reg: RegRef) -> int:
+        """Read one CTRL register, by address (0x00..0x1C) or name.
+
+        Write-only registers (``RESET``, ``SFLAGS_CLR``) and addresses that
+        name nothing read 0.  The value is the one visible in this cycle.
+        """
+        name = self._ctrl_name(reg, for_write=False)
+        if name == "ID":
+            return H.ID_VALUE
+        if name == "VERSION":
+            return self.version
+        if name == "RUN":
+            return self.run & 0xF
+        if name == "HALTED":
+            return self.halted & 0xF
+        if name is not None and name.startswith("RESET_PC"):
+            return self.reset_pc[int(name[-1])] & PC_MASK
+        if name == "IRQ_EN":
+            return self.irq_en & WORD_MASK
+        if name == "IRQ_STAT":
+            return self.irq_stat
+        if name == "IRQ_STAT2":
+            return self.irq_stat2
+        if name == "SFLAGS":
+            return self.sflags & 0xFF
+        if name == "OD_MASK":
+            return self.od_mask & 0xFF
+        if name == "PIN_OUT":
+            return self.pin_out & WORD_MASK
+        if name == "PIN_OE":
+            return self.pin_oe & 0xFF
+        if name == "PIN_IN":
+            return self.pin_in_word
+        if name == "CAPS":
+            return self.caps
+        if name == "BADOP":
+            return self.badop & WORD_MASK
+        if name == "SWIRQ":
+            return self.swirq & 0xF
+        if name == "IRQ_EN2":
+            return self.irq_en2 & H.IRQ_EN2_MASK
+        return 0
+
+    def host_write_ctrl(self, reg: RegRef, value: int) -> None:
+        """Write one CTRL register, by address or name; commits at the next edge.
+
+        By address, read-only registers and unused addresses ignore the write,
+        as the port does; by name, writing a read-only register raises.
+        """
+        name = self._ctrl_name(reg, for_write=True)
+        value &= WORD_MASK
+        if name == "RUN":
+            self.host_set_run(value)
+        elif name == "RESET":
+            for t in range(THREADS):
+                if (value >> t) & 1:
+                    self.host_reset_thread(t)
+        elif name is not None and name.startswith("RESET_PC"):
+            self.host_write_reset_pc(int(name[-1]), value)
+        elif name == "IRQ_EN":
+            self.host_write_irq_en(value)
+        elif name == "SFLAGS":
+            self.host_write_sflags_set(value)
+        elif name == "SFLAGS_CLR":
+            self.host_write_sflags_clr(value)
+        elif name == "OD_MASK":
+            self.host_write_od_mask(value)
+        elif name == "PIN_OUT":
+            self.host_write_pin_out(value)
+        elif name == "PIN_OE":
+            self.host_write_pin_oe(value)
+        elif name == "BADOP":
+            self.host_clear_badop(value)
+        elif name == "SWIRQ":
+            self.host_clear_swirq(value)
+        elif name == "IRQ_EN2":
+            self.host_write_irq_en2(value)
+        # ID, VERSION, HALTED, IRQ_STAT*, PIN_IN, CAPS: read-only, ignored.
+
+    # ---- run state as the host sees it
     def thread_halted_for_debug(self, thread: int) -> bool:
         """SEMANTICS 7: ``RUN[t] == 0``, ``STEP_REQ[t] == 0``, no slot of ``t`` in flight.
 
-        This, not ``HALTED[t]``, is the condition for host access to ``r0..r7``:
-        ``HALTED[t]`` is only the sticky record that a ``HALT`` instruction ran,
-        so registers can be preloaded before a thread's first run.
+        This, not ``HALTED[t]``, is the condition for every host debug write
+        and for host reads of ``r0..r7``: ``HALTED[t]`` is only the sticky
+        record that a ``HALT`` instruction ran, so registers can be preloaded
+        before a thread's first run.
         """
         if (self.run >> thread) & 1 or (self.step_req >> thread) & 1:
             return False
@@ -415,102 +615,249 @@ class Machine:
         """The negation of :meth:`thread_halted_for_debug`, for readability."""
         return not self.thread_halted_for_debug(thread)
 
-    def host_read_debug(self, thread: int, name: str) -> int:
-        """Read one DEBUG-space register.  ``r0..r7`` read 0 while the thread runs."""
-        th = self.threads[thread]
-        if name.lower().startswith("r") and name[1:].isdigit():
-            index = int(name[1:])
+    # ---- the DEBUG space (HOST_PROTOCOL space 4)
+    @staticmethod
+    def _debug_key(name: str) -> str:
+        text = str(name).strip()
+        if text[:1] in ("r", "R") and text[1:].isdigit():
+            index = int(text[1:])
             if not 0 <= index <= 7:
-                raise LoomsimError("no register " + name)
-            if self.thread_running(thread):
-                return 0
-            return th.regs[index]
-        key = name.upper()
-        if key == "PC":
-            return th.pc
-        if key == "FLAGS":
-            return th.flags
-        if key == "TD":
-            return th.td
-        if key == "DT":
-            return th.dt
-        if key == "NOW":
-            return th.now
-        if key == "ACC":
-            return th.acc
-        if key == "TICK_SEEN":
-            return th.tick_seen
-        if key == "PREV_PINS":
-            return th.prev_pins
-        if key == "STEPS":
-            return th.steps
-        if key == "RS0":
-            return th.rs0
+                raise LoomsimError("no register " + text)
+            return "r%d" % index
+        return text.upper()
+
+    def _debug_number(self, key: str) -> Optional[int]:
+        """HOST_PROTOCOL register number of a debug name, or None for a view."""
+        if key in H.DEBUG:
+            return H.DEBUG[key]
+        csr = self.isa.csr_by_name.get(key)
+        if csr is not None and csr < H.DEBUG_CSR_COUNT:
+            return H.DEBUG_CSR_BASE + csr
+        return None
+
+    def host_read_debug(self, thread: int, reg: RegRef) -> int:
+        """Read one DEBUG-space register, by name or by number (0x00..0xFF).
+
+        ``r0..r7`` read 0 unless the thread is halted in the sense of
+        :meth:`thread_halted_for_debug`; everything else reads at any time.
+        Registers of a feature that is not built read 0.  Besides the
+        HOST_PROTOCOL names (``PC``, ``STEPS``, ``LAT``, ``FIFO_CNT``, the CSR
+        names of the window 0x10..0x1F ...) the model offers the views
+        ``RS1``, ``DEPTH``, ``ACC``, ``PREV_PINS``, ``LAT_VALID``,
+        ``LAT_PIN``, ``LAT_VAL``, ``INQ_CNT`` and ``OUTQ_CNT``.
+        """
+        self._check_thread(thread)
+        if isinstance(reg, int):
+            return self._debug_read(thread, reg & 0xFF)
+        key = self._debug_key(reg)
+        number = self._debug_number(key)
+        if number is not None:
+            return self._debug_read(thread, number)
+        th = self.threads[thread]
         if key == "RS1":
             return th.rs1
         if key == "DEPTH":
             return th.depth
-        if key == "WAIT_ACTIVE":
-            return th.wait_active
-        if key in ("TICK_INT", "TICK_FRAC", "OUTGRP", "INGRP", "TID"):
-            return th.csrs[key]
-        raise LoomsimError("unknown debug register " + name)
+        if key == "ACC":
+            return th.acc
+        if key == "PREV_PINS":
+            return th.prev_pins
+        if key in ("LAT_VALID", "LAT_PIN", "LAT_VAL"):
+            if not self._setpd:
+                return 0
+            return {"LAT_VALID": th.lat_valid, "LAT_PIN": th.lat_pin,
+                    "LAT_VAL": th.lat_val}[key]
+        if key in ("INQ_CNT", "OUTQ_CNT"):
+            if not self._fifo:
+                return 0
+            return len(th.inq) if key == "INQ_CNT" else len(th.outq)
+        raise LoomsimError("unknown debug register " + str(reg))
 
-    def host_write_debug(self, thread: int, name: str, value: int) -> None:
-        """Write one DEBUG-space register (``r0..r7`` only while halted)."""
+    def host_write_debug(self, thread: int, reg: RegRef, value: int) -> None:
+        """Write one DEBUG-space register, by name or by number (0x00..0xFF).
+
+        Every debug write is dropped unless the thread is halted in the sense
+        of :meth:`thread_halted_for_debug`, judged in the cycle of the call;
+        an accepted write commits at the edge that ends that cycle.  By
+        number, read-only and unused registers ignore the write as the port
+        does; by name, an unknown or read-only register raises.  A write of
+        a register whose feature is not built is ignored.
+        """
+        self._check_thread(thread)
+        if isinstance(reg, int):
+            number: Optional[int] = reg & 0xFF
+            key = None
+        else:
+            key = self._debug_key(reg)
+            number = self._debug_number(key)
+            if number is None:
+                if key in _DEBUG_VIEWS_READ_ONLY:
+                    raise LoomsimError("debug register " + str(reg) + " is not writable")
+                if key not in _DEBUG_VIEWS_WRITABLE:
+                    raise LoomsimError("unknown debug register " + str(reg))
+            elif key in _DEBUG_READ_ONLY_NAMES:
+                raise LoomsimError("debug register " + str(reg) + " is not writable")
+        if not self.thread_halted_for_debug(thread):
+            return                                   # dropped (SEMANTICS 7)
         value &= WORD_MASK
-        if name.lower().startswith("r") and name[1:].isdigit():
-            index = int(name[1:])
-            if not 0 <= index <= 7:
-                raise LoomsimError("no register " + name)
-            if self.thread_running(thread):
-                return
-            self._host(thread=thread, reg_we=True, reg_rd=index, reg_val=value)
-            return
-        key = name.upper()
-        if key == "PC":
-            # A debug PC write also clears WAIT_ACTIVE (SEMANTICS 7).
-            self._host(thread=thread, pc=value & PC_MASK, wait_active=0)
-        elif key == "FLAGS":
-            self._host(thread=thread, flags=value & 7)
-        elif key == "TD":
-            self._host(thread=thread, td=value)
-        elif key == "DT":
-            self._host(thread=thread, dt=value)
-        elif key == "TICK_INT":
-            self._host(thread=thread, tick_int=value)
-        elif key == "TICK_FRAC":
-            self._host(thread=thread, tick_frac=value & 0xFF)
-        elif key == "OUTGRP":
-            self._host(thread=thread, outgrp=value & 0x3FF)
-        elif key == "INGRP":
-            self._host(thread=thread, ingrp=value & 0x3FF)
-        elif key == "RS0":
-            self._host(thread=thread, rs0=value & PC_MASK)
+        if number is not None:
+            self._debug_write(thread, number, value)
         elif key == "RS1":
             self._host(thread=thread, rs1=value & PC_MASK)
         elif key == "DEPTH":
             self._host(thread=thread, depth=value & 3)
-        elif key == "WAIT_ACTIVE":
-            self._host(thread=thread, wait_active=value & 1)
-        else:
-            raise LoomsimError("debug register " + name + " is not writable")
 
-    # ---- host FIFO side (feature "FIFO")
+    def _debug_read(self, t: int, number: int) -> int:
+        """A DEBUG-space read by register number, as the port answers it."""
+        th = self.threads[t]
+        if 0 <= number <= 7:
+            return 0 if self.thread_running(t) else th.regs[number] & WORD_MASK
+        if number == 0x08:
+            return th.pc & PC_MASK
+        if number == 0x09:
+            return th.flags & 7
+        if number == 0x0A:
+            return th.td & WORD_MASK
+        if number == 0x0B:
+            return th.now & WORD_MASK
+        if number == 0x0C:
+            return th.sr & WORD_MASK if self._be else 0
+        if number == 0x0D:
+            return th.cnt & CNT_MASK if self._be else 0
+        if number == 0x0E:
+            return th.crc & WORD_MASK if self._be else 0
+        if number == 0x0F:
+            return th.rs0 & PC_MASK
+        if H.DEBUG_CSR_BASE <= number < H.DEBUG_CSR_BASE + H.DEBUG_CSR_COUNT:
+            return self._thread_csr_value(th, number - H.DEBUG_CSR_BASE)
+        if number == 0x20:
+            return th.steps & WORD_MASK
+        if number == 0x21:
+            return H.pack_rs1_depth(th.rs1, th.depth)
+        if number == 0x22:
+            return th.wait_active & 1
+        if number == 0x23:
+            return th.dt & WORD_MASK
+        if number == 0x24:
+            return th.tick_seen & 1
+        if number == 0x25:
+            return th.lat if self._setpd else 0
+        if number == 0x26:
+            return H.pack_fifo_counts(len(th.inq), len(th.outq)) if self._fifo else 0
+        return 0
+
+    def _debug_write(self, t: int, number: int, value: int) -> None:
+        """A DEBUG-space write by register number (already gated on halted)."""
+        if 0 <= number <= 7:
+            self._host(thread=t, reg_we=True, reg_rd=number, reg_val=value)
+        elif number == 0x08:
+            # A debug PC write also clears WAIT_ACTIVE (SEMANTICS 7).
+            self._host(thread=t, pc=value & PC_MASK, wait_active=0)
+        elif number == 0x09:
+            self._host(thread=t, flags=value & 7)
+        elif number == 0x0A:
+            self._host(thread=t, td=value, td_written=True)
+        elif number in (0x0C, 0x0D, 0x0E):
+            if self._be:
+                csr = {0x0C: CSR_SR, 0x0D: CSR_CNT, 0x0E: CSR_CRC}[number]
+                self._host(thread=t, **self._be_csr_fields(csr, value))
+        elif number == 0x0F:
+            self._host(thread=t, rs0=value & PC_MASK)
+        elif H.DEBUG_CSR_BASE <= number < H.DEBUG_CSR_BASE + H.DEBUG_CSR_COUNT:
+            self._debug_csr_write(t, number - H.DEBUG_CSR_BASE, value)
+        elif number == 0x20:
+            self._host(thread=t, steps=value)
+        elif number == 0x21:
+            self._host(thread=t, rs1=value & PC_MASK, depth=(value >> 10) & 3)
+        elif number == 0x22:
+            self._host(thread=t, wait_active=value & 1)
+        elif number == 0x23:
+            self._host(thread=t, dt=value)
+        elif number == 0x24:
+            self._host(thread=t, tick_seen=value & 1)
+        elif number == 0x25:
+            if self._setpd:
+                valid, val, pin = H.unpack_lat(value)
+                self._host(thread=t, lat_set=(valid, pin, val))
+        # 0x0B NOW, 0x26 FIFO counts and unused numbers ignore writes.
+
+    def _debug_csr_write(self, t: int, csr: int, value: int) -> None:
+        """Host write of the thread's CSR ``csr`` (0x00..0x0F) through the window."""
+        if csr == CSR_TICK_INT:
+            self._host(thread=t, tick_int=value)
+        elif csr == CSR_TICK_FRAC:
+            self._host(thread=t, tick_frac=value & 0xFF)
+        elif csr == CSR_OUTGRP:
+            self._host(thread=t, outgrp=value & 0x3FF)
+        elif csr == CSR_INGRP:
+            self._host(thread=t, ingrp=value & 0x3FF)
+        elif csr == CSR_TD:
+            self._host(thread=t, td=value, td_written=True)
+        elif csr == CSR_FLAGS:
+            self._host(thread=t, flags=value & 7)
+        elif csr in BE_CSRS:
+            if self._be:
+                self._host(thread=t, **self._be_csr_fields(csr, value))
+        # NOW and TID are read-only.
+
+    @staticmethod
+    def _be_csr_fields(csr: int, value: int) -> Dict[str, int]:
+        """Commit fields for a write of bit-engine CSR ``csr`` (truncated to width)."""
+        if csr == CSR_BE_CFG:
+            return {"be_cfg": value & BE_CFG_M2_MASK}
+        if csr == CSR_BE_PINS:
+            return {"be_pins": value & BE_PINS_MASK}
+        if csr == CSR_BE_RELOAD:
+            return {"be_reload": value & BE_RELOAD_MASK}
+        if csr == CSR_CRC_POLY:
+            return {"crc_poly": value & WORD_MASK}
+        if csr == CSR_CRC_INIT:
+            return {"crc_init": value & WORD_MASK}
+        if csr == CSR_SR:
+            return {"sr": value & WORD_MASK}
+        if csr == CSR_CNT:
+            return {"cnt": value & CNT_MASK}
+        if csr == CSR_CRC:
+            return {"crc": value & WORD_MASK}
+        raise LoomsimError("CSR 0x%02X is not a bit-engine CSR" % csr)
+
+    # ---- host FIFO side (feature "FIFO", SEMANTICS 6.7)
     def _require_fifo(self) -> None:
-        if "FIFO" not in self.features:
+        if not self._fifo:
             raise LoomsimError("this build has no FIFOs; construct with features={'FIFO'}")
 
     def host_fifo_push(self, thread: int, word: int) -> None:
-        """Push one word into ``INQ[t]``; dropped if full (HOST_PROTOCOL space 3)."""
+        """Push one word into ``INQ[t]`` at the edge that ends this cycle.
+
+        Accepted iff ``INQ_CNT[t] < FIFO_DEPTH`` just before that edge (a thread
+        ``POP`` committing at the same edge does not make room for it);
+        otherwise the word is dropped and ``BADOP[14]`` is set at that edge.
+        """
         self._require_fifo()
         self._host(thread=thread, inq_push=word & WORD_MASK)
 
+    def host_fifo_peek(self, thread: int) -> Optional[int]:
+        """The head of ``OUTQ[t]`` as visible in this cycle, or ``None`` if empty.
+
+        No side effect.  A transport uses this for the SPI port's peek, then
+        :meth:`host_fifo_pop` at the edge where the word has gone out.
+        """
+        self._require_fifo()
+        queue = self.threads[thread].outq
+        return queue[0] if queue else None
+
     def host_fifo_pop(self, thread: int) -> int:
-        """Pop one word from ``OUTQ[t]``; returns 0 and pops nothing if empty."""
+        """Pop one word from ``OUTQ[t]``, atomically, at the edge that ends this cycle.
+
+        Returns the head if ``OUTQ_CNT[t] > 0`` in this cycle and removes it at
+        the edge; otherwise returns 0, removes nothing and sets ``BADOP[14]``
+        at the edge.  (The port splits a pop into a peek and a pop; see
+        :meth:`host_fifo_peek`.)
+        """
         self._require_fifo()
         queue = self.threads[thread].outq
         if not queue:
+            self._host(badop_set=H.BADOP_FIFO)
             return 0
         self._host(thread=thread, outq_pop=True)
         return queue[0]
@@ -520,6 +867,12 @@ class Machine:
         self._require_fifo()
         th = self.threads[thread]
         return {"inq": len(th.inq), "outq": len(th.outq), "depth": self.fifo_depth}
+
+    def host_fifo_status_word(self, thread: int) -> int:
+        """The FIFO-space status word at ``0x0100 + t`` (HOST_PROTOCOL space 3)."""
+        self._require_fifo()
+        th = self.threads[thread]
+        return H.pack_fifo_status(len(th.inq), len(th.outq), self.fifo_depth)
 
     # ------------------------------------------------------------- the edge
     def _slot_in_flight(self, thread: Optional[int] = None) -> bool:
@@ -540,6 +893,9 @@ class Machine:
         landing = [cm for cm in self._pending if cm.visible_from == c + 1]
         self._pending = [cm for cm in self._pending if cm.visible_from != c + 1]
 
+        # HOST_IRQ is a register fed from the values visible in this cycle.
+        irq_next = self._irq_level()
+
         # The tick generator uses pre-edge TICK_INT/TICK_FRAC and ACC.
         ticks = []
         for th in self.threads:
@@ -549,19 +905,30 @@ class Machine:
             else:
                 ticks.append((0, (th.acc + 256) & 0xFFFFFF))
         pre_now = [th.now for th in self.threads]
+        pre_od_mask = self.od_mask
+        pre_lat = [(th.lat_valid, th.lat_pin, th.lat_val) for th in self.threads]
         pad_sample = self._sample_pads()
 
         # Host first, thread second: on a same-edge conflict the thread wins.
-        for commit in [cm for cm in landing if not cm.is_slot]:
+        host = [cm for cm in landing if not cm.is_slot]
+        slots = [cm for cm in landing if cm.is_slot]
+        for commit in host:
             self._apply_commit(commit, pre_now)
-        for commit in [cm for cm in landing if cm.is_slot]:
+        slot_out = slot_oe = slot_index = 0
+        for commit in slots:
             self._apply_commit(commit, pre_now)
+            slot_out |= commit.pin_out_mask
+            slot_oe |= commit.pin_oe_mask
+            slot_index |= commit.pin_index_mask
 
-        slot_commit = [cm for cm in landing if cm.is_slot and cm.steps_inc]
+        slot_commit = [cm for cm in slots if cm.steps_inc]
         # SEMANTICS 4: any write to TICK_INT or TICK_FRAC clears ACC at the same
         # edge, by a committed CSRW or by a host debug-space write alike.
         acc_clear = {cm.thread for cm in landing
                      if cm.tick_int is not None or cm.tick_frac is not None}
+        host_tick_seen = {cm.thread: cm.tick_seen for cm in host
+                          if cm.tick_seen is not None}
+        ticked = [0] * THREADS
         for t, th in enumerate(self.threads):
             tick, new_acc = ticks[t]
             if t in acc_clear:
@@ -571,13 +938,66 @@ class Machine:
             else:
                 th.acc = new_acc
             th.now = (th.now + tick) & WORD_MASK
+            ticked[t] = tick
             if tick:
-                th.tick_seen = 1
+                th.tick_seen = 1                     # a tick wins over any clear
+            elif t in host_tick_seen:
+                th.tick_seen = host_tick_seen[t] & 1
             elif any(cm.thread == t for cm in slot_commit):
                 th.tick_seen = 0
 
+        if self._setpd:
+            self._deadline_latches(landing, pre_lat, pre_od_mask, ticked,
+                                   slot_out, slot_oe, slot_index)
+
+        self.host_irq = irq_next
         self._ff2 = self._ff1
         self._ff1 = pad_sample
+
+    def _deadline_latches(self, landing: List[Commit],
+                          pre_lat: List[Tuple[int, int, int]], od_mask: int,
+                          ticked: List[int], slot_out: int, slot_oe: int,
+                          slot_index: int) -> None:
+        """SEMANTICS 6.10 at one edge, after every commit and the tick have landed.
+
+        A latch valid before the edge fires when (rule 1) ``NOW`` ticked to
+        exactly ``TD`` and ``TD`` was not written at this edge, or (rule 2)
+        ``TD`` was written at this edge and ``reached(NOW', TD')`` holds for the
+        values after it.  A latch loaded at this edge (``SETP ... D`` or a host
+        write of debug 0x25) cannot fire before the next edge; the old content
+        may still fire at the loading edge.  ``CTRL.RESET`` discards: a latch
+        whose thread is reset at this edge does not fire.
+
+        The staged write uses the pin-write rule of 6.3 with ``OD_MASK`` as
+        visible before the edge.  A slot's ordinary pin write (SETP, OUT, SHO)
+        to the same pin index at this edge wins, and the whole staged write is
+        dropped; other bits a slot commit wrote (OEP, CSRW PIN_OUT/PIN_OE) keep
+        the slot's value; the staged write beats a host write of the same
+        bits.  If staged writes of two threads land on one bit at one edge the
+        higher-numbered thread's value stays.
+        """
+        for t, th in enumerate(self.threads):
+            valid, pin, value = pre_lat[t]
+            mine = [cm for cm in landing if cm.thread == t]
+            if not valid or any(cm.thread_reset for cm in mine):
+                continue
+            if any(cm.td_written for cm in mine):
+                fire = alu.reached(th.now, th.td)                  # rule 2
+            else:
+                fire = bool(ticked[t]) and th.now == th.td         # rule 1
+            if not fire:
+                continue
+            if not (slot_index >> pin) & 1:
+                staged = Commit(visible_from=self.cycle + 1)
+                staged.write_pin(pin, value, od_mask)
+                out_mask = staged.pin_out_mask & ~slot_out
+                oe_mask = staged.pin_oe_mask & ~slot_oe
+                self.pin_out = ((self.pin_out & ~out_mask)
+                                | (staged.pin_out_val & out_mask)) & WORD_MASK
+                self.pin_oe = ((self.pin_oe & ~oe_mask)
+                               | (staged.pin_oe_val & oe_mask)) & 0xFF
+            if not any(cm.lat_set is not None for cm in mine):
+                th.lat_valid = 0
 
     def _sample_pads(self) -> int:
         """The 13-bit pad value the input flops latch at this edge."""
@@ -595,7 +1015,7 @@ class Machine:
 
         if cm.imem_write is not None:
             if self._imem_host_blocked():
-                self.badop |= 1 << 15
+                self.badop |= H.BADOP_ACCESS
             else:
                 addr, word = cm.imem_write
                 self.imem[addr & self.imem_mask] = word
@@ -608,6 +1028,11 @@ class Machine:
             th.td = pre_now[cm.thread]
             th.depth = 0
             th.wait_active = 0
+            # SEMANTICS 6.7 and 6.10: the FIFOs are emptied and the staged pin
+            # write is discarded (both are always empty in builds without them).
+            th.inq.clear()
+            th.outq.clear()
+            th.lat_valid = 0
         if cm.run_set is not None:
             rising = cm.run_set & ~self.run
             self.run = cm.run_set
@@ -627,8 +1052,15 @@ class Machine:
             self.badop &= ~cm.badop_clr
         if cm.badop_set:
             self.badop |= cm.badop_set
+        if cm.swirq_clr:
+            self.swirq &= ~cm.swirq_clr
         if cm.swirq_set:
             self.swirq |= cm.swirq_set
+        self.swirq &= 0xF
+        if cm.irq_en is not None:
+            self.irq_en = cm.irq_en & WORD_MASK
+        if cm.irq_en2 is not None:
+            self.irq_en2 = cm.irq_en2 & H.IRQ_EN2_MASK
 
         if cm.pin_out_mask:
             self.pin_out = (self.pin_out & ~cm.pin_out_mask) | (cm.pin_out_val & cm.pin_out_mask)
@@ -673,10 +1105,37 @@ class Machine:
             th.outgrp = cm.outgrp & 0x3FF
         if cm.ingrp is not None:
             th.ingrp = cm.ingrp & 0x3FF
+        if cm.steps is not None:
+            th.steps = cm.steps & WORD_MASK
         if cm.steps_inc:
             th.steps = (th.steps + 1) & WORD_MASK
-        if cm.inq_push is not None and len(th.inq) < self.fifo_depth:
-            th.inq.append(cm.inq_push)
+        if cm.sr is not None:
+            th.sr = cm.sr & WORD_MASK
+        if cm.cnt is not None:
+            th.cnt = cm.cnt & CNT_MASK
+        if cm.crc is not None:
+            th.crc = cm.crc & WORD_MASK
+        if cm.be_cfg is not None:
+            th.be_cfg = cm.be_cfg & BE_CFG_M2_MASK
+        if cm.be_pins is not None:
+            th.be_pins = cm.be_pins & BE_PINS_MASK
+        if cm.be_reload is not None:
+            th.be_reload = cm.be_reload & BE_RELOAD_MASK
+        if cm.crc_poly is not None:
+            th.crc_poly = cm.crc_poly & WORD_MASK
+        if cm.crc_init is not None:
+            th.crc_init = cm.crc_init & WORD_MASK
+        if cm.lat_set is not None:
+            th.lat_valid, th.lat_pin, th.lat_val = (
+                cm.lat_set[0] & 1, cm.lat_set[1] & 0x1F, cm.lat_set[2] & 1)
+        # FIFOs (SEMANTICS 6.7).  Host pushes see the count from before the
+        # edge because host commits are applied before the slot's; a thread
+        # PUSH/POP decided in X can never be invalidated before its commit.
+        if cm.inq_push is not None:
+            if len(th.inq) < self.fifo_depth:
+                th.inq.append(cm.inq_push)
+            else:
+                self.badop |= H.BADOP_FIFO
         if cm.outq_pop and th.outq:
             th.outq.pop(0)
         if cm.inq_pop and th.inq:
@@ -697,15 +1156,17 @@ class Machine:
     def _feature_built(self, instr: Instr, ops: Dict[str, int]) -> bool:
         """SEMANTICS 9: an instruction of an unbuilt feature is a ``NOP`` + ``BADOP``."""
         if instr.cls == "be":
-            return "BE" in self.features
+            return self._be
         if instr.cls == "fifo":
-            return "FIFO" in self.features
+            return self._fifo
         if instr.name == "WAITB":
-            # Condition 0 asks the bit engine whether it is idle; conditions 1
-            # and 2 ask the FIFOs and 3 asks this thread's tick.
+            # WAITB is built with the FIFOs; condition 0 (bit engine idle)
+            # additionally needs the bit engine (SEMANTICS 6.4).
+            if not self._fifo:
+                return False
             if ops.get("cond") == 0:
-                return "BE" in self.features
-            return "FIFO" in self.features
+                return self._be
+            return True
         if instr.optional == "DMEM":
             return "DMEM" in self.features
         return True
@@ -857,7 +1318,11 @@ class Machine:
 
         # ---------------------------------------------------------------- pins
         elif name == "SETP":
-            cm.write_pin(ops["pin"], ops["val"], self.od_mask)
+            if ops.get("lat", 0) and self._setpd:
+                # SEMANTICS 6.10: stage the write instead of doing it.
+                cm.lat_set = (1, ops["pin"] & 0x1F, ops["val"] & 1)
+            else:
+                cm.write_pin(ops["pin"], ops["val"], self.od_mask)
         elif name == "OEP":
             pin = ops["pin"]
             if 0 <= pin <= 7:
@@ -881,6 +1346,7 @@ class Machine:
             first = th.wait_active == 0
             deadline = (th.td + ops["imm"]) & WORD_MASK if first else th.td
             cm.td = deadline
+            cm.td_written = first
             done = alu.reached(th.now, deadline)
             cm.wait_active = 0 if done else 1
             cm.pc = nxt if done else pc
@@ -893,6 +1359,7 @@ class Machine:
             cm.pc = nxt if done else pc
         elif name == "SETD":
             cm.td = (th.now + ops["imm"]) & WORD_MASK
+            cm.td_written = True
         elif name == "NOP":
             pass
         elif name in ("WAITP", "WAITE", "WAITS", "WAITB"):
@@ -930,6 +1397,31 @@ class Machine:
                 done = False
             cm.wait_active = 0 if done else 1
             cm.pc = nxt if done else pc
+
+        # ---------------------------------------------------------- bit engine
+        elif name in ("SHO", "SHI"):
+            cfg = th.be_cfg
+            msb_first = bool(cfg & BE_CFG_DIR)
+            inv = 1 if cfg & BE_CFG_INV else 0
+            if name == "SHO":
+                bit = alu.be_out_bit(th.sr, msb_first)
+                cm.write_pin(th.be_pins & 0x1F, bit ^ inv, self.od_mask)
+                cm.sr = alu.be_shift_out(th.sr, msb_first)
+            else:
+                bit = self.pin_in((th.be_pins >> 5) & 0x1F) ^ inv
+                cm.sr = alu.be_shift_in(th.sr, bit, msb_first)
+            cm.cnt = alu.be_count(th.cnt)
+            z = 1 if cm.cnt == 0 else 0                  # C and T unchanged
+            if cfg & BE_CFG_CRC_EN:
+                cm.crc = alu.crc_step(th.crc, bit, th.crc_poly)
+        elif name == "LDSR":
+            cm.sr = regs[ops["ra"]]
+        elif name == "STSR":
+            write(ops["rd"], th.sr)
+        elif name == "CRCI":
+            cm.crc = th.crc_init
+        elif name == "STCRC":
+            write(ops["rd"], th.crc)
 
         # ----------------------------------------------------------------- CSR
         elif name == "CSRR":
@@ -981,13 +1473,13 @@ class Machine:
                 return len(th.inq) > 0
             if cond == 3:
                 return bool(th.tick_seen)
-            # Condition 0 (BE idle) never reaches here: without the bit engine
-            # the instruction is a NOP with BADOP set, see _feature_built.
-            return False
+            # Condition 0, bit engine idle: always true until auto mode (M3).
+            # Only reached when the bit engine is built (see _feature_built).
+            return True
         raise LoomsimError("no condition for " + name)
 
-    def _csr_read(self, th: ThreadState, number: int, x: int) -> int:
-        """``CSRR``: the CSR value visible in X, zero-extended (0 if unbuilt)."""
+    def _thread_csr_value(self, th: ThreadState, number: int) -> int:
+        """Per-thread CSR 0x00..0x0F as visible now (0 if its feature is unbuilt)."""
         if number == CSR_TICK_INT:
             return th.tick_int & WORD_MASK
         if number == CSR_TICK_FRAC:
@@ -1004,6 +1496,29 @@ class Machine:
             return th.flags & 7
         if number == CSR_TID:
             return th.tid & 3
+        if number in BE_CSRS and self._be:
+            if number == CSR_BE_CFG:
+                return th.be_cfg & BE_CFG_M2_MASK
+            if number == CSR_BE_PINS:
+                return th.be_pins & BE_PINS_MASK
+            if number == CSR_BE_RELOAD:
+                return th.be_reload & BE_RELOAD_MASK
+            if number == CSR_CRC_POLY:
+                return th.crc_poly & WORD_MASK
+            if number == CSR_CRC_INIT:
+                return th.crc_init & WORD_MASK
+            if number == CSR_SR:
+                return th.sr & WORD_MASK
+            if number == CSR_CNT:
+                return th.cnt & CNT_MASK
+            if number == CSR_CRC:
+                return th.crc & WORD_MASK
+        return 0
+
+    def _csr_read(self, th: ThreadState, number: int, x: int) -> int:
+        """``CSRR``: the CSR value visible in X, zero-extended (0 if unbuilt)."""
+        if number < 0x10:
+            return self._thread_csr_value(th, number)
         if number == CSR_OD_MASK:
             return self.od_mask & 0xFF
         if number == CSR_PIN_OUT:
@@ -1030,8 +1545,13 @@ class Machine:
             cm.ingrp = value & 0x3FF
         elif number == CSR_TD:
             cm.td = value & WORD_MASK
+            cm.td_written = True
         elif number == CSR_FLAGS:
             z, c_flag, t_flag = value & 1, (value >> 1) & 1, (value >> 2) & 1
+        elif number in BE_CSRS:
+            if self._be:
+                for field, field_value in self._be_csr_fields(number, value).items():
+                    setattr(cm, field, field_value)
         elif number == CSR_OD_MASK:
             cm.od_mask = value & 0xFF
         elif number == CSR_PIN_OUT:
@@ -1049,13 +1569,22 @@ class Machine:
 
     # ------------------------------------------------------------------ extras
     def dump_thread(self, thread: int) -> Dict[str, int]:
-        """The DEBUG-space view of one thread, for co-simulation comparisons."""
-        th = self.threads[thread]
+        """The named debug view of one thread (:data:`DEBUG_REGS` plus run state).
+
+        Unchanged since M1 so that co-simulation comparisons keep their keys;
+        :meth:`dump_debug_space` has the HOST_PROTOCOL DEBUG space by number.
+        """
         out = {name: self.host_read_debug(thread, name) for name in DEBUG_REGS}
         out["RUN"] = (self.run >> thread) & 1
         out["HALTED"] = (self.halted >> thread) & 1
         out["BADOP"] = (self.badop >> thread) & 1
         return out
+
+    def dump_debug_space(self, thread: int) -> Dict[int, int]:
+        """Every DEBUG-space register 0x00..0x26 of ``thread``, as the port reads it."""
+        self._check_thread(thread)
+        return {number: self._debug_read(thread, number)
+                for number in range(H.DEBUG_LAST + 1)}
 
     def __repr__(self) -> str:
         return ("<Machine cycle=%d run=%X halted=%X pc=%s>"
