@@ -365,3 +365,15 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   power script left every standard-cell rail unconnected (654 PSM-0038
   warnings; the standard flow has none). Next: SRAM agent fixes both, with a
   capped router so failures end fast.
+- 2026-09-18 (afternoon), Opus 5: all three agents died together to a stream
+  stall. Co-simulation was nearly done, so the director finished it (0812cc7:
+  generator tests, Makefile wiring, fault-injection proof; zero divergences;
+  CI green on GitHub's Icarus). ISA 0.4.0 landed early (c26d022: `SETP ... D`
+  encoding with assembler token `D`, SHO/SHI set Z, canonical CRC presets;
+  RTL decodes `D` as a plain SETP until M2). Relaunched the SRAM and firmware
+  agents with progress-file-first instructions, and started the M2 RTL agent:
+  D-019 timing fix first, then FIFOs, host interrupt, manual bit engine and
+  deadline-latched SETP, with co-simulation kept green by a generator flag
+  until the golden model gets its M2 update. M2 hardening is deliberately
+  deferred to the memory decision: at M1 density plus M2 features the block
+  would be near 87 percent full.
