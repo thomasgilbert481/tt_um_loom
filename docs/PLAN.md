@@ -142,8 +142,11 @@ same cocotb UART model as M0; first synthesis numbers recorded.
       tests generated from `isa.yaml` (at least one per mnemonic) passing on
       Icarus; first constrained-random co-sim run (1000 programs) passing.
 - [ ] `firmware/uart_tx.loom` passes the L3 UART test at 115200 and 1 Mbaud.
-- [ ] First hardening run (GitHub `gds` workflow) with the flop imem: record
-      cells, utilisation, worst slack at 20 ns in `docs/AREA.md`.
+- [x] 2026-09-18: first hardening of the M1 core (CI run 35272974272): DRC,
+      LVS and antenna clean, precheck and gate-level test pass, but 78.8
+      percent utilisation, +1.45 ns setup slack at the typical corner and
+      -9.9 ns at the slow corner. Numbers in `docs/AREA.md`; critical path and
+      the planned fix in D-019; CI cost fix in D-018.
 - [ ] Fable review: ISA freeze, area numbers, decide FIFO depth.
 
 ### M2: host interface and the three required protocols (by 2026-10-19)
@@ -151,6 +154,14 @@ same cocotb UART model as M0; first synthesis numbers recorded.
 Exit: UART RX/TX, SPI master and slave, I2C master all pass their L3 tests with
 data moving through the SPI host port; FPGA prototype runs the same tests.
 
+- [ ] Area and timing before features (M1 left 79 percent utilisation and
+      +1.45 ns typical slack): the D-019 one-hot W-stage thread select,
+      replicated per consumer; then re-harden. M2 features (FIFOs, bit
+      engines, about 80-100K um2) do not fit until the memory decision frees
+      area, so the memory gate below is also the area gate.
+- [ ] `docs/SEMANTICS.md` M2 text (director, before any M2 RTL or model work):
+      FIFOs and blocking PUSH/POP, WAITB, bit engine manual and auto mode with
+      encoders, stuffing and CRC, deadline-latched `SETP ... D` (D-016), IRQ.
 - [ ] `loom_spi_host` + `loom_host_ctl`: full `docs/HOST_PROTOCOL.md` including
       the debug space, single-step, IRQ.
 - [ ] `loom_fifo` x 8, `PUSH`/`POP`, `WAITB`, `SIG`/`CLR`/`WAITS`.
@@ -315,3 +326,26 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   smoke test in the worktree `../tt_um_loom_sram` on branch `sram-smoke`. The
   model and RTL agents may not read each other's code. Director integrates,
   reviews and commits; spec questions land in `docs/spec-questions/`.
+- 2026-09-17 (later), Fable 5.1: integrated all three. Assembler d39a5c8,
+  golden model d37b6a6, M1 RTL 03a1bca (42 pin-level cocotb tests, 615 tool
+  tests, lint clean). 21 spec questions from the agents resolved into
+  SEMANTICS, HOST_PROTOCOL, D-016 (deadline-latched pin writes, M2) and D-017
+  (reset vectors). First synthesis: 27.7K generic cells, half of it the flop
+  memory. `sram-smoke`: three fast failures understood (instance path, then
+  pdngen cannot stripe a Metal4-pin macro on cmos5l); run 4 without a macro
+  grid got past PDN generation. Launched the co-simulation agent
+  (`tools/loomgen`, `test/test_cosim.py`): RTL vs model, slot by slot, on
+  constrained-random programs, with a rule that every divergence is decided by
+  quoting SEMANTICS and logged in `docs/BUGS.md`.
+- 2026-09-18, Opus 5 (the owner switched models as planned; the session had
+  also hit a usage limit overnight): the co-simulation agent had been killed
+  by the limit mid-task; relaunched with its partial files and a progress
+  note. M1 core hardened overnight: tape-out clean, 78.8 percent full, +1.45
+  ns typical slack (D-019 has the critical path), 4 h 39 min hardening plus
+  3 h 27 min precheck (D-018 limits hardening to hardware changes and cancels
+  superseded runs). `sram-smoke` run 4 was killed by GitHub's 6-hour limit in
+  detailed routing: all 108 macro signal pins are on Metal2 along the macro's
+  bottom edge, which the placement put 6 um from the die floor, and the custom
+  power script left every standard-cell rail unconnected (654 PSM-0038
+  warnings; the standard flow has none). Next: SRAM agent fixes both, with a
+  capped router so failures end fast.

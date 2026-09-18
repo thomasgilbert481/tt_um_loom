@@ -177,3 +177,36 @@ threads at address 0 in the 256-word flop build.
 Decision: `RESET_PC[t]` resets to `t * (IMEM_WORDS / 4)`. The assembler's
 `.thread N` default origin follows the same rule through an `--imem-words`
 option (default 1024, so existing programs are unchanged).
+
+## D-018 2026-09-18 Opus 5: hardening runs only when the hardware changes
+
+Finding: the first hardening of the real M1 core took 4 h 39 min, and the TT
+precheck on it another 3 h 27 min, because the 6x4 block is 79 percent full
+and detailed routing has only Metal1 to Metal4. Every push to any branch
+started that eight-hour pipeline, including documentation and Python-only
+commits.
+Decision: `.github/workflows/gds.yaml` gains a `paths` filter (`src/**`,
+`info.yaml`, `test/**`, `macro/**`, the workflow itself) and a `concurrency`
+group that cancels a superseded run on the same branch. The jobs themselves are
+the unchanged Tiny Tapeout template. This is the one sanctioned edit to that
+file; `CLAUDE.md` says so.
+Consequence: a commit that touches none of those paths has no GDS of its own.
+Before submission, run the `gds` workflow manually (`workflow_dispatch`) on the
+exact commit being submitted.
+
+## D-019 2026-09-18 Opus 5: M1 critical path is the W-stage thread decode
+
+Finding (post-route STA of CI run 35272974272): at the typical corner the
+worst setup path is 17.8 ns of a 20 ns clock (+1.45 ns slack); at the slow
+corner (1.08 V, 125 C) it fails by 9.9 ns on 1,084 endpoints. The worst path
+starts at the W-stage thread register (`tr_thread`), is decoded through
+NAND/NOR levels into per-thread write enables, and fans out to every piece of
+per-thread state before a MUX4 into the destination flop. Several weak `_1`
+gates on it drive large loads (one NOR3 alone takes 3.65 ns).
+Decision (M2, after co-simulation lands so the two edits do not collide):
+replace the decode with a one-hot ring counter for the W stage, which needs
+no decode because the slot order is fixed, and replicate it per consumer
+(register file, timers, PC/flags, pins) so no single net fans out to all
+per-thread state. Target: +4 ns slack at the typical corner and a slow-corner
+failure under 3 ns before M2 features are added. Re-measure after the change;
+the flop instruction memory's 256:1 read mux is the next suspect.

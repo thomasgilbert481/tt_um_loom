@@ -46,9 +46,14 @@ decision or configuring the flow; it is reference material.
   `initial` in synthesisable code. No latches outside `loom_imem.v`. Parameters
   not macros. One file per module, file name = module name.
 - **Do not edit `src/config.json`** except `CLOCK_PERIOD` and
-  `PL_TARGET_DENSITY_PCT`, and only with a DECISIONS entry. Never edit
-  `.github/workflows/gds.yaml`, `docs.yaml`, `test.yaml` beyond adding our own
-  jobs in new files.
+  `PL_TARGET_DENSITY_PCT`, and only with a DECISIONS entry. Never edit the
+  jobs in `.github/workflows/gds.yaml`, `docs.yaml`, `test.yaml`; add our own
+  jobs in new files. The trigger block of `gds.yaml` (paths filter and
+  concurrency) is ours under D-018.
+- **Hardening is expensive.** A 6x4 hardening plus precheck takes about eight
+  hours in CI at M1 density. Commits that only touch docs or Python tools do
+  not trigger it (D-018). Before submission, run `gds` by hand on the exact
+  commit being submitted.
 - **Tiny Tapeout hygiene:** all outputs assigned; unused inputs listed in the
   `_unused` wire; `ena` ignored; pins documented in `info.yaml`; `source_files`
   and `test/Makefile` `PROJECT_SOURCES` kept in sync (the flow fails otherwise).
