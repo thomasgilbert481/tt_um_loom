@@ -273,8 +273,8 @@ as in CI run 35377845679, and the FS pin edge (y 231.34) faces 123 free rows.
 The arithmetic is in the comments of `src/config.json`.
 Rejected: another k in x = 12 + 67.44 k (valid for the stripes, but k = 0
 keeps the whole right side and the top 475 um free and is the verified
-geometry); y = 10 (would drop the 6 rows under the macro, a negligible gain,
-on an untested placement).
+geometry); y = 10 (would only move the 6 short rows under the macro to above
+it, a negligible gain, on an untested placement).
 Consequences: these keys now fall under the same rule as the rest of the file
 (change only with a DECISIONS entry); the CLAUDE.md sentence on
 `src/config.json` should say so. The illegal-overlap waiver would hide a new
