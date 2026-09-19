@@ -74,14 +74,15 @@ TOPLEVEL = tb
 export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 
 # List test modules to run, separated by commas and without the .py suffix.
-# Gate-level simulation is far slower, so CI's gl_test runs the subset that
-# proves the netlist end to end (host port, timing, UART). Run the full set at
-# gate level by hand with: make GATES=yes COCOTB_TEST_MODULES=<list>
-# test_flops drives the second, FLOPS-memory instance in tb.v (RTL only).
+# Gate level runs every module that can see a netlist: about 35 minutes for
+# 70 tests, inside the time precheck takes anyway (the gl_test job runs next
+# to it). Left out: test_cosim (it skips itself on a netlist, having none of
+# the internal signals it compares) and test_flops, which drives the second,
+# FLOPS-memory instance in tb.v (RTL only).
 ifneq ($(GATES),yes)
 COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim,test_flops
 else
-COCOTB_TEST_MODULES ?= test_host,test_timing,test_uart
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd
 endif
 
 # include cocotb's make rules to take care of the simulator setup

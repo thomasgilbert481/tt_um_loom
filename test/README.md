@@ -54,6 +54,12 @@ Then run:
 make -B GATES=yes
 ```
 
+For this project the netlist comes from a CI run's `tt_submission` artifact
+(`tt_submission/tt_um_loom.v`) and `PDK_ROOT` needs only the three cell-model
+files CI uses; `docs/tt_cmos5l_facts.md` section 12 has the recipe. The
+gate-level list is every module except `test_cosim` (it skips itself on a
+netlist) and `test_flops` (RTL only): 70 tests, about 35 minutes.
+
 If you wish to save the waveform in VCD format instead of FST format, edit tb.v to use `$dumpfile("tb.vcd");` and then run:
 
 ```sh
