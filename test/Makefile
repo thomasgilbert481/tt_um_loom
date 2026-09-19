@@ -77,8 +77,9 @@ export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 # Gate-level simulation is far slower, so CI's gl_test runs the subset that
 # proves the netlist end to end (host port, timing, UART). Run the full set at
 # gate level by hand with: make GATES=yes COCOTB_TEST_MODULES=<list>
+# test_flops drives the second, FLOPS-memory instance in tb.v (RTL only).
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim,test_flops
 else
 COCOTB_TEST_MODULES ?= test_host,test_timing,test_uart
 endif

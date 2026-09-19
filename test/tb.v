@@ -7,8 +7,8 @@
 module tb ();
 
   // Dump the signals to a FST file. You can view it with gtkwave or surfer.
-  // Dumping the whole design (including the 256 x 16 instruction memory)
-  // roughly triples the run time of the M1 suite, so it is opt-in:
+  // Dumping the whole design (including the instruction memories) roughly
+  // triples the run time of the suite, so it is opt-in:
   //     make PLUSARGS=+dump
   initial begin
     if ($test$plusargs("dump")) begin
@@ -45,5 +45,35 @@ module tb ();
       .clk    (clk),      // clock
       .rst_n  (rst_n)     // not reset
   );
+
+`ifndef GL_TEST
+  // The FLOPS fallback build (D-020): a second, independent tt_um_loom with
+  // the 256 x 16 flip-flop instruction memory instead of the SRAM macro, on
+  // its own pins (same names with a _flops suffix, same pad model). Only
+  // test_flops.py drives it; nothing else toggles clk_flops, so the other
+  // tests pay only its compile time. The gate-level netlist is the MACRO
+  // build, so this instance exists in RTL simulation only.
+  reg        clk_flops;
+  reg        rst_n_flops;
+  reg        ena_flops;
+  reg  [7:0] ui_in_flops;
+  reg  [7:0] uio_drv_flops;
+  wire [7:0] uo_out_flops;
+  wire [7:0] uio_out_flops;
+  wire [7:0] uio_oe_flops;
+  wire [7:0] uio_in_flops = (uio_out_flops & uio_oe_flops)
+                            | (uio_drv_flops & ~uio_oe_flops);
+
+  tt_um_loom #(.IMEM_IMPL("FLOPS"), .IMEM_WORDS(256)) user_project_flops (
+      .ui_in  (ui_in_flops),
+      .uo_out (uo_out_flops),
+      .uio_in (uio_in_flops),
+      .uio_out(uio_out_flops),
+      .uio_oe (uio_oe_flops),
+      .ena    (ena_flops),
+      .clk    (clk_flops),
+      .rst_n  (rst_n_flops)
+  );
+`endif
 
 endmodule
