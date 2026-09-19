@@ -284,3 +284,39 @@ a quarter fewer stripes; IR drop is not checked by the flow). The macro's
 A_DOUT clock-to-output (3.73 ns typical, 6.25 ns at the slow corner, against
 roughly 0.5 ns for the M1 flop) now starts the D-stage paths; the first 6x4
 hardening with the macro shows whether that matters at 20 ns.
+Outcome (2026-09-19, run 35419160398): it does not; the worst path the macro
+launches has +2.07 ns at the slow corner. The overlap count read 10, and the
+rule is restated: what must not change is the set of crossings, not the
+count. All 10 are the four POWER stripes crossing the macro's `obsm4` band at
+y 186.1-192.3 um (x 28.2, 95.6, 163.1, 230.5 um, the 67.44 pitch), each
+reported as two boxes split at y 190.95, the same crossings the smoke test
+waived (facts 12). A hardening whose Magic feedback shows any other box
+needs a look before the waiver covers it.
+
+## D-022 2026-09-19 Opus 5: the deadline-latch fire logic picks among finished differences
+
+Decision: `loom_timer` computes `lat_fire` (SEMANTICS 6.10 rules 1 and 2)
+from three 16-bit differences per thread, `NOW - cm_td`, `NOW - h_wdata` and
+`NOW - TD`, each straight from registers, and uses the TD write strobes
+(commit, then host) and `tick` only as the selects of a final 1-bit mux. The
+old code muxed TD' first (commit value, host value or TD) and subtracted
+once.
+Why: 22 of the 23 slow-corner setup violations of the first macro hardening
+(worst -2.07 ns) start at `h_dbg_thread` and end at the pin registers: the
+host write strobe `h_mine` (a thread-number compare) fanned out through
+`buf_1` buffers with slews up to 1.85 ns into the 16-bit TD' mux, then the
+subtract, the 15-bit AND and the staged pin write. Now the decode and `tick`
+(itself a 25-bit compare) arrive at the last mux, in parallel with the
+subtractors.
+Evidence: Yosys `equiv_make`/`equiv_simple`/`equiv_induct` proves the new
+module equivalent to the old one (964 `$equiv` cells, `lat_fire` included,
+0 unproven); the RTL suite and co-simulation are unchanged.
+Rejected: registering the host write strobes (moves the host TD write by a
+clock, which HOST_PROTOCOL's E+4 rule fixes); leaving it to the flow's
+resizer (it did not fix it, and the typical corner already passes, so the
+flow has no reason to try).
+Consequences: eight more 16-bit subtractors: Yosys generic synthesis of the
+merged tree goes from 19,493 to 19,921 cells (+2.2 per cent), flops
+unchanged at 3,028, longest path 62 -> 60 generic cells. Behaviour is
+unchanged, so SEMANTICS, the model and the tests are untouched. The next
+hardening shows what it buys at the slow corner.

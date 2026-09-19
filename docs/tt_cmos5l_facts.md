@@ -789,3 +789,60 @@ published cmos5l SRAM result that passes the Tiny Tapeout precheck.
 - A mock of the relevant OpenDB calls in Python's Tcl 8.6 (`tkinter`) ran the real
   `pdn_cfg.tcl` offline before each push; it caught the geometry but not PDN-0234,
   which lives in C++ (run 6).
+
+## 12. The macro in the 6x4 core: gate-level simulation and sign-off readings, 2026-09-19
+
+From the first hardening of the real core with the macro (run 35419160398, branch
+`macro-core` d41fe34).
+
+### Reproducing CI's `gl_test` locally
+
+- CI's job installs the PDK from **IHP-Open-PDK** at the commit named in the job log
+  ("Install ihp-sg13cmos5l PDK", `PDK_VERSION`; 2bbec755dc67 for this run) and uses only
+  three model files: `ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilog/sg13cmos5l_stdcell.v`,
+  `.../sg13cmos5l_udp.v` and `ihp-sg13cmos5l/libs.ref/sg13cmos5l_io/verilog/sg13cmos5l_io.v`.
+  They download as raw files from GitHub at that commit; lay them out under a
+  `PDK_ROOT` with the same relative paths.
+- The netlist is `tt_submission/tt_um_loom.v` from the run's `tt_submission` artifact;
+  the job copies it to `test/gate_level_netlist.v`.
+- Then `make GATES=yes` in `test/` with that `PDK_ROOT` (Icarus 14 and cocotb 2.1 from the
+  OSS CAD Suite behave like CI's Icarus 13 and cocotb 2.0.1: same failure, same sim
+  times). CI compiles with `-DGL_TEST -DFUNCTIONAL -DSIM`, so the cells are zero-delay
+  and the macro wrapper takes its behavioural branch. One test takes seconds; the CI
+  subset about 4 minutes.
+- The `gatelevel_test_results` artifact holds only `results.xml` (no waveform).
+
+### What differs from RTL at gate level
+
+- **Clock tree depth.** CTS builds a separate branch for the macro: `clk` -> six
+  `delaybuf_*` -> `clkbuf_0_clk` -> `clkbuf_1_0__f_clk` -> `A_CLK`, 8 buffers, while all
+  3,027 flops hang 5 buffers deep on `clk_regs`. In a zero-delay simulation every buffer
+  is a delta cycle, so the flops update before the macro's clock edge arrives. A monitor
+  in the macro model (inputs at the posedge against the previous negedge) found no input
+  that changed first over 10,700 edges: the flop-to-macro paths are deeper than the three
+  deltas. The macro's `A_DOUT` updates with a nonblocking assignment, after every flop
+  has sampled. Recheck this if a flop ever drives a macro pin through one or two gates.
+- **X.** Unwritten SRAM reads as X in the model. RTL executes an X instruction quietly
+  (`if` and `case` take the default branch); the netlist spreads it (BUGS 4: the pin
+  write mask went X and `uo_out[0]` read X one clock after every edge, which
+  `resolve()` in the tests turns into 0). `test/tb.v` now stops an RTL run at the first
+  valid slot decoding an X/Z word, so RTL and gate level agree on this.
+- **Differential debugging** found BUGS 4 in minutes: the netlist keeps most RTL
+  register names as escaped per-bit nets (`\u_loom.u_core.pc_all[13] `), so dumping the
+  same named signals from an RTL run and a gate-level run of one test (`$dumpvars` on each
+  bit net in GL, on the vector in RTL) and comparing them clock by clock shows the first
+  divergence and whether it is 0/1 or X.
+
+### Sign-off readings
+
+- **Magic illegal overlaps: 10**, against the smoke test's 5. They are the same four
+  POWER stripes crossing the macro's `obsm4` band at the `VDD!`/`VDDARRAY!` split
+  (y 186.1-192.3 um; x 28.2, 95.6, 163.1, 230.5 um, the 67.44 um pitch), each now
+  reported as two boxes split at y 190.95 (one stripe also in two x pieces). Magic's
+  `64-magic-spiceextraction/feedback.txt` lists the boxes in 5 nm units. The waiver
+  holds for these boxes only (D-021, outcome).
+- Magic DRC reports 57,924 errors with `ERROR_ON_MAGIC_DRC` false; precheck's KLayout
+  SG13CMOS5L DRC, the sign-off check, is clean.
+- Timing sign-off is the typical corner only (`TIMING_VIOLATION_CORNERS` `*typ*`); the
+  slow and fast corners are reported but never fail the flow. The macro's slow
+  clock-to-output (6.25 ns) leaves +2.07 ns on its worst path at the slow corner.

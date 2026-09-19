@@ -220,8 +220,10 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       `IMEM_IMPL "FLOPS"` (or add an iCE40 block-RAM backend to `loom_imem`).
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,
       with the latch array as fallback. Remaining conditions: Tiny Tapeout's
-      view of the overlap waiver and power-script wrapper, Jane Street's answer
-      on macros, and a 6x4 hardening of the real core with the macro.
+      view of the overlap waiver and power-script wrapper, and Jane Street's
+      answer on macros. The third, a 6x4 hardening of the real core with the
+      macro, is met (2026-09-19, run 35419160398: precheck pass, 51.5 percent,
+      +6.21 ns typical).
       2026-09-18: integrated on branch `macro-core` (D-021): `loom_imem`
       `IMPL "MACRO"` by default, FLOPS kept and tested (`test_flops.py`),
       the recipe in `src/config.json` with the macro FS at (12, 40); Yosys
@@ -432,3 +434,26 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   Next: read the first 6x4 hardening with the macro (utilisation, the
   macro's 3.7 ns typical / 6.25 ns slow clock-to-output on the D-stage paths,
   illegal-overlap count 5, precheck), then merge `macro-core` into `main`.
+- 2026-09-19, Opus 5: the first 6x4 hardening with the macro in the core
+  (run 35419160398, `macro-core` d41fe34) passed gds, precheck and viewer:
+  utilisation 51.5 percent (was 78.8), setup +6.21 ns typical and +11.07 ns
+  fast, -2.07 ns at the slow corner on 23 endpoints (was -9.95 ns on 1,084),
+  hold clean everywhere, DRC, LVS and antenna 0 (AREA.md). The macro's slow
+  clock-to-output does not matter: its worst path has +2.07 ns at the slow
+  corner. The illegal-overlap count read 10, not 5; they are the same four
+  stripe crossings as the smoke test, each reported as two boxes (facts 12).
+  `gl_test` failed 1 of 15, which was a test bug, not a netlist bug (BUGS 4):
+  `test_other_threads_do_not_move_the_edges` never reset thread 1 after
+  setting its RESET_PC, so in the 512-word build the thread ran unwritten
+  memory at 0x80; RTL decoded the X words quietly, the netlist spread them into
+  the pin register. Found by reproducing the job locally (netlist from the
+  run, cell models from IHP-Open-PDK at CI's commit) and diffing 982 named
+  nets between RTL and gate level clock by clock (facts 12). The test now
+  resets the thread and checks the loop ran, and `tb.v` stops any RTL run
+  whose valid slot decodes an X word. Merged `macro-core` into `main`.
+  The slow-corner group is the deadline-latch fire logic: the host debug
+  thread decode fanned out ahead of a 16-bit subtract (D-022 restructures it,
+  proven equivalent with Yosys `equiv_*`). The remaining -0.26 ns path is
+  `tx_th` fanout through a chain of six `buf_1`; the flow signs off at the
+  typical corner only (`TIMING_VIOLATION_CORNERS` `*typ*`), so slow-corner
+  closure stays a stretch item with the flow knobs in AREA.md.

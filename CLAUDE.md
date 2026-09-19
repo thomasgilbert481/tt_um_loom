@@ -1,9 +1,9 @@
 # Loom (tt_um_loom): instructions for Claude sessions in this repo
 
 You are implementing a protocol emulator ASIC for the Jane Street competition
-(Tiny Tapeout, IHP CMOS5L, 8x4 tiles, deadline 2027-01-18). The architecture
-was set by Fable 5.1; you (usually Opus 5) implement it. Thomas Gilbert owns
-the project.
+(Tiny Tapeout, IHP CMOS5L, 6x4 tiles since the cmos5l flow offers no 8x4,
+deadline 2027-01-18). The architecture was set by Fable 5.1; you (usually
+Opus 5) implement it. Thomas Gilbert owns the project.
 
 ## Read order, every session
 
@@ -46,12 +46,15 @@ decision or configuring the flow; it is reference material.
   `initial` in synthesisable code. No latches outside `loom_imem.v`. Parameters
   not macros. One file per module, file name = module name.
 - **Do not edit `src/config.json`** except `CLOCK_PERIOD` and
-  `PL_TARGET_DENSITY_PCT`, and only with a DECISIONS entry. Never edit the
+  `PL_TARGET_DENSITY_PCT`, and only with a DECISIONS entry. The SRAM macro
+  keys that D-021 added (`MACROS`, the PDN grid, the Magic waivers) fall under
+  the same rule, and `src/pdn_cfg.tcl` with them. Never edit the
   jobs in `.github/workflows/gds.yaml`, `docs.yaml`, `test.yaml`; add our own
   jobs in new files. The trigger block of `gds.yaml` (paths filter and
   concurrency) is ours under D-018.
 - **Hardening is expensive.** A 6x4 hardening plus precheck takes about eight
-  hours in CI at M1 density. Commits that only touch docs or Python tools do
+  hours in CI at M1 density (about six with the macro: 3 h 53 min gds, about
+  2 h precheck). Commits that only touch docs or Python tools do
   not trigger it (D-018). Before submission, run `gds` by hand on the exact
   commit being submitted.
 - **Tiny Tapeout hygiene:** all outputs assigned; unused inputs listed in the
@@ -122,7 +125,8 @@ is required or `/mnt/c/...` arguments are rewritten into Git paths, and shell
 variables inside a `wsl ... bash -c '...'` one-liner are expanded to nothing
 before bash sees them, so put anything with variables in a script file.
 Gate-level simulation needs the netlist from the CI artefact and the three PDK
-cell-model files; the recipe is in `docs/BUGS.md` entry 2 and the project memory.
+cell-model files; the recipe to reproduce CI's `gl_test` locally, and to diff
+RTL against gate level net by net, is `docs/tt_cmos5l_facts.md` section 12.
 
 ## Milestone M0 for a fresh session (if PLAN M0 boxes are still open)
 

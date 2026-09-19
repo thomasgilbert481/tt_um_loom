@@ -31,11 +31,17 @@
  *     rule 1: NOW ticks at e to exactly TD, and TD is not written at e;
  *     rule 2: TD is written at e (commit port, or a host debug write) and
  *             reached(NOW', TD') holds for the values after e.
- *   Both use one subtraction, D = NOW - TD', where TD' is the value TD takes
- *   at e: rule 1 is NOW + 1 == TD, i.e. D == 16'hFFFF with TD unchanged, and
+ *   Both use D = NOW - TD', where TD' is the value TD takes at e: rule 1 is
+ *   NOW + 1 == TD, i.e. D == 16'hFFFF with TD unchanged, and
  *   NOW' - TD' = D + tick, whose bit 15 is D[15] ^ (tick & D[14:0] == 7FFF).
  *   CTRL.RESET also writes TD (TD := NOW) but is not a rule-2 write: it
  *   discards the staged write instead (loom_core).
+ *   D is computed three times, once per candidate TD' (the commit value, the
+ *   host value, TD itself), straight from registers, and the write strobes
+ *   and `tick` only pick among the finished results. One subtraction after
+ *   the TD' mux put the host thread decode and its fanout ahead of the
+ *   subtractor, the worst path of the first 6x4 macro hardening (-2.07 ns
+ *   at the slow corner, D-022).
  *
  * All per-thread outputs are flattened: thread t occupies bits
  * [16*t +: 16] of the 16-bit vectors and [8*t +: 8] of the 8-bit ones.
@@ -107,14 +113,20 @@ module loom_timer (
       // TD written at this edge in the sense of rule 2: a commit (WAITD
       // first issue, SETD, CSRW TD) or a host debug write. CTRL.RESET is
       // left out on purpose (it discards the staged write).
-      wire        td_w     = (mine && cm_td_we) || (h_mine && h_td_we);
-      wire [15:0] td_new   = (mine && cm_td_we) ? cm_td
-                           : (h_mine && h_td_we) ? h_wdata : td;
-      wire [15:0] lat_d    = now - td_new;
-      wire        lat_all1 = &lat_d[14:0];
-      wire        rule1    = tick && !td_w && !h_reset[t] && lat_d[15] && lat_all1;
-      wire        rule2    = td_w && !(lat_d[15] ^ (tick && lat_all1));
-      assign lat_fire[t] = rule1 || rule2;
+      // The commit write wins over the host write (as for TD itself below).
+      wire        w_cm     = mine && cm_td_we;
+      wire        w_h      = h_mine && h_td_we;
+      wire [15:0] d_cm     = now - cm_td;     // D if the commit writes TD
+      wire [15:0] d_h      = now - h_wdata;   // D if the host writes TD
+      wire [15:0] d_td     = now - td;        // D if nothing writes TD
+      // rule 2 as a function of D, for tick = 1 and tick = 0
+      wire        f_cm1    = !(d_cm[15] ^ (&d_cm[14:0]));
+      wire        f_h1     = !(d_h[15]  ^ (&d_h[14:0]));
+      // rule 1 needs a tick, so it only appears on the tick = 1 side
+      wire        f_td1    = !h_reset[t] && d_td[15] && (&d_td[14:0]);
+      wire        fire_t1  = w_cm ? f_cm1 : w_h ? f_h1 : f_td1;
+      wire        fire_t0  = w_cm ? !d_cm[15] : w_h ? !d_h[15] : 1'b0;
+      assign lat_fire[t] = tick ? fire_t1 : fire_t0;
 
       always @(posedge clk) begin
         if (!rst_n) begin
