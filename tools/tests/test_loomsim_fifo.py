@@ -99,6 +99,18 @@ def test_a_host_pop_of_an_empty_outq_returns_zero_and_sets_badop_14_at_the_edge(
     assert machine.threads[2].outq == []
 
 
+def test_host_fifo_error_flags_without_popping():
+    """The port's pop half when the peek was empty but a PUSH filled the queue
+    in between (SEMANTICS 6.7): the error is set, the entry stays."""
+    machine = fifo_machine([("HALT", {})])
+    machine.threads[1].outq.append(0xBEEF)
+    machine.host_fifo_error()
+    assert machine.badop == 0                          # set at the edge, not before
+    machine.step_cycle()
+    assert machine.badop == 1 << 14
+    assert machine.threads[1].outq == [0xBEEF]
+
+
 def test_badop_14_is_write_one_to_clear():
     machine = fifo_machine([("HALT", {})])
     machine.host_fifo_pop(0)

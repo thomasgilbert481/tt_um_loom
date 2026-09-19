@@ -291,9 +291,11 @@ an edge and is visible from the following cycle, like every other register.
   previous word) it **peeks**: the head if `OUTQ_CNT[t] > 0` then, else 0. The
   **pop** commits at the edge where the word's last bit has gone out, and only
   if the peek found an entry; an empty peek sets `BADOP[14]` at that edge. A
-  word cut short by `CS_n` pops nothing. The word loaded at the edge where the
-  previous word is popped is the entry after the head, and needs
-  `OUTQ_CNT[t] >= 2` in that cycle. Nothing is lost or read twice. A thread push or pop committing at the same edge is
+  word cut short by `CS_n` pops nothing. The word loaded while the previous
+  word's pop is still in flight is the entry after the head, and needs
+  `OUTQ_CNT[t] >= 2` as visible in the cycle the load is decided, a count that
+  still includes the entry that pop is about to remove. Nothing is lost or
+  read twice. A thread push or pop committing at the same edge is
   applied too: the new count is `count + pushes - pops`.
 - `CTRL.RESET` of thread `t` also empties `INQ[t]` and `OUTQ[t]`.
 - `WAITB c` conditions (6.4): 1 is `OUTQ_CNT[t] < FIFO_DEPTH`, 2 is

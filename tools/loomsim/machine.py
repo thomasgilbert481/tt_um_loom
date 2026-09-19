@@ -862,6 +862,18 @@ class Machine:
         self._host(thread=thread, outq_pop=True)
         return queue[0]
 
+    def host_fifo_error(self) -> None:
+        """Set ``BADOP[14]`` at the edge that ends this cycle, and nothing else.
+
+        The host FIFO error of a pop whose peek found ``OUTQ`` empty
+        (SEMANTICS 6.7).  :meth:`host_fifo_pop` raises it too when the queue is
+        empty in the pop cycle, but a thread ``PUSH`` may have filled the queue
+        between the peek and the pop: the port still pops nothing and still
+        flags the error, which is what this call is for.
+        """
+        self._require_fifo()
+        self._host(badop_set=H.BADOP_FIFO)
+
     def host_fifo_status(self, thread: int) -> Dict[str, int]:
         """Occupancy of both FIFOs of ``thread`` as visible in this cycle."""
         self._require_fifo()
