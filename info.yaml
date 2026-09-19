@@ -16,6 +16,11 @@ project:
 
   # Keep in sync with PROJECT_SOURCES in test/Makefile.
   # loom_isa.vh is a header for testbenches and formal only, not for synthesis.
+  # The SRAM macro (D-020) is not a source file: src/config.json brings it in
+  # through MACROS. src/RM_IHPSG13_1P_512x16_c2_bm_bist.v is its port-only
+  # blackbox, which the MACROS "nl" entry points at (LibreLane reads it as a
+  # blackbox model) and local lint uses; it stays out of this list, as on the
+  # sram-smoke branch.
   source_files:
     - "tt_um_loom.v"
     - "loom_top.v"
@@ -23,6 +28,7 @@ project:
     - "loom_spi_host.v"
     - "loom_host_ctl.v"
     - "loom_imem.v"
+    - "loom_imem_macro.v"
     - "loom_core.v"
     - "loom_decode.v"
     - "loom_regfile.v"

@@ -14,6 +14,7 @@ PROJECT_SOURCES += loom_sync.v
 PROJECT_SOURCES += loom_spi_host.v
 PROJECT_SOURCES += loom_host_ctl.v
 PROJECT_SOURCES += loom_imem.v
+PROJECT_SOURCES += loom_imem_macro.v
 PROJECT_SOURCES += loom_core.v
 PROJECT_SOURCES += loom_decode.v
 PROJECT_SOURCES += loom_regfile.v
@@ -23,11 +24,26 @@ PROJECT_SOURCES += loom_pins.v
 PROJECT_SOURCES += loom_fifo.v
 PROJECT_SOURCES += loom_be.v
 
+# The vendored simulation model of the SRAM macro (D-020), as on the sram-smoke
+# branch. Needed for BOTH the RTL and the gate-level case: the netlist
+# instantiates the macro as a blackbox, so the model has to be supplied either
+# way. The core behavioural file comes first because the wrapper instantiates
+# the module it defines, and -DFUNCTIONAL selects that behavioural path inside
+# the wrapper (without it the wrapper uses its specify/timing-check branch).
+# src/RM_IHPSG13_1P_512x16_c2_bm_bist.v (the synthesis and lint blackbox) is
+# deliberately NOT in PROJECT_SOURCES: compiling it as well would redefine the
+# module.
+MACRO_DIR     = $(PWD)/../macro/RM_IHPSG13_1P_512x16_c2_bm_bist
+MACRO_MODELS  = $(MACRO_DIR)/RM_IHPSG13_1P_core_behavioral_bm_bist.v
+MACRO_MODELS += $(MACRO_DIR)/RM_IHPSG13_1P_512x16_c2_bm_bist.v
+
 ifneq ($(GATES),yes)
 
 # RTL simulation:
 SIM_BUILD				= sim_build/rtl
+COMPILE_ARGS    += -DFUNCTIONAL
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
+VERILOG_SOURCES += $(MACRO_MODELS)
 
 else
 
@@ -39,6 +55,7 @@ COMPILE_ARGS    += -DSIM
 VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13cmos5l/libs.ref/sg13cmos5l_io/verilog/sg13cmos5l_io.v
 VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilog/sg13cmos5l_stdcell.v
 VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilog/sg13cmos5l_udp.v
+VERILOG_SOURCES += $(MACRO_MODELS)
 
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
