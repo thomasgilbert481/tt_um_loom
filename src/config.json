@@ -9,6 +9,11 @@
 
   "//": "If you get stuck with this config, please open an issue or get in touch via the discord.",
 
+  "//": "Loom: the SRAM macro block below and the four FP_PDN_V* stripe keys are the only changes to",
+  "//": "the template (docs/DECISIONS.md D-020, D-021). They are the recipe that took the macro",
+  "//": "through hardening, precheck and gl_test on branch sram-smoke (docs/tt_cmos5l_facts.md",
+  "//": "section 11), adapted from the 2x2 smoke test to this 6x4 block.",
+
   "//": "Here are some of the variables you may want to change:",
 
   "//": "PL_TARGET_DENSITY_PCT - You can increase this if Global Placement fails with error GPL-0302.",
@@ -30,6 +35,138 @@
   "//": "If you need a custom clock configuration, read the following documentation first:",
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
   "CLOCK_PORT": "clk",
+
+  "//": "================= SRAM macro integration (D-020, D-021) =================",
+
+  "//": "MACROS - the LibreLane way of bringing in a hard macro (NOT EXTRA_LEFS/EXTRA_GDS_FILES).",
+  "//": "https://librelane.readthedocs.io/en/latest/usage/using_macros.html . Key = the macro name.",
+  "//": "Everything below is vendored at IHP-Open-PDK commit 2bbec755; see",
+  "//": "macro/RM_IHPSG13_1P_512x16_c2_bm_bist/README.md.",
+  "//": "  instances - the key is the instance's FLATTENED path (CheckMacroInstances rejects anything",
+  "//":             "else; sram-smoke CI run 1). tt_um_loom.u_loom (loom_top) -> u_imem (loom_imem) ->",
+  "//":             "generate block g_macro (IMEM_IMPL MACRO) -> u_macro (loom_imem_macro) -> sram. Yosys,",
+  "//":             "reading the sources the way LibreLane does and flattening, names the cell",
+  "//":             "u_loom.u_imem.g_macro.u_macro.sram. PDN_MACRO_CONNECTIONS below uses the same path.",
+  "//": "  orientation FS - mirrored about the X axis (LEF SYMMETRY X Y R90 allows it). All 108 signal",
+  "//":             "pins of the macro are Metal2 stubs at LEF y 0..0.26, its bottom edge; FS puts them on",
+  "//":             "its TOP edge, facing the free rows above it where the logic sits. Mirroring about X",
+  "//":             "keeps every power column at the same x, so the stripe alignment below is unchanged.",
+  "//":             "Orientation must keep the columns vertical (N, FS, FN or S): the stripes are Metal4",
+  "//":             "like the pins, so they cannot cross them. Unmirrored (N) with the pins 6 um from the",
+  "//":             "core edge, sram-smoke CI run 4 drowned in detailed routing.",
+  "//": "  location [12, 40] - lower-left corner of the placed macro, absolute die coordinates.",
+  "//":             "6x4 block (tt-support-tools, branch ihp-sg13cmos5l, tech/ihp-sg13cmos5l/def/",
+  "//":             "tt_block_6x4_pgvdd.def): DIEAREA 0 0 1289.28 710.64; ROW_0 at (2.88, 3.78), 186 rows of",
+  "//":             "3.78, 2674 sites of 0.48, so the core is x 2.88..1286.40, y 3.78..706.86. That is",
+  "//":             "LEFT_MARGIN_MULT 6 x 0.48 = 2.88 and BOTTOM_MARGIN_MULT 1 x 3.78, the same core origin",
+  "//":             "as the 2x2 smoke test, so (12, 40) is the smoke test's placement relative to the core",
+  "//":             "and every number checked there carries over. All 43 block pins are on the top edge",
+  "//":             "(y 710.14, x 29.76..191.04).",
+  "//":             "The macro is 236.80 x 191.34, so FS at (12, 40) occupies x 12..248.80, y 40..231.34,",
+  "//":             "with its signal pins at y 231.08..231.34. Above it: the 10 um halo, then 123 rows",
+  "//":             "(y 241.92..706.86) for the logic and the 63 tie cells of the tied-off macro pins.",
+  "//":             "Right of it: x 258.80..1286.40 at full height. Below it: 6 rows (y 3.78..26.46).",
+  "//":             "x: the stripe grid below has its POWER stripe centres at 2.88 + 26.36 + 67.44 n =",
+  "//":             "29.24 + 67.44 n. Four cross the macro, at 29.24, 96.68, 164.12 and 231.56, which is",
+  "//":             "macro-local 17.24, 84.68, 152.12 and 219.56, inside VDD!/VDDARRAY! columns; the",
+  "//":             "GROUND stripes 5.62 um to the right (local 22.86, 90.30, 157.74, 225.18) are inside",
+  "//":             "VSS! columns. The same holds at x = 12 + 67.44 k for any k (the macro moves by whole",
+  "//":             "stripe pitches); any other x needs FP_PDN_VOFFSET recomputed (src/pdn_cfg.tcl).",
+  "//":             "y: FS puts VDD! (local y 0..38.825, pin edge) at die y 192.52..231.34 and VDDARRAY!",
+  "//":             "(local 45.465..191.34) at die y 40..185.88. The stripes run through the macro over",
+  "//":             "the full core height (y 3.56..707.08), so each of the four POWER stripes lies in a",
+  "//":             "VDD! column and a VDDARRAY! column and both supplies are reached at any y; y = 40 is",
+  "//":             "the smoke test's value (routed clean: 94 violations at iteration 0, none from",
+  "//":             "iteration 3), with the pin edge 475 um below the core top.",
+  "//": "  lib - keyed by timing-corner wildcard. The cmos5l STA corners are nom_typ_1p20V_25C,",
+  "//":     "nom_fast_1p32V_m40C and nom_slow_1p08V_125C, and LibreLane loads every key that",
+  "//":     "matches (common/toolbox.py filter_views). The reference project's keys (nom_*, min_*,",
+  "//":     "max_*, *) gave the typ lib at all three corners (sram-smoke CI runs 5 and 7), so the",
+  "//":     "keys name the process corner.",
+  "//": "  nl - the port-only blackbox in src/, not the behavioural model. Same as the reference.",
+  "MACROS": {
+    "RM_IHPSG13_1P_512x16_c2_bm_bist": {
+      "instances": {
+        "u_loom.u_imem.g_macro.u_macro.sram": {
+          "location": [12, 40],
+          "orientation": "FS"
+        }
+      },
+      "gds": [
+        "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.gds"
+      ],
+      "lef": [
+        "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.lef"
+      ],
+      "lib": {
+        "*_typ_*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_typ_1p20V_25C.lib"
+        ],
+        "*_fast_*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_fast_1p32V_m55C.lib"
+        ],
+        "*_slow_*": [
+          "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist_slow_1p08V_125C.lib"
+        ]
+      },
+      "nl": [
+        "dir::./RM_IHPSG13_1P_512x16_c2_bm_bist.v"
+      ],
+      "spice": [
+        "dir::../macro/RM_IHPSG13_1P_512x16_c2_bm_bist/RM_IHPSG13_1P_512x16_c2_bm_bist.cdl"
+      ]
+    }
+  },
+
+  "//": "PDN_MACRO_CONNECTIONS - hooks the macro's power pins onto the block's nets without needing",
+  "//": "USE_POWER_PINS in the RTL. Format: <instance> <block power net> <block ground net>",
+  "//": "<macro power pin> <macro ground pin>. The macro has three: VDD! (periphery), VDDARRAY!",
+  "//": "(the bit-cell array) and VSS!. Both supplies go to VPWR, as the reference project does;",
+  "//": "the macro would allow them to be separate rails but Tiny Tapeout only gives us one.",
+  "PDN_MACRO_CONNECTIONS": [
+    "u_loom.u_imem.g_macro.u_macro.sram VPWR VGND VDD! VSS!",
+    "u_loom.u_imem.g_macro.u_macro.sram VPWR VGND VDDARRAY! VSS!"
+  ],
+
+  "//": "PDN_CFG - LibreLane's default PDN script with its macro grid replaced. On cmos5l",
+  "//": "FP_PDN_VERTICAL_LAYER is Metal4, which is also the layer of the macro's power pins, and",
+  "//": "TopMetal1 belongs to tt_top, so the default macro grid (Metal4 <-> TopMetal1) is empty",
+  "//": "(PDN-0232, sram-smoke CI runs 2-3) and pdngen alone leaves the macro unconnected (run 4).",
+  "//": "The script lets the stripes run through the macro inside its same-net Metal4 power",
+  "//": "columns, so every stripe is one full-height power pin (the precheck pin check demands that;",
+  "//": "run 5's cut stripes failed it), verifies every stripe over the macro, and fails the PDN",
+  "//": "step at once if check_power_grid still finds an open.",
+  "PDN_CFG": "dir::pdn_cfg.tcl",
+
+  "//": "SRAM GDS has no PR boundary layer; read the full GDS instead of a blackbox.",
+  "//": "(cmos5l sets PRIMARY_GDSII_STREAMOUT_TOOL=klayout, so this may end up unused; kept because",
+  "//": "it is harmless and it is what the reference needs.)",
+  "MAGIC_MACRO_STD_CELL_SOURCE": "PDK",
+
+  "//": "SRAM macro internals trigger massive DRC in Magic (57,923 in the smoke test, every one",
+  "//": "inside the macro: Magic's cmos5l tech lacks the SRAM exceptions of the KLayout deck); Magic",
+  "//": "DRC is not part of the cmos5l precheck, whose KLayout SG13CMOS5L deck checks the merged",
+  "//": "GDS (0 violations in the smoke test). KLayout DRC is already off below.",
+  "ERROR_ON_MAGIC_DRC": false,
+
+  "//": "ERROR_ON_ILLEGAL_OVERLAPS - off for ONE known, checked case. The four POWER stripes cross",
+  "//": "the macro's VDD!/VDDARRAY! split, where the LEF puts a Metal4 OBS across each power column",
+  "//": "(local y 39.085..45.205, die y 186.135..192.255 here). Magic extracts the macro from its",
+  "//": "LEF (MAGIC_EXT_ABSTRACT_CELLS below) and reports each crossing as 'Illegal overlap between",
+  "//": "obsm4 and metal4 (types do not connect)': 5 boxes in sram-smoke CI run 7, all at the POWER",
+  "//": "stripes' x. The macro GDS, flattened, has no Metal4 (any datatype), Via3 or TopMetal1",
+  "//": "within 1 um of those stripes in that band, LVS passes, and the precheck's KLayout DRC checks",
+  "//": "the real metal. The count is still reported as magic__illegal_overlap__count in the run's",
+  "//": "metrics; anything beyond those crossings would be a new problem.",
+  "ERROR_ON_ILLEGAL_OVERLAPS": false,
+
+  "//": "Blackbox the SRAM macro during SPICE extraction for LVS: the IHP macros are not LVS clean.",
+  "MAGIC_EXT_ABSTRACT_CELLS": ["RM_IHPSG13_.*"],
+
+  "//": "DRT_OPT_ITERS stays at LibreLane's default (64): the smoke test's cap of 12 bounded a tiny",
+  "//": "design's failed runs and is not meant for this block.",
+
+  "//": "======================= end SRAM macro integration =======================",
 
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
@@ -58,8 +195,23 @@
   "FP_IO_HLENGTH": 2,
   "FP_IO_VLENGTH": 2,
 
-  "FP_PDN_VPITCH": 50.0,
+  "//": "PDN geometry (D-021). VPITCH, VSPACING and VOFFSET differ from the template, and only so",
+  "//": "that the Metal4 stripes sit inside the macro's Metal4 power pins. VWIDTH stays at the",
+  "//": "template's 2.1 because these stripes are also the block's power pins, which tt_top connects",
+  "//": "to (2.1 is the precheck's minimum power-port width on cmos5l).",
+  "//": "  VPITCH   67.44 = 6 x 11.24 um, the macro's same-net power column pitch, chosen so that no",
+  "//":                   "stripe lands in the macro's irregular middle band (template: 50). Over this",
+  "//":                   "core that is 19 stripe pairs, at 29.24 + 67.44 n (n = 0..18).",
+  "//": "  VSPACING 3.52: OpenROAD puts the GROUND stripe of a pair at (spacing + width) = 5.62 um",
+  "//":                   "from the POWER stripe centre, which is the macro's POWER-to-GROUND column",
+  "//":                   "distance.",
+  "//": "  VOFFSET  26.36 measured from the core-area xMin of 2.88 (the same on 2x2 and 6x4), giving",
+  "//":                   "the first POWER stripe centre at 29.24 = macro x 12 + 17.24.",
+  "//": "Full derivation and the verified stripe positions are in src/pdn_cfg.tcl.",
+  "FP_PDN_VPITCH": 67.44,
   "FP_PDN_VWIDTH": 2.1,
+  "FP_PDN_VSPACING": 3.52,
+  "FP_PDN_VOFFSET": 26.36,
 
   "//": "Clock",
   "RUN_CTS": 1,
