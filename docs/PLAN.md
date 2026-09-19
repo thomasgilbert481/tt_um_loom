@@ -204,16 +204,24 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
 - [x] 2026-09-18: `tools/loomhost`: protocol encoder, `Loom` API, transports
       (`ModelTransport` over the golden model as an executable reference of
       the host protocol, `PicoTransport`, `TTBoardTransport` using the RP2040's
-      SPI0), MicroPython side in `tools/loomhost/micropython/`, CLI. A cocotb
-      `SimTransport` is still to do.
-- [ ] Firmware: `uart_rx`, `spi_master`, `spi_slave`, `i2c_master`. Each with an
+      SPI0), MicroPython side in `tools/loomhost/micropython/`, CLI.
+      2026-09-19: `SimTransport` too, which moves host bytes over the RTL's
+      own SPI pads as one more pin model of the cocotb bench, so the host
+      library drives the RTL exactly as it drives the model.
+- [x] Firmware: `uart_rx`, `spi_master`, `spi_slave`, `i2c_master`. Each with an
       L3 test against a Python reference model, including error cases (framing
       error, NACK, clock stretching). 2026-09-18: `uart_tx_fifo`, `uart_rx`,
       `spi_master`, `i2c_master` pass end to end on the golden model with
       `tools/protomodels` (framing error, NACK and clock stretching
-      included); `spi_slave` and the same tests on the RTL are open. The
-      short start bit after idle in `uart_tx.loom` (firmware spec question 8)
-      is fixed.
+      included). The short start bit after idle in `uart_tx.loom` (firmware
+      spec question 8) is fixed. 2026-09-19: `spi_slave.loom` (modes 0 and 3,
+      MSB first, 50 words, `.tick 32`) and **the same test bodies on the
+      RTL**: `test/rtl_bench.py` gives the RTL the interface of the model's
+      bench, so the unchanged scenarios and the unchanged `tools/protomodels`
+      models run on both, with the program and the data going through the SPI
+      pads (`SimTransport`). 37 scenarios on the model, 29 of them on the RTL
+      (the 8 left out are slow 115200-baud and mode-sweep cases, marked with
+      the reason); no divergence between the two sides.
 - [ ] FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
       L3 tests re-run on hardware through `loomhost` (same scripts). The
       macro does not exist on the FPGA: build `tt_um_loom` with
@@ -457,3 +465,22 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   `tx_th` fanout through a chain of six `buf_1`; the flow signs off at the
   typical corner only (`TIMING_VIOLATION_CORNERS` `*typ*`), so slow-corner
   closure stays a stretch item with the flow knobs in AREA.md.
+- 2026-09-19 (evening), Opus 5, two agents in worktrees: **co-simulation over
+  the M2 features** and **the L3 firmware tests on the RTL**, both landed on
+  `main` after the director re-ran every check. Co-simulation now builds the
+  model from `CTRL.CAPS` instead of generating around the M2 features (the
+  `m2_built` flag is gone), generates FIFO, bit-engine and `SETP ... D` code
+  with a static no-deadlock rule, drives the host port throughout the two SPI
+  seeds (pushes, pops, CTRL writes, all mirrored into the model at the cycle
+  the RTL commits them) and compares `HOST_IRQ` every cycle. Coverage 553
+  bins, 33 empty, each with a reason. Four of five hand-written M2 mutants die
+  at seed 1 (FIFO full off by one, bit-engine shift direction, the `SETP D`
+  rule-2 compare, host-side INQ full); the fifth is documented as equivalent
+  in practice. Zero divergences. The firmware side gives the RTL the golden
+  model's bench interface (`test/rtl_bench.py` + `SimTransport`), so the same
+  test bodies and the same `tools/protomodels` models run on both: 37
+  scenarios on the model, 29 on the RTL, no divergence, plus the new
+  `spi_slave.loom`. Suite 104 cocotb tests and 1,293 tool tests. Two spec
+  items came out of it: SEMANTICS 6.7 now names the edge the next FIFO read
+  word is loaded at, and the model gained `host_fifo_error()`. M2's exit
+  criterion is met except the FPGA box.

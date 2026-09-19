@@ -177,8 +177,9 @@ state = loom.dump(0)                         # dict of the DEBUG space for threa
 loom.step(0); assert loom.dump(0) == model.step()
 ```
 
-Transports: `SimTransport` (cocotb coroutine driving the SPI pins with a
-cocotb clock), `PicoTransport` (USB serial to a Raspberry Pi Pico running
+Transports: `SimTransport` (the host port of a cocotb run: a pin model of
+`test/rtl_bench.py` that drives CS_n, SCK and MOSI and reads MISO and
+`HOST_IRQ` on `uo_out[6]`, at the timing `ModelTransport` uses), `PicoTransport` (USB serial to a Raspberry Pi Pico running
 `tools/loomhost/pico/` which converts a tiny line protocol to SPI),
 `TTBoardTransport` (tt-micropython-firmware REPL over USB on the Tiny Tapeout
 demo board; the firmware has no SPI driver for project pins, so the transport

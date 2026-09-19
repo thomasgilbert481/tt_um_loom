@@ -208,6 +208,22 @@ property that only reaches bounded depth is listed as bounded, not proven.
 | `gds` (TT) | push | hardening, precheck, GL test, viewer | ~30 to 60 min |
 | `fpga` | manual | bitstream artefact | minutes |
 
+## Where the checks live, 2026-09-19
+
+The plan above is the target; this is what exists and where, so a reader can
+run it.
+
+| Check | Implemented in | State |
+|---|---|---|
+| L0 static | `scripts/check_all.sh`, CI `lint` | Verilator `-Wall` on the TT top and the generated decoder |
+| L1 unit | `test/test_{host,alu,ctrl,pins,timing,uart,fifo,irq,be,setpd}.py` | 70 cocotb tests, all of which also run on the netlist in CI's `gl_test` |
+| L2-RAND, L2-TRACE, L2-SLOT | `tools/loomgen` + `test/test_cosim.py` | lockstep on every cycle: retire record, pads, `HOST_IRQ`, guard registers, periodic full state. Both sides built from `CTRL.CAPS`, so the M2 features (FIFOs, bit engine, `SETP ... D`) are exercised, and two seeds drive the host port throughout the run |
+| L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 553 bins, 33 empty at the default run, each listed with its reason |
+| L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
+| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 37 scenarios on the model, 29 on the RTL |
+| L7 mutation, by hand | `make SRC_DIR=<mutated copy>` | five mutants tried, four caught at seed 1 or 2 by co-simulation, one documented as equivalent in practice (`test/README.md`). `tools/mutate` itself is not written |
+| L4 formal, L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L4 and L6 are open |
+
 ## What "done" means for a check
 
 A check is done when: a test or proof references its ID; it passes in CI; the
