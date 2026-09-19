@@ -101,15 +101,13 @@ at every edge:
   the accumulate; `NOW` does not tick at that edge).
 - `TICK_INT = 0` is stored and read back as 0; the divider treats it as 1.
 - `reached(a, b)` is `((a - b) mod 2^16) < 2^15`.
-- `TICK_SEEN` is cleared at the commit edge of every valid slot of the thread
-  (unless a tick sets it at the same edge).
-- **Scheduled fix (rtl-m2 question 4, not yet built):** the rule above loses
-  a tick that lands at edge `x + 1`, between a slot's X cycle and its commit,
-  so `WAITB 3` can miss ticks indefinitely. The corrected rule clears only
-  what the slot saw: at the commit edge, `TICK_SEEN <= tick | (TICK_SEEN &
-  ~seen)`, where `seen` is the value the slot read in its X cycle. RTL and
-  golden model switch to it together in one commit; until then both keep the
-  rule above.
+- At the commit edge of every valid slot of the thread, `TICK_SEEN` keeps only
+  what the slot did not see: `TICK_SEEN <= tick | (TICK_SEEN & ~seen)`, where
+  `seen` is the value the slot read in its X cycle. A tick at the same edge
+  sets it. (Until 2026-09-18 the rule cleared `TICK_SEEN` outright, which lost
+  a tick landing at edge `x + 1`, between a slot's X cycle and its commit, so
+  `WAITB 3` could miss ticks indefinitely; rtl-m2 question 4. RTL and golden
+  model changed in the same commit.)
 
 ## 5. Per-thread architectural state and reset values
 

@@ -15,8 +15,11 @@
  *       NOW <= NOW + tick ; if tick then TICK_SEEN <= 1
  *   A TICK_INT or TICK_FRAC write committing at the same edge clears ACC and
  *   suppresses the tick at that edge (the clear wins over the accumulate).
- *   TICK_SEEN is cleared at the commit edge of every valid slot of the thread
- *   unless a tick sets it at the same edge (set wins).
+ *   At the commit edge of every valid slot of the thread, TICK_SEEN keeps only
+ *   what the slot did not see: TICK_SEEN <= tick | (TICK_SEEN & ~seen), where
+ *   `seen` (cm_tseen) is the value the slot read in its X cycle, so a tick at
+ *   edge x + 1 is not lost (SEMANTICS 4, rtl-m2 question 4). A tick at the same
+ *   edge sets it (set wins).
  *   The commit port selects its thread with `cm_sel`, a one-hot vector that
  *   loom_core builds from its own W-stage ring and w_valid (D-019), so no
  *   thread number is decoded here.
@@ -47,6 +50,7 @@ module loom_timer (
     // Commit port, driven from the W stage of loom_core (one thread per edge).
     input  wire [3:0]  cm_sel,        // bit t: a valid slot of thread t commits now
     input  wire        cm_td_we,
+    input  wire        cm_tseen,      // TICK_SEEN as the committing slot read it in X
     input  wire [15:0] cm_td,
     input  wire        cm_dt_we,
     input  wire [15:0] cm_dt,
@@ -130,7 +134,7 @@ module loom_timer (
           if (tick) now <= now + 16'd1;
 
           if (tick)                 tick_seen <= 1'b1;   // set wins over clear
-          else if (mine)            tick_seen <= 1'b0;
+          else if (mine)            tick_seen <= tick_seen & ~cm_tseen;   // clear only what the slot saw
           else if (h_mine && h_tseen_we) tick_seen <= h_wdata[0];
 
           // ------------------------------------------------------- TD / DT

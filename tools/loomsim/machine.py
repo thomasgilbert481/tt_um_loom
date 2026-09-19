@@ -943,8 +943,12 @@ class Machine:
                 th.tick_seen = 1                     # a tick wins over any clear
             elif t in host_tick_seen:
                 th.tick_seen = host_tick_seen[t] & 1
-            elif any(cm.thread == t for cm in slot_commit):
-                th.tick_seen = 0
+            else:
+                # SEMANTICS 4: a slot's commit clears only the TICK_SEEN it saw
+                # in its X cycle, so a tick at edge x + 1 survives the commit.
+                for cm in slot_commit:
+                    if cm.thread == t:
+                        th.tick_seen &= ~cm.seen_tick & 1
 
         if self._setpd:
             self._deadline_latches(landing, pre_lat, pre_od_mask, ticked,
@@ -1181,6 +1185,7 @@ class Machine:
 
         cm = Commit(visible_from=x + 2, thread=t, is_slot=True, steps_inc=True)
         cm.prev_pins = self.pin_in_word
+        cm.seen_tick = th.tick_seen & 1
         z, c_flag, t_flag = th.z, th.c, th.t
         done = True
         cm.pc = nxt

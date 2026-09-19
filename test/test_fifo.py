@@ -286,22 +286,25 @@ def waitb3_model(period, loops):
     4 and 6.4, in cycles relative to the X cycle (0) of its CSRW TICK_INT.
 
     The CSRW commits at edge 2, which clears ACC and eats that edge's tick,
-    so the ticks are at edges 2 + k * period. TICK_SEEN is set by a tick and
-    cleared at the commit edge (X + 2) of every slot of the thread, the tick
-    winning at the same edge; a slot sees the value of its X cycle.
+    so the ticks are at edges 2 + k * period. TICK_SEEN is set by a tick; at
+    the commit edge (X + 2) of every slot of the thread it keeps only what
+    that slot did not see in its X cycle (TICK_SEEN &= ~seen), the tick
+    winning at the same edge. The run starts with TICK_INT 1, so the CSRW saw
+    TICK_SEEN = 1 and leaves it 0 after edge 2.
     """
     ticks = set(2 + k * period for k in range(1, 8 * loops + 8))
     prog = ["CSRW", "WAITB", "SETP1", "WAITB", "SETP0", "DJNZ", "HALT"]
-    commits = {2}
+    commit_seen = {2: 1}          # commit edge -> TICK_SEEN as that slot saw it
     seen, edge, pc, x, left, edges = 0, 2, 1, 4, loops, []
     while prog[pc] != "HALT":
         for e in range(edge + 1, x + 1):          # TICK_SEEN during cycle x
             if e in ticks:
                 seen = 1
-            elif e in commits:
-                seen = 0
+            elif e in commit_seen:
+                seen &= ~commit_seen[e] & 1
         edge = x
         ins, nxt = prog[pc], pc + 1
+        commit_seen[x + 2] = seen
         if ins == "WAITB" and not seen:
             nxt = pc
         elif ins == "SETP1":
@@ -311,7 +314,6 @@ def waitb3_model(period, loops):
         elif ins == "DJNZ":
             left -= 1
             nxt = 1 if left else 6
-        commits.add(x + 2)
         pc, x = nxt, x + 4
     return edges
 
@@ -320,9 +322,10 @@ def waitb3_model(period, loops):
 async def test_waitb_tick_seen(dut):
     """WAITB 3 waits for TICK_SEEN (SEMANTICS 4, 6.4). With a period that is
     a multiple of 4 clocks the edges are exactly one period apart; with 41
-    the pattern, including ticks that land between a slot's X cycle and its
-    commit and are cleared by it, matches the literal rule. Also WAITB with
-    T and a past deadline, and debug 0x24."""
+    the pattern matches the rule edge for edge, and no tick is lost: a tick
+    that lands between a slot's X cycle and its commit survives the commit
+    (the rule was fixed on 2026-09-18; before, WAITB 3 at period 41 showed
+    gaps of 84). Also WAITB with T and a past deadline, and debug 0x24."""
     host = LoomHost(dut)
     await host.start()
     await fifo_depth(host)
@@ -338,6 +341,7 @@ async def test_waitb_tick_seen(dut):
                 0x05: asm("DJNZ", rd=3, rel=-5),
                 0x06: asm("HALT")}
         await host.write(SP_CTRL, CTRL_PIN_OUT, 0)
+        await host.write_csr(0, CSR_TICK_INT, 1)     # known TICK_SEEN at the start
         await host.load_program(prog, verify=False)
         await host.set_reset_pc(0, 0)
         await host.reset_thread(0)
@@ -354,6 +358,7 @@ async def test_waitb_tick_seen(dut):
         dut._log.info("WAITB 3, period %d: gaps %s" % (period, gaps))
         if period == 40:
             assert all(g == 40 for g in gaps), gaps
+        assert max(gaps) <= period + 4, f"period {period}: a tick was lost: {gaps}"
 
     # WAITB with T: a condition that holds wins (T <- 0); otherwise a
     # deadline already reached ends it with T <- 1. INQ[0] is empty here.

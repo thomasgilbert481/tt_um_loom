@@ -310,6 +310,9 @@ class Commit:
     #: Host debug writes of ``STEPS`` and ``TICK_SEEN`` (HOST_PROTOCOL space 4).
     steps: Optional[int] = None
     tick_seen: Optional[int] = None
+    #: For a slot: TICK_SEEN as the slot read it in its X cycle. The commit
+    #: clears only that (SEMANTICS 4, rtl-m2 question 4).
+    seen_tick: int = 0
 
     # --- shared ----------------------------------------------------------
     pin_out_mask: int = 0

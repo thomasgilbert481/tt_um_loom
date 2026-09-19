@@ -288,6 +288,7 @@ module loom_core #(
   reg [2:0]  w_rd, w_flags;
   reg [12:0] w_prev_pins;
   reg        w_td_we, w_dt_we, w_tint_we, w_tfrac_we, w_outgrp_we, w_ingrp_we;
+  reg        w_tseen;   // TICK_SEEN as this slot read it in X (SEMANTICS 4)
   reg [15:0] w_td, w_dt, w_csr_val;
   reg        w_rs_we;
   reg [9:0]  w_rs0, w_rs1;
@@ -489,7 +490,7 @@ module loom_core #(
   loom_timer u_timer (
       .clk(clk), .rst_n(rst_n),
       .cm_sel({4{w_valid}} & woh_tmr),
-      .cm_td_we(w_td_we), .cm_td(w_td),
+      .cm_td_we(w_td_we), .cm_td(w_td), .cm_tseen(w_tseen),
       .cm_dt_we(w_dt_we), .cm_dt(w_dt),
       .cm_tint_we(w_tint_we), .cm_tint(w_csr_val),
       .cm_tfrac_we(w_tfrac_we), .cm_tfrac(w_csr_val[7:0]),
@@ -891,6 +892,7 @@ module loom_core #(
       w_becfg_we <= 1'b0; w_bepins_we <= 1'b0; w_bereload_we <= 1'b0;
       w_crcpoly_we <= 1'b0; w_crcinit_we <= 1'b0;
       w_lat <= 1'b0; w_lat_pin <= 5'd0; w_lat_val <= 1'b0;
+      w_tseen <= 1'b0;
     end else begin
       w_valid       <= vx;
       w_thread      <= tx_th;
@@ -905,6 +907,7 @@ module loom_core #(
       w_wait_active <= wait_class ? x_stall : x_wa;
       w_prev_pins   <= pin32[12:0];
       w_td_we       <= x_td_we;
+      w_tseen       <= x_tseen;
       w_td          <= x_td_val;
       w_dt_we       <= x_dt_we;
       w_dt          <= dt_new;
