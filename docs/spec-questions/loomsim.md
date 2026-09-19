@@ -273,3 +273,127 @@ edges.
   offsets after their deadline produce a constant skew between those edges.
   This is firmware's problem, not the core's, but it is the first thing to
   check when a protocol test is off by a few clocks.
+
+---
+
+## M2 update
+
+Opus 5, 2026-09-18, written against `docs/SEMANTICS.md` 1.0-draft (6.7 to
+6.10), `docs/HOST_PROTOCOL.md` 0.2 and `isa/isa.yaml` 0.4.0 while bringing
+the model to M2 (host registers, `FIFO`, `BE`, `SETPD`; commits ad8a94f to
+8d0d59e on `model-m2`). As above, each item is a place where the text does
+not decide, the model implements the reading marked **chosen**, and none is
+ruled on yet. Items 8 and 9 are pinned by tests that name them.
+
+### 1. What `CTRL.VERSION` holds
+
+HOST_PROTOCOL lists the register but not its contents.
+**Chosen:** `{major, minor}` of the host protocol the port implements, 0x0002
+for 0.2 (`Machine(version=...)` overrides it). A host library needs a value
+it can compare against the document it was written for.
+
+### 2. Where `HOST_IRQ` appears in the model's pad view
+
+6.8 puts `HOST_IRQ` on pad `uo_out[6]`; the model's `uo_out` has always been
+`PIN_OUT[13:8]` (six bits), and co-simulation compares it.
+**Chosen:** `uo_out`, `PadState` and `dump_thread` stay as at M1; the
+registered output is `Machine.host_irq` and `CycleTrace.host_irq`. A
+harness compares `uo_out[6]` with that field; nothing M1 compares moved.
+
+### 3. When "halted" is judged for a host debug write
+
+SEMANTICS 7 allows debug writes while the thread is halted but not at which
+instant. **Chosen:** in the cycle the host issues the write, the cycle
+before its commit edge, for every debug register alike. It matches 6.7's
+host push ("as visible in the cycle before the commit edge").
+
+### 4. Debug numbers that name nothing, and read-only ones, by number
+
+HOST_PROTOCOL defines 0x00..0x26 and says nothing about the rest.
+**Chosen:** 0x27..0xFF read 0 and ignore writes, as the read-only 0x0B
+(`NOW`) and 0x26 (FIFO counts) ignore theirs, and the bit-engine CSRs in the
+window 0x10..0x1F read 0 when the engine is not built, like 0x0C..0x0E. Same
+rule as unimplemented CSRs in 6.6, and the port has no way to report an error.
+
+### 5. `CTRL.RESET` against rule 2 of 6.10 at the reset edge
+
+`CTRL.RESET` writes `TD <= NOW` (so `reached` holds at once) and clears
+`LAT_VALID`; read literally, rule 2 would apply the staged write at that same
+edge. **Chosen:** the clear wins and nothing lands at the reset edge. A reset
+should not make a pad edge, and the host may only reset a halted thread.
+Tested by `test_loomsim_setpd.py::test_ctrl_reset_discards_the_staged_write`.
+
+### 6. Same-edge precedence of a staged write against other pin commits
+
+6.10 settles only "a slot's ordinary pin writes" to the same pin.
+**Chosen:** slot pin write (`SETP`, `OUT`, `SHO`) to that index > staged
+write > host write of `PIN_OUT`/`PIN_OE`; a slot's raw `CSRW PIN_OUT`,
+`CSRW PIN_OE` or `OEP` at that edge is not a pin write to the index, so the
+staged write still lands but those bits keep the slot's value. It extends
+SEMANTICS 7's "the thread wins" to the thread's own staged write.
+
+### 7. Which `OD_MASK` a staged write uses
+
+A slot's pin write uses `OD_MASK` as visible in its X cycle; a staged write
+has no X cycle. **Chosen:** `OD_MASK` as visible in the cycle before the
+landing edge, so a `CSRW OD_MASK` committing at that edge does not affect it.
+Every register an edge reads is the pre-edge value everywhere else.
+
+### 8. A staged write whose edge is also the edge a newer one is staged
+
+`SETP ... D` stages "at the commit edge ..., replacing any write already
+staged". If the older write meets its deadline at exactly that edge, it can
+either land or be discarded. **Chosen:** it lands, and the latch then holds
+the newer write, which (staged at that edge) waits for a later one. The other
+reading silently drops an edge that is exactly on time. Pinned by
+`test_loomsim_setpd.py::test_an_older_write_still_lands_at_the_edge_a_newer_one_is_staged`.
+
+### 9. Host writes of debug 0x25
+
+6.10 says the latch is "readable through the debug space"; HOST_PROTOCOL
+makes every debug register other than `r0..r7` writable while the thread is
+not running. **Chosen:** writable, and a write loads `{LAT_VALID, LAT_VAL,
+LAT_PIN}` exactly as a `SETP ... D` commit would, so it cannot land at its
+own edge. A debugger must be able to save and restore a thread. Pinned by
+`test_loomsim_setpd.py::test_a_latch_loaded_by_the_host_cannot_fire_at_its_loading_edge`.
+
+### 10. Two threads' staged writes to one pin at one edge
+
+Each thread has its own latch and nothing orders them. **Chosen:** applied
+in thread order, so the higher-numbered thread's value stays. Deterministic
+and cheap; firmware that relies on it is wrong anyway.
+
+### 11. `LAT_PIN` and `LAT_VAL` after the write lands or is discarded
+
+6.10 clears only `LAT_VALID`, both when the write lands and on `CTRL.RESET`.
+**Chosen:** literal, the other two fields keep their values, so debug 0x25
+reads `{0, val, pin}` afterwards (tested). Worth a line in 6.10 if the RTL
+would rather clear all seven bits.
+
+### 12. The debug 0x25 layout adds up to 15 bits
+
+HOST_PROTOCOL writes `{8'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]}` "in bits
+6:0". **Chosen:** fields in bits 6:0, bits 15:7 read 0. A typo for `9'b0`.
+
+### 13. A `WAITD` re-issue is not a `TD` write for rule 2
+
+A re-issue commits `TD <= TD`. 6.10 names "a `WAITD` first issue", so the
+model counts only that. **Chosen:** literal. Counting re-issues too would
+change nothing observable (a re-issue rewrites the same value, and while the
+thread waits nothing else can load its latch), so the RTL may use either.
+
+### Consequences worth stating (M2)
+
+* **A staged write lands while its thread is halted.** Rule 1 needs only the
+  tick, and the tick generator runs whether or not the thread runs
+  (SEMANTICS 4). `SETP TX, v, D; HALT` still moves the pad at the deadline.
+* **The CRC register is raw.** The `.crc` presets load poly and init; the
+  catalogue's `refout` and `xorout` are not applied. Over "123456789" the raw
+  register gives the catalogue check values (usb5 0x19, usb16 0xB4C8, can15
+  0x059E, smbus8 0xF4) only after the reflection and final XOR are applied in
+  software; `refin` is simply the order the bits are shifted (LSB first for
+  USB). Pinned in `test_loomsim_be.py` against an independent reference.
+* **Latched edges are clock-exact, the M1 idiom is not.** At 433.5 clocks per
+  tick `SETP ... D; WAITD 1` puts every edge on the tick edge (spacing 433 and
+  434) where `WAITD 1; SETP` gives 432 and 436, and at 434 clocks the latched
+  spacing is exactly 434 (`test_loomsim_setpd.py`, 101 edges each).
