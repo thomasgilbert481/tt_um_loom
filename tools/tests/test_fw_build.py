@@ -19,6 +19,7 @@ PROGRAMS = {
     "uart_tx_fifo": (24, 18),
     "uart_rx": (8, 47),
     "spi_master": (28, 72),
+    "spi_slave": (32, 50),
     "i2c_master": (5, 105),
 }
 M2_BUILT = {"PUSH", "POP", "WAITB"}

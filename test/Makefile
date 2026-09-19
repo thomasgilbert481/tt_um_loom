@@ -76,11 +76,13 @@ export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 # List test modules to run, separated by commas and without the .py suffix.
 # Gate level runs every module that can see a netlist: about 35 minutes for
 # 70 tests, inside the time precheck takes anyway (the gl_test job runs next
-# to it). Left out: test_cosim (it skips itself on a netlist, having none of
-# the internal signals it compares) and test_flops, which drives the second,
-# FLOPS-memory instance in tb.v (RTL only).
+# to it). Three modules are RTL only: test_cosim (it skips itself on a
+# netlist, having none of the internal signals it compares), test_flops (it
+# drives the second, FLOPS-memory instance in tb.v) and test_fw (the L3
+# firmware tests of tools/tests/test_fw_*.py through rtl_bench.py, which
+# reads the retire record).
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim,test_flops
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim,test_fw,test_flops
 else
 COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd
 endif

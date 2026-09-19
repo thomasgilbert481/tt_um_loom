@@ -1,18 +1,23 @@
-"""L3-I2C-MASTER on the golden model: firmware/i2c_master.loom and a 24C02.
+"""L3-I2C-MASTER on the model and the RTL: firmware/i2c_master.loom and a 24C02.
 
-The program is loaded and fed through ``tools.loomhost.Loom`` over
-``ModelTransport``. SCL (BIDIR0) and SDA (BIDIR1) are open drain with bench
-pull-ups; ``tools.protomodels.i2c.I2cEeprom`` answers, ``I2cMonitor``
-decodes the bus. Modelled rate: TICK_INT 8, 16 ticks per SCL period, so 128
-clocks per bit: 390 kHz at 50 MHz.
+The program is loaded and fed through ``tools.loomhost.Loom``. SCL (BIDIR0)
+and SDA (BIDIR1) are open drain with bench pull-ups;
+``tools.protomodels.i2c.I2cEeprom`` answers, ``I2cMonitor`` decodes the bus.
+Modelled rate: TICK_INT 8, 16 ticks per SCL period, so 128 clocks per bit:
+390 kHz at 50 MHz.
+
+Every body takes a ``backend`` (``tools/tests/fw_backend.py``): pytest runs
+them on the golden model over ``ModelTransport``, ``test/test_fw.py`` runs
+the same bodies on the RTL over ``SimTransport`` and the real SPI pads, where
+the open-drain wired-AND is resolved the same way by ``RtlBench``. The error
+cases (NACK, refused data byte, clock stretching, stuck SCL) run on both.
 """
 
 import pytest
 
 from tools.loomasm import assemble_file
-from tools.loomhost import Loom, ModelTransport
 from tools.loomisa import REPO, load
-from tools.protomodels.bench import Bench, Model, pad_of
+from tools.protomodels.bench import Model, pad_of
 from tools.protomodels.i2c import I2cEeprom, I2cMonitor
 
 ISA = load()
@@ -44,13 +49,13 @@ class Scl(Model):
             self.since, self.prev = lines.cycle, v
 
 
-def setup(**eeprom):
-    bench = Bench(pullups=0b11)
+def setup(backend, **eeprom):
+    bench = backend.bench(pullups=0b11)
     ee = bench.add(I2cEeprom("BIDIR0", "BIDIR1", memory=MEMORY, **eeprom))
     mon = bench.add(I2cMonitor("BIDIR0", "BIDIR1"))
     scl = bench.add(Scl())
     program = assemble_file(REPO / "firmware" / "i2c_master.loom", isa=ISA, strict=True)
-    loom = Loom(ModelTransport(bench), isa=ISA)
+    loom = backend.loom(bench, isa=ISA)
     loom.load(program)
     loom.write_csr(0, "TICK_INT", TICK)
     loom.run(0)
@@ -63,8 +68,8 @@ def settle(bench, mon):
     bench.step(LOW * TICK)
 
 
-def test_write_then_random_read_back():
-    bench, ee, mon, scl, loom = setup()
+def test_write_then_random_read_back(backend):
+    bench, ee, mon, scl, loom = setup(backend)
     loom.push(0, [START | 0xA0, 0x10, 0x11, STOP | 0x22])
     assert loom.pop(0, 4) == [0xA0, 0x10, 0x11, 0x22]    # all acknowledged
     settle(bench, mon)
@@ -78,16 +83,16 @@ def test_write_then_random_read_back():
     assert loom.badop() == 0
 
 
-def test_current_address_read_continues_after_the_last_byte():
-    bench, ee, mon, scl, loom = setup()
+def test_current_address_read_continues_after_the_last_byte(backend):
+    bench, ee, mon, scl, loom = setup(backend)
     loom.push(0, [START | 0xA0, 0xFE, NOBYTE | STOP])    # set the address pointer
     loom.pop(0, 2)
     loom.push(0, [START | 0xA1, READ, READ, READ | NACK | STOP])
     assert loom.pop(0, 4) == [0xA1, MEMORY[0xFE], MEMORY[0xFF], R_NACK | MEMORY[0x00]]
 
 
-def test_nack_from_an_absent_address_then_a_bare_stop():
-    bench, ee, mon, scl, loom = setup()
+def test_nack_from_an_absent_address_then_a_bare_stop(backend):
+    bench, ee, mon, scl, loom = setup(backend)
     loom.push(0, [START | 0xA4, NOBYTE | STOP])          # 0x52: nobody there
     assert loom.pop(0, 1) == [R_NACK | 0xA4]
     settle(bench, mon)
@@ -95,16 +100,16 @@ def test_nack_from_an_absent_address_then_a_bare_stop():
     assert loom.fifo_status(0)["outq"] == 0               # NOBYTE pushes nothing
 
 
-def test_a_refused_data_byte_is_reported():
-    bench, ee, mon, scl, loom = setup(nack_data_index=0)
+def test_a_refused_data_byte_is_reported(backend):
+    bench, ee, mon, scl, loom = setup(backend, nack_data_index=0)
     loom.push(0, [START | 0xA0, 0x20, STOP | 0x55])
     assert loom.pop(0, 3) == [0xA0, 0x20, R_NACK | 0x55]
     settle(bench, mon)
     assert ee.memory[0x20] == MEMORY[0x20]
 
 
-def test_clock_stretching_is_honoured():
-    bench, ee, mon, scl, loom = setup(stretch_clocks=400, stretch_bytes=[1])
+def test_clock_stretching_is_honoured(backend):
+    bench, ee, mon, scl, loom = setup(backend, stretch_clocks=400, stretch_bytes=[1])
     loom.push(0, [START | 0xA0, 0x30, STOP | 0x99])
     assert loom.pop(0, 3) == [0xA0, 0x30, 0x99]
     settle(bench, mon)
@@ -116,8 +121,8 @@ def test_clock_stretching_is_honoured():
     assert min(scl.high) >= (2 * Q - 1) * TICK - SLOT
 
 
-def test_scl_phases_follow_the_tick_schedule():
-    bench, ee, mon, scl, loom = setup()
+def test_scl_phases_follow_the_tick_schedule(backend):
+    bench, ee, mon, scl, loom = setup(backend)
     loom.push(0, [START | 0xA0, 0x00, 0x01, 0x02, STOP | 0x03])
     loom.pop(0, 5)
     settle(bench, mon)
@@ -136,12 +141,12 @@ def test_scl_phases_follow_the_tick_schedule():
                for t in highs), highs
 
 
-def test_a_stuck_scl_times_out_and_the_bus_is_released():
-    bench, ee, mon, scl, loom = setup()
+def test_a_stuck_scl_times_out_and_the_bus_is_released(backend):
+    bench, ee, mon, scl, loom = setup(backend)
     scl.stuck = True
     loom.push(0, [START | 0xA0])
     assert loom.pop(0, 1) == [R_TIMEOUT]
-    assert bench.machine.uio_oe & 0b11 == 0               # both lines let go
+    assert bench.lines.uio_oe & 0b11 == 0                # both lines let go
     scl.stuck = False
     loom.push(0, [START | 0xA0, NOBYTE | STOP])
-    assert loom.pop(0, 1) == [0xA0]                       # works again
+    assert loom.pop(0, 1) == [0xA0]                      # works again

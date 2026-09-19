@@ -141,6 +141,26 @@ class Model:
 Observer = Callable[[object], None]
 
 
+def resolve_pads(drive: Drive, uio_out: int, uio_oe: int, pullups: int,
+                 ui_idle: int) -> Tuple[int, int, int]:
+    """The pad resolution of :meth:`Bench.step`, for benches that clock something
+    other than the golden model (``test/rtl_bench.py`` clocks the RTL).
+
+    ``drive`` is what the models drive this cycle, ``uio_out`` and ``uio_oe``
+    the chip's ``uio`` pad registers during it. Returns ``(ui, uio,
+    conflict)``: ``ui_in`` (model drive over ``ui_idle``), the wired ``uio``
+    lines (low if anyone drives low, the chip's own drive included, else high
+    if anyone drives high, else the pull-up) and the bits driven both ways.
+    :meth:`Bench.step` does the same arithmetic inline, for speed;
+    ``tools/tests/test_proto_resolve.py`` checks that the two agree.
+    """
+    ui = ((ui_idle & ~drive.ui_mask) | (drive.ui_val & drive.ui_mask)) & 0xFF
+    low = drive.uio_low | (drive.uio_mask & ~drive.uio_val) | (uio_oe & ~uio_out)
+    high = (drive.uio_mask & drive.uio_val) | (uio_oe & uio_out)
+    uio = (high | (pullups & ~(high | low))) & ~low & 0xFF
+    return ui, uio, low & high & 0xFF
+
+
 class Bench:
     """Steps a :class:`tools.loomsim.Machine` and its pin models together.
 

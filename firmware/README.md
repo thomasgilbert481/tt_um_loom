@@ -18,9 +18,10 @@ set the rate first.
 | `uart_tx_fifo.loom` | TX = OUT0 | 18 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
 | `uart_rx.loom` | RX = IN0 | 47 | 8 clocks per tick, 8 ticks per bit | 20 clocks | 64 clocks/bit (781 kbaud); 115200 baud (TICK 54 + 64/256); +-3 % sender error |
 | `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 72 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
+| `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 50 | 32 clocks per tick, 4 ticks per SCK period | 8 clocks | TICK 32: 390 kHz SCK, modes 0 and 3 |
 | `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 105 | 5 clocks per tick, 16 ticks per SCL period | 0 clocks | TICK 8: 390 kHz SCL; 100 kHz is TICK 31 + 64/256 |
 
-All four assemble with `--strict` and no diagnostic at all: every deadline
+All five assemble with `--strict` and no diagnostic at all: every deadline
 pair is proved and none is unbounded (`tools/tests/test_fw_build.py`). Each
 fits in thread 0's quarter of the 512-word memory of D-020.
 
@@ -92,6 +93,41 @@ words = loom.pop(0, 4)                              # four received frames
   bytes SCK waits while the master fetches the next command (legal: the
   master owns the clock).
 
+## spi_slave.loom: SPI slave answering a master
+
+- **Host command** (push to thread 0): one word per byte to send, bits 7:0;
+  the other bits are ignored. The slave pops the next response byte as soon
+  as it has finished one, so the head of `INQ[0]` is what the master's next
+  byte will read. With `INQ` empty it sends `0xFF`, and it replaces that
+  filler with a real byte as soon as one is queued and nothing of it has
+  gone out yet.
+- **Result** (pop thread 0): one word per byte the master clocked in, bits
+  7:0 as sampled on MOSI. A byte that arrives while `OUTQ` is full is
+  dropped (the host is not keeping up); nothing else is lost.
+- **Rate**: one tick is a quarter of an SCK period, `TICK_INT` = clocks per
+  SCK period / 4. What limits the rate is not the bit loop but the 21 slots
+  between two bytes (push the byte received, pop the next one to send, put
+  its first bit on MISO): 84 clocks inside the three quarters of a period
+  (96 clocks at TICK 32) that separate a byte's last sampling edge from the
+  next byte's first one. A master that pauses between bytes can clock the
+  bits themselves faster.
+- **Modes 0 and 3**: both sample MOSI and MISO on the rising edge, so one
+  loop serves both and the idle level and the falling edge are never looked
+  at. Modes 1 and 2 sample on the falling edge and are not supported.
+- Each bit is one `WAITE SCK, RISE` (the master samples there), then MOSI is
+  sampled and the next MISO bit is written at a deadline one tick later, a
+  quarter period before the trailing edge: that `SETD 0` to `WAITD 1`
+  interval is the deadline pair the checker proves (24 of 32 clocks).
+  While deselected the slave watches `INQ` and pre-loads, so the master may
+  raise SCK two slots after CS_n falls; MISO holds its last bit between
+  transactions (a Tiny Tapeout pad cannot be let go). SCK silence for 16
+  ticks inside a byte makes the slave look at CS_n: a master that still
+  selects us is only pausing and the wait is resumed, one that has
+  deselected us cut the transaction short, so the partial byte is dropped
+  and the slave resynchronises. That timeout is also how the end of a
+  transaction is noticed, so a host that queues bytes for the next one
+  should allow those 16 ticks first.
+
 ## i2c_master.loom: I2C master with clock stretching
 
 - **Host command** (push to thread 0): one word per operation.
@@ -119,8 +155,22 @@ words = loom.pop(0, 4)                              # four received frames
 
 ## Tests
 
-`tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_i2c.py` run each
-program end to end on the golden model: loaded, configured and fed through
-`tools.loomhost.Loom` over `ModelTransport` (every host access is SPI bytes,
-64 clocks each, with the firmware running meanwhile), against the reference
-models in `tools/protomodels` on the pads.
+`tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py` and
+`test_fw_i2c.py` run each program end to end, loaded, configured and fed
+through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks
+each, with the firmware running meanwhile), against the reference models in
+`tools/protomodels` on the pads. Each body takes a *backend*
+(`tools/tests/fw_backend.py`) and builds its bench and its transport through
+it, so the same bodies run twice:
+
+- under pytest on the **golden model**, `tools.protomodels.bench.Bench` over
+  `ModelTransport`;
+- under cocotb on the **RTL** (`test/test_fw.py`), `test/rtl_bench.py`'s
+  `RtlBench` clocking `tb.v` with the same pad resolution, and
+  `tools.loomhost.SimTransport` moving the host bytes through the real SPI
+  pads of the design. That is the M2 exit criterion of `docs/PLAN.md`.
+
+A body marked `model_only` runs on the model alone, with the reason in the
+mark: the 115200-baud UART receive cases and most of the SPI master mode
+sweep, which would add minutes of simulation and prove what their faster
+siblings already prove.

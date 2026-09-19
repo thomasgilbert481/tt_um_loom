@@ -1,0 +1,118 @@
+; spi_slave.loom
+; SPI slave, modes 0 and 3 (both sample on the rising edge), MSB first. M2
+; firmware: needs the FIFOs (POP, PUSH, WAITB), nothing else.
+;
+; Pins: SCK = IN1, MOSI = IN2, CS_n = IN3, MISO = OUT0.
+;
+; Host command format (FIFO space, thread 0): one word per byte to send,
+; bits 7:0; the other bits are ignored. The slave pops the next response
+; byte as soon as it has finished one, so the word at the head of INQ is
+; what the master's next byte reads. With INQ empty it sends IDLE (0xFF).
+;
+; Result format (FIFO space read): one word per byte the master clocked in,
+; bits 7:0 the byte as sampled on MOSI. A byte that arrives while OUTQ is
+; full is dropped (the host is not keeping up); nothing else is lost.
+;
+; Modes: in mode 0 (CPOL 0, CPHA 0) and in mode 3 (CPOL 1, CPHA 1) the
+; master samples MOSI and MISO on the rising edge of SCK, so one loop serves
+; both; this program never looks at the idle level or at the falling edge.
+; Modes 1 and 2 sample on the falling edge and are not supported.
+;
+; Rate: one tick is a quarter of an SCK period, so TICK_INT = clocks per SCK
+; period / 4, written by the host through the debug space before RUN. MISO
+; changes one tick after the sampling edge: a quarter period before the
+; trailing edge, three quarters of a period before the master samples it.
+; The tick must be at least 32 clocks (.tick below), so at 50 MHz SCK is at
+; most 390 kHz with bytes back to back (what the tests use). The bit loop
+; alone would run four times faster; the limit is the work between two
+; bytes (push the byte received, pop the next one to send, put its first bit
+; on MISO): 21 slots, 84 clocks, in the three quarters of a period (96
+; clocks at TICK 32) between the last sampling edge of a byte and the first
+; edge of the next one, with MISO carrying the new bit 7 after 16 of them.
+; A master that pauses between bytes can clock the bits themselves faster.
+;
+; Selection: while CS_n is high the slave watches INQ and pre-loads the next
+; response byte as soon as one is queued, so its first bit is on MISO before
+; the master may raise SCK two slots after CS_n falls. A host that queues
+; nothing before the transaction starts gets IDLE for that byte. MISO keeps
+; the last bit it drove while deselected (a Tiny Tapeout output pad cannot
+; be let go).
+;
+; If SCK stops inside a byte for TMO ticks the slave looks at CS_n: a master
+; that still selects us is only pausing, and the wait is resumed; a master
+; that has deselected us has cut the transaction short, so the partial byte
+; is dropped and the slave resynchronises on the next selection. That is
+; also how the end of every transaction is noticed.
+;
+; Registers: r0 the byte to send, reversed, next bit in bit 0; r1 bit count;
+; r2 the byte being received; r4 scratch for the idle level; r6 "a byte from
+; the host is loaded and none of it has gone out yet", so that a byte
+; pre-loaded at the end of one transaction is not thrown away by the next
+; pre-load and a filler byte is replaced as soon as the host queues one;
+; r7 .csr scratch.
+
+        .thread 0
+        .pins   SCK = IN1, MOSI = IN2, CS_N = IN3, MISO = OUT0
+        .tick   32                      ; a quarter of an SCK period
+        .equ    IDLE = 0xFF             ; sent when the host has queued nothing
+        .equ    TMO = 16                ; ticks of silence before CS_n is checked
+
+start:  .csr    OUTGRP, 16 | (1 << 5)   ; OUT drives MISO (OUT0) alone; clobbers r7
+        LDI     r4, 0
+        OUT     r4                      ; MISO low until the first byte is loaded
+
+idle:   WAITP   CS_N, 1                 ; deselected (a partial byte is dropped)
+        TEST    r6, r6
+        BNZ     armed                   ; a host byte is loaded and still unsent
+poll:   SETD    0                       ; TD = NOW, so the WAITB only tests INQ
+        WAITB   INQ_NE, T
+        BT      nobyte
+        CALL    load                    ; a byte is queued: pre-load it
+armed:  WAITP   CS_N, 0                 ; selected: the master may clock now
+        JMP     bit
+nobyte: JP      CS_N, 1, poll           ; nothing to send yet: look again
+        JMP     byte                    ; selected with INQ empty: send IDLE
+
+; One byte. `load` returns into `bit`, which saves the jump back on the path
+; between two bytes: that path is what limits the SCK rate.
+byte:   CALL    load                    ; the next byte to send, first bit on MISO
+bit:    SETD    TMO                     ; the wait below gives up after TMO ticks
+        WAITE   SCK, RISE, T            ; the master samples MOSI and MISO here
+        BT      quiet
+        SETD    0                       ; anchor the schedule on the sampling edge
+        SHLI    r2, 1
+        JP      MOSI, 0, m0             ; sample MOSI
+        ORI     r2, 1
+m0:     SHRI    r0, 1                   ; the next bit to send, into bit 0
+        LDI     r6, 0                   ; this byte has left the queue for good
+        WAITD   1                       ; a quarter period later: change MISO
+        OUT     r0
+        DJNZ    r1, bit
+
+        SETD    0                       ; TD = NOW: the WAITB cannot block
+        WAITB   OUTQ_NF, T
+        BT      drop                    ; OUTQ full: this byte is lost
+        PUSH    r2
+drop:   JP      CS_N, 0, byte           ; still selected: on to the next byte
+        JMP     idle                    ; deselected: resynchronise
+
+quiet:  JP      CS_N, 0, bit            ; only a pause: keep waiting for the edge
+        JMP     idle                    ; deselected mid-byte: start again
+
+; The next byte to send, reversed so that a SHRI feeds MISO, with its first
+; bit already on the pin. Never blocks: the WAITB is timed and its deadline
+; has passed, so INQ is only tested, not waited for.
+load:   SETD    0
+        WAITB   INQ_NE, T
+        BT      noq
+        POP     r0
+        REV     r0, r0                  ; bit 7 of the byte to bit 8 ...
+        SHRI    r0, 8                   ; ... and down to bit 0
+        LDI     r6, 1                   ; a host byte is loaded and unsent
+pres:   OUT     r0                      ; bit 7 on MISO before the first edge
+        LDI     r1, 8                   ; (the loop shifts before every later bit)
+        LDI     r2, 0
+        RET
+noq:    LDI     r0, IDLE                ; nothing queued: send 0xFF
+        LDI     r6, 0                   ; ... which a queued byte may replace
+        JMP     pres
