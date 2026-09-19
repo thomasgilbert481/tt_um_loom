@@ -8,20 +8,25 @@ clock at a time and compares, on **every cycle**:
 * the retire record of ``docs/SEMANTICS.md`` section 8 (``tr_*``, reached
   hierarchically in ``loom_top``) against the model's ``RetireRecord`` for the
   slot in W that cycle (``rd``/``val`` only when ``we`` is set);
-* the pad outputs ``uo_out[5:0]``, ``uio_out`` and ``uio_oe`` (``uo_out[7:6]``
-  are the host MISO and IRQ pins and are masked);
+* the pad outputs ``uo_out[6:0]`` (``uo_out[6]`` is ``HOST_IRQ``, SEMANTICS
+  6.8), ``uio_out`` and ``uio_oe``; only ``uo_out[7]``, the host MISO pin the
+  model has no port for, is masked;
 * as guards, ``ph`` (and that it equals ``k mod 4``), ``RUN``, ``HALTED``,
   ``BADOP``, ``SFLAGS`` and ``OD_MASK``;
 * L2-SLOT: a thread's ``PC`` register changes only at the edge that ends a W
   cycle of that thread, that W cycle has ``ph == (t + 3) mod 4``, and the new
   value is that slot's ``tr_next_pc``; a slot that does not complete is a
-  wait-class instruction and re-issues its own ``PC``.
+  wait-class or blocking (``PUSH``/``POP``) instruction and re-issues its own
+  ``PC``.
 
 Every ``LOOM_COSIM_STATE_EVERY`` cycles and at the end of every seed the whole
 architectural state of SEMANTICS 5 is read out of the RTL hierarchy and
 compared with the model (registers, PC, flags, TD, DT, NOW, ACC, TICK_SEEN,
 RS0/RS1/DEPTH, WAIT_ACTIVE, PREV_PINS, STEPS, TICK_INT/FRAC, OUTGRP/INGRP,
-RUN/HALTED/STEP_REQ/BADOP/SFLAGS/SWIRQ, PIN_OUT/PIN_OE/OD_MASK).
+RUN/HALTED/STEP_REQ/BADOP/SFLAGS/SWIRQ, PIN_OUT/PIN_OE/OD_MASK, and for the
+features the build has: ``INQ_CNT``/``OUTQ_CNT``, the bit-engine state
+``SR``/``CNT``/``CRC`` and its CSRs, the deadline latch, ``IRQ_EN``/``IRQ_EN2``
+and the registered ``HOST_IRQ``).
 
 Alignment
 ---------
@@ -76,21 +81,52 @@ slot.
 ``CTRL.RUN`` write go through the real SPI pads with ``test/spi_host.py``. The
 commit cycle is observed, not chosen, as SEMANTICS 10 allows ("the host actions
 with the cycle at which each commits (observed from the RTL in co-simulation)"):
-every host-control pulse of ``loom_host_ctl`` (IMEM write, RUN write, and every
-other one, which would be an error here) is one clock wide in the cycle before
-its commit edge, so seeing it at the falling edge of cycle ``k`` and making the
-same ``host_*`` call before the model steps cycle ``k`` commits both at edge
-``k + 1``. The lockstep comparison runs through the whole load as well.
+every host-control pulse of ``loom_host_ctl`` (IMEM write, RUN write, FIFO
+push and pop, the CTRL registers the run touches) is one clock wide in the
+cycle before its commit edge, so seeing it at the falling edge of cycle ``k``
+and making the same ``host_*`` call before the model steps cycle ``k`` commits
+both at edge ``k + 1``. The lockstep comparison runs through the whole load as
+well.
 
-M2 features
------------
+The build
+---------
 
-At the start of every seed the harness resets the RTL and reads ``CTRL.CAPS``
-through the SPI host port. If it reports an M2 feature (FIFOs, bit engine,
-deadline-latched ``SETP``), the program is generated with the ``m2_built``
-avoid flag of ``tools/loomgen``, which leaves those instructions, the
-bit-engine CSRs and the ``D`` form of ``SETP`` out: the golden model may still
-treat them as unbuilt (``NOP`` + ``BADOP``) while the RTL builds them.
+At the start of every seed the harness resets the RTL, reads ``CTRL.CAPS``
+through the SPI host port and **builds the golden model from it**
+(:class:`_Build`): ``[15:12]`` the instruction memory size, ``[3]`` the FIFOs
+with depth ``2 ** CAPS[2:0]``, ``[4]`` the bit engine, ``[7]`` the
+deadline-latched ``SETP``. The generated program is made for the same build,
+so both sides execute the M2 instructions, or treat them as ``NOP`` + ``BADOP``
+(SEMANTICS 9), together. A ``CAPS`` bit the model cannot build (data memory,
+boot ROM, bit-engine auto mode, a reserved bit) fails the test rather than
+skipping anything.
+
+Host traffic (``test_cosim_over_the_host_port``)
+------------------------------------------------
+
+A program generated with ``host_traffic=True`` carries a
+``tools.loomgen.hostplan.HostPlan``: FIFO pushes into ``INQ[t]``, FIFO reads
+that pop ``OUTQ[t]``, and CTRL writes (``IRQ_EN``, ``IRQ_EN2``, ``SWIRQ``,
+``BADOP``, ``SFLAGS``, ``SFLAGS_CLR``, ``RUN``). A cocotb task sends them over
+the SPI pads, one after another, for as long as the run lasts, and the
+lockstep loop mirrors each one into the model at the cycle the RTL commits it:
+
+* the byte layer's ``byte_done`` pulse says which byte of the transaction has
+  just finished, so the harness knows when a word's effect is due (the next
+  cycle: HOST_PROTOCOL's "registered at edge E+3, target register at E+4")
+  and when a FIFO read **peeks** ``OUTQ`` (at the end of the dummy byte, or of
+  the previous word, taking the entry after the head while that one is being
+  popped, SEMANTICS 6.7);
+* the model is then given that host action with the harness's own data, and
+  the ``loom_host_ctl`` pulse and data bus for the same cycle are **compared**
+  against what was expected, so a word that is dropped, doubled, mistimed or
+  corrupted on the way through the SPI port is a divergence like any other;
+* what the read returned on MISO is compared with the model's peek.
+
+The model has no public call for "a FIFO read whose peek was empty while a
+thread push has filled the queue since", which sets ``BADOP[14]`` and pops
+nothing; ``tools.loomgen.runner.fifo_error`` does it through the model's own
+host-commit path.
 
 Environment
 -----------
@@ -98,7 +134,7 @@ Environment
 ``LOOM_COSIM_SEEDS`` (default 12) and ``LOOM_COSIM_CYCLES`` (default 4000, per
 seed, counted from ``RUN``) size the random run; ``LOOM_COSIM_SEED_BASE``
 (default 1) is the first seed; ``LOOM_COSIM_SPI_SEEDS`` (default 2) and
-``LOOM_COSIM_SPI_CYCLES`` (default 1500) size the host-path variant;
+``LOOM_COSIM_SPI_CYCLES`` (default 8000) size the host-path variant;
 ``LOOM_COSIM_STATE_EVERY`` (default 500) sets how often the full state is
 compared; ``LOOM_COSIM_KEEP_GOING=1`` records a failure and moves on to the
 next seed instead of stopping; ``LOOM_COSIM_REPLAY=path.json`` runs one saved
@@ -107,18 +143,20 @@ program (a file from ``test/cosim_failures/`` or ``python -m tools.loomgen
 
 A divergence fails with the seed, cycle, thread, PC, the disassembled
 instruction, both records and the thread's last 12 retire records, and writes
-``test/cosim_failures/seed_<n>.json`` (image, stimulus, failure) plus a
-``.lst`` listing; ``python -m tools.loomgen --replay FILE --run N --trace T``
-shows the model's side of it. The module skips itself on a gate-level netlist
-(``GATES=yes``), which has none of the signals it reads. In an RTL run a
-signal it cannot find fails the tests instead of skipping them (the
-instruction array moved when the SRAM macro came in, D-020, and a silent skip
-would have looked like a pass).
+``test/cosim_failures/seed_<n>.json`` (image, stimulus, host log, failure)
+plus a ``.lst`` listing; ``python -m tools.loomgen --replay FILE --run N
+--trace T`` shows the model's side of it, replaying the recorded host actions
+at the cycles this harness observed them. The module skips itself on a
+gate-level netlist (``GATES=yes``), which has none of the signals it reads. In
+an RTL run a signal it cannot find fails the tests instead of skipping them
+(the instruction array moved when the SRAM macro came in, D-020, and a silent
+skip would have looked like a pass).
 """
 
 from __future__ import annotations
 
 import collections
+import inspect
 import json
 import os
 import pathlib
@@ -133,18 +171,22 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from cosim_coverage import Coverage                              # noqa: E402
-from spi_host import (CLK_NS, CTRL_CAPS, CTRL_RUN, SP_CTRL,       # noqa: E402
-                      LoomHost)
-from tools.loomasm.disasm import disassemble                     # noqa: E402
-from tools.loomgen import (GeneratedProgram, LOAD_CYCLE, RUN_CYCLE,  # noqa: E402
-                           generate, host_actions)
-from tools.loomisa import load as load_isa                       # noqa: E402
-from tools.loomsim import Machine                                # noqa: E402
+from cosim_coverage_m2 import M2Coverage, SlotContext                 # noqa: E402
+from spi_host import (CLK_NS, CTRL_BADOP, CTRL_CAPS, CTRL_IRQ_EN,     # noqa: E402
+                      CTRL_IRQ_EN2, CTRL_RUN, CTRL_SFLAGS,
+                      CTRL_SFLAGS_CLR, CTRL_SWIRQ, FIFO_QUEUE, SP_CTRL,
+                      SP_FIFO, LoomHost)
+from tools.loomasm.disasm import disassemble                          # noqa: E402
+from tools.loomgen import (GeneratedProgram, LOAD_CYCLE, RUN_CYCLE,   # noqa: E402
+                           generate, host_actions, peek_word,
+                           pop_after_peek)
+from tools.loomisa import load as load_isa                            # noqa: E402
+from tools.loomsim import Machine                                     # noqa: E402
 
 THREADS = 4
 #: Instruction memory size of the default build: the 512 x 16 SRAM macro
-#: (D-020). The harness checks it against CAPS[15:12] and the RTL array.
+#: (D-020). The harness takes the real size from CAPS[15:12] and checks it
+#: against the RTL array.
 IMEM_WORDS = 512
 
 
@@ -156,33 +198,51 @@ SEEDS = _env_int("LOOM_COSIM_SEEDS", 12)
 CYCLES = _env_int("LOOM_COSIM_CYCLES", 4000)
 SEED_BASE = _env_int("LOOM_COSIM_SEED_BASE", 1)
 SPI_SEEDS = _env_int("LOOM_COSIM_SPI_SEEDS", 2)
-SPI_CYCLES = _env_int("LOOM_COSIM_SPI_CYCLES", 1500)
+SPI_CYCLES = _env_int("LOOM_COSIM_SPI_CYCLES", 8000)
 STATE_EVERY = _env_int("LOOM_COSIM_STATE_EVERY", 500)
 KEEP_GOING = os.environ.get("LOOM_COSIM_KEEP_GOING", "") not in ("", "0")
 REPLAY = os.environ.get("LOOM_COSIM_REPLAY", "")
 
-PROFILE_ORDER = ("mixed", "timing", "pins", "alu")
+#: The profiles the seeds rotate through. ``m2`` comes first and the seeds
+#: with fewer than four running threads are the last of every six, so the
+#: early seeds are the densest: a broken M2 feature shows up in seed 1 or 2
+#: rather than five seeds later (the mutants of docs/VERIFICATION.md L7).
+PROFILE_ORDER = ("m2", "timing", "pins", "alu", "mixed")
 
 #: Constructs ``docs/spec-questions/cosim.md`` has open. Neither side may be
 #: changed for them until the director rules, so the random programs leave
 #: them out and the rest of the run stays useful.
 AVOID = ("csrw_pin_out_high_bits",)
 
-#: CAPS bits of M2 features (SEMANTICS 5): [3] FIFOs, [4] bit engine (manual
-#: mode), [7] deadline-latched ``SETP``. If the RTL reports any of them, the
-#: programs are generated with ``m2_built`` as well (see the module notes).
-CAPS_M2_FEATURES = (1 << 3) | (1 << 4) | (1 << 7)
-
 HERE = pathlib.Path(__file__).resolve().parent
 FAILURE_DIR = HERE / "cosim_failures"
 COVERAGE_PATH = HERE / "cosim_coverage.json"
 
 ISA = load_isa()
-COVERAGE = Coverage(ISA)
+COVERAGE = M2Coverage(ISA)
 
 #: SPI host pins in ui_in, idle: CS_n high, SCK low, MOSI low.
 UI_CS = 1 << 4
 UI_HOST_MASK = 0x70
+
+#: CTRL register address of every write a host plan may make, and the pulse
+#: (write strobe, data bus) ``loom_host_ctl`` raises for it in the cycle
+#: before its commit edge. ``IRQ_EN``/``IRQ_EN2`` live inside the module, so
+#: their strobes are read from it by name.
+CTRL_WRITE_ADDR = {"IRQ_EN": CTRL_IRQ_EN, "IRQ_EN2": CTRL_IRQ_EN2,
+                   "SWIRQ": CTRL_SWIRQ, "BADOP": CTRL_BADOP,
+                   "SFLAGS": CTRL_SFLAGS, "SFLAGS_CLR": CTRL_SFLAGS_CLR,
+                   "RUN": CTRL_RUN}
+CTRL_WRITE_PULSE = {"SWIRQ": ("h_swirq_clr_we", "h_swirq_clr", 0xF),
+                    "BADOP": ("h_badop_clr_we", "h_badop_clr", 0xFFFF),
+                    "SFLAGS": ("h_sfset_we", "h_sfset", 0xFF),
+                    "SFLAGS_CLR": ("h_sfclr_we", "h_sfclr", 0xFF),
+                    "RUN": ("h_run_we", "h_run", 0xF)}
+#: Coverage names for the CTRL writes of a host plan.
+CTRL_WRITE_EVENT = {"IRQ_EN": "IRQ_EN:written", "IRQ_EN2": "IRQ_EN2:written",
+                    "SWIRQ": "SWIRQ:cleared", "BADOP": "BADOP:cleared",
+                    "SFLAGS": "SFLAGS:set", "SFLAGS_CLR": "SFLAGS:cleared",
+                    "RUN": "RUN:rewritten"}
 
 
 # ------------------------------------------------------------ gate level
@@ -202,6 +262,7 @@ def _rtl_hierarchy_present(dut) -> bool:
     """True when the RTL hierarchy this module reads exists under ``dut``."""
     try:
         dut.user_project.u_loom.u_core.ph                      # noqa: B018
+        dut.user_project.u_loom.byte_done                      # noqa: B018
         imem_array(dut.user_project.u_loom)
     except AttributeError:
         return False
@@ -211,9 +272,9 @@ def _rtl_hierarchy_present(dut) -> bool:
 def _require_rtl(dut):
     """Fail, rather than skip, an RTL run that lacks the signals read here."""
     assert _rtl_hierarchy_present(dut), (
-        "RTL hierarchy not found: user_project.u_loom.u_core.ph and the "
-        "instruction array of loom_imem (macro model memory or g_flops.mem) "
-        "are needed; gate-level runs must set GATES=yes")
+        "RTL hierarchy not found: user_project.u_loom.u_core.ph, "
+        "u_loom.byte_done and the instruction array of loom_imem (macro model "
+        "memory or g_flops.mem) are needed; gate-level runs must set GATES=yes")
 
 
 #: cocotb 2 has no run-time skip, so the flag is decided at import time.
@@ -221,7 +282,79 @@ def _require_rtl(dut):
 GATE_LEVEL = os.environ.get("GATES", "").lower() == "yes"
 
 
+# ------------------------------------------------------------------- build
+class BuildError(AssertionError):
+    """``CTRL.CAPS`` reports something the golden model cannot be built for."""
+
+
+class _Build:
+    """The build ``CTRL.CAPS`` reports (SEMANTICS 5), for both sides.
+
+    ``[2:0]`` log2 of the FIFO depth, ``[3]`` FIFOs, ``[4]`` bit engine
+    (manual mode), ``[5]`` data memory, ``[6]`` boot ROM, ``[7]``
+    deadline-latched ``SETP``, ``[8]`` bit-engine auto mode, ``[11:9]`` zero,
+    ``[15:12]`` log2 of ``IMEM_WORDS``.
+    """
+
+    def __init__(self, caps: int):
+        self.caps = caps & 0xFFFF
+        self.imem_words = 1 << ((caps >> 12) & 0xF)
+        features = []
+        if caps & (1 << 3):
+            features.append("FIFO")
+            self.fifo_depth = 1 << (caps & 0x7)
+            if self.fifo_depth not in (2, 4, 8):
+                raise BuildError("CAPS %04X asks for FIFOs of depth %d; "
+                                 "SEMANTICS 6.7 allows 2, 4 or 8"
+                                 % (self.caps, self.fifo_depth))
+        else:
+            self.fifo_depth = 4
+            if caps & 0x7:
+                raise BuildError("CAPS %04X has no FIFOs but CAPS[2:0] = %d"
+                                 % (self.caps, caps & 0x7))
+        if caps & (1 << 4):
+            features.append("BE")
+        if caps & (1 << 7):
+            features.append("SETPD")
+        for bit, what in ((5, "data memory"), (6, "a boot ROM"),
+                          (8, "bit-engine auto mode")):
+            if caps & (1 << bit):
+                raise BuildError(
+                    "CAPS %04X reports %s (bit %d); the golden model cannot be "
+                    "built for it, so this run would compare nothing. Teach "
+                    "tools/loomsim the feature (or take the bit out of the RTL)."
+                    % (self.caps, what, bit))
+        if caps & 0x0E00:
+            raise BuildError("CAPS %04X sets a reserved bit (11:9)" % self.caps)
+        self.features = tuple(sorted(features))
+        #: Width of one ``INQ_CNT``/``OUTQ_CNT`` field in the RTL vectors.
+        self.fifo_width = self.fifo_depth.bit_length()
+
+    def machine(self) -> Machine:
+        machine = Machine(imem_words=self.imem_words, features=self.features,
+                          fifo_depth=self.fifo_depth, loopback=True, isa=ISA)
+        if machine.caps != self.caps:
+            raise BuildError("the model built from CAPS %04X reports %04X"
+                             % (self.caps, machine.caps))
+        return machine
+
+    def __str__(self) -> str:
+        return "caps=%04X %d words, %s" % (
+            self.caps, self.imem_words,
+            ", ".join(self.features) + (" depth %d" % self.fifo_depth
+                                        if "FIFO" in self.features else "")
+            if self.features else "M1")
+
+
 # ------------------------------------------------------------------ probe
+def _optional(obj, name):
+    """A hierarchical signal that only some builds have."""
+    try:
+        return getattr(obj, name)
+    except AttributeError:
+        return None
+
+
 class _Probe:
     """Cached handles for everything the harness reads or deposits."""
 
@@ -248,14 +381,32 @@ class _Probe:
         self.pin_oe = loom.u_pins.pin_oe
         self.od_mask = loom.u_pins.od_mask
         self.uo_out, self.uio_out, self.uio_oe = dut.uo_out, dut.uio_out, dut.uio_oe
+        # SPI byte layer, for the host-traffic mirror.
+        self.byte_done, self.cs_active = loom.byte_done, loom.cs_active
         # Host-control pulses (loom_host_ctl outputs), for the SPI variant.
         self.host = {name: getattr(loom, name) for name in (
             "h_imem_req", "h_imem_we", "h_imem_addr", "h_imem_wdata",
             "h_run_we", "h_run", "h_reset", "h_step_we", "h_step",
             "h_rpc_we", "h_rpc_sel", "h_rpc", "h_sfset_we", "h_sfset",
             "h_sfclr_we", "h_sfclr", "h_badop_clr_we", "h_badop_clr",
-            "h_badop_set15", "h_swirq_clr_we", "h_pout_we", "h_pout",
-            "h_poe_we", "h_poe", "h_od_we", "h_od", "h_dbg_req")}
+            "h_badop_set15", "h_swirq_clr_we", "h_swirq_clr", "h_pout_we", "h_pout",
+            "h_poe_we", "h_poe", "h_od_we", "h_od", "h_dbg_req",
+            "h_inq_push", "h_fifo_wdata", "h_outq_pop", "h_badop_set14")}
+        # The two CTRL registers loom_host_ctl keeps itself (IRQ_EN, IRQ_EN2)
+        # pulse an internal write strobe in the cycle before their edge.
+        self.irq_en_wr = _optional(loom.u_host, "irq_en_wr")
+        self.irq_en2_wr = _optional(loom.u_host, "irq_en2_wr")
+        self.irq_en = _optional(loom.u_host, "irq_en")
+        self.irq_en2 = _optional(loom.u_host, "irq_en2")
+        # M2 architectural state, per feature (SEMANTICS 5).
+        self.inq_cnt_all = _optional(core, "inq_cnt_all")
+        self.outq_cnt_all = _optional(core, "outq_cnt_all")
+        self.be = {name: _optional(core, name) for name in (
+            "be_sr_all", "be_cnt_all", "be_crc_all", "be_poly_all",
+            "be_init_all", "be_reload_all", "be_cfg_all", "be_pins_all")}
+        self.lat_valid_all = _optional(core, "lat_valid_all")
+        self.lat_pin_all = _optional(core, "lat_pin_all")
+        self.lat_val_all = _optional(core, "lat_val_all")
 
 
 def _i(handle) -> int:
@@ -275,9 +426,26 @@ def _field(word: int, index: int, width: int) -> int:
 FIELDS = ("thread", "pc", "ir", "done", "we", "rd", "val", "flags", "next_pc")
 
 
+def _loose(handle) -> int:
+    """``int(handle.value)``, or -1 when it holds X or Z.
+
+    Only for the ``tr_rd``/``tr_val`` of a slot that writes no register:
+    ``POP`` reads the FIFO entry, and SEMANTICS 5 says FIFO entries are not
+    reset, so the array is X in simulation until something is pushed. The
+    comparison ignores both fields unless the slot writes (``_diff_record``),
+    and a ``tr_val`` that is X while ``tr_we`` is 1 still fails.
+    """
+    try:
+        return int(handle.value)
+    except ValueError:
+        return -1
+
+
 def _rtl_record(p: _Probe):
+    we = _i(p.tr_we)
     return (_i(p.tr_thread), _i(p.tr_pc), _i(p.tr_ir), _i(p.tr_done),
-            _i(p.tr_we), _i(p.tr_rd), _i(p.tr_val), _i(p.tr_flags),
+            we, _i(p.tr_rd) if we else _loose(p.tr_rd),
+            _i(p.tr_val) if we else _loose(p.tr_val), _i(p.tr_flags),
             _i(p.tr_next_pc))
 
 
@@ -315,7 +483,7 @@ def _fmt(rec) -> str:
 
 
 # ------------------------------------------------------ architectural state
-def _state_pairs(p: _Probe, machine: Machine):
+def _state_pairs(p: _Probe, machine: Machine, build: _Build):
     """Every architectural value of SEMANTICS 5, as (name, RTL, model)."""
     pairs = []
     add = pairs.append
@@ -359,6 +527,59 @@ def _state_pairs(p: _Probe, machine: Machine):
     add(("PIN_OUT", _i(p.pin_out), machine.pin_out))
     add(("PIN_OE", _i(p.pin_oe), machine.pin_oe))
     add(("OD_MASK", _i(p.od_mask), machine.od_mask))
+    pairs += _m2_state_pairs(p, machine, build)
+    return pairs
+
+
+def _needed(handle, name, feature):
+    assert handle is not None, (
+        "CAPS says this build has %s, but the RTL signal %s is not there; the "
+        "co-simulation cannot compare that state" % (feature, name))
+    return handle
+
+
+def _m2_state_pairs(p: _Probe, machine: Machine, build: _Build):
+    """The M2 state of SEMANTICS 5, for the features the build has."""
+    pairs = []
+    add = pairs.append
+    if "FIFO" in build.features:
+        inq = _i(_needed(p.inq_cnt_all, "u_core.inq_cnt_all", "FIFOs"))
+        outq = _i(_needed(p.outq_cnt_all, "u_core.outq_cnt_all", "FIFOs"))
+        width = build.fifo_width
+        for t in range(THREADS):
+            add(("t%d.INQ_CNT" % t, _field(inq, t, width),
+                 len(machine.threads[t].inq)))
+            add(("t%d.OUTQ_CNT" % t, _field(outq, t, width),
+                 len(machine.threads[t].outq)))
+    if "BE" in build.features:
+        be = {name: _i(_needed(handle, "u_core." + name, "the bit engine"))
+              for name, handle in p.be.items()}
+        for t in range(THREADS):
+            th = machine.threads[t]
+            add(("t%d.SR" % t, _field(be["be_sr_all"], t, 16), th.sr))
+            add(("t%d.CNT" % t, _field(be["be_cnt_all"], t, 5), th.cnt))
+            add(("t%d.CRC" % t, _field(be["be_crc_all"], t, 16), th.crc))
+            add(("t%d.CRC_POLY" % t, _field(be["be_poly_all"], t, 16), th.crc_poly))
+            add(("t%d.CRC_INIT" % t, _field(be["be_init_all"], t, 16), th.crc_init))
+            add(("t%d.BE_RELOAD" % t, _field(be["be_reload_all"], t, 5), th.be_reload))
+            add(("t%d.BE_PINS" % t, _field(be["be_pins_all"], t, 10), th.be_pins))
+            # The RTL keeps the three BE_CFG fields M2 builds, {CRC_EN, INV, DIR}.
+            cfg = _field(be["be_cfg_all"], t, 3)
+            add(("t%d.BE_CFG.DIR" % t, cfg & 1, (th.be_cfg >> 1) & 1))
+            add(("t%d.BE_CFG.INV" % t, (cfg >> 1) & 1, (th.be_cfg >> 7) & 1))
+            add(("t%d.BE_CFG.CRC_EN" % t, (cfg >> 2) & 1, (th.be_cfg >> 9) & 1))
+    if "SETPD" in build.features:
+        valid = _i(_needed(p.lat_valid_all, "u_core.lat_valid_all", "SETP D"))
+        value = _i(_needed(p.lat_val_all, "u_core.lat_val_all", "SETP D"))
+        pin = _i(_needed(p.lat_pin_all, "u_core.lat_pin_all", "SETP D"))
+        for t in range(THREADS):
+            th = machine.threads[t]
+            add(("t%d.LAT_VALID" % t, (valid >> t) & 1, th.lat_valid))
+            add(("t%d.LAT_VAL" % t, (value >> t) & 1, th.lat_val))
+            add(("t%d.LAT_PIN" % t, _field(pin, t, 5), th.lat_pin))
+    if p.irq_en is not None:
+        add(("IRQ_EN", _i(p.irq_en), machine.irq_en))
+        add(("IRQ_EN2", _i(p.irq_en2), machine.irq_en2))
     return pairs
 
 
@@ -371,19 +592,29 @@ class _Run:
     """One program, one reset, one lockstep comparison."""
 
     def __init__(self, dut, probe: _Probe, prog: GeneratedProgram, label: str,
-                 cycles: int, spi: bool = False):
+                 cycles: int, build: _Build, spi: bool = False):
         self.dut = dut
         self.p = probe
         self.prog = prog
         self.label = label
         self.cycles = cycles
         self.spi = spi
-        self.machine = Machine(imem_words=prog.imem_words, loopback=True, isa=ISA)
+        self.build = build
+        self.machine = build.machine()
         self.history = [collections.deque(maxlen=12) for _ in range(THREADS)]
         self.host = LoomHost(dut) if spi else None
+        self.traffic = prog.host if (spi and prog.host is not None) else None
         self.host_log = []
         self.run_cycle = RUN_CYCLE if not spi else None
         self.retired = 0
+        # --- host traffic mirror (SPI variant)
+        self.txn = None             # transaction the host task is sending
+        self.peeks = []             # model peek per word of a FIFO read
+        self.byte_index = 0         # byte counter of the current transaction
+        self.expect = []            # [(cycle, action)] the RTL must perform
+        self.host_error = None      # set by the host task, checked every cycle
+        self.host_touched = []      # (thread, "push"/"read") applied this cycle
+        self.txn_count = 0
 
     # ---------------------------------------------------------------- report
     def fail(self, cycle, diffs, rtl=None, model=None, kind="retire record",
@@ -418,16 +649,18 @@ class _Run:
             lines += ["    " + h for h in self.history[thread]]
         info = {"label": self.label, "cycle": cycle, "kind": kind,
                 "run_cycle": self.run_cycle, "cycles": self.cycles,
-                "spi": self.spi, "thread": thread,
+                "spi": self.spi, "thread": thread, "caps": self.build.caps,
                 "diffs": [[n, g, w] for n, g, w in diffs],
                 "rtl": _fmt(rtl) if rtl is not None else None,
                 "model": _fmt(_model_tuple(model)) if model is not None else None,
+                "host_log": [list(e) for e in self.host_log],
                 "history": list(self.history[thread]) if thread is not None else []}
         path = _dump(self.prog, info)
         raise Divergence("\n".join(lines) + "\n\n  replay: %s\n" % path)
 
     def check_state(self, cycle):
-        bad = [(n, g, w) for n, g, w in _state_pairs(self.p, self.machine) if g != w]
+        bad = [(n, g, w) for n, g, w in _state_pairs(self.p, self.machine, self.build)
+               if g != w]
         if bad:
             thread = int(bad[0][0][1]) if bad[0][0].startswith("t") and \
                 bad[0][0][1].isdigit() else None
@@ -454,18 +687,23 @@ class _Run:
             return [(p.run_r, prog.run_mask)]
         raise AssertionError("unexpected host action cycle %d" % cycle)
 
+    # ---- the SPI variant: mirror every host action at the cycle it commits
     def mirror_host_pulses(self, cycle):
         """SPI variant: the host-control pulses visible in ``cycle`` commit at
         the edge that ends it; give the model the same actions now."""
         h, m = self.p.host, self.machine
+        self.host_touched = []
+        consumed = self._apply_expected(cycle)
         if _i(h["h_imem_req"]):
             addr = _i(h["h_imem_addr"])
             if _i(h["h_imem_we"]):
                 m.host_write_imem(addr, _i(h["h_imem_wdata"]))
-                self.host_log.append((cycle, "imem_write", addr))
+                self.host_log.append((cycle, "imem_write", addr,
+                                      _i(h["h_imem_wdata"])))
             else:
                 m.host_read_imem(addr)
-        if _i(h["h_run_we"]):
+                self.host_log.append((cycle, "imem_read", addr))
+        if _i(h["h_run_we"]) and "h_run_we" not in consumed:
             m.host_set_run(_i(h["h_run"]))
             self.host_log.append((cycle, "run", _i(h["h_run"])))
             if self.run_cycle is None:
@@ -473,10 +711,199 @@ class _Run:
         others = [n for n in ("h_reset", "h_step_we", "h_rpc_we", "h_sfset_we",
                               "h_sfclr_we", "h_badop_clr_we", "h_badop_set15",
                               "h_swirq_clr_we", "h_pout_we", "h_poe_we",
-                              "h_od_we", "h_dbg_req") if _i(h[n])]
+                              "h_od_we", "h_dbg_req", "h_inq_push", "h_outq_pop",
+                              "h_badop_set14")
+                  if _i(h[n]) and n not in consumed]
+        for name in ("irq_en_wr", "irq_en2_wr"):
+            handle = getattr(self.p, name)
+            if handle is not None and _i(handle) and name not in consumed:
+                others.append(name)
         if others:
-            raise AssertionError("cycle %d: host action %s is not mirrored into "
-                                 "the model by this harness" % (cycle, others))
+            self.fail(cycle, [], kind="host action", thread=None,
+                      note="host-control pulse %s with no host word due in this "
+                           "cycle (the harness mirrors every host action it "
+                           "sends; an extra one is the RTL's own)" % others)
+        # The byte that ends in this cycle says what is due in the next one.
+        if _i(self.p.cs_active):
+            if _i(self.p.byte_done):
+                self._byte_done(cycle, self.byte_index)
+                self.byte_index += 1
+        else:
+            self.byte_index = 0
+
+    def _byte_done(self, cycle, index):
+        """Byte ``index`` of the transaction the host task is sending has just
+        gone out: schedule the model action its word commits at the next edge,
+        and take the model's peek when a FIFO read word is loaded."""
+        txn = self.txn
+        if txn is None:
+            return                          # the program load: pulse-mirrored
+        if txn.kind == "push":
+            word = index - 4                # cmd, addr hi, addr lo, then words
+            if word >= 0 and word % 2 == 0 and word // 2 < len(txn.words):
+                self.expect.append((cycle + 1,
+                                    ("push", txn.thread, txn.words[word // 2])))
+        elif txn.kind == "pop":
+            load = index - 3                # the dummy byte, then every word
+            if load >= 0 and load % 2 == 0 and load // 2 < txn.count:
+                j = load // 2
+                popping = j > 0 and self.peeks[j - 1] is not None
+                self.peeks.append(peek_word(self.machine, txn.thread, popping))
+                if popping:
+                    COVERAGE.host_event("host_read:next_entry")
+            end = index - 5
+            if end >= 0 and end % 2 == 0 and end // 2 < txn.count:
+                self.expect.append((cycle + 1, ("pop", txn.thread, end // 2)))
+        elif index == 4:                    # cmd, addr hi, addr lo, hi, lo
+            self.expect.append((cycle + 1, ("ctrl", txn.reg, txn.value)))
+
+    def _apply_expected(self, cycle):
+        """Give the model every host action due in ``cycle`` and check that
+        the RTL raised the matching pulse with the matching data."""
+        h, m = self.p.host, self.machine
+        due = [a for c, a in self.expect if c == cycle]
+        if not due:
+            return set()
+        self.expect = [(c, a) for c, a in self.expect if c != cycle]
+        consumed = set()
+        for action in due:
+            if action[0] == "push":
+                _, thread, word = action
+                self._expect_pulse(cycle, "h_inq_push", thread,
+                                   "the host push into INQ[%d]" % thread)
+                got = _i(h["h_fifo_wdata"])
+                if got != word:
+                    self.fail(cycle, [("h_fifo_wdata", got, word)],
+                              kind="host action", thread=thread,
+                              note="the word the host pushed into INQ[%d]" % thread)
+                full = len(m.threads[thread].inq) >= self.build.fifo_depth
+                m.host_fifo_push(thread, word)
+                self.host_log.append((cycle, "fifo_push", thread, word))
+                COVERAGE.host_event("host_push:dropped(full)" if full
+                                    else "host_push:accepted")
+                if full:
+                    COVERAGE.host_event("BADOP14:host_push_full")
+                self.host_touched.append((thread, "push"))
+                consumed.add("h_inq_push")
+            elif action[0] == "pop":
+                _, thread, word = action
+                peeked = self.peeks[word] if word < len(self.peeks) else None
+                if peeked is not None:
+                    self._expect_pulse(cycle, "h_outq_pop", thread,
+                                       "the host pop of OUTQ[%d]" % thread)
+                    consumed.add("h_outq_pop")
+                    COVERAGE.host_event("host_read:word")
+                    self.host_log.append((cycle, "fifo_pop", thread))
+                else:
+                    if not _i(h["h_badop_set14"]):
+                        self.fail(cycle, [("h_badop_set14", 0, 1)],
+                                  kind="host action", thread=thread,
+                                  note="the model peeked nothing in OUTQ[%d], so "
+                                       "the word that just went out should set "
+                                       "BADOP[14] (SEMANTICS 6.7)" % thread)
+                    consumed.add("h_badop_set14")
+                    COVERAGE.host_event("host_read:empty_peek")
+                    COVERAGE.host_event("BADOP14:host_read_empty")
+                    if m.threads[thread].outq:
+                        COVERAGE.host_event("host_read:filled_after_empty_peek")
+                    self.host_log.append((cycle, "fifo_pop_empty", thread))
+                pop_after_peek(m, thread, peeked)
+                self.host_touched.append((thread, "read"))
+            else:
+                _, reg, value = action
+                consumed |= self._ctrl_write(cycle, reg, value)
+        return consumed
+
+    def _expect_pulse(self, cycle, name, thread, what):
+        got = _i(self.p.host[name])
+        if not (got >> thread) & 1:
+            self.fail(cycle, [(name, got, 1 << thread)], kind="host action",
+                      thread=thread,
+                      note="%s commits at this edge (HOST_PROTOCOL: the word's "
+                           "effect is registered at E+3 and lands at E+4), so "
+                           "%s should be set" % (what, name))
+
+    def _ctrl_write(self, cycle, reg, value):
+        """One CTRL write of the host plan: check the strobe, tell the model."""
+        m = self.machine
+        if reg in CTRL_WRITE_PULSE:
+            strobe, bus, mask = CTRL_WRITE_PULSE[reg]
+            if not _i(self.p.host[strobe]):
+                self.fail(cycle, [(strobe, 0, 1)], kind="host action",
+                          note="the host wrote CTRL.%s = %04X; its write strobe "
+                               "is due in this cycle" % (reg, value))
+            got = _i(self.p.host[bus])
+            if got != value & mask:
+                self.fail(cycle, [(bus, got, value & mask)], kind="host action",
+                          note="the value the host wrote to CTRL.%s" % reg)
+            consumed = {strobe}
+        else:
+            name = "irq_en_wr" if reg == "IRQ_EN" else "irq_en2_wr"
+            handle = getattr(self.p, name)
+            assert handle is not None, \
+                "loom_host_ctl.%s is needed to mirror CTRL.%s writes" % (name, reg)
+            if not _i(handle):
+                self.fail(cycle, [(name, 0, 1)], kind="host action",
+                          note="the host wrote CTRL.%s = %04X; loom_host_ctl's "
+                               "write strobe is due in this cycle" % (reg, value))
+            consumed = {name}
+        if reg == "RUN":
+            m.host_set_run(value & 0xF)
+            self.host_log.append((cycle, "run", value & 0xF))
+        elif reg == "SWIRQ":
+            m.host_clear_swirq(value & 0xF)
+            self.host_log.append((cycle, "swirq_clr", value & 0xF))
+        elif reg == "BADOP":
+            m.host_clear_badop(value & 0xFFFF)
+            self.host_log.append((cycle, "badop_clr", value & 0xFFFF))
+        elif reg == "SFLAGS":
+            m.host_write_sflags_set(value & 0xFF)
+            self.host_log.append((cycle, "sflags_set", value & 0xFF))
+        elif reg == "SFLAGS_CLR":
+            m.host_write_sflags_clr(value & 0xFF)
+            self.host_log.append((cycle, "sflags_clr", value & 0xFF))
+        elif reg == "IRQ_EN":
+            m.host_write_irq_en(value & 0xFFFF)
+            self.host_log.append((cycle, "irq_en", value & 0xFFFF))
+        else:
+            m.host_write_irq_en2(value & 0xF)
+            self.host_log.append((cycle, "irq_en2", value & 0xF))
+        COVERAGE.host_event(CTRL_WRITE_EVENT[reg])
+        return consumed
+
+    async def host_traffic(self):
+        """Send the program's host plan over the SPI pads, over and over."""
+        plan, host = self.traffic, self.host
+        index = 0
+        while True:
+            txn = plan[index]
+            index += 1
+            if txn.gap:
+                await ClockCycles(self.dut.clk, txn.gap)
+            self.peeks = []
+            self.txn = txn
+            try:
+                if txn.kind == "push":
+                    await host.write(SP_FIFO, FIFO_QUEUE + txn.thread,
+                                     list(txn.words))
+                elif txn.kind == "pop":
+                    got = await host.read(SP_FIFO, FIFO_QUEUE + txn.thread,
+                                          txn.count)
+                    want = [0 if p is None else p for p in self.peeks]
+                    if got != want and self.host_error is None:
+                        self.host_error = (
+                            "the host read %s from OUTQ[%d] over SPI; the model "
+                            "had %s in the cycles the words were loaded "
+                            "(SEMANTICS 6.7 peek)"
+                            % (["%04X" % w for w in got], txn.thread,
+                               ["%04X" % w for w in want]))
+                    if txn.count > 1:
+                        COVERAGE.host_event("host_read:multi_word")
+                else:
+                    await host.write(SP_CTRL, CTRL_WRITE_ADDR[txn.reg], txn.value)
+            finally:
+                self.txn = None
+            self.txn_count += 1
 
     # ------------------------------------------------------------ lockstep
     async def reset(self):
@@ -498,10 +925,53 @@ class _Run:
         return ((self.host._cs & 1) << 4) | ((self.host._sck & 1) << 5) \
             | ((self.host._mosi & 1) << 6)
 
+    def _irq_causes(self):
+        """Which cause of SEMANTICS 6.8 is active in this cycle."""
+        m = self.machine
+        stat = m.irq_stat & m.irq_en
+        causes = []
+        if m.swirq & 0xF:
+            causes.append("SWIRQ")
+        if stat & 0xFF00:
+            causes.append("SFLAGS")
+        if stat & 0x00F0:
+            causes.append("INQ_NOT_FULL")
+        if stat & 0x000F:
+            causes.append("OUTQ_NOT_EMPTY")
+        if m.irq_stat2 & m.irq_en2:
+            causes.append("HALTED")
+        return causes
+
+    def _latch_events(self, lat_before, model, w_wait_active):
+        """A staged pin write that landed at this edge, and by which rule
+        (SEMANTICS 6.10): rule 2 when the thread's own slot wrote ``TD`` at
+        this edge, rule 1 when ``NOW`` ticked onto ``TD``."""
+        m = self.machine
+        for t, was in enumerate(lat_before):
+            th = m.threads[t]
+            if not was or th.lat_valid:
+                continue
+            rule = 1
+            if model is not None and model.thread == t and model.done:
+                decoded = ISA.decode(model.ir)
+                if decoded is not None:
+                    name, fields = decoded[0].name, decoded[1]
+                    if name == "SETD" or (name == "WAITD" and not w_wait_active) \
+                            or (name == "CSRW"
+                                and ISA.csrs.get(fields["csr"], {}).get("name") == "TD"):
+                        rule = 2
+            ordinary = False
+            if model is not None and model.done:
+                decoded = ISA.decode(model.ir)
+                if decoded is not None and decoded[0].name == "SETP" \
+                        and not decoded[1]["lat"] and decoded[1]["pin"] == th.lat_pin:
+                    ordinary = True
+            COVERAGE.latch_fired(rule, th.lat_pin, m.od_mask, ordinary)
+
     async def run(self):
         dut, p, m, plan = self.dut, self.p, self.machine, self.prog.stimulus
         await self.reset()
-        loader = None
+        loader = traffic = None
         if self.spi:
             self.host._cs, self.host._sck, self.host._mosi = 1, 0, 0
 
@@ -509,9 +979,34 @@ class _Run:
                 await ClockCycles(dut.clk, 2)
                 await self.host.load_program(self.prog.image, verify=False)
                 await self.host.write(SP_CTRL, CTRL_RUN, self.prog.run_mask)
+                if self.traffic is not None:
+                    await self.host_traffic()
 
             loader = cocotb.start_soon(load_and_run())
 
+        try:
+            k = await self._lockstep(loader)
+        finally:
+            for task in (loader, traffic):
+                if task is not None and not task.done():
+                    task.cancel()
+        return k
+
+    def _check_host_task(self, loader, cycle):
+        """A host task that died takes the traffic with it, and the run would
+        then pass for the wrong reason."""
+        if not loader.done():
+            return
+        try:
+            exc = loader.exception()
+        except BaseException:                    # cancelled: nothing to report
+            return
+        if exc is not None:
+            raise AssertionError("cycle %d: the SPI host task failed: %r"
+                                 % (cycle, exc)) from exc
+
+    async def _lockstep(self, loader):
+        dut, p, m, plan = self.dut, self.p, self.machine, self.prog.stimulus
         prev_rtl = None          # record in W during the previous cycle
         prev_model = None
         prev_od = 0              # OD_MASK as visible in the previous cycle
@@ -526,18 +1021,30 @@ class _Run:
                 raise AssertionError("seed %d: RUN never committed over SPI"
                                      % self.prog.seed)
             await FallingEdge(dut.clk)
+            if self.host_error is not None:
+                self.fail(k, [], kind="host data", note=self.host_error)
+            if loader is not None and k % 64 == 0:
+                self._check_host_task(loader, k)
 
             # ---- RTL during cycle k
             ph = _i(p.ph)
             regs_rtl = (_i(p.run_r), _i(p.halted_r), _i(p.badop_r),
                         _i(p.sflags_r), _i(p.od_mask))
-            pads_rtl = (_i(p.uo_out) & 0x3F, _i(p.uio_out), _i(p.uio_oe))
+            uo_out = _i(p.uo_out)
+            pads_rtl = (uo_out & 0x3F, (uo_out >> 6) & 1, _i(p.uio_out),
+                        _i(p.uio_oe))
             pc_now = _i(p.pc_all)
-            rtl = _rtl_record(p) if _i(p.tr_valid) else None
+            x_error = None
+            try:
+                rtl = _rtl_record(p) if _i(p.tr_valid) else None
+            except AssertionError as exc:
+                # An X or Z in the retire record. Report it with the model's
+                # view of the same slot rather than as a bare exception.
+                rtl, x_error = None, str(exc)
 
             # ---- model during cycle k (before it steps)
             regs_model = (m.run, m.halted, m.badop, m.sflags, m.od_mask)
-            pads_model = (m.uo_out, m.uio_out, m.uio_oe)
+            pads_model = (m.uo_out, m.host_irq, m.uio_out, m.uio_oe)
             guards = []
             if ph != m.ph or ph != k % 4:
                 guards.append(("ph", ph, m.ph))
@@ -545,7 +1052,8 @@ class _Run:
                                        regs_rtl, regs_model):
                 if got != want:
                     guards.append((name, got, want))
-            for name, got, want in zip(("uo_out[5:0]", "uio_out", "uio_oe"),
+            for name, got, want in zip(("uo_out[5:0]", "HOST_IRQ uo_out[6]",
+                                        "uio_out", "uio_oe"),
                                        pads_rtl, pads_model):
                 if got != want:
                     guards.append((name, got, want))
@@ -597,18 +1105,51 @@ class _Run:
             # the slot saw in X (coverage context).
             od_now = m.od_mask
             th = m.threads[(k + 1) % 4]
-            context = (th.depth, th.outgrp, th.ingrp, list(th.regs))
+            context = SlotContext(
+                features=self.build.features, fifo_depth=self.build.fifo_depth,
+                depth=th.depth, outgrp=th.outgrp, ingrp=th.ingrp,
+                regs=list(th.regs), od_mask=prev_od, inq=len(th.inq),
+                outq=len(th.outq), sr=th.sr, cnt=th.cnt, crc=th.crc,
+                be_cfg=th.be_cfg, be_pins=th.be_pins, lat_valid=th.lat_valid,
+                w_record=prev_model)
+            w_wait_active = th.wait_active
+            lat_before = [t.lat_valid for t in m.threads]
+            irq_before = m.host_irq
+            causes = self._irq_causes()
             model = m.step_cycle()
+            if x_error is not None:
+                self.fail(k, [], None, model, kind="unresolvable RTL signal",
+                          note=x_error + " (the model's record for the slot in "
+                                         "W this cycle is below)")
             diffs = _diff_record(rtl, model)
             if diffs:
                 self.fail(k, diffs, rtl, model)
+
+            # ---- M2 events that have no retire record of their own
+            self._latch_events(lat_before, model, w_wait_active)
+            if m.host_irq != irq_before:
+                COVERAGE.irq_event("HOST_IRQ:rise" if m.host_irq
+                                   else "HOST_IRQ:clear")
+                if m.host_irq:
+                    for cause in causes:
+                        COVERAGE.irq_event("cause:%s" % cause)
+            for thread, what in self.host_touched:
+                if model is not None and model.thread == thread and model.done:
+                    name = (ISA.decode(model.ir) or (None,))[0]
+                    name = name.name if name is not None else ""
+                    if name == "PUSH" and what == "read":
+                        COVERAGE.host_event("same_edge:thread_push+host_read")
+                    elif name == "POP" and what == "push":
+                        COVERAGE.host_event("same_edge:thread_pop+host_push")
+            self.host_touched = []
 
             if model is not None:
                 self.retired += 1
                 t = model.thread
                 # L2-SLOT: W of thread t only when ph == (t + 3) mod 4; a
                 # running thread's slots are exactly 4 cycles apart and each
-                # one fetches the previous one's next PC; only waits stall.
+                # one fetches the previous one's next PC; only waits and the
+                # blocking FIFO ops stall.
                 problems = []
                 if k % 4 != (t + 3) % 4:
                     problems.append("W of thread %d in a cycle with ph=%d" % (t, k % 4))
@@ -619,17 +1160,16 @@ class _Run:
                                         % (rtl[1], gap_pc))
                 if not model.done:
                     decoded = ISA.decode(model.ir)
-                    if decoded is None or decoded[0].timing != "wait" \
+                    if decoded is None or decoded[0].timing not in ("wait", "blocking") \
                             or model.next_pc != model.pc:
-                        problems.append("a stall that is not a wait re-issue")
+                        problems.append("a stall that is not a wait or blocking "
+                                        "FIFO re-issue")
                 if problems:
                     self.fail(k, [], rtl, model, kind="L2-SLOT",
                               note="; ".join(problems))
                 last_w[t] = (k, model.next_pc)
                 self.history[t].append("W %6d  %s" % (k, _fmt(_model_tuple(model))))
-                depth, outgrp, ingrp, regs = context
-                COVERAGE.note(model, depth=depth, outgrp=outgrp, ingrp=ingrp,
-                              regs=regs, od_mask=prev_od, w_record=prev_model)
+                COVERAGE.note(model, context)
             prev_rtl, prev_model, prev_od = rtl, model, od_now
 
             if deposits:
@@ -641,8 +1181,6 @@ class _Run:
         # ---- end of seed: the whole state, both as visible in cycle k
         await FallingEdge(dut.clk)
         self.check_state(k)
-        if loader is not None and not loader.done():
-            loader.cancel()
         return k
 
 
@@ -663,8 +1201,35 @@ async def _read_caps(dut) -> int:
 
 
 def _avoid_for(caps: int):
-    """The avoid flags for an RTL that reports ``caps``."""
-    return AVOID + (("m2_built",) if caps & CAPS_M2_FEATURES else ())
+    """The avoid flags for an RTL that reports ``caps``. The M2 features are
+    not avoided any more: both sides are built for them (see ``_Build``)."""
+    return AVOID
+
+
+def _make_program(make, build: _Build):
+    """Call a program maker. Makers that take the build get it (the M2
+    constructs need to know the FIFO depth and which features are built);
+    older ones (``test_flops.py``) take the avoid flags only and generate for
+    the default build, which is then checked against ``CAPS``."""
+    avoid = _avoid_for(build.caps)
+    try:
+        takes_build = "build" in inspect.signature(make).parameters
+    except (TypeError, ValueError):                  # pragma: no cover
+        takes_build = False
+    prog = make(avoid, build=build) if takes_build else make(avoid)
+    if prog.imem_words != build.imem_words:
+        raise AssertionError("CAPS %04X reports %d instruction words, the "
+                             "program is for %d" % (build.caps, build.imem_words,
+                                                    prog.imem_words))
+    if tuple(prog.features) != build.features or \
+            ("FIFO" in build.features and prog.fifo_depth != build.fifo_depth):
+        raise AssertionError(
+            "the program was generated for features %s (FIFO depth %d) but "
+            "CAPS %04X says the chip has %s (depth %d); the two sides would "
+            "not mean the same thing by an M2 instruction"
+            % (",".join(prog.features) or "M1", prog.fifo_depth, build.caps,
+               ",".join(build.features) or "M1", build.fifo_depth))
+    return prog
 
 
 # ------------------------------------------------------------- failures
@@ -693,38 +1258,39 @@ def _start_clock(dut) -> Clock:
 
 
 def _seed_plan(count, base):
-    """(seed, profile, threads): profiles rotate, most seeds run 4 threads."""
+    """(seed, profile, threads): profiles rotate, most seeds run 4 threads;
+    the one- and two-thread programs are the last of every six."""
     for index in range(count):
         seed = base + index
-        threads = 4 if index % 6 else 1 + (index // 6) % 3
+        threads = 4 if index % 6 != 5 else 1 + (index // 6) % 3
         yield seed, PROFILE_ORDER[index % len(PROFILE_ORDER)], threads
 
 
 async def _run_programs(dut, programs, spi=False):
     """``programs``: (program or maker, label, cycles). A maker is called with
-    the avoid flags that the RTL's CAPS, read at the start of the seed, asks
-    for, and returns the program."""
+    the avoid flags the RTL's CAPS asks for, and the build itself if it takes
+    one, and returns the program."""
     _require_rtl(dut)
     probe = _Probe(dut)
     failures = []
     total_slots = total_cycles = 0
     started = time.time()
     for make, label, cycles in programs:
+        caps = await _read_caps(dut)
+        build = _Build(caps)
         if callable(make):
-            caps = await _read_caps(dut)
-            prog = make(_avoid_for(caps))
-            label = "%s caps=%04X%s" % (label, caps,
-                                         " m2_built" if "m2_built" in prog.avoid else "")
-            if 1 << (caps >> 12) != prog.imem_words:
-                raise AssertionError("CAPS %04X reports %d instruction words, the "
-                                     "program is for %d" % (caps, 1 << (caps >> 12),
-                                                            prog.imem_words))
+            prog = _make_program(make, build)
+            label = "%s %s%s" % (label, build,
+                                 " +host traffic" if prog.host else "")
         else:
             prog = make
+            label = "%s %s" % (label, build)
         if probe.mem_words != prog.imem_words:
             raise AssertionError("the RTL instruction array has %d words, the "
-                                 "program is for %d" % (probe.mem_words, prog.imem_words))
-        run = _Run(dut, probe, prog, label, cycles, spi=spi)
+                                 "program is for %d" % (probe.mem_words,
+                                                        prog.imem_words))
+        COVERAGE.note_build(build.features, build.fifo_depth)
+        run = _Run(dut, probe, prog, label, cycles, build, spi=spi)
         try:
             spent = await run.run()
         except Divergence as exc:
@@ -737,9 +1303,11 @@ async def _run_programs(dut, programs, spi=False):
         total_slots += run.retired
         total_cycles += spent
         dut._log.info("seed %d (%s, run_mask %X): %d slots matched over %d "
-                      "cycles, RUN from cycle %d"
+                      "cycles, RUN from cycle %d%s"
                       % (prog.seed, label, prog.run_mask, run.retired, spent,
-                         run.run_cycle))
+                         run.run_cycle,
+                         ", %d host transactions" % run.txn_count
+                         if run.txn_count else ""))
     dut._log.info("%d programs, %d cycles, %d retire records compared in %.1f s"
                   % (len(programs), total_cycles, total_slots,
                      time.time() - started))
@@ -762,9 +1330,12 @@ async def test_cosim_random_programs(dut):
     else:
         programs = []
         for seed, profile, threads in _seed_plan(SEEDS, SEED_BASE):
-            def make(avoid, seed=seed, profile=profile, threads=threads):
-                return generate(seed=seed, threads=threads, imem_words=IMEM_WORDS,
-                                profile=profile, cycles=CYCLES, avoid=avoid, isa=ISA)
+            def make(avoid, build, seed=seed, profile=profile, threads=threads):
+                return generate(seed=seed, threads=threads,
+                                imem_words=build.imem_words, profile=profile,
+                                cycles=CYCLES, avoid=avoid, isa=ISA,
+                                features=build.features,
+                                fifo_depth=build.fifo_depth)
             programs.append((make, "backdoor profile=%s threads=%d"
                              % (profile, threads), CYCLES))
     try:
@@ -775,15 +1346,19 @@ async def test_cosim_random_programs(dut):
 
 @cocotb.test(skip=GATE_LEVEL or SPI_SEEDS <= 0 or bool(REPLAY))
 async def test_cosim_over_the_host_port(dut):
-    """The same comparison with the image and CTRL.RUN written over SPI."""
+    """The same comparison with the image, ``CTRL.RUN`` and the host's FIFO
+    and interrupt traffic written over SPI."""
     clock = _start_clock(dut)
     programs = []
     for index in range(SPI_SEEDS):
         seed = SEED_BASE + 5000 + index
-        profile = PROFILE_ORDER[(index + 1) % len(PROFILE_ORDER)]
-        def make(avoid, seed=seed, profile=profile):
-            return generate(seed=seed, threads=2, imem_words=IMEM_WORDS,
-                            profile=profile, cycles=SPI_CYCLES, avoid=avoid, isa=ISA)
+        profile = ("m2", "timing", "pins", "mixed")[index % 4]
+        def make(avoid, build, seed=seed, profile=profile):
+            return generate(seed=seed, threads=2, imem_words=build.imem_words,
+                            profile=profile, cycles=SPI_CYCLES, avoid=avoid,
+                            isa=ISA, features=build.features,
+                            fifo_depth=build.fifo_depth,
+                            host_traffic="FIFO" in build.features)
         programs.append((make, "spi profile=%s threads=2" % profile, SPI_CYCLES))
     try:
         await _run_programs(dut, programs, spi=True)
@@ -798,7 +1373,7 @@ async def test_cosim_coverage_report(dut):
     dut._log.info(COVERAGE.table())
     holes = COVERAGE.holes()
     if holes:
-        dut._log.warning("L2-COV: %d reachable bins not hit (listed above)"
-                         % len(holes))
+        dut._log.warning("L2-COV: %d bins stayed empty (listed above): %s"
+                         % (len(holes), ", ".join("%s/%s" % h for h in holes)))
     await Timer(1, "ns")
     assert COVERAGE.slots > 0, "no retire records were compared"

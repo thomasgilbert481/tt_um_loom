@@ -25,6 +25,50 @@ bounded number of cycles without supervision:
   and only a small minority are untimed waits that may never complete, which
   is a legitimate thing for the harness to see.
 
+The build
+---------
+
+A program is generated for one build of the chip, the one ``CTRL.CAPS``
+reports (``docs/SEMANTICS.md`` 5): ``features`` (any of ``"FIFO"``, ``"BE"``,
+``"SETPD"``) and ``fifo_depth``. The default is the M2 chip, FIFOs of depth 4,
+the manual bit engine and the deadline-latched ``SETP``. Instructions of a
+feature that is built are generated as live code (below); those of a feature
+that is not are ``NOP`` + ``BADOP`` (SEMANTICS 9) and come from the unbuilt
+pool, as ``LD``/``ST`` always do. Both implementations are then run with the
+same build, so a program means the same thing to both.
+
+How each M2 construct stays live
+--------------------------------
+
+* ``PUSH ra`` (OUTQ, SEMANTICS 6.7) stalls while ``OUTQ[t]`` is full, and only
+  the host pops it. Without host traffic every ``PUSH`` is guarded:
+  ``[SETD k] WAITB OUTQ_NF, T; BT +1; PUSH ra``. The ``WAITB`` ends by its
+  condition (``T <= 0``) or at the deadline (``T <= 1``) and ``BT`` skips the
+  ``PUSH`` on a timeout. After a condition end the ``PUSH`` cannot stall:
+  only thread ``t`` pushes ``OUTQ[t]`` and the host can only pop it, so it
+  cannot fill up between the ``WAITB``'s X cycle and the ``PUSH``'s.
+* ``POP rd`` (INQ) stalls while ``INQ[t]`` is empty, and only the host pushes
+  it; the guard is the same with ``WAITB INQ_NE, T``. No thread ever pops
+  what another thread pushes (there is no such path in the chip).
+* With ``host_traffic=True`` the program comes with a :class:`HostPlan` that
+  pushes every running thread's ``INQ`` and reads its ``OUTQ`` in every round
+  (:mod:`tools.loomgen.hostplan`), and then raw ``PUSH``/``POP`` and untimed
+  ``WAITB OUTQ_NF``/``INQ_NE`` are emitted too: the plan serves them.
+* ``WAITB TICK`` (``TICK_SEEN``) and ``WAITB BE_IDLE`` (always true until auto
+  mode) are live on their own; they are generated timed and untimed.
+* Bit-engine loops count with ``CNT``: ``LDI r7, n; CSRW CNT, r7; SHO|SHI;
+  [DLY|WAITD]; BNZ back``. ``SHO``/``SHI`` set ``CNT <= max(CNT - 1, 0)`` and
+  ``Z = (CNT == 0)`` (SEMANTICS 6.9), nothing else in the loop touches ``Z``,
+  so the loop runs ``max(n, 1)`` times, at most 31.
+* ``SETP pin, v, D`` does not wait for anything: it stages a write that lands
+  on the thread's next deadline (6.10). The generator follows it with a
+  ``WAITD``, a ``SETD``, a ``CSRW TD`` or nothing, with deadlines both ahead
+  of ``NOW`` (the write lands by rule 1, ``NOW`` ticking onto ``TD``) and
+  already passed (rule 2, at the ``TD`` write).
+
+There are no FIFO CSRs in ``isa/isa.yaml``: a thread sees its FIFOs only
+through ``PUSH``, ``POP`` and ``WAITB``.
+
 Everything an instruction encodes goes through :mod:`tools.loomisa`; there is
 no instruction hex in this file.
 
@@ -42,6 +86,7 @@ from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 from tools.loomisa import Isa
 from tools.loomisa import load as load_isa
 
+from .hostplan import HostPlan, build_host_plan
 from .stimulus import StimulusPlan, build_plan
 
 THREADS = 4
@@ -61,34 +106,52 @@ M1_MNEMONICS: Tuple[str, ...] = (
     "CSRR", "CSRW", "CLR", "SIG",
 )
 
-#: Instructions that decode but whose feature M1 does not build: the FIFO
-#: ops and WAITB (M2), the bit engine (M2/M3) and LD/ST (optional DMEM). They
-#: execute as ``NOP`` and set ``BADOP`` (SEMANTICS 9).
+#: Instructions that decode but whose feature the M1 build does not have:
+#: the FIFO ops and WAITB (M2), the bit engine (M2/M3) and LD/ST (optional
+#: DMEM). In a build without their feature they execute as ``NOP`` and set
+#: ``BADOP`` (SEMANTICS 9); :func:`unbuilt_mnemonics` gives the list for a
+#: given build.
 UNBUILT_MNEMONICS: Tuple[str, ...] = (
     "PUSH", "POP", "WAITB", "SHO", "SHI", "LDSR", "STSR", "CRCI", "STCRC",
     "LD", "ST",
 )
 
-#: Instructions the M2 RTL builds (SEMANTICS 6.7, 6.9): FIFOs, WAITB and the
-#: manual bit engine. With the ``m2_built`` avoid flag they leave the unbuilt
-#: pool as well, so a program means the same thing to an M2 build and to a
-#: golden model that still treats them as unbuilt.
+#: Instructions of the M2 features (SEMANTICS 6.7, 6.9): FIFOs, WAITB and the
+#: manual bit engine. (``SETP ... D`` is ``SETP`` with the ``lat`` bit.)
 M2_MNEMONICS: Tuple[str, ...] = (
     "PUSH", "POP", "WAITB", "SHO", "SHI", "LDSR", "STSR", "CRCI", "STCRC",
 )
+
+#: The feature each M2 instruction needs. ``WAITB BE_IDLE`` needs ``"BE"``
+#: as well (SEMANTICS 6.4); :func:`instruction_built` handles that operand.
+FEATURE_OF: Dict[str, str] = {
+    "PUSH": "FIFO", "POP": "FIFO", "WAITB": "FIFO",
+    "SHO": "BE", "SHI": "BE", "LDSR": "BE", "STSR": "BE", "CRCI": "BE",
+    "STCRC": "BE", "LD": "DMEM", "ST": "DMEM",
+}
 
 #: CSRs built at M1 (SEMANTICS 6.6: 0x00-0x03, 0x09-0x0C, 0x10-0x15), by name.
 M1_CSR_NAMES: Tuple[str, ...] = (
     "TICK_INT", "TICK_FRAC", "OUTGRP", "INGRP", "NOW", "TD", "FLAGS", "TID",
     "OD_MASK", "PIN_OUT", "PIN_OE", "PIN_IN", "SFLAGS", "HOST_IRQ",
 )
-#: CSRs of unbuilt features: they read 0 and ignore writes, without BADOP.
+#: CSRs of the bit engine (SEMANTICS 6.9). In a build without ``"BE"`` they
+#: read 0 and ignore writes, without BADOP (6.6).
 UNBUILT_CSR_NAMES: Tuple[str, ...] = (
     "BE_CFG", "BE_PINS", "BE_RELOAD", "CRC_POLY", "CRC_INIT", "SR", "CNT", "CRC",
 )
-#: The bit-engine CSRs, which an M2 build implements (SEMANTICS 6.9). The
-#: ``m2_built`` avoid flag takes them out of the "reads 0" pool.
+#: The same list under the name the M2 build uses for it: built with ``"BE"``.
 M2_CSR_NAMES: Tuple[str, ...] = UNBUILT_CSR_NAMES
+
+#: Features :func:`generate` can build for (the ones that change what an
+#: instruction does; ``DMEM`` and ``BOOTROM`` are not modelled).
+FEATURES: FrozenSet[str] = frozenset(("FIFO", "BE", "SETPD"))
+#: The M2 chip: ``CAPS`` reports the FIFOs (depth 4), the manual bit engine
+#: and the deadline-latched ``SETP``. What :func:`generate` assumes unless told.
+DEFAULT_FEATURES: Tuple[str, ...] = ("BE", "FIFO", "SETPD")
+DEFAULT_FIFO_DEPTH = 4
+#: Legal FIFO depths (SEMANTICS 6.7): a power of two from 2 to 8.
+FIFO_DEPTHS: Tuple[int, ...] = (2, 4, 8)
 
 #: Register 7 is the generator's scratch: no random instruction writes it, so
 #: the only values it ever holds are the ones a ``LDI``/``LDIH`` or ``CSRR
@@ -106,22 +169,62 @@ ZC_BRANCHES = ("BZ", "BNZ", "BC", "BNC")
 #: BT/BNT is almost always an infinite loop. Forward only.
 T_BRANCHES = ("BT", "BNT")
 
+#: ``WAITB`` conditions (``isa.yaml`` ``enums.cond``).
+WAITB_BE_IDLE, WAITB_OUTQ_NF, WAITB_INQ_NE, WAITB_TICK = 0, 1, 2, 3
+
+#: ``BE_CFG`` fields that exist at M2 (SEMANTICS 6.9).
+BE_CFG_DIR, BE_CFG_INV, BE_CFG_CRC_EN = 1 << 1, 1 << 7, 1 << 9
+
 #: Known ``avoid`` flags. Each switches off one construct on which the RTL
 #: and the model disagree where ``docs/SEMANTICS.md`` does not decide the
 #: answer, until the director rules; see ``docs/spec-questions/cosim.md``.
-#:
-#: ``m2_built`` is different in kind: it marks a run against an RTL that
-#: builds M2 features (``CAPS`` says so) while the golden model may not. It
-#: removes :data:`M2_MNEMONICS` from every pool, keeps the bit-engine CSRs
-#: out of the dead-CSR pool, and never sets the ``D`` (lat) bit of ``SETP``.
 AVOID_FLAGS: FrozenSet[str] = frozenset((
     "csrw_pin_out_high_bits",
-    "m2_built",
 ))
 
 
 class LoomgenError(ValueError):
     """Bad generator arguments, or an image that breaks a generator rule."""
+
+
+def unbuilt_mnemonics(features: Iterable[str]) -> Tuple[str, ...]:
+    """The instructions that are ``NOP`` + ``BADOP`` in a build with
+    ``features`` (``WAITB`` counts as built with the FIFOs even though its
+    ``BE_IDLE`` operand also needs the bit engine)."""
+    built = frozenset(features)
+    return tuple(n for n in UNBUILT_MNEMONICS if FEATURE_OF[n] not in built)
+
+
+def instruction_built(name: str, fields: Dict[str, int],
+                      features: Iterable[str]) -> bool:
+    """Does this decoded instruction execute (rather than ``NOP`` + ``BADOP``)
+    in a build with ``features``? SEMANTICS 6.4: ``WAITB BE_IDLE`` needs the
+    bit engine as well as the FIFOs."""
+    built = frozenset(features)
+    feature = FEATURE_OF.get(name)
+    if feature is None:
+        return True
+    if feature not in built:
+        return False
+    if name == "WAITB" and fields.get("cond") == WAITB_BE_IDLE:
+        return "BE" in built
+    return True
+
+
+def normalise_build(features: Iterable[str], fifo_depth: int) -> Tuple[Tuple[str, ...], int]:
+    """Check a build and return it in canonical form: sorted feature names
+    and the FIFO depth (the default depth when the FIFOs are not built)."""
+    names = tuple(sorted(frozenset(str(f).upper() for f in features)))
+    unknown = [n for n in names if n not in FEATURES]
+    if unknown:
+        raise LoomgenError("cannot generate for feature(s) %s; know %s"
+                           % (", ".join(unknown), ", ".join(sorted(FEATURES))))
+    if "FIFO" in names:
+        if fifo_depth not in FIFO_DEPTHS:
+            raise LoomgenError("fifo_depth must be 2, 4 or 8, not %r" % (fifo_depth,))
+    else:
+        fifo_depth = DEFAULT_FIFO_DEPTH
+    return names, int(fifo_depth)
 
 
 # --------------------------------------------------------------------- blocks
@@ -174,6 +277,12 @@ class GeneratedProgram:
     avoid: Tuple[str, ...] = ()
     #: Addresses that are branch targets (block heads), for the listing.
     heads: FrozenSet[int] = frozenset()
+    #: The build the program is for (SEMANTICS 5, ``CAPS``): sorted feature
+    #: names and the FIFO depth. ``()`` is the M1 build.
+    features: Tuple[str, ...] = ()
+    fifo_depth: int = DEFAULT_FIFO_DEPTH
+    #: Host traffic the program relies on (raw PUSH/POP), or None.
+    host: Optional[HostPlan] = None
 
     @property
     def stride(self) -> int:
@@ -208,6 +317,9 @@ class GeneratedProgram:
             "run_mask": self.run_mask,
             "avoid": list(self.avoid),
             "heads": sorted(self.heads),
+            "features": list(self.features),
+            "fifo_depth": self.fifo_depth,
+            "host": self.host.to_obj() if self.host is not None else None,
             "stimulus": self.stimulus.to_obj(),
             "source": "generated by tools.loomgen seed %d profile %s"
                       % (self.seed, self.profile),
@@ -215,19 +327,25 @@ class GeneratedProgram:
 
     @staticmethod
     def from_obj(obj: Dict) -> "GeneratedProgram":
+        """Inverse of :meth:`to_obj`. A file written before the build was
+        recorded (no ``features`` key) is an M1-build program."""
         image = {int(k, 0) if isinstance(k, str) else int(k): int(v)
                  for k, v in obj["words"].items()}
         threads = dict(obj["threads"])
         entries = [int(threads[str(t)]["entry"]) for t in range(THREADS)]
         run_mask = int(obj["run_mask"])
+        host = obj.get("host")
         return GeneratedProgram(
             seed=int(obj["seed"]), profile=str(obj["profile"]),
             threads=bin(run_mask).count("1"),
             imem_words=int(obj["imem_words"]), image=image, entries=entries,
             run_mask=run_mask,
             stimulus=StimulusPlan.from_obj(obj["stimulus"]),
-            avoid=tuple(obj.get("avoid", ())),
-            heads=frozenset(int(a) for a in obj.get("heads", ())))
+            avoid=tuple(a for a in obj.get("avoid", ()) if a != "m2_built"),
+            heads=frozenset(int(a) for a in obj.get("heads", ())),
+            features=tuple(sorted(obj.get("features", ()))),
+            fifo_depth=int(obj.get("fifo_depth", DEFAULT_FIFO_DEPTH)),
+            host=HostPlan.from_obj(host) if host else None)
 
     def disassembly(self, isa: Optional[Isa] = None) -> str:
         """An annotated listing of every word, for debugging a failing seed."""
@@ -238,6 +356,9 @@ class GeneratedProgram:
                  % (self.seed, self.profile, self.threads, self.imem_words),
                  "; run_mask=0x%X avoid=%s" % (self.run_mask,
                                                ",".join(self.avoid) or "-"),
+                 "; build: features=%s fifo_depth=%d host traffic=%s"
+                 % (",".join(self.features) or "M1", self.fifo_depth,
+                    "%d transactions" % len(self.host) if self.host else "none"),
                  "; '>' marks a block head (a branch target)"]
         for t in range(THREADS):
             start, end = self.region(t)
@@ -254,12 +375,20 @@ class GeneratedProgram:
                 mark = ">" if addr in self.heads else " "
                 lines.append("  %03X %s %04X  %s"
                              % (addr, mark, word, disassemble(word, isa)))
+        if self.host:
+            lines.append("")
+            lines.append("; ---- host plan (repeats until the run ends)")
+            lines += ["  %3d  gap %-4d %s" % (i, txn.gap, txn)
+                      for i, txn in enumerate(self.host.txns)]
         return "\n".join(lines) + "\n"
 
 
 # ------------------------------------------------------------------- profiles
 #: Relative weight of every block emitter, per profile. Names are the
-#: ``_emit_*`` methods of :class:`_ThreadBuilder`.
+#: ``_emit_*`` methods of :class:`_ThreadBuilder`. The M2 emitters
+#: (``fifo_*``, ``waitb``, ``be_*``, ``crc``, ``setp_d``) fall back to the
+#: unbuilt pool (or, for ``setp_d``, an ordinary ``SETP``) in a build without
+#: their feature.
 PROFILES: Dict[str, Dict[str, int]] = {
     "mixed": {
         "alu3": 10, "alui": 10, "ldi": 5, "ldih": 3, "unary": 9,
@@ -268,7 +397,9 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "setp": 8, "oep": 3, "out": 4, "in": 4, "grpcfg": 2,
         "waitd": 5, "dly": 3, "setd": 3, "nop": 2, "tdrel": 1, "retick": 1,
         "waitp": 4, "waite": 4, "waits": 4, "sig": 4, "clr": 3,
-        "csrr": 6, "csrw": 6, "reserved": 2, "unbuilt": 3,
+        "csrr": 6, "csrw": 6, "reserved": 2, "unbuilt": 2,
+        "fifo_push": 3, "fifo_pop": 3, "waitb": 2, "be_cfg": 1, "be_op": 3,
+        "be_loop": 1, "crc": 1, "setp_d": 3,
     },
     "alu": {
         "alu3": 26, "alui": 24, "ldi": 8, "ldih": 6, "unary": 22,
@@ -278,6 +409,8 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitd": 2, "dly": 1, "setd": 2, "nop": 2, "tdrel": 1, "retick": 1,
         "waitp": 1, "waite": 1, "waits": 2, "sig": 2, "clr": 1,
         "csrr": 4, "csrw": 4, "reserved": 2, "unbuilt": 2,
+        "fifo_push": 1, "fifo_pop": 1, "waitb": 1, "be_cfg": 1, "be_op": 3,
+        "be_loop": 1, "crc": 1, "setp_d": 1,
     },
     "timing": {
         "alu3": 5, "alui": 5, "ldi": 3, "ldih": 2, "unary": 4,
@@ -287,6 +420,8 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitd": 14, "dly": 9, "setd": 8, "nop": 2, "tdrel": 4, "retick": 4,
         "waitp": 8, "waite": 8, "waits": 8, "sig": 7, "clr": 4,
         "csrr": 5, "csrw": 6, "reserved": 2, "unbuilt": 2,
+        "fifo_push": 2, "fifo_pop": 2, "waitb": 5, "be_cfg": 1, "be_op": 2,
+        "be_loop": 2, "crc": 1, "setp_d": 8,
     },
     "pins": {
         "alu3": 4, "alui": 4, "ldi": 5, "ldih": 3, "unary": 4,
@@ -296,6 +431,21 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitd": 3, "dly": 2, "setd": 3, "nop": 1, "tdrel": 1, "retick": 1,
         "waitp": 10, "waite": 12, "waits": 4, "sig": 3, "clr": 2,
         "csrr": 5, "csrw": 6, "reserved": 2, "unbuilt": 2,
+        "fifo_push": 1, "fifo_pop": 1, "waitb": 2, "be_cfg": 4, "be_op": 8,
+        "be_loop": 3, "crc": 1, "setp_d": 6,
+    },
+    # The M2 features first: FIFOs, bit engine, deadline-latched SETP, with
+    # enough of everything else around them to keep the slots varied.
+    "m2": {
+        "alu3": 4, "alui": 4, "ldi": 3, "ldih": 2, "unary": 3,
+        "branch": 4, "tbranch": 2, "djnz_loop": 1, "djnz_fwd": 1, "jp": 1,
+        "jp_poll": 1, "jmp": 2, "call": 2, "call_chain": 1, "ret": 2,
+        "setp": 4, "oep": 2, "out": 2, "in": 2, "grpcfg": 1,
+        "waitd": 5, "dly": 2, "setd": 3, "nop": 1, "tdrel": 2, "retick": 1,
+        "waitp": 2, "waite": 2, "waits": 2, "sig": 2, "clr": 1,
+        "csrr": 4, "csrw": 4, "reserved": 1, "unbuilt": 1,
+        "fifo_push": 8, "fifo_pop": 7, "waitb": 5, "be_cfg": 3, "be_op": 9,
+        "be_loop": 4, "crc": 2, "setp_d": 9,
     },
 }
 
@@ -303,7 +453,12 @@ PROFILES: Dict[str, Dict[str, int]] = {
 HALT_RATE = 0.12
 #: Share of conditional waits that are untimed on something that may never
 #: happen (the "gamble"); every other untimed wait watches a live condition.
+#: The M2 constructs never gamble: they are timed unless live.
 GAMBLE_RATE = 1.0 / 14.0
+
+#: Deadline offsets for the latched ``SETP``: short ones are usually already
+#: passed when the ``TD`` write commits (rule 2), long ones land by rule 1.
+LATCH_IMMS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24)
 
 
 # ------------------------------------------------------------- thread builder
@@ -313,7 +468,9 @@ class _ThreadBuilder:
     def __init__(self, rng: random.Random, isa: Isa, thread: int,
                  size: int, profile: str, plan: StimulusPlan,
                  others_running: bool, flag_pool: Sequence[int],
-                 avoid: FrozenSet[str]):
+                 avoid: FrozenSet[str], features: Sequence[str] = (),
+                 fifo_depth: int = DEFAULT_FIFO_DEPTH,
+                 host_traffic: bool = False):
         self.rng = rng
         self.isa = isa
         self.thread = thread
@@ -322,6 +479,24 @@ class _ThreadBuilder:
         self.others_running = others_running
         self.flag_pool = tuple(flag_pool)
         self.avoid = avoid
+        self.features = frozenset(features)
+        self.fifo = "FIFO" in self.features
+        self.be = "BE" in self.features
+        self.setpd = "SETPD" in self.features
+        self.fifo_depth = fifo_depth
+        # The host pushes INQ[t] and pops OUTQ[t] of every running thread in
+        # every round of its plan (tools.loomgen.hostplan), which is what
+        # makes a raw PUSH/POP or an untimed FIFO WAITB live. A round is a
+        # few thousand clocks, so a region gets at most one raw PUSH and one
+        # raw POP: more would leave the thread waiting for the host most of
+        # the run instead of executing the rest of its program.
+        self.host_traffic = host_traffic and self.fifo
+        # PUSH is released by any host read of this thread's OUTQ and the
+        # plan makes one every round, so two raw pushes are affordable; a raw
+        # POP waits for a push into its INQ, which is the longer wait.
+        self.raw_left = {"PUSH": 2 if self.host_traffic else 0,
+                         "POP": 1 if self.host_traffic else 0,
+                         "WAITB": 1 if self.host_traffic else 0}
         self.blocks: List[_Block] = []
         self.loop_head_index = 0
         csr = isa.csr_by_name
@@ -338,16 +513,14 @@ class _ThreadBuilder:
         self.outputs = tuple(sorted(p for p, d in pins.items() if d["dir"] == "out"))
         self.reserved_pins = tuple(p for p in range(32) if p not in pins)
         self.reserved_words = _reserved_words(isa, rng)
-        self.m2_built = "m2_built" in avoid
-        self.unbuilt_cycle = [n for n in UNBUILT_MNEMONICS
-                              if not (self.m2_built and n in M2_MNEMONICS)]
+        self.unbuilt_cycle = list(unbuilt_mnemonics(self.features))
         rng.shuffle(self.unbuilt_cycle)
         self.unbuilt_next = 0
-        self.m1_csrs = [csr[n] for n in M1_CSR_NAMES]
+        built_csrs = list(M1_CSR_NAMES) + (list(M2_CSR_NAMES) if self.be else [])
+        self.m1_csrs = [csr[n] for n in built_csrs]
         # Unbuilt CSRs plus the CSR numbers isa.yaml does not define at all:
         # both read 0 and ignore writes (SEMANTICS 6.6).
-        self.dead_csrs = [csr[n] for n in UNBUILT_CSR_NAMES
-                          if not (self.m2_built and n in M2_CSR_NAMES)] + \
+        self.dead_csrs = [csr[n] for n in UNBUILT_CSR_NAMES if not self.be] + \
             [n for n in range(32) if n not in isa.csrs]
         self.csr_cycle = list(self.m1_csrs)
         rng.shuffle(self.csr_cycle)
@@ -362,6 +535,18 @@ class _ThreadBuilder:
 
     def one(self, name: str, **ops: int) -> None:
         self.push([self.enc(name, **ops)])
+
+    def fit(self, words: List[_Word], droppable: int = 0) -> bool:
+        """Push ``words`` as one block if they fit, dropping up to
+        ``droppable`` optional words from the front first. False (and
+        nothing pushed) if they still do not fit."""
+        while len(words) > self.room and droppable > 0:
+            words = words[1:]
+            droppable -= 1
+        if len(words) > self.room:
+            return False
+        self.push(words)
+        return True
 
     @staticmethod
     def fixup(fix: str, name: str, direction: str = "any", offset: int = 0,
@@ -438,6 +623,46 @@ class _ThreadBuilder:
             return rng.choice([n for n in range(1, 41) if n % 4])
         return rng.choice((1, 1, 2, 3, 4, 5, 6, 7, 8))
 
+    def be_cfg_value(self, crc: Optional[bool] = None) -> int:
+        """A ``BE_CFG`` value: usually just ``DIR``/``INV``/``CRC_EN``, now and
+        then all sixteen bits random (the other bits must be ignored)."""
+        rng = self.rng
+        if crc is None and rng.random() < 0.3:
+            return rng.randrange(1 << 16)
+        value = (BE_CFG_DIR if rng.random() < 0.5 else 0) | \
+            (BE_CFG_INV if rng.random() < 0.3 else 0)
+        if crc if crc is not None else rng.random() < 0.4:
+            value |= BE_CFG_CRC_EN
+        return value
+
+    def be_pins_value(self) -> int:
+        """``BE_PINS = {in[9:5], out[4:0]}``: every index class for both.
+
+        ``SHO`` writes its bit to ``out`` with the rules of 6.3 (a read-only
+        or reserved index is ignored) and ``SHI`` reads ``in`` as an
+        instruction sees it (a pad, a ``PIN_OUT`` bit, or 0 for anything
+        else, SEMANTICS 3), so both index spaces are worth covering.
+        """
+        roll = self.rng.random()
+        if roll < 0.40:
+            out = self.rng.choice(self.bidir)
+        elif roll < 0.70:
+            out = self.rng.choice(self.outputs)
+        elif roll < 0.85:
+            out = self.rng.choice(self.inputs)           # read-only: ignored
+        else:
+            out = self.rng.choice(self.reserved_pins)    # reserved: ignored
+        roll = self.rng.random()
+        if roll < 0.45:
+            pin_in = self.rng.choice(self.live_any)
+        elif roll < 0.7:
+            pin_in = self.rng.choice(self.outputs)        # reads PIN_OUT back
+        elif roll < 0.85:
+            pin_in = self.rng.choice(self.reserved_pins)  # reads 0
+        else:
+            pin_in = self.rng.randrange(32)
+        return ((pin_in & 0x1F) << 5) | (out & 0x1F)
+
     # -------------------------------------------------------------- prologue
     def emit_prologue(self) -> None:
         """Set the tick divider, the pin groups and the deadline anchor.
@@ -456,6 +681,10 @@ class _ThreadBuilder:
             self.push(self.csrw_scratch("OD_MASK", od), targetable=False)
         self.push(self.group_block("OUTGRP"), targetable=False)
         self.push(self.group_block("INGRP"), targetable=False)
+        if self.be and rng.random() < 0.7:
+            # Give SHO/SHI real pins most of the time (reset is index 0 both).
+            self.push(self.csrw_scratch("BE_PINS", self.be_pins_value()),
+                      targetable=False)
         # SEMANTICS 6.4: "Always SETD before the first deadline", otherwise the
         # first WAITD compares against TD = 0 and completes at once.
         self.push([self.enc("SETD", imm=self.small_imm())], targetable=False)
@@ -542,8 +771,7 @@ class _ThreadBuilder:
         self.one("HALT")
 
     def _emit_setp(self) -> None:
-        # lat (the D form, SEMANTICS 6.10) stays 0: a staged write is an M2
-        # feature, and with ``m2_built`` the model may not have it.
+        # The ordinary form; the D form (SEMANTICS 6.10) is _emit_setp_d.
         self.one("SETP", pin=self.write_pin(), val=self.rng.randrange(2), lat=0)
 
     def _emit_oep(self) -> None:
@@ -583,9 +811,12 @@ class _ThreadBuilder:
         """``TD = NOW + k`` the long way round: ``CSRR NOW``, ``ADDI``, ``CSRW TD``."""
         if self.room < 3:
             return self._emit_setd()
-        self.push([self.enc("CSRR", rd=SCRATCH, csr=self.csr["NOW"]),
-                   self.enc("ADDI", rd=SCRATCH, imm=self.rng.randrange(16)),
-                   self.enc("CSRW", csr=self.csr["TD"], ra=SCRATCH)])
+        self.push(self.tdrel_words(self.rng.randrange(16)))
+
+    def tdrel_words(self, offset: int) -> List[_Word]:
+        return [self.enc("CSRR", rd=SCRATCH, csr=self.csr["NOW"]),
+                self.enc("ADDI", rd=SCRATCH, imm=offset & 0x3F),
+                self.enc("CSRW", csr=self.csr["TD"], ra=SCRATCH)]
 
     def _emit_retick(self) -> None:
         """Change the tick rate mid-run (ACC is cleared at that edge)."""
@@ -666,9 +897,7 @@ class _ThreadBuilder:
             block = self.csrw_scratch(name, value)
         elif name == "TD":
             if rng.random() < 0.7 and self.room >= 3:
-                block = [self.enc("CSRR", rd=SCRATCH, csr=self.csr["NOW"]),
-                         self.enc("ADDI", rd=SCRATCH, imm=rng.randrange(24)),
-                         self.enc("CSRW", csr=number, ra=SCRATCH)]
+                block = self.tdrel_words(rng.randrange(24))
             else:
                 block = self.csrw_scratch(name, rng.randrange(48))
         elif name in ("OUTGRP", "INGRP") and rng.random() < 0.7:
@@ -676,6 +905,10 @@ class _ThreadBuilder:
         elif name == "PIN_OUT" and "csrw_pin_out_high_bits" in self.avoid:
             # PIN_OUT[15:14] have no pin; see docs/spec-questions/cosim.md.
             block = self.csrw_scratch(name, rng.randrange(0x4000))
+        elif name == "BE_PINS" and self.be and rng.random() < 0.6:
+            block = self.csrw_scratch(name, self.be_pins_value())
+        elif name == "BE_CFG" and self.be and rng.random() < 0.6:
+            block = self.csrw_scratch(name, self.be_cfg_value())
         else:
             block = [self.enc("CSRW", csr=number, ra=self.any_reg())]
         if len(block) > self.room:
@@ -687,8 +920,14 @@ class _ThreadBuilder:
         self.push([_Word(word=word, mnemonic="")])
 
     def _emit_unbuilt(self) -> None:
+        if not self.unbuilt_cycle:
+            return self._emit_reserved()
         name = self.unbuilt_cycle[self.unbuilt_next % len(self.unbuilt_cycle)]
         self.unbuilt_next += 1
+        self._emit_unbuilt_named(name)
+
+    def _emit_unbuilt_named(self, name: str) -> None:
+        """One instruction of an unbuilt feature, random operands."""
         ops: Dict[str, int] = {}
         for operand in self.isa.by_name[name].ops:
             base = operand.rstrip("0123456789")
@@ -702,6 +941,163 @@ class _ThreadBuilder:
                 ops["tmo"] = self.rng.randrange(2)
         self.one(name, **ops)
 
+    # ------------------------------------------------------ M2: FIFOs (6.7)
+    def _guarded_fifo(self, cond: int, name: str, **ops: int) -> None:
+        """``[SETD k] WAITB cond, T; BT +1; PUSH|POP``: the FIFO op runs only
+        when the ``WAITB`` ended by its condition, and then cannot stall (see
+        the module docstring); on a timeout ``BT`` skips it."""
+        words: List[_Word] = []
+        optional = 0
+        if self.rng.random() < 0.6:
+            words.append(self.enc("SETD", imm=self.small_imm()))
+            optional = 1                  # only the SETD may be dropped
+        words += [self.enc("WAITB", cond=cond, tmo=1),
+                  self.enc("BT", rel=1),              # to the word after the op
+                  self.enc(name, **ops)]
+        if not self.fit(words, droppable=optional):
+            self._emit_nop()
+
+    def _raw_fifo(self, name: str) -> bool:
+        """May this region hold one more raw (blocking) ``PUSH``/``POP``?"""
+        if not self.raw_left.get(name) or self.rng.random() < 0.5:
+            return False
+        self.raw_left[name] -= 1
+        return True
+
+    def _emit_fifo_push(self) -> None:
+        if not self.fifo:
+            return self._emit_unbuilt_named("PUSH")
+        ra = self.any_reg()
+        if self._raw_fifo("PUSH"):
+            self.one("PUSH", ra=ra)                   # the host plan pops OUTQ[t]
+        else:
+            self._guarded_fifo(WAITB_OUTQ_NF, "PUSH", ra=ra)
+
+    def _emit_fifo_pop(self) -> None:
+        if not self.fifo:
+            return self._emit_unbuilt_named("POP")
+        rd = self.reg()
+        if self._raw_fifo("POP"):
+            self.one("POP", rd=rd)                    # the host plan pushes INQ[t]
+        else:
+            self._guarded_fifo(WAITB_INQ_NE, "POP", rd=rd)
+
+    def _emit_waitb(self) -> None:
+        if not self.fifo:
+            return self._emit_unbuilt_named("WAITB")
+        cond = self.rng.choice((WAITB_BE_IDLE, WAITB_OUTQ_NF, WAITB_OUTQ_NF,
+                                WAITB_INQ_NE, WAITB_INQ_NE, WAITB_TICK,
+                                WAITB_TICK))
+        if cond == WAITB_TICK:
+            live = True                               # ticks never stop
+        elif cond == WAITB_BE_IDLE:
+            live = True                               # true until auto mode (or BADOP)
+        else:
+            # Only the host can empty OUTQ or fill INQ, and it takes a round
+            # of its plan to get to this thread: one untimed FIFO WAITB per
+            # region, like the raw PUSH/POP.
+            live = self._raw_fifo("WAITB")
+        self._cond_wait("WAITB", live, force_timed=not live, cond=cond)
+
+    # ------------------------------------------------- M2: bit engine (6.9)
+    def _emit_be_cfg(self) -> None:
+        """``BE_CFG`` and/or ``BE_PINS`` from the scratch register."""
+        if not self.be:
+            return self._emit_unbuilt()
+        rng = self.rng
+        words: List[_Word] = []
+        if rng.random() < 0.7:
+            words += self.csrw_scratch("BE_CFG", self.be_cfg_value())
+        if not words or rng.random() < 0.5:
+            words += self.csrw_scratch("BE_PINS", self.be_pins_value())
+        if not self.fit(words):
+            self._emit_nop()
+
+    def _emit_be_op(self) -> None:
+        """One bit-engine instruction."""
+        rng = self.rng
+        name = rng.choice(("SHO", "SHO", "SHO", "SHI", "SHI", "SHI", "LDSR",
+                           "LDSR", "STSR", "STSR", "CRCI", "STCRC", "STCRC"))
+        if not self.be:
+            return self._emit_unbuilt_named(name)
+        if name == "LDSR":
+            self.one(name, ra=self.any_reg())
+        elif name in ("STSR", "STCRC"):
+            self.one(name, rd=self.reg())
+        else:
+            self.one(name)
+
+    def _emit_be_loop(self) -> None:
+        """A transmit or receive loop counted by ``CNT`` (bounded, see the
+        module docstring)."""
+        if not self.be:
+            return self._emit_unbuilt_named(self.rng.choice(("SHO", "SHI")))
+        rng = self.rng
+        n = rng.choice((0, 1, 2, 3, 4, 5, 7, 8, 12, 16))
+        pace: List[_Word] = []
+        roll = rng.random()
+        if roll < 0.3:
+            pace = [self.enc("DLY", imm=rng.choice((0, 1, 2, 3)))]
+        elif roll < 0.5:
+            pace = [self.enc("WAITD", imm=rng.choice((1, 1, 2, 4)))]
+        head = self.load_scratch(n) + [self.enc("CSRW", csr=self.csr["CNT"], ra=SCRATCH)]
+        back = -(2 + len(pace))              # BNZ -> the SHO/SHI
+        if rng.random() < 0.5:
+            words = [self.enc("LDSR", ra=self.any_reg())] + head + \
+                [self.enc("SHO")] + pace + [self.enc("BNZ", rel=back)]
+        else:
+            rd = self.reg()
+            words = head + [self.enc("SHI")] + pace + [self.enc("BNZ", rel=back),
+                                                       self.enc("STSR", rd=rd)]
+            if 0 < n < 16 and rng.random() < 0.5:
+                words.append(self.enc("SHRI", rd=rd, imm=16 - n))
+        if not self.fit(words):
+            self._emit_be_op()
+
+    def _emit_crc(self) -> None:
+        """A ``.crc`` preset loaded left-aligned (SEMANTICS 6.9), ``CRCI``, and
+        ``CRC_EN`` switched on; the loops and single shifts then update it."""
+        if not self.be:
+            return self._emit_unbuilt_named(self.rng.choice(("CRCI", "STCRC")))
+        rng = self.rng
+        presets = self.isa.crc_presets
+        preset = presets[rng.choice(sorted(presets))]
+        width = int(preset["width"])
+        poly = (int(preset["poly"]) << (16 - width)) & 0xFFFF
+        init = (int(preset["init"]) << (16 - width)) & 0xFFFF
+        words = self.csrw_scratch("CRC_POLY", poly) + \
+            self.csrw_scratch("CRC_INIT", init) + [self.enc("CRCI")]
+        if rng.random() < 0.8:
+            words += self.csrw_scratch("BE_CFG", self.be_cfg_value(crc=True))
+        if not self.fit(words):
+            self._emit_be_op()
+
+    # ------------------------------------------ M2: latched SETP (6.10)
+    def _emit_setp_d(self) -> None:
+        """``SETP pin, v, D`` and the deadline it lands on.
+
+        Without ``"SETPD"`` the ``D`` bit is ignored and this is an ordinary
+        ``SETP`` on both sides (SEMANTICS 5, ISA note)."""
+        rng = self.rng
+        words: List[_Word] = []
+        optional = 0
+        if rng.random() < 0.4:
+            words.append(self.enc("SETD", imm=rng.choice(LATCH_IMMS)))
+            optional = 1
+        words.append(self.enc("SETP", pin=self.write_pin(),
+                              val=rng.randrange(2), lat=1))
+        roll = rng.random()
+        if roll < 0.55:
+            words.append(self.enc("WAITD", imm=rng.choice(LATCH_IMMS)))
+        elif roll < 0.7:
+            words.append(self.enc("SETD", imm=rng.choice(LATCH_IMMS)))
+        elif roll < 0.8:
+            words += self.tdrel_words(rng.choice(LATCH_IMMS))
+        # else: left staged; it lands when NOW ticks onto TD (rule 1) or at
+        # the next TD write of the thread (rule 2), or is replaced first.
+        if not self.fit(words, droppable=optional):
+            self._emit_setp()
+
     # ------------------------------------------------------------- assembly
     def build(self, weights: Dict[str, int], want_halt: bool) -> List[_Block]:
         self.emit_prologue()
@@ -711,7 +1107,7 @@ class _ThreadBuilder:
         for flag in self.flag_pool:
             if self.rng.random() < 0.75:
                 self.one("SIG", flag=flag)
-        names = sorted(weights)
+        names = sorted(n for n in weights if weights[n] > 0)
         totals = [weights[n] for n in names]
         halt_at = None
         if want_halt:
@@ -819,12 +1215,45 @@ def static_target(isa: Isa, addr: int, word: int) -> Optional[int]:
     return None
 
 
+def _check_fifo_liveness(prog: GeneratedProgram, isa: Isa, t: int,
+                         words: Dict[int, int], targets: FrozenSet[int]) -> None:
+    """Without host traffic, every ``PUSH``/``POP`` is guarded (module
+    docstring) and no untimed ``WAITB OUTQ_NF``/``INQ_NE`` exists: the INQ
+    is never pushed and the OUTQ never popped, so either would block for
+    good. The guard is ``WAITB cond, T`` then ``BT +1`` right before the op,
+    and nothing branches to the ``BT`` or the op."""
+    guard_cond = {"PUSH": WAITB_OUTQ_NF, "POP": WAITB_INQ_NE}
+    for addr, word in words.items():
+        decoded = isa.decode(word)
+        if decoded is None:
+            continue
+        name, fields = decoded[0].name, decoded[1]
+        if name == "WAITB" and fields["cond"] in (WAITB_OUTQ_NF, WAITB_INQ_NE) \
+                and not fields["tmo"]:
+            raise LoomgenError("thread %d: untimed %s at %#x with no host traffic"
+                               % (t, "WAITB", addr))
+        if name not in guard_cond:
+            continue
+        bt = isa.decode(words.get(addr - 1, 0))
+        wait = isa.decode(words.get(addr - 2, 0))
+        ok = (bt is not None and bt[0].name == "BT" and bt[1]["rel"] == 1
+              and wait is not None and wait[0].name == "WAITB"
+              and wait[1]["cond"] == guard_cond[name] and wait[1]["tmo"] == 1
+              and addr not in targets and addr - 1 not in targets)
+        if not ok:
+            raise LoomgenError("thread %d: %s at %#x is not guarded by WAITB %d, T; "
+                               "BT +1 and there is no host traffic"
+                               % (t, name, addr, guard_cond[name]))
+
+
 def check_program(prog: GeneratedProgram, isa: Optional[Isa] = None) -> None:
     """Raise :class:`LoomgenError` unless ``prog`` keeps every generator rule:
     words and targets inside their region, the region closed by a ``JMP`` to
     a head, no self-loop except a ``JP`` poll, no backward free ``DJNZ``,
-    ``BT``/``BNT`` or ``JP``."""
+    ``BT``/``BNT`` or ``JP``, and (FIFO build, no host traffic) every
+    ``PUSH``/``POP`` guarded and no untimed FIFO ``WAITB``."""
     isa = isa or load_isa()
+    fifo_guards = "FIFO" in prog.features and prog.host is None
     for t in prog.running():
         start, end = prog.region(t)
         words = {a: w for a, w in prog.image.items() if start <= a < end}
@@ -834,10 +1263,12 @@ def check_program(prog: GeneratedProgram, isa: Optional[Isa] = None) -> None:
         last = isa.decode(words[end - 1])
         if last is None or last[0].name != "JMP":
             raise LoomgenError("thread %d region does not end with JMP" % t)
+        targets = set()
         for addr, word in words.items():
             target = static_target(isa, addr, word)
             if target is None:
                 continue
+            targets.add(target)
             if not start <= target < end:
                 raise LoomgenError("thread %d: %#x targets %#x outside %#x..%#x"
                                    % (t, addr, target, start, end))
@@ -851,6 +1282,10 @@ def check_program(prog: GeneratedProgram, isa: Optional[Isa] = None) -> None:
                 raise LoomgenError("thread %d: backward JP at %#x" % (t, addr))
             if target < addr and name == "DJNZ" and target != addr - 1:
                 raise LoomgenError("thread %d: unbounded DJNZ at %#x" % (t, addr))
+        if fifo_guards:
+            # A guard's own BT +1 targets the word after the op; only other
+            # branches into the guard matter.
+            _check_fifo_liveness(prog, isa, t, words, frozenset(targets))
     outside = [a for a in prog.image
                if not any(prog.region(t)[0] <= a < prog.region(t)[1]
                           for t in prog.running())]
@@ -865,7 +1300,11 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
              entries: Optional[Sequence[int]] = None,
              avoid: Iterable[str] = (),
              run_mask: Optional[int] = None,
-             isa: Optional[Isa] = None) -> GeneratedProgram:
+             isa: Optional[Isa] = None,
+             features: Iterable[str] = DEFAULT_FEATURES,
+             fifo_depth: int = DEFAULT_FIFO_DEPTH,
+             host_traffic: bool = False,
+             weights: Optional[Dict[str, int]] = None) -> GeneratedProgram:
     """Build one random program.
 
     Args:
@@ -875,7 +1314,7 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
             Which ones is part of the random draw unless ``run_mask`` is given.
         imem_words: instruction-memory size, a power of two from 64 to 1024.
             Each thread's region is a quarter of it.
-        profile: ``"alu"``, ``"timing"``, ``"pins"`` or ``"mixed"``.
+        profile: ``"alu"``, ``"timing"``, ``"pins"``, ``"mixed"`` or ``"m2"``.
         cycles: how long the run is expected to be (recorded in the plan).
         entries: per-thread start addresses; each thread's region is
             ``[entry, entry + imem_words / 4)``. The default is D-017's
@@ -885,6 +1324,11 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
             that ``docs/spec-questions/cosim.md`` has open.
         run_mask: which threads run; overrides the random choice (and
             ``threads``).
+        features, fifo_depth: the build the program is for (``CAPS``); see
+            the module docstring. ``features=()`` is the M1 build.
+        host_traffic: the program comes with a :class:`HostPlan` of SPI
+            traffic and may block on it (raw ``PUSH``/``POP``); needs FIFOs.
+        weights: emitter weights to use instead of the profile's (tests).
     """
     if not 1 <= threads <= THREADS:
         raise LoomgenError("threads must be 1..4, got %r" % (threads,))
@@ -897,13 +1341,22 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
     unknown = avoid - AVOID_FLAGS
     if unknown:
         raise LoomgenError("unknown avoid flags: %s" % ", ".join(sorted(unknown)))
+    feature_names, fifo_depth = normalise_build(features, fifo_depth)
+    if host_traffic and "FIFO" not in feature_names:
+        raise LoomgenError("host traffic needs a build with FIFOs")
+    if weights is not None:
+        bad = [n for n in weights if not hasattr(_ThreadBuilder, "_emit_" + n)]
+        if bad or not any(v > 0 for v in weights.values()):
+            raise LoomgenError("bad weights: %s" % (", ".join(bad) or "all zero"))
 
     isa = isa or load_isa()
     rng = random.Random()
-    rng.seed("loomgen|%d|%d|%d|%s|%s|%s|%s" % (
+    rng.seed("loomgen|%d|%d|%d|%s|%s|%s|%s|%s|%d|%d|%s" % (
         seed, threads, imem_words, profile, ",".join(sorted(avoid)),
         ",".join(str(e) for e in entries) if entries is not None else "-",
-        run_mask if run_mask is not None else "-"))
+        run_mask if run_mask is not None else "-",
+        ",".join(feature_names), fifo_depth, int(bool(host_traffic)),
+        ",".join("%s=%d" % kv for kv in sorted(weights.items())) if weights else "-"))
 
     stride = imem_words // THREADS
     entry_list = list(entries) if entries is not None \
@@ -926,24 +1379,28 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
         raise LoomgenError("a thread region does not fit in %d words" % imem_words)
 
     plan = build_plan(rng, cycles, busy=(profile == "pins"))
-    weights = PROFILES[profile]
+    chosen_weights = dict(weights) if weights is not None else PROFILES[profile]
     flag_pool = rng.sample(range(8), rng.choice((1, 2, 2, 3)))
 
     image: Dict[int, int] = {}
     heads: List[int] = []
     for thread in running:
         builder = _ThreadBuilder(rng, isa, thread, stride, profile, plan,
-                                 len(running) > 1, flag_pool, avoid)
-        blocks = builder.build(weights, rng.random() < HALT_RATE)
+                                 len(running) > 1, flag_pool, avoid,
+                                 features=feature_names, fifo_depth=fifo_depth,
+                                 host_traffic=host_traffic)
+        blocks = builder.build(chosen_weights, rng.random() < HALT_RATE)
         _place(blocks, entry_list[thread])
         loop_head = blocks[builder.loop_head_index].addr
         image.update(_resolve(blocks, isa, rng, loop_head))
         heads += [b.addr for b in blocks if b.targetable]
 
+    host = build_host_plan(rng, run_mask, fifo_depth) if host_traffic else None
     prog = GeneratedProgram(
         seed=seed, profile=profile, threads=len(running),
         imem_words=imem_words, image=image, entries=entry_list,
         run_mask=run_mask, stimulus=plan, avoid=tuple(sorted(avoid)),
-        heads=frozenset(heads))
+        heads=frozenset(heads), features=feature_names, fifo_depth=fifo_depth,
+        host=host)
     check_program(prog, isa)
     return prog

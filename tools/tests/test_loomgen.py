@@ -97,11 +97,12 @@ def test_programs_run_in_the_model(seed):
     assert machine is not None
 
 
-# ------------------------------------------------------------ m2_built flag
-# test/test_cosim.py passes avoid=("m2_built",) whenever the RTL's CAPS says
-# an M2 feature is built, so the random programs mean the same thing to the
-# M2 RTL and to a golden model that still treats those features as unbuilt.
-from tools.loomgen import M2_CSR_NAMES, M2_MNEMONICS, UNBUILT_MNEMONICS  # noqa: E402
+# ------------------------------------------------------------- the build
+# A program is generated for the build CTRL.CAPS reports, and the harness
+# builds the golden model the same way (test/test_cosim.py). The M2
+# constructs have their own file, tools/tests/test_loomgen_m2.py.
+from tools.loomgen import (DEFAULT_FEATURES, M2_CSR_NAMES,  # noqa: E402
+                           M2_MNEMONICS, UNBUILT_MNEMONICS)
 
 
 def _names_and_fields(prog):
@@ -112,42 +113,45 @@ def _names_and_fields(prog):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_m2_built_leaves_out_every_m2_construct(seed):
+def test_the_m1_build_never_executes_an_m2_construct(seed):
+    """``features=()``: every M2 word is there, but as a NOP + BADOP word of
+    SEMANTICS 9 (the generator does not guard or loop on them)."""
     prog = generate(seed=seed, threads=1 + seed % 4,
                     profile=sorted(PROFILES)[seed % len(PROFILES)],
-                    avoid=("m2_built",))
+                    features=())
     check_program(prog, ISA)
+    assert prog.features == ()
+
+
+def test_the_m1_build_still_produces_every_unbuilt_word():
+    seen = set()
+    for seed in range(40):
+        prog = generate(seed=seed, threads=4, profile="mixed", features=())
+        seen |= {name for name, _ in _names_and_fields(prog)}
+    assert set(UNBUILT_MNEMONICS) <= seen, \
+        f"unbuilt words missing: {sorted(set(UNBUILT_MNEMONICS) - seen)}"
+
+
+def test_the_m2_build_executes_them_instead():
+    seen = set()
+    lat = 0
     be_csrs = {ISA.csr_by_name[n] for n in M2_CSR_NAMES}
-    for name, fields in _names_and_fields(prog):
-        assert name not in M2_MNEMONICS, f"seed {seed}: {name} generated"
-        if name == "SETP":
-            assert fields["lat"] == 0, f"seed {seed}: SETP with the D bit"
-        if name in ("CSRR", "CSRW"):
-            assert fields["csr"] not in be_csrs, \
-                f"seed {seed}: {name} of bit-engine CSR {fields['csr']:#x}"
-
-
-def test_m2_built_keeps_the_other_unbuilt_words():
-    seen = set()
-    for seed in range(60):
-        prog = generate(seed=seed, threads=4, profile="mixed", avoid=("m2_built",))
-        seen |= {name for name, _ in _names_and_fields(prog)}
-    rest = set(UNBUILT_MNEMONICS) - set(M2_MNEMONICS)
-    assert rest and rest <= seen, f"unbuilt words missing: {sorted(rest - seen)}"
-
-
-def test_without_the_flag_m2_words_are_still_unbuilt_words():
-    seen = set()
-    for seed in range(60):
-        prog = generate(seed=seed, threads=4, profile="mixed")
-        seen |= {name for name, _ in _names_and_fields(prog)}
+    csr_hits = 0
+    for seed in range(20):
+        prog = generate(seed=seed, threads=4, profile="mixed",
+                        features=DEFAULT_FEATURES)
+        for name, fields in _names_and_fields(prog):
+            seen.add(name)
+            lat += fields["lat"] if name == "SETP" else 0
+            csr_hits += int(name in ("CSRR", "CSRW") and fields["csr"] in be_csrs)
     assert set(M2_MNEMONICS) <= seen, sorted(set(M2_MNEMONICS) - seen)
+    assert lat and csr_hits
 
 
 @pytest.mark.parametrize("seed", range(4))
-def test_m2_built_programs_run_in_the_model(seed):
+def test_m1_build_programs_run_in_the_model(seed):
     prog = generate(seed=seed, threads=4, profile=sorted(PROFILES)[seed],
-                    avoid=("m2_built",))
+                    features=())
     retired = []
     run_model(prog, cycles=3000, on_record=retired.append)
     assert any(r.done for r in retired)
