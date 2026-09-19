@@ -18,12 +18,12 @@ from spi_host import (
 from tools.loomisa import load
 
 ISA = load()
-IMEM_WORDS = 256
+IMEM_WORDS = 512    # the SRAM macro (D-020); test_flops.py covers the 256-word flops
 FIFO_DEPTH = 4
 VERSION = 0x0002    # M2: FIFOs, host IRQ, manual bit engine, SETP D
-#: What this build reports: FIFOs with depth 4 (log2 = 2), the bit engine in
-#: manual mode and the deadline-latched SETP.
-EXPECT_CAPS = 0x8000 | 0x80 | 0x10 | 0x08 | 0x02
+#: What this build reports: log2(IMEM_WORDS) = 9 in [15:12], FIFOs with depth
+#: 4 (log2 = 2), the bit engine in manual mode and the deadline-latched SETP.
+EXPECT_CAPS = 0x9000 | 0x80 | 0x10 | 0x08 | 0x02
 
 
 @cocotb.test()
@@ -44,7 +44,8 @@ async def test_id_version_caps(dut):
     assert caps & 0x20 == 0, "DMEM must report absent"
     assert caps & 0x08, "the M2 build has FIFOs"
     assert caps & 0x07 == FIFO_DEPTH.bit_length() - 1, "log2(FIFO_DEPTH)"
-    assert caps == EXPECT_CAPS, f"256-word build must read {EXPECT_CAPS:#06x}, got {caps:#06x}"
+    assert caps == EXPECT_CAPS, \
+        f"{IMEM_WORDS}-word build must read {EXPECT_CAPS:#06x}, got {caps:#06x}"
     # The unbuilt data-memory space reads 0 and ignores writes.
     assert await host.read1(SP_DMEM, 0) == 0
     await host.write(SP_DMEM, 0, 0xBEEF)
@@ -63,6 +64,20 @@ async def test_imem_write_readback(dut):
     await host.write(SP_IMEM, 0x7F, 0xC0DE)
     assert await host.read1(SP_IMEM, 0x7F) == 0xC0DE
     assert await host.read(SP_IMEM, 0x10, 2) == words[:2]
+    # Every address bit selects its own word: address 0 and the walking-one
+    # addresses 1, 2, 4 .. IMEM_WORDS/2 get distinct values, so an address bit
+    # that is missing or stuck on the way to the array (the macro's A_ADDR[8]
+    # is new with 512 words) would make two of them alias.
+    addrs = [0] + [1 << b for b in range(IMEM_WORDS.bit_length() - 1)]
+    for i, a in enumerate(addrs):
+        await host.write(SP_IMEM, a, 0x5A00 + i)
+    for i, a in enumerate(addrs):
+        got = await host.read1(SP_IMEM, a)
+        assert got == 0x5A00 + i, f"IMEM[{a:#05x}] = {got:#06x}, aliased?"
+    # The last word (every address bit set) is a word of its own too.
+    await host.write(SP_IMEM, IMEM_WORDS - 1, 0x1DEA)
+    assert await host.read1(SP_IMEM, IMEM_WORDS - 1) == 0x1DEA
+    assert await host.read1(SP_IMEM, IMEM_WORDS // 2) == 0x5A00 + len(addrs) - 1
 
 
 @cocotb.test()
@@ -101,7 +116,7 @@ async def test_reset_pc_and_run_halted(dut):
     """RESET_PC is readable and writable; RUN starts a thread, HALT stops it."""
     host = LoomHost(dut)
     await host.start()
-    # Defaults are t * (IMEM_WORDS / 4): 0, 64, 128, 192 for 256 words.
+    # Defaults are t * (IMEM_WORDS / 4): 0, 128, 256, 384 for 512 words.
     for t in range(4):
         expect = t * (IMEM_WORDS // 4)
         assert await host.read1(SP_CTRL, CTRL_RESET_PC0 + t) == expect

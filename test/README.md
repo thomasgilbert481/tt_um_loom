@@ -16,9 +16,16 @@ See [the website](https://tinytapeout.com/hdl/testing/) for the flow itself.
 - `test_pins.py` — SETP, OEP, OUT, IN, open drain, WAITP, WAITE, timed waits.
 - `test_timing.py` — when pin edges happen: slot grid, jitter, drift.
 - `test_uart.py` — end to end, a UART transmitter written in Loom assembly.
+- `test_flops.py` — the FLOPS fallback of the instruction memory (D-020):
+  host port, addressing, programs and a short co-simulation on the second
+  design instance in `tb.v`.
 - `tb.v` — the wrapper, including the Tiny Tapeout pad model that loops
   `uio_out` back into `uio_in` for the bits the design drives. The testbench
-  drives the outside world's value on `uio_drv`.
+  drives the outside world's value on `uio_drv`. `user_project` is the chip
+  build (instruction memory = the 512 x 16 SRAM macro, simulated by its
+  vendored model under `macro/`); in RTL simulation only, `user_project_flops`
+  is a second instance with `IMEM_IMPL "FLOPS"` and 256 words on its own
+  `*_flops` pins, idle unless `test_flops.py` clocks it.
 
 Programs are always built through `tools.loomisa` (`isa.encode(...)`), never
 from literal instruction hex, and expected values are computed in the test
@@ -77,6 +84,11 @@ time, and compares the retire record, the pad outputs and a set of guard
 registers on every cycle, plus the full architectural state periodically and at
 the end of each seed. The two sides were written independently from
 `docs/SEMANTICS.md`. The alignment scheme is documented at the top of the file.
+The backdoor load writes the instruction array of whichever backend was built:
+`memory` inside the SRAM macro's behavioural model
+(`u_imem.g_macro.u_macro.sram.i_SRAM_1P_behavioral_bm_bist`, 512 words) or
+`mem` of the flop array (`u_imem.g_flops`); the harness checks the program's
+size against `CAPS[15:12]` and the array.
 
 Environment knobs:
 
@@ -84,6 +96,9 @@ Environment knobs:
 |---|---|---|
 | `LOOM_COSIM_SEEDS` | 12 | random seeds loaded through the backdoor |
 | `LOOM_COSIM_CYCLES` | 4000 | cycles per seed |
+| `LOOM_FLOPS_SEEDS` | 4 | backdoor seeds on the FLOPS instance (`test_flops.py`) |
+| `LOOM_FLOPS_CYCLES` | 4000 | cycles per FLOPS seed |
+| `LOOM_FLOPS_SPI_SEEDS` | 1 | FLOPS seeds loaded over the SPI host port |
 
 Two further seeds load the program and start the threads through the real SPI
 host port. A divergence fails the test with the seed, cycle, thread, PC,

@@ -29,7 +29,11 @@ module tt_um_loom (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  parameter integer IMEM_WORDS = 256;
+  // Instruction memory (D-020): the 512 x 16 SRAM macro. The flip-flop
+  // fallback is IMEM_IMPL "FLOPS" with any power-of-two IMEM_WORDS; the
+  // macro needs 512. See loom_imem.v.
+  parameter         IMEM_IMPL  = "MACRO";
+  parameter integer IMEM_WORDS = 512;
 
   // Retire record: simulation and debug only, reached hierarchically by the
   // testbench. Nothing above this level consumes it.
@@ -39,7 +43,7 @@ module tt_um_loom (
   wire [15:0] tr_ir, tr_val;
   wire [2:0]  tr_rd, tr_flags;
 
-  loom_top #(.IMEM_WORDS(IMEM_WORDS)) u_loom (
+  loom_top #(.IMEM_IMPL(IMEM_IMPL), .IMEM_WORDS(IMEM_WORDS)) u_loom (
       .ui_in(ui_in), .uo_out(uo_out),
       .uio_in(uio_in), .uio_out(uio_out), .uio_oe(uio_oe),
       .clk(clk), .rst_n(rst_n),

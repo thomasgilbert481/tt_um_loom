@@ -238,3 +238,49 @@ power-script wrapper (question in the Discord thread), Jane Street's answer on
 macros (email of 2026-09-17), and one 6x4 hardening of the real core with the
 macro, placed on the stripe grid (macro x = 12 + 67.44k um, pin edge facing
 free rows). If Tiny Tapeout rejects the waiver, the fallback is the latch array.
+
+## D-021 2026-09-18 Opus 5: the core's hardening config takes the macro recipe (under D-020)
+
+Decision: `src/config.json` of the real core (branch `macro-core`, for `main`)
+gains the `sram-smoke` recipe (`docs/tt_cmos5l_facts.md` section 11), adapted
+to the 6x4 block:
+- `MACROS`: `RM_IHPSG13_1P_512x16_c2_bm_bist`, instance named by its flattened
+  path `u_loom.u_imem.g_macro.u_macro.sram` (tt_um_loom, loom_top, loom_imem,
+  its `g_macro` generate block, loom_imem_macro; checked with Yosys reading the
+  sources as LibreLane does), orientation FS at (12, 40), libs keyed
+  `*_typ_*`, `*_fast_*`, `*_slow_*`, the port blackbox as `nl`, the CDL as
+  `spice`.
+- `PDN_MACRO_CONNECTIONS` on the same path (`VDD!` and `VDDARRAY!` to VPWR,
+  `VSS!` to VGND); `PDN_CFG` = `src/pdn_cfg.tcl`, the pdngen wrapper,
+  unchanged from the smoke test.
+- `MAGIC_MACRO_STD_CELL_SOURCE` PDK, `ERROR_ON_MAGIC_DRC` false,
+  `ERROR_ON_ILLEGAL_OVERLAPS` false, `MAGIC_EXT_ABSTRACT_CELLS`
+  `["RM_IHPSG13_.*"]`.
+- Stripe grid: `FP_PDN_VPITCH` 50 -> 67.44, new `FP_PDN_VSPACING` 3.52 and
+  `FP_PDN_VOFFSET` 26.36; `FP_PDN_VWIDTH` stays 2.1.
+- `DRT_OPT_ITERS` is not carried over (the smoke test's cap of 12 was for a
+  tiny design); every other key is the template's, unchanged.
+
+Why: D-020 puts the macro in the core, and the CLAUDE.md rule on this file
+allows only `CLOCK_PERIOD` and `PL_TARGET_DENSITY_PCT` without a decision
+(D-015 covered `sram-smoke` only). The placement repeats the smoke test's
+geometry relative to the core origin: the 6x4 floorplan
+(`tt_block_6x4_pgvdd.def` on tt-support-tools `ihp-sg13cmos5l`: 186 rows of
+2674 sites from (2.88, 3.78), die 1289.28 x 710.64) has the same core origin
+as the 2x2, so the POWER stripes at 29.24 + 67.44 n (19 pairs across the core)
+put four stripes per supply through the macro's same-net power columns exactly
+as in CI run 35377845679, and the FS pin edge (y 231.34) faces 123 free rows.
+The arithmetic is in the comments of `src/config.json`.
+Rejected: another k in x = 12 + 67.44 k (valid for the stripes, but k = 0
+keeps the whole right side and the top 475 um free and is the verified
+geometry); y = 10 (would only move the 6 short rows under the macro to above
+it, a negligible gain, on an untested placement).
+Consequences: these keys now fall under the same rule as the rest of the file
+(change only with a DECISIONS entry); the CLAUDE.md sentence on
+`src/config.json` should say so. The illegal-overlap waiver would hide a new
+overlap, so each hardening's `magic__illegal_overlap__count` must stay at the
+smoke test's 5. The pitch goes from 50 to 67.44 um for the whole block (about
+a quarter fewer stripes; IR drop is not checked by the flow). The macro's
+A_DOUT clock-to-output (3.73 ns typical, 6.25 ns at the slow corner, against
+roughly 0.5 ns for the M1 flop) now starts the D-stage paths; the first 6x4
+hardening with the macro shows whether that matters at 20 ns.

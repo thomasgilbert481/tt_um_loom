@@ -11,12 +11,18 @@
  *
  * The retire record (tr_*) is simulation and debug only; it is exported so a
  * testbench can reach it, and left unconnected in tt_um_loom.
+ *
+ * Instruction memory (D-020): IMEM_IMPL "MACRO" (default) is the 512 x 16
+ * IHP SRAM macro and needs IMEM_WORDS 512; "FLOPS" is the flip-flop array of
+ * any power-of-two size (see loom_imem). IMEM_WORDS sets the address width,
+ * the default reset vectors t * IMEM_WORDS / 4 and CAPS[15:12].
  */
 
 `default_nettype none
 
 module loom_top #(
-    parameter [15:0]  IMEM_WORDS = 16'd256,
+    parameter         IMEM_IMPL  = "MACRO",
+    parameter [15:0]  IMEM_WORDS = 16'd512,
     parameter integer FIFO_DEPTH = 4,
     parameter [15:0]  ID_VALUE   = 16'h4C4D,
     parameter [15:0]  VERSION    = 16'h0002
@@ -105,7 +111,7 @@ module loom_top #(
   wire               core_imem_en, h_imem_req, h_imem_we;
   wire [15:0]        imem_rdata, h_imem_wdata;
 
-  loom_imem #(.WORDS(IMEM_WORDS), .AW(IMEM_AW)) u_imem (
+  loom_imem #(.IMPL(IMEM_IMPL), .WORDS(IMEM_WORDS), .AW(IMEM_AW)) u_imem (
       .clk(clk),
       .en   (h_imem_req | core_imem_en),
       .we   (h_imem_req & h_imem_we),

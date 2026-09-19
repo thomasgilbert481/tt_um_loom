@@ -30,8 +30,9 @@ Tiny Tapeout wrapper: pad mapping only.
 | `ena` | in | ignored, listed in `_unused` |
 | `clk`, `rst_n` | in | single clock domain, synchronous reset |
 
-Parameter `IMEM_WORDS` (default 256) is passed down to `loom_top`. The retire
-record is instantiated but unconnected here and collected in `_unused`.
+Parameters `IMEM_IMPL` (default `"MACRO"`) and `IMEM_WORDS` (default 512) are
+passed down to `loom_top` (D-020). The retire record is instantiated but
+unconnected here and collected in `_unused`.
 
 ---
 
@@ -39,8 +40,10 @@ record is instantiated but unconnected here and collected in `_unused`.
 
 Instantiates everything; all parameters live here.
 
-Parameters: `IMEM_WORDS` (16 bits, default 256), `FIFO_DEPTH` (a power of
-two from 2 to 8, default 4), `ID_VALUE` (0x4C4D), `VERSION` (0x0001).
+Parameters: `IMEM_IMPL` (`"MACRO"`, the default, or `"FLOPS"`; see
+loom_imem), `IMEM_WORDS` (16 bits, default 512; the macro needs 512),
+`FIFO_DEPTH` (a power of two from 2 to 8, default 4), `ID_VALUE` (0x4C4D),
+`VERSION` (0x0002).
 Derived: `IMEM_AW = $clog2(IMEM_WORDS)`, `CAPS_VAL` (SEMANTICS 5: FIFOs with
 `log2(FIFO_DEPTH)` in bits 2:0, and one bit per M2 feature as it is built).
 
@@ -194,18 +197,38 @@ SPACE 2 (DMEM) reads 0 and ignores writes.
 
 ## loom_imem
 
-Single-port instruction memory, FLOPS backend, no reset on the array.
+Single-port instruction memory, no reset on the array. Parameter `IMPL`
+selects the backend: `"MACRO"` (default, D-020) is one
+`RM_IHPSG13_1P_512x16_c2_bm_bist` SRAM macro through `loom_imem_macro` and
+needs `WORDS` 512, `AW` 9; `"FLOPS"` is a `WORDS` x 16 flip-flop array.
+Both keep the ports and the one-cycle read latency below.
 
 | Port | Dir | Meaning / validity |
 |---|---|---|
-| `en` | in | enable: gates both the read and the write |
-| `we` | in | write enable |
+| `en` | in | enable: gates both the read and the write; a cycle without it leaves `rdata` unchanged (MACRO: drives the macro's A_MEN) |
+| `we` | in | write enable, only with `en` |
 | `addr[AW-1:0]` | in | address, sampled at the edge that ends the cycle |
 | `wdata[15:0]` | in | write data |
-| `rdata[15:0]` | out | contents of `addr` as presented in the previous cycle: the address driven in F is returned in D |
+| `rdata[15:0]` | out | contents of `addr` as presented in the previous cycle: the address driven in F is returned in D. After a write cycle it is not defined by this contract (FLOPS: the old contents; MACRO: unchanged), and nothing reads it |
 
-Parameters `WORDS` (16 bits) and `AW`. An SRAM macro backend at M2 keeps these
-ports and this one-cycle read latency.
+Parameters `IMPL`, `WORDS` (16 bits) and `AW`. The flattened path of the macro
+instance, which `src/config.json` names, is `u_loom.u_imem.g_macro.u_macro.sram`.
+
+---
+
+## loom_imem_macro
+
+The SRAM macro behind a single-port read/write interface (brought over
+unchanged from the `sram-smoke` test). Every enable of the macro is active
+high; the BIST port is tied off, `A_DLY` is tied 1, the bit mask all ones.
+
+| Port | Dir | Meaning / validity |
+|---|---|---|
+| `rst_n` | in | drives A_MEN: low means no access and A_DOUT holds. loom_imem feeds it `en` |
+| `addr[8:0]` | in | read address, sampled at the edge that ends the cycle |
+| `rdata[15:0]` | out | A_DOUT, the macro's registered output: the word read at the previous edge |
+| `we` | in | write this cycle (A_WEN); no read is performed in that cycle (A_REN = ~we) |
+| `waddr[8:0]`, `wdata[15:0]` | in | write address and data, valid with `we` |
 
 ---
 

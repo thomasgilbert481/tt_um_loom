@@ -215,11 +215,18 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       short start bit after idle in `uart_tx.loom` (firmware spec question 8)
       is fixed.
 - [ ] FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
-      L3 tests re-run on hardware through `loomhost` (same scripts).
+      L3 tests re-run on hardware through `loomhost` (same scripts). The
+      macro does not exist on the FPGA: build `tt_um_loom` with
+      `IMEM_IMPL "FLOPS"` (or add an iCE40 block-RAM backend to `loom_imem`).
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,
       with the latch array as fallback. Remaining conditions: Tiny Tapeout's
       view of the overlap waiver and power-script wrapper, Jane Street's answer
       on macros, and a 6x4 hardening of the real core with the macro.
+      2026-09-18: integrated on branch `macro-core` (D-021): `loom_imem`
+      `IMPL "MACRO"` by default, FLOPS kept and tested (`test_flops.py`),
+      the recipe in `src/config.json` with the macro FS at (12, 40); Yosys
+      generic 33,425 -> 19,456 cells, 7,138 -> 3,027 flops. The first 6x4
+      hardening with the macro was started from that branch.
       Original gate text, kept for the record: trial hardening of
       `RM_IHPSG13_1P_512x16_c2_bm_bist` (16 bits wide, 236.80 x 191.34 um)
       following the `tt_um_urish_sram_test` recipe (`MACROS`, custom
@@ -409,3 +416,19 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   until the golden model gets its M2 update. M2 hardening is deliberately
   deferred to the memory decision: at M1 density plus M2 features the block
   would be near 87 percent full.
+- 2026-09-18 (night), Opus 5, macro agent on branch `macro-core` (from main
+  52ee9f8): the SRAM macro in the real core (D-020, D-021). The views, the
+  wrapper, `pdn_cfg.tcl` and the blackbox came over byte-exact from
+  `sram-smoke`; `loom_imem` gained `IMPL` (`"MACRO"` by default, the wrapper's
+  enable driven by `en` so bubbles do not access the macro; `"FLOPS"` kept);
+  `src/config.json` got the recipe with the instance at
+  `u_loom.u_imem.g_macro.u_macro.sram`, FS at (12, 40), on the 67.44 um
+  stripe grid (the 6x4 core origin is the 2x2's). Yosys generic: 33,425 ->
+  19,456 cells, 7,138 -> 3,027 flops; the FLOPS 256 variant still gives
+  exactly main's numbers. Tests: 512-word expectations (CAPS 0x909A, reset
+  vectors 0/128/256/384, walking-one IMEM addressing), co-simulation on the
+  macro model, and `test_flops.py` on a second, FLOPS instance in `tb.v`;
+  `check_all.sh` green (75 cocotb tests, zero co-simulation divergences).
+  Next: read the first 6x4 hardening with the macro (utilisation, the
+  macro's 3.7 ns typical / 6.25 ns slow clock-to-output on the D-stage paths,
+  illegal-overlap count 5, precheck), then merge `macro-core` into `main`.

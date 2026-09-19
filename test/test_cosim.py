@@ -63,8 +63,11 @@ Starting the threads
 --------------------
 
 **Backdoor (default).** Host actions follow ``tools.loomgen.runner``: in cycle
-``LOAD_CYCLE`` (0) the model gets ``host_write_imem`` for all 256 words and the
-RTL instruction array is deposited after edge 1; in cycle ``RUN_CYCLE - 1``
+``LOAD_CYCLE`` (0) the model gets ``host_write_imem`` for every word
+(``IMEM_WORDS``, 512 with the SRAM macro) and the RTL instruction array is
+deposited after edge 1: the ``memory`` array of the macro's behavioural model
+(``u_imem.g_macro.u_macro.sram.i_SRAM_1P_behavioral_bm_bist``), or ``mem`` of
+the flop array in a FLOPS build (``test_flops.py``); in cycle ``RUN_CYCLE - 1``
 the model gets ``host_set_run`` and ``u_core.run_r`` is deposited after edge
 ``RUN_CYCLE`` (4), so both see ``RUN`` from cycle 4 and thread 0 has the first
 slot.
@@ -107,8 +110,10 @@ instruction, both records and the thread's last 12 retire records, and writes
 ``test/cosim_failures/seed_<n>.json`` (image, stimulus, failure) plus a
 ``.lst`` listing; ``python -m tools.loomgen --replay FILE --run N --trace T``
 shows the model's side of it. The module skips itself on a gate-level netlist
-(``GATES=yes``, or no ``user_project.u_loom`` hierarchy), which has none of the
-signals it reads.
+(``GATES=yes``), which has none of the signals it reads. In an RTL run a
+signal it cannot find fails the tests instead of skipping them (the
+instruction array moved when the SRAM macro came in, D-020, and a silent skip
+would have looked like a pass).
 """
 
 from __future__ import annotations
@@ -138,7 +143,9 @@ from tools.loomisa import load as load_isa                       # noqa: E402
 from tools.loomsim import Machine                                # noqa: E402
 
 THREADS = 4
-IMEM_WORDS = 256
+#: Instruction memory size of the default build: the 512 x 16 SRAM macro
+#: (D-020). The harness checks it against CAPS[15:12] and the RTL array.
+IMEM_WORDS = 512
 
 
 def _env_int(name: str, default: int) -> int:
@@ -179,25 +186,39 @@ UI_HOST_MASK = 0x70
 
 
 # ------------------------------------------------------------ gate level
-def _rtl_hierarchy_present() -> bool:
-    """True when the RTL hierarchy this module reads exists.
-
-    ``cocotb.top`` is set before test modules are imported, so this can
-    decide the ``skip`` flag at import time (cocotb 2 has no run-time skip).
-    """
-    top = getattr(cocotb, "top", None)
-    if top is None:
-        return False
+def imem_array(loom):
+    """The instruction-memory array of whichever ``loom_imem`` backend the
+    ``loom_top`` instance ``loom`` was built with: ``memory`` in the SRAM
+    macro's behavioural model (IMEM_IMPL "MACRO", D-020) or the flop array
+    ``mem`` ("FLOPS"). Raises AttributeError if neither exists."""
+    imem = loom.u_imem
     try:
-        top.user_project.u_loom.u_core.ph                      # noqa: B018
-        top.user_project.u_loom.u_imem.mem                     # noqa: B018
+        return imem.g_macro.u_macro.sram.i_SRAM_1P_behavioral_bm_bist.memory
+    except AttributeError:
+        return imem.g_flops.mem
+
+
+def _rtl_hierarchy_present(dut) -> bool:
+    """True when the RTL hierarchy this module reads exists under ``dut``."""
+    try:
+        dut.user_project.u_loom.u_core.ph                      # noqa: B018
+        imem_array(dut.user_project.u_loom)
     except AttributeError:
         return False
     return True
 
 
-GATE_LEVEL = os.environ.get("GATES", "").lower() == "yes" \
-    or not _rtl_hierarchy_present()
+def _require_rtl(dut):
+    """Fail, rather than skip, an RTL run that lacks the signals read here."""
+    assert _rtl_hierarchy_present(dut), (
+        "RTL hierarchy not found: user_project.u_loom.u_core.ph and the "
+        "instruction array of loom_imem (macro model memory or g_flops.mem) "
+        "are needed; gate-level runs must set GATES=yes")
+
+
+#: cocotb 2 has no run-time skip, so the flag is decided at import time.
+#: The gate-level flows (test/Makefile, Tiny Tapeout's gl_test) set GATES=yes.
+GATE_LEVEL = os.environ.get("GATES", "").lower() == "yes"
 
 
 # ------------------------------------------------------------------ probe
@@ -209,7 +230,8 @@ class _Probe:
         loom = dut.user_project.u_loom
         core = loom.u_core
         self.loom, self.core = loom, core
-        self.mem = loom.u_imem.mem
+        self.mem = imem_array(loom)
+        self.mem_words = len(self.mem)
         self.regs = core.u_rf.regs
         self.acc = [core.u_timer.g_thread[t].acc for t in range(THREADS)]
         for name in ("ph", "run_r", "halted_r", "step_req_r", "badop_r",
@@ -682,6 +704,7 @@ async def _run_programs(dut, programs, spi=False):
     """``programs``: (program or maker, label, cycles). A maker is called with
     the avoid flags that the RTL's CAPS, read at the start of the seed, asks
     for, and returns the program."""
+    _require_rtl(dut)
     probe = _Probe(dut)
     failures = []
     total_slots = total_cycles = 0
@@ -692,8 +715,15 @@ async def _run_programs(dut, programs, spi=False):
             prog = make(_avoid_for(caps))
             label = "%s caps=%04X%s" % (label, caps,
                                          " m2_built" if "m2_built" in prog.avoid else "")
+            if 1 << (caps >> 12) != prog.imem_words:
+                raise AssertionError("CAPS %04X reports %d instruction words, the "
+                                     "program is for %d" % (caps, 1 << (caps >> 12),
+                                                            prog.imem_words))
         else:
             prog = make
+        if probe.mem_words != prog.imem_words:
+            raise AssertionError("the RTL instruction array has %d words, the "
+                                 "program is for %d" % (probe.mem_words, prog.imem_words))
         run = _Run(dut, probe, prog, label, cycles, spi=spi)
         try:
             spent = await run.run()

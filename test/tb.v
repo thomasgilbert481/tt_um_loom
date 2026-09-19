@@ -7,8 +7,8 @@
 module tb ();
 
   // Dump the signals to a FST file. You can view it with gtkwave or surfer.
-  // Dumping the whole design (including the 256 x 16 instruction memory)
-  // roughly triples the run time of the M1 suite, so it is opt-in:
+  // Dumping the whole design (including the instruction memories) roughly
+  // triples the run time of the suite, so it is opt-in:
   //     make PLUSARGS=+dump
   initial begin
     if ($test$plusargs("dump")) begin
@@ -45,5 +45,59 @@ module tb ();
       .clk    (clk),      // clock
       .rst_n  (rst_n)     // not reset
   );
+
+`ifndef GL_TEST
+  // Executing an instruction word that was never written is always a test or
+  // firmware bug, but RTL simulation hides it: the decoder's `if`s and `case`s
+  // take their default branch on X and the slot does something harmless. The
+  // gate-level netlist spreads the X instead (BUGS 4). So stop the RTL run at
+  // the first valid slot whose D-stage word has an X or Z bit in it.
+  always @(posedge clk)
+    if (user_project.u_loom.u_core.vd === 1'b1
+        && $isunknown(user_project.u_loom.imem_rdata)) begin
+      $display("%t tb: a valid slot is decoding an unwritten IMEM word (%b)",
+               $time, user_project.u_loom.imem_rdata);
+      $fatal(1, "X instruction executed");
+    end
+`endif
+
+`ifndef GL_TEST
+  // The FLOPS fallback build (D-020): a second, independent tt_um_loom with
+  // the 256 x 16 flip-flop instruction memory instead of the SRAM macro, on
+  // its own pins (same names with a _flops suffix, same pad model). Only
+  // test_flops.py drives it; nothing else toggles clk_flops, so the other
+  // tests pay only its compile time. The gate-level netlist is the MACRO
+  // build, so this instance exists in RTL simulation only.
+  reg        clk_flops;
+  reg        rst_n_flops;
+  reg        ena_flops;
+  reg  [7:0] ui_in_flops;
+  reg  [7:0] uio_drv_flops;
+  wire [7:0] uo_out_flops;
+  wire [7:0] uio_out_flops;
+  wire [7:0] uio_oe_flops;
+  wire [7:0] uio_in_flops = (uio_out_flops & uio_oe_flops)
+                            | (uio_drv_flops & ~uio_oe_flops);
+
+  tt_um_loom #(.IMEM_IMPL("FLOPS"), .IMEM_WORDS(256)) user_project_flops (
+      .ui_in  (ui_in_flops),
+      .uo_out (uo_out_flops),
+      .uio_in (uio_in_flops),
+      .uio_out(uio_out_flops),
+      .uio_oe (uio_oe_flops),
+      .ena    (ena_flops),
+      .clk    (clk_flops),
+      .rst_n  (rst_n_flops)
+  );
+
+  // The same unwritten-word check for the FLOPS build.
+  always @(posedge clk_flops)
+    if (user_project_flops.u_loom.u_core.vd === 1'b1
+        && $isunknown(user_project_flops.u_loom.imem_rdata)) begin
+      $display("%t tb: a valid slot is decoding an unwritten IMEM word (%b) [FLOPS]",
+               $time, user_project_flops.u_loom.imem_rdata);
+      $fatal(1, "X instruction executed");
+    end
+`endif
 
 endmodule
