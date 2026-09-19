@@ -797,6 +797,9 @@ From the first hardening of the real core with the macro (run 35419160398, branc
 
 ### Reproducing CI's `gl_test` locally
 
+`scripts/gl/` does all of this (`fetch.sh`, `run.sh`, `diff.sh`; see its README).
+What they do, and why:
+
 - CI's job installs the PDK from **IHP-Open-PDK** at the commit named in the job log
   ("Install ihp-sg13cmos5l PDK", `PDK_VERSION`; 2bbec755dc67 for this run) and uses only
   three model files: `ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilog/sg13cmos5l_stdcell.v`,
@@ -827,7 +830,7 @@ From the first hardening of the real core with the macro (run 35419160398, branc
   write mask went X and `uo_out[0]` read X one clock after every edge, which
   `resolve()` in the tests turns into 0). `test/tb.v` now stops an RTL run at the first
   valid slot decoding an X/Z word, so RTL and gate level agree on this.
-- **Differential debugging** found BUGS 4 in minutes: the netlist keeps most RTL
+- **Differential debugging** (`scripts/gl/diff.sh`) found BUGS 4 in minutes: the netlist keeps most RTL
   register names as escaped per-bit nets (`\u_loom.u_core.pc_all[13] `), so dumping the
   same named signals from an RTL run and a gate-level run of one test (`$dumpvars` on each
   bit net in GL, on the vector in RTL) and comparing them clock by clock shows the first

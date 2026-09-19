@@ -125,8 +125,8 @@ is required or `/mnt/c/...` arguments are rewritten into Git paths, and shell
 variables inside a `wsl ... bash -c '...'` one-liner are expanded to nothing
 before bash sees them, so put anything with variables in a script file.
 Gate-level simulation needs the netlist from the CI artefact and the three PDK
-cell-model files; the recipe to reproduce CI's `gl_test` locally, and to diff
-RTL against gate level net by net, is `docs/tt_cmos5l_facts.md` section 12.
+cell-model files: `scripts/gl/` fetches both and runs or diffs them
+(`scripts/gl/README.md`, `docs/tt_cmos5l_facts.md` section 12).
 
 ## Milestone M0 for a fresh session (if PLAN M0 boxes are still open)
 
