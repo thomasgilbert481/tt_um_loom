@@ -124,7 +124,7 @@ state. (`docs/SEMANTICS.md` section 7.)
 | 0x22 | WAIT_ACTIVE in bit 0 |
 | 0x23 | DT (the hidden target of `DLY`) |
 | 0x24 | TICK_SEEN in bit 0 (M2) |
-| 0x25 | staged pin write: {8'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]} in bits 6:0 (M2, `docs/SEMANTICS.md` 6.10) |
+| 0x25 | staged pin write: {9'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]}, i.e. bits 6:0 (M2, `docs/SEMANTICS.md` 6.10); writable while halted; LAT_PIN and LAT_VAL keep their values when LAT_VALID clears |
 | 0x26 | {INQ_CNT, OUTQ_CNT} as {byte, byte} (M2), read-only: a written count would expose entries never pushed |
 
 `CSRW PIN_OUT`, `CSRW PIN_OE` and the host's PIN_OUT/PIN_OE writes are raw

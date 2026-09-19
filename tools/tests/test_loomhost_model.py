@@ -16,7 +16,7 @@ from tools.loomhost import (Loom, LoomError, LoomStateError, LoomTimeout,
                             LoomVerifyError, ModelTransport, load_image, thread_mask)
 from tools.loomhost import protocol as P
 from tools.loomisa import load as load_isa
-from tools.loomsim import Machine, LoomsimError
+from tools.loomsim import Machine
 from tools.protomodels.bench import Bench
 
 ISA = load_isa()
@@ -463,8 +463,6 @@ def _machine():
     return m
 
 
-@pytest.mark.xfail(reason="SEMANTICS 6.7: a host push to a full INQ sets BADOP[14]; "
-                          "the model drops the word without it", strict=False)
 def test_model_push_to_full_inq_sets_badop_14():
     m = _machine()
     for word in range(5):
@@ -473,8 +471,6 @@ def test_model_push_to_full_inq_sets_badop_14():
     assert m.badop & (1 << 14)
 
 
-@pytest.mark.xfail(reason="SEMANTICS 6.7: a host pop from an empty OUTQ sets BADOP[14]; "
-                          "the model returns 0 without it", strict=False)
 def test_model_pop_from_empty_outq_sets_badop_14():
     m = _machine()
     assert m.host_fifo_pop(0) == 0
@@ -482,8 +478,6 @@ def test_model_pop_from_empty_outq_sets_badop_14():
     assert m.badop & (1 << 14)
 
 
-@pytest.mark.xfail(reason="SEMANTICS 6.7: CTRL.RESET of thread t empties INQ[t] and "
-                          "OUTQ[t]; the model's host_reset_thread keeps them", strict=False)
 def test_model_reset_empties_fifos():
     m = _machine()
     m.host_fifo_push(0, 1)
@@ -493,9 +487,6 @@ def test_model_reset_empties_fifos():
     assert m.host_fifo_status(0)["inq"] == 0
 
 
-@pytest.mark.xfail(reason="HOST_PROTOCOL space 4: debug registers are writable only while "
-                          "the thread is halted; the model applies an OUTGRP write while "
-                          "running", strict=False)
 def test_model_drops_debug_writes_while_running():
     m = Machine({0: ISA.encode("JMP", abs=0)}, features={"FIFO"})
     m.host_set_run(1)
@@ -507,9 +498,6 @@ def test_model_drops_debug_writes_while_running():
     assert m.threads[0].outgrp == 0
 
 
-@pytest.mark.xfail(reason="HOST_PROTOCOL space 4: STEPS (0x20) is a writable debug "
-                          "register; the model refuses the write",
-                   raises=LoomsimError, strict=False)
 def test_model_steps_is_writable():
     m = _machine()
     m.host_write_debug(0, "STEPS", 7)

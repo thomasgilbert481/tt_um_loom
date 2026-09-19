@@ -397,3 +397,5 @@ thread waits nothing else can load its latch), so the RTL may use either.
   tick `SETP ... D; WAITD 1` puts every edge on the tick edge (spacing 433 and
   434) where `WAITD 1; SETP` gives 432 and 436, and at 434 clocks the latched
   spacing is exactly 434 (`test_loomsim_setpd.py`, 101 edges each).
+
+**Resolution of the M2 update items (director, 2026-09-18):** all thirteen readings are accepted as the rule. Items 5, 6, 8, 10 and 13 were reached independently by the RTL session as well (docs/spec-questions/rtl-m2.md and its design notes), which is the agreement co-simulation will check. Item 12 was a real error in HOST_PROTOCOL and is fixed (0x25 is {9'b0, LAT_VALID, LAT_VAL, LAT_PIN}); item 11's behaviour is now written there too.
