@@ -182,12 +182,23 @@ async def test_other_threads_do_not_move_the_edges(dut):
     busy = {0x40: asm("ADDI", rd=7, imm=1),
             0x41: asm("XOR", rd=6, ra=7, rb=7),
             0x42: asm("JMP", abs=0x40)}
+    # RESET_PC reaches the PC only through a thread reset. Without one,
+    # thread 1 starts at its power-on PC, which is 0x80 in the 512-word build
+    # and holds unwritten (X) memory: the RTL decoded that quietly and passed,
+    # the gate-level netlist spread the X into the pin register (BUGS 4).
     await host.set_reset_pc(1, 0x40)
+    await host.reset_thread(1)
+    await host.write_reg(1, 6, 0xFFFF)
+    await host.write_reg(1, 7, 0)
     with_busy = await run_toggles(host, dut, 32, 0, 1, 8, extra=busy)
     gaps_busy = [b - a for a, b in zip(with_busy, with_busy[1:])]
 
     assert gaps_alone == gaps_busy, \
         f"thread 1 moved the edges: {gaps_alone} vs {gaps_busy}"
     assert all(g == 32 for g in gaps_busy), gaps_busy
+    # ...and thread 1 really ran its loop the whole time.
+    loops = await host.read_reg(1, 7)
+    assert loops > 40 and await host.read_reg(1, 6) == 0, \
+        f"thread 1 did not run the busy loop (r7 = {loops})"
     await host.halt()
     await ClockCycles(dut.clk, 8)

@@ -47,6 +47,21 @@ module tb ();
   );
 
 `ifndef GL_TEST
+  // Executing an instruction word that was never written is always a test or
+  // firmware bug, but RTL simulation hides it: the decoder's `if`s and `case`s
+  // take their default branch on X and the slot does something harmless. The
+  // gate-level netlist spreads the X instead (BUGS 4). So stop the RTL run at
+  // the first valid slot whose D-stage word has an X or Z bit in it.
+  always @(posedge clk)
+    if (user_project.u_loom.u_core.vd === 1'b1
+        && $isunknown(user_project.u_loom.imem_rdata)) begin
+      $display("%t tb: a valid slot is decoding an unwritten IMEM word (%b)",
+               $time, user_project.u_loom.imem_rdata);
+      $fatal(1, "X instruction executed");
+    end
+`endif
+
+`ifndef GL_TEST
   // The FLOPS fallback build (D-020): a second, independent tt_um_loom with
   // the 256 x 16 flip-flop instruction memory instead of the SRAM macro, on
   // its own pins (same names with a _flops suffix, same pad model). Only
@@ -74,6 +89,15 @@ module tb ();
       .clk    (clk_flops),
       .rst_n  (rst_n_flops)
   );
+
+  // The same unwritten-word check for the FLOPS build.
+  always @(posedge clk_flops)
+    if (user_project_flops.u_loom.u_core.vd === 1'b1
+        && $isunknown(user_project_flops.u_loom.imem_rdata)) begin
+      $display("%t tb: a valid slot is decoding an unwritten IMEM word (%b) [FLOPS]",
+               $time, user_project_flops.u_loom.imem_rdata);
+      $fatal(1, "X instruction executed");
+    end
 `endif
 
 endmodule
