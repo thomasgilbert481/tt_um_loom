@@ -132,3 +132,45 @@ def reached(now: int, deadline: int) -> bool:
     16-bit range, which is how ``WAITD`` survives ``NOW`` wrapping.
     """
     return ((now - deadline) & WORD_MASK) < (1 << (WORD_BITS - 1))
+
+
+# ---------------------------------------------------------------- bit engine
+# SEMANTICS 6.9, manual mode.  ``msb_first`` is BE_CFG.DIR.
+
+def be_out_bit(sr: int, msb_first: bool) -> int:
+    """``SHO``'s data bit: ``DIR ? SR[15] : SR[0]`` (before any inversion)."""
+    return (sr >> (WORD_BITS - 1)) & 1 if msb_first else sr & 1
+
+
+def be_shift_out(sr: int, msb_first: bool) -> int:
+    """``SHO``'s new ``SR``: ``DIR ? {SR[14:0], 0} : {0, SR[15:1]}``."""
+    sr &= WORD_MASK
+    return (sr << 1) & WORD_MASK if msb_first else sr >> 1
+
+
+def be_shift_in(sr: int, bit: int, msb_first: bool) -> int:
+    """``SHI``'s new ``SR``: ``DIR ? {SR[14:0], s} : {s, SR[15:1]}``."""
+    sr &= WORD_MASK
+    bit &= 1
+    if msb_first:
+        return ((sr << 1) & WORD_MASK) | bit
+    return (bit << (WORD_BITS - 1)) | (sr >> 1)
+
+
+def be_count(cnt: int) -> int:
+    """``CNT <= (CNT == 0) ? 0 : CNT - 1`` (5 bits); ``Z`` is the result == 0."""
+    cnt &= 0x1F
+    return 0 if cnt == 0 else cnt - 1
+
+
+def crc_step(crc: int, bit: int, poly: int) -> int:
+    """One serial, MSB-first CRC step on the left-aligned 16-bit register.
+
+    ``fb = CRC[15] ^ x; CRC <= {CRC[14:0], 1'b0} ^ (fb ? CRC_POLY : 0)``.  An
+    ``n``-bit CRC lives in ``CRC[15:16-n]`` with its polynomial and initial
+    value shifted left by ``16 - n`` (SEMANTICS 6.9).
+    """
+    crc &= WORD_MASK
+    feedback = ((crc >> (WORD_BITS - 1)) ^ bit) & 1
+    crc = (crc << 1) & WORD_MASK
+    return crc ^ (poly & WORD_MASK) if feedback else crc

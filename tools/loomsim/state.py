@@ -28,16 +28,23 @@ THREAD_CSRS = {
     0x03: "ingrp",
 }
 
-#: Widths of every CSR, from ``isa/isa.yaml`` (filled in by the Machine at
-#: construction so that the model never hard-codes a second copy).
+#: CSR numbers, as in ``isa/isa.yaml`` ``csrs``.
 CSR_TICK_INT = 0x00
 CSR_TICK_FRAC = 0x01
 CSR_OUTGRP = 0x02
 CSR_INGRP = 0x03
+CSR_BE_CFG = 0x04
+CSR_BE_PINS = 0x05
+CSR_BE_RELOAD = 0x06
+CSR_CRC_POLY = 0x07
+CSR_CRC_INIT = 0x08
 CSR_NOW = 0x09
 CSR_TD = 0x0A
 CSR_FLAGS = 0x0B
 CSR_TID = 0x0C
+CSR_SR = 0x0D
+CSR_CNT = 0x0E
+CSR_CRC = 0x0F
 CSR_OD_MASK = 0x10
 CSR_PIN_OUT = 0x11
 CSR_PIN_OE = 0x12
@@ -50,6 +57,22 @@ CSR_HOST_IRQ = 0x15
 M1_CSRS = frozenset(
     list(range(0x00, 0x04)) + list(range(0x09, 0x0D)) + list(range(0x10, 0x16))
 )
+
+#: CSRs of the bit engine (SEMANTICS 6.9), built with feature ``"BE"``.
+BE_CSRS = frozenset((CSR_BE_CFG, CSR_BE_PINS, CSR_BE_RELOAD, CSR_CRC_POLY,
+                     CSR_CRC_INIT, CSR_SR, CSR_CNT, CSR_CRC))
+
+#: ``BE_CFG`` fields that exist at M2 (SEMANTICS 6.9).  The other bits of the
+#: 13-bit CSR read 0 and ignore writes until M3 builds them.
+BE_CFG_DIR = 1 << 1          # 0 LSB first, 1 MSB first
+BE_CFG_INV = 1 << 7          # invert the pin level
+BE_CFG_CRC_EN = 1 << 9       # update the CRC with every shifted bit
+BE_CFG_M2_MASK = BE_CFG_DIR | BE_CFG_INV | BE_CFG_CRC_EN
+
+#: Register widths of the bit-engine state.
+CNT_MASK = 0x1F              # CNT is 5 bits
+BE_PINS_MASK = 0x3FF         # {in[9:5], out[4:0]}
+BE_RELOAD_MASK = 0x1F        # CNT reload in auto mode (M3); stored at M2
 
 
 @dataclasses.dataclass
@@ -89,8 +112,30 @@ class ThreadState:
 
     steps: int = 0
 
+    #: FIFO contents, head first; ``len()`` is ``INQ_CNT``/``OUTQ_CNT``
+    #: (SEMANTICS 6.7, feature ``"FIFO"``).
     inq: List[int] = dataclasses.field(default_factory=list)
     outq: List[int] = dataclasses.field(default_factory=list)
+
+    # --- bit engine, manual mode (SEMANTICS 6.9, feature "BE")
+    sr: int = 0
+    cnt: int = 0
+    crc: int = 0
+    be_cfg: int = 0
+    be_pins: int = 0
+    be_reload: int = 0
+    crc_poly: int = 0
+    crc_init: int = 0
+
+    # --- deadline-latched pin write (SEMANTICS 6.10, feature "SETPD")
+    lat_valid: int = 0
+    lat_pin: int = 0
+    lat_val: int = 0
+
+    @property
+    def lat(self) -> int:
+        """Debug 0x25: ``{LAT_VALID, LAT_VAL, LAT_PIN[4:0]}`` in bits 6:0."""
+        return ((self.lat_valid & 1) << 6) | ((self.lat_val & 1) << 5) | (self.lat_pin & 0x1F)
 
     @property
     def flags(self) -> int:
@@ -193,7 +238,9 @@ class CycleTrace:
 
     All values describe the state *during* ``cycle``, before the edge that ends
     it, so a pad write with X cycle ``x`` first shows up in the entry for cycle
-    ``x + 2``.
+    ``x + 2``.  ``uo_out`` is ``PIN_OUT[13:8]`` (pads ``uo_out[5:0]``);
+    ``host_irq`` is the registered ``HOST_IRQ`` output, pad ``uo_out[6]``
+    (SEMANTICS 6.8).
     """
 
     cycle: int
@@ -204,6 +251,7 @@ class CycleTrace:
     ui_in: int
     uio_in: int
     retire: Optional[RetireRecord] = None
+    host_irq: int = 0
 
 
 @dataclasses.dataclass
@@ -240,15 +288,38 @@ class Commit:
     outgrp: Optional[int] = None
     ingrp: Optional[int] = None
     acc_clear: bool = False
+    #: ``TD`` is written at this edge in the sense of SEMANTICS 6.10 rule 2:
+    #: a ``WAITD`` first issue, ``SETD``, ``CSRW TD`` or a host write.  A
+    #: ``WAITD`` re-issue commits ``TD <= TD`` and does not count.
+    td_written: bool = False
     #: Thread FIFOs: value pushed into OUTQ, and whether INQ is popped.
     outq_push: Optional[int] = None
     inq_pop: bool = False
+    #: Bit engine (SEMANTICS 6.9).
+    sr: Optional[int] = None
+    cnt: Optional[int] = None
+    crc: Optional[int] = None
+    be_cfg: Optional[int] = None
+    be_pins: Optional[int] = None
+    be_reload: Optional[int] = None
+    crc_poly: Optional[int] = None
+    crc_init: Optional[int] = None
+    #: Deadline latch load ``(valid, pin, val)``: a ``SETP ... D`` commit or a
+    #: host write of debug 0x25 (SEMANTICS 6.10).
+    lat_set: Optional[Tuple[int, int, int]] = None
+    #: Host debug writes of ``STEPS`` and ``TICK_SEEN`` (HOST_PROTOCOL space 4).
+    steps: Optional[int] = None
+    tick_seen: Optional[int] = None
 
     # --- shared ----------------------------------------------------------
     pin_out_mask: int = 0
     pin_out_val: int = 0
     pin_oe_mask: int = 0
     pin_oe_val: int = 0
+    #: Pin indices (bit ``i`` for index ``i``) this commit wrote through the
+    #: pin-write rule of SEMANTICS 6.3; an ordinary pin write to an index beats
+    #: a staged write to the same index at the same edge (SEMANTICS 6.10).
+    pin_index_mask: int = 0
     od_mask: Optional[int] = None
     sflags_set: int = 0
     sflags_clr: int = 0
@@ -261,6 +332,9 @@ class Commit:
     badop_set: int = 0
     badop_clr: int = 0
     swirq_set: int = 0
+    swirq_clr: int = 0
+    irq_en: Optional[int] = None
+    irq_en2: Optional[int] = None
     reset_pc: Optional[Tuple[int, int]] = None
     imem_write: Optional[Tuple[int, int]] = None
     #: Host FIFO side: value pushed into INQ, and whether OUTQ is popped.
@@ -281,9 +355,11 @@ class Commit:
         value &= 1
         if 16 <= index <= 21:
             bit = index - 8
+            self.pin_index_mask |= 1 << index
             self.pin_out_mask |= 1 << bit
             self.pin_out_val = (self.pin_out_val & ~(1 << bit)) | (value << bit)
         elif 0 <= index <= 7:
+            self.pin_index_mask |= 1 << index
             if (od_mask >> index) & 1:
                 self.pin_out_mask |= 1 << index
                 self.pin_out_val &= ~(1 << index)
