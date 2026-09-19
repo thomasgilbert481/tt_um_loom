@@ -82,4 +82,4 @@ session's file). `uart_tx_fifo.loom` avoids it by ticking faster than the bit
 rate. **Fix wanted:** re-anchor with `SETD 0` and wait one extra tick, or tick
 at a multiple of the bit rate, in `uart_tx.loom` and `uart_hello.loom`.
 
-**Resolution (director, 2026-09-18):** a real firmware bug; fix scheduled with the next firmware work (PLAN M2).
+**Resolution (director, 2026-09-18):** a real firmware bug, fixed in `uart_tx.loom`: after `SETD 0` a `WAITD 1` aligns to the next tick edge before the start bit, so the start bit is a whole bit (444 clocks at TICK_INT 434 on the golden model after idle times of 0, 1,237 and 3,001 cycles; it was 0 to 434 before). `uart_hello.loom` is left as it is: it anchors once right after clearing the tick accumulator, so only its first start bit is about 2 per cent short.

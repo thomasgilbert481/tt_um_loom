@@ -211,8 +211,9 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       error, NACK, clock stretching). 2026-09-18: `uart_tx_fifo`, `uart_rx`,
       `spi_master`, `i2c_master` pass end to end on the golden model with
       `tools/protomodels` (framing error, NACK and clock stretching
-      included); `spi_slave` and the same tests on the RTL are open. Fix the
-      short first start bit in `uart_tx.loom` (firmware spec question 8).
+      included); `spi_slave` and the same tests on the RTL are open. The
+      short start bit after idle in `uart_tx.loom` (firmware spec question 8)
+      is fixed.
 - [ ] FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
       L3 tests re-run on hardware through `loomhost` (same scripts).
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,

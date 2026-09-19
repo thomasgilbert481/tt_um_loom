@@ -19,6 +19,8 @@ start:  SETP    TX, 1                   ; line idles high
 
 byte:   POP     r0                      ; block until the host pushes a byte
         SETD    0                       ; re-anchor: deadline = now (POP took an unknown time)
+        WAITD   1                       ; align to the next tick edge (0 to 1 bit), so that
+                                        ; the start bit below is a whole bit long
         SETP    TX, 0                   ; start bit
         WAITD   1                       ; hold exactly one bit period
         LDI     r1, 8
@@ -53,6 +55,19 @@ next:   WAITD   1                       ; both paths land here; the deadline, no
 ; period that is a multiple of 4 clocks makes the lateness constant and the
 ; edges exactly periodic; 432 and 436 are both within 0.5 per cent of 115200
 ; baud, well inside what 8N1 tolerates.
+;
+; Why the extra WAITD after SETD (docs/spec-questions/firmware.md item 8): after
+; an idle POP, SETD 0 lands anywhere inside a tick, and a start bit driven
+; straight away would last only until the next tick edge, 0 to 1 bit. Waiting
+; for that edge first makes it a whole bit: on the golden model the start bit
+; measures 444 clocks at TICK_INT 434 whatever the idle time was (the start
+; edge fires one slot after its deadline and the data edges four, hence the
+; 2 per cent; SETP ... D at M2 makes every edge exact). The price is one idle bit time
+; between back-to-back bytes (11 bit times per frame); firmware/uart_tx_fifo.loom
+; ticks faster than the bit rate and keeps full throughput. uart_hello.loom
+; anchors once, right after its CSRW TICK_INT clears the tick accumulator, so
+; only its first start bit is short, by the few slots before its SETD (about
+; 2 per cent of a bit), which no receiver notices.
 ;
 ; Bit-engine variant (M2): replace the bit loop with
 ;       LDSR r0 ; CSRW CNT, r1 (8) ; loop: SHO ; WAITD 1 ; DJNZ r1, loop
