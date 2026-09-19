@@ -44,14 +44,38 @@
  * FIFOs (SEMANTICS 6.7): INQ[t] and OUTQ[t] are loom_fifo instances. PUSH
  * and POP decide in X from the counts visible there and stall like waits
  * (WAIT_ACTIVE); the entry moves at the commit edge. WAITB tests OUTQ not
- * full (1), INQ not empty (2) and TICK_SEEN (3); WAITB 0 needs the bit
- * engine. A host push into a full INQ is dropped and sets BADOP[14]; the
- * host's pops arrive already checked from loom_host_ctl, which also reports
- * a pop from an empty OUTQ on h_badop_set14. CTRL.RESET empties both FIFOs
- * of the thread.
+ * full (1), INQ not empty (2) and TICK_SEEN (3); WAITB 0 belongs to the bit
+ * engine (below). A host push into a full INQ is dropped and sets
+ * BADOP[14]; the host's pops arrive already checked from loom_host_ctl,
+ * which also reports a pop from an empty OUTQ on h_badop_set14. CTRL.RESET
+ * empties both FIFOs of the thread.
  *
- * Not built: the bit engine and LD/ST. Those decode normally and execute as
- * NOP with BADOP[t] set (SEMANTICS section 9).
+ * Bit engine, manual mode (SEMANTICS 6.9): the state lives in loom_be; SHO,
+ * SHI, LDSR, CRCI and CSRW compute the new SR/CNT/CRC in X and the W stage
+ * commits them. SHO's pin write uses the same single-pin path as SETP, so
+ * the open-drain rule and the index checks are shared. WAITB 0 (bit engine
+ * idle) is always true until auto mode exists.
+ *
+ * Deadline-latched SETP (SEMANTICS 6.10): `SETP pin, v, D` writes no pin;
+ * its commit stages {LAT_VALID, LAT_PIN, LAT_VAL} in the thread's latch,
+ * replacing what was staged. loom_timer raises lat_fire[t] in the cycle
+ * before an edge at which rule 1 (NOW ticks to exactly TD, TD not written)
+ * or rule 2 (TD written, reached(NOW', TD')) holds; a staged write that is
+ * already valid before that edge is applied at it (the lw_* port of
+ * loom_pins, 6.3 rules and open drain included) and LAT_VALID clears. So
+ * the edge that arms a write never applies it, while a write staged earlier
+ * does apply at the edge where a new SETP D replaces it. A slot's ordinary
+ * pin write wins on every bit it writes at the same edge (loom_pins), and
+ * where two threads' staged writes hit one pin at one edge the higher
+ * thread wins. CTRL.RESET discards the staged write without a pin write,
+ * although it also writes TD. Only a first-issue WAITD writes TD: a WAITD
+ * that re-issues would write TD with its own value, so it commits nothing,
+ * which keeps "TD is written" (rule 2) exactly as 6.10 lists it. Debug 0x25
+ * reads {LAT_VALID, LAT_VAL, LAT_PIN} in bits 6:0 and writes it while the
+ * thread is halted.
+ *
+ * Not built: LD/ST (data memory). They decode normally and execute as NOP
+ * with BADOP[t] set (SEMANTICS section 9).
  */
 
 `default_nettype none
@@ -82,6 +106,11 @@ module loom_core #(
     output wire [7:0]        cw_oe_data,
     output wire              cw_od_we,
     output wire [7:0]        cw_od,
+    // Staged (deadline-latched) pin writes applying at the coming edge.
+    output wire [13:0]       lw_out_mask,
+    output wire [13:0]       lw_out_data,
+    output wire [7:0]        lw_oe_mask,
+    output wire [7:0]        lw_oe_data,
 
     // ------------------------------------------------------- host control
     input  wire              h_run_we,
@@ -151,6 +180,8 @@ module loom_core #(
   reg [51:0] pp_all;
   reg [39:0] outgrp_all, ingrp_all;
   reg [63:0] steps_all;
+  reg [3:0]  lat_valid_all, lat_val_all;   // deadline latch (6.10)
+  reg [19:0] lat_pin_all;
 
   assign run         = run_r;
   assign halted      = halted_r;
@@ -269,6 +300,13 @@ module loom_core #(
   reg        w_swirq;
   reg [15:0] w_steps;
   reg        w_push, w_pop;         // a PUSH / POP completes in this slot
+  reg        w_sr_we, w_cnt_we, w_crc_we;
+  reg [15:0] w_sr, w_crc;
+  reg [4:0]  w_cnt;
+  reg        w_becfg_we, w_bepins_we, w_bereload_we, w_crcpoly_we, w_crcinit_we;
+  reg        w_lat;                 // a SETP D completes in this slot
+  reg [4:0]  w_lat_pin;
+  reg        w_lat_val;
 
   // ============================================= W-stage thread rings (D-019)
   // Bit t of every ring is high in exactly the cycles whose W slot belongs to
@@ -279,6 +317,8 @@ module loom_core #(
   reg [3:0] woh_rf;     // register file write port
   reg [3:0] woh_tmr;    // loom_timer commit port
   reg [3:0] woh_fifo;   // FIFO push/pop commits
+  reg [3:0] woh_be;     // bit-engine state commits
+  reg [3:0] woh_lat;    // deadline-latch commits (SETP D)
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -287,12 +327,16 @@ module loom_core #(
       woh_rf   <= 4'b0010;
       woh_tmr  <= 4'b0010;
       woh_fifo <= 4'b0010;
+      woh_be   <= 4'b0010;
+      woh_lat  <= 4'b0010;
     end else begin
       woh_pc   <= {woh_pc[2:0],   woh_pc[3]};
       woh_aux  <= {woh_aux[2:0],  woh_aux[3]};
       woh_rf   <= {woh_rf[2:0],   woh_rf[3]};
       woh_tmr  <= {woh_tmr[2:0],  woh_tmr[3]};
       woh_fifo <= {woh_fifo[2:0], woh_fifo[3]};
+      woh_be   <= {woh_be[2:0],   woh_be[3]};
+      woh_lat  <= {woh_lat[2:0],  woh_lat[3]};
     end
   end
 
@@ -437,6 +481,7 @@ module loom_core #(
   wire [63:0] now_all, td_all_w, dt_all_w, tick_int_all;
   wire [31:0] tick_frac_all;
   wire [3:0]  tick_seen_all;
+  wire [3:0]  lat_fire;
   wire        tmr_h_we, tmr_h_td_we, tmr_h_dt_we, tmr_h_tint_we, tmr_h_tfrac_we;
   wire        tmr_h_tseen_we;
   wire [15:0] tmr_h_wdata;
@@ -456,7 +501,8 @@ module loom_core #(
       .h_wdata(tmr_h_wdata),
       .now_all(now_all), .td_all(td_all_w), .dt_all(dt_all_w),
       .tick_int_all(tick_int_all), .tick_frac_all(tick_frac_all),
-      .tick_seen_all(tick_seen_all)
+      .tick_seen_all(tick_seen_all),
+      .lat_fire(lat_fire)
   );
 
   // ============================================ X stage: state it can see
@@ -531,6 +577,20 @@ module loom_core #(
   wire         x_inq_ne   = (x_inq_cnt != {(FAW+1){1'b0}});
   wire         x_outq_nf  = (x_outq_cnt != FDEPTH);
 
+  // =========================================================== bit engine
+  wire [63:0] be_sr_all, be_crc_all, be_poly_all, be_init_all;
+  wire [19:0] be_cnt_all, be_reload_all;
+  wire [11:0] be_cfg_all;
+  wire [39:0] be_pins_all;
+  wire [15:0] x_sr     = be_sr_all[xsel*16 +: 16];
+  wire [4:0]  x_cnt    = be_cnt_all[xsel*5 +: 5];
+  wire [15:0] x_crc    = be_crc_all[xsel*16 +: 16];
+  wire [15:0] x_poly   = be_poly_all[xsel*16 +: 16];
+  wire [15:0] x_init   = be_init_all[xsel*16 +: 16];
+  wire [4:0]  x_reload = be_reload_all[xsel*5 +: 5];
+  wire [2:0]  x_becfg  = be_cfg_all[xsel*3 +: 3];     // {CRC_EN, INV, DIR}
+  wire [9:0]  x_bepins = be_pins_all[xsel*10 +: 10];  // {in, out}
+
   // STEPS + 1 is formed here and registered, so the commit only loads it.
   // The host cannot write STEPS between this X cycle and the commit edge,
   // because the thread has a valid slot in flight (SEMANTICS 7).
@@ -542,9 +602,8 @@ module loom_core #(
                         & ~(w_valid ? w_sf_clr : 8'd0);
 
   // ---------------------------------------------------------- not built
-  // The bit engine and LD/ST are not built; WAITB 0 (bit engine idle) needs
-  // the bit engine, so it is the one WAITB condition that is NOP + BADOP.
-  wire unbuilt = grp_be | grp_mem | (is_waitb & (f_cond == 2'd0));
+  // Only LD/ST (data memory) are not built.
+  wire unbuilt = grp_mem;
   wire bad_op  = is_reserved | unbuilt;
 
   wire [9:0] x_next = pcx + 10'd1;
@@ -599,11 +658,31 @@ module loom_core #(
   wire [63:0] ig_rot  = {pin32, pin32} >> ig_base;
   wire [15:0] in_value = ig_rot[15:0] & ig_m17[15:0];
 
+  // ------------------------------------------------- bit engine (6.9)
+  wire        be_dir   = x_becfg[0];
+  wire        be_inv   = x_becfg[1];
+  wire        be_crcen = x_becfg[2];
+  wire        is_shift = is_sho | is_shi;
+  wire        sho_b    = be_dir ? x_sr[15] : x_sr[0];
+  wire        shi_s    = pin32[x_bepins[9:5]] ^ be_inv;
+  wire        be_bit   = is_shi ? shi_s : sho_b;          // shifted and CRC'd
+  wire [15:0] be_sr_sh = be_dir ? {x_sr[14:0], is_shi & shi_s}
+                                : {is_shi & shi_s, x_sr[15:1]};
+  wire [4:0]  be_cnt_n = (x_cnt == 5'd0) ? 5'd0 : (x_cnt - 5'd1);
+  // Serial CRC, MSB first on a left-aligned register.
+  wire        be_fb    = x_crc[15] ^ be_bit;
+  wire [15:0] be_crc_n = {x_crc[14:0], 1'b0} ^ (be_fb ? x_poly : 16'd0);
+
   // ------------------------------------------------------- pin writes
-  wire [31:0] setp_mask32 = 32'd1 << f_pin;
-  wire [31:0] pinw_mask = (is_setp ? setp_mask32 : 32'd0)
+  // One single-pin write path (6.3) for SETP and for SHO, which drives
+  // b ^ INV onto BE_PINS.out. SETP D writes no pin: it stages (6.10).
+  wire        sp_en   = (is_setp & ~f_lat) | is_sho;
+  wire [4:0]  sp_pin  = is_sho ? x_bepins[4:0] : f_pin;
+  wire        sp_val  = is_sho ? (sho_b ^ be_inv) : f_val;
+  wire [31:0] setp_mask32 = 32'd1 << sp_pin;
+  wire [31:0] pinw_mask = (sp_en ? setp_mask32 : 32'd0)
                           | (is_out ? out_mask32 : 32'd0);
-  wire [31:0] pinw_data = (is_setp ? (f_val ? setp_mask32 : 32'd0) : 32'd0)
+  wire [31:0] pinw_data = ((sp_en & sp_val) ? setp_mask32 : 32'd0)
                           | (is_out ? out_data32 : 32'd0);
   wire [13:0] pw_m14 = {pinw_mask[21:16], pinw_mask[7:0]};
   wire [13:0] pw_d14 = {pinw_data[21:16], pinw_data[7:0]};
@@ -643,6 +722,15 @@ module loom_core #(
     else if (csr_pin_oe)    csr_rdata = {8'd0, pin_oe_reg};
     else if (csr_pin_in)    csr_rdata = pin_in_reg;
     else if (csr_sflags)    csr_rdata = {8'd0, sflags_x};
+    else if (csr_be_cfg)    csr_rdata = {6'd0, x_becfg[2], 1'b0, x_becfg[1],
+                                         5'd0, x_becfg[0], 1'b0};
+    else if (csr_be_pins)   csr_rdata = {6'd0, x_bepins};
+    else if (csr_be_reload) csr_rdata = {11'd0, x_reload};
+    else if (csr_crc_poly)  csr_rdata = x_poly;
+    else if (csr_crc_init)  csr_rdata = x_init;
+    else if (csr_sr)        csr_rdata = x_sr;
+    else if (csr_cnt)       csr_rdata = {11'd0, x_cnt};
+    else if (csr_crc)       csr_rdata = x_crc;
   end
 
   // ------------------------------------------------------------- waits
@@ -659,9 +747,9 @@ module loom_core #(
   wire reach_dt_new = ~d_dt_new[15];
   wire reach_td     = ~d_td[15];
 
-  // Conditional-wait condition mux. WAITB (6.4, 6.7): 1 OUTQ not full,
-  // 2 INQ not empty, 3 TICK_SEEN; 0 is unbuilt (BADOP) without the bit
-  // engine and never reaches here.
+  // Conditional-wait condition mux. WAITB (6.4, 6.7): 0 bit engine idle,
+  // which is always true in manual mode, 1 OUTQ not full, 2 INQ not empty,
+  // 3 TICK_SEEN.
   wire cond_waitp = (pin_sel == f_val);
   wire cond_waite = pin_edge_ok & edge_hit;
   wire cond_waits = sflags_x[f_flag];
@@ -671,7 +759,7 @@ module loom_core #(
       2'd1:    cond_waitb = x_outq_nf;
       2'd2:    cond_waitb = x_inq_ne;
       2'd3:    cond_waitb = x_tseen;
-      default: cond_waitb = 1'b0;
+      default: cond_waitb = 1'b1;
     endcase
   end
   wire cond_hit   = (is_waitp & cond_waitp)
@@ -716,7 +804,7 @@ module loom_core #(
                    | (grp_alui & ~is_cmpi)
                    | grp_ldi
                    | (grp_unary & ~is_cmp & ~is_test)
-                   | is_djnz | is_in | is_csrr
+                   | is_djnz | is_in | is_csrr | is_stsr | is_stcrc
                    | (is_pop & x_inq_ne));
 
   reg [15:0] x_rval;
@@ -727,6 +815,8 @@ module loom_core #(
     else if (is_in)   x_rval = in_value;
     else if (is_csrr) x_rval = csr_rdata;
     else if (is_pop)  x_rval = x_inq_head;
+    else if (is_stsr) x_rval = x_sr;
+    else if (is_stcrc) x_rval = x_crc;
     else              x_rval = alu_y;
   end
 
@@ -738,6 +828,7 @@ module loom_core #(
     x_flags = {x_t, x_c, x_z};
     if (alu_flags)      x_flags = {x_t, alu_c, alu_z};
     else if (csrw_fl)   x_flags = op_a[2:0];
+    else if (is_shift & ~bad_op) x_flags = {x_t, x_c, be_cnt_n == 5'd0};
     else if (is_cwait & f_tmo & wait_done) x_flags = {timeout, x_c, x_z};
   end
 
@@ -755,7 +846,9 @@ module loom_core #(
   wire [1:0] x_depth_n = is_call ? ((x_depth == 2'd2) ? 2'd2 : (x_depth + 2'd1))
                                  : (x_depth - 2'd1);
 
-  wire x_td_we = ~bad_op & (is_waitd | is_setd | (is_csrw & csr_td));
+  // A re-issued WAITD has TD' = TD and writes nothing (6.10 counts only a
+  // first issue as a TD write).
+  wire x_td_we = ~bad_op & ((is_waitd & first_issue) | is_setd | (is_csrw & csr_td));
   wire [15:0] x_td_val = (is_csrw & csr_td) ? op_a : td_new;
   wire x_dt_we = ~bad_op & is_dly;
 
@@ -793,6 +886,11 @@ module loom_core #(
       w_out_mask <= 14'd0; w_out_data <= 14'd0; w_oe_mask <= 8'd0;
       w_oe_data <= 8'd0; w_od_we <= 1'b0; w_od <= 8'd0; w_swirq <= 1'b0;
       w_steps <= 16'd0; w_push <= 1'b0; w_pop <= 1'b0;
+      w_sr_we <= 1'b0; w_cnt_we <= 1'b0; w_crc_we <= 1'b0;
+      w_sr <= 16'd0; w_crc <= 16'd0; w_cnt <= 5'd0;
+      w_becfg_we <= 1'b0; w_bepins_we <= 1'b0; w_bereload_we <= 1'b0;
+      w_crcpoly_we <= 1'b0; w_crcinit_we <= 1'b0;
+      w_lat <= 1'b0; w_lat_pin <= 5'd0; w_lat_val <= 1'b0;
     end else begin
       w_valid       <= vx;
       w_thread      <= tx_th;
@@ -833,6 +931,20 @@ module loom_core #(
       w_steps       <= x_steps1;
       w_push        <= ~bad_op & is_push & x_outq_nf;
       w_pop         <= ~bad_op & is_pop  & x_inq_ne;
+      w_sr_we       <= ~bad_op & (is_shift | is_ldsr | (is_csrw & csr_sr));
+      w_sr          <= is_shift ? be_sr_sh : op_a;
+      w_cnt_we      <= ~bad_op & (is_shift | (is_csrw & csr_cnt));
+      w_cnt         <= is_shift ? be_cnt_n : op_a[4:0];
+      w_crc_we      <= ~bad_op & ((is_shift & be_crcen) | is_crci | (is_csrw & csr_crc));
+      w_crc         <= is_shift ? be_crc_n : (is_crci ? x_init : op_a);
+      w_becfg_we    <= ~bad_op & is_csrw & csr_be_cfg;
+      w_bepins_we   <= ~bad_op & is_csrw & csr_be_pins;
+      w_bereload_we <= ~bad_op & is_csrw & csr_be_reload;
+      w_crcpoly_we  <= ~bad_op & is_csrw & csr_crc_poly;
+      w_crcinit_we  <= ~bad_op & is_csrw & csr_crc_init;
+      w_lat         <= ~bad_op & is_setp & f_lat;
+      w_lat_pin     <= f_pin;
+      w_lat_val     <= f_val;
     end
   end
 
@@ -861,6 +973,17 @@ module loom_core #(
   wire [15:0] g_steps  = steps_all[dsel*16 +: 16];
   wire        g_wa     = wa_all[h_dbg_thread];
   wire        g_tseen  = tick_seen_all[h_dbg_thread];
+  wire [15:0] g_sr     = be_sr_all[dsel*16 +: 16];
+  wire [4:0]  g_cnt    = be_cnt_all[dsel*5 +: 5];
+  wire [15:0] g_crc    = be_crc_all[dsel*16 +: 16];
+  wire [15:0] g_poly   = be_poly_all[dsel*16 +: 16];
+  wire [15:0] g_init   = be_init_all[dsel*16 +: 16];
+  wire [4:0]  g_reload = be_reload_all[dsel*5 +: 5];
+  wire [2:0]  g_becfg  = be_cfg_all[dsel*3 +: 3];
+  wire [9:0]  g_bepins = be_pins_all[dsel*10 +: 10];
+  wire        g_lat_valid = lat_valid_all[h_dbg_thread];
+  wire        g_lat_val   = lat_val_all[h_dbg_thread];
+  wire [4:0]  g_lat_pin   = lat_pin_all[dsel*5 +: 5];
   wire [FAW:0] g_icnt0 = inq_cnt_all[dsel*(FAW+1) +: FAW+1];
   wire [FAW:0] g_ocnt0 = outq_cnt_all[dsel*(FAW+1) +: FAW+1];
   wire [7:0]  g_icnt   = {{(7-FAW){1'b0}}, g_icnt0};
@@ -873,20 +996,32 @@ module loom_core #(
       8'h09:   dbg_rd_other = {13'd0, g_fl};
       8'h0A:   dbg_rd_other = g_td;
       8'h0B:   dbg_rd_other = g_now;
+      8'h0C:   dbg_rd_other = g_sr;
+      8'h0D:   dbg_rd_other = {11'd0, g_cnt};
+      8'h0E:   dbg_rd_other = g_crc;
       8'h0F:   dbg_rd_other = {6'd0, g_rs0};
       8'h10:   dbg_rd_other = g_tint;
       8'h11:   dbg_rd_other = {8'd0, g_tfrac};
       8'h12:   dbg_rd_other = {6'd0, g_outgrp};
       8'h13:   dbg_rd_other = {6'd0, g_ingrp};
+      8'h14:   dbg_rd_other = {6'd0, g_becfg[2], 1'b0, g_becfg[1], 5'd0, g_becfg[0], 1'b0};
+      8'h15:   dbg_rd_other = {6'd0, g_bepins};
+      8'h16:   dbg_rd_other = {11'd0, g_reload};
+      8'h17:   dbg_rd_other = g_poly;
+      8'h18:   dbg_rd_other = g_init;
       8'h19:   dbg_rd_other = g_now;
       8'h1A:   dbg_rd_other = g_td;
       8'h1B:   dbg_rd_other = {13'd0, g_fl};
       8'h1C:   dbg_rd_other = {14'd0, h_dbg_thread};
+      8'h1D:   dbg_rd_other = g_sr;
+      8'h1E:   dbg_rd_other = {11'd0, g_cnt};
+      8'h1F:   dbg_rd_other = g_crc;
       8'h20:   dbg_rd_other = g_steps;
       8'h21:   dbg_rd_other = {4'd0, g_depth, g_rs1};
       8'h22:   dbg_rd_other = {15'd0, g_wa};
       8'h23:   dbg_rd_other = g_dt;
       8'h24:   dbg_rd_other = {15'd0, g_tseen};
+      8'h25:   dbg_rd_other = {9'd0, g_lat_valid, g_lat_val, g_lat_pin};
       8'h26:   dbg_rd_other = {g_icnt, g_ocnt};
       default: dbg_rd_other = 16'd0;
     endcase
@@ -938,12 +1073,70 @@ module loom_core #(
   wire       dw_steps = (h_dbg_reg == 8'h20);
   wire       dw_rs1   = (h_dbg_reg == 8'h21);
   wire       dw_wa    = (h_dbg_reg == 8'h22);
+  wire       dw_lat   = (h_dbg_reg == 8'h25);
+
+  // Bit-engine state: committed by the W stage, written by the host while
+  // the thread is halted (SR 0x0C/0x1D, CNT 0x0D/0x1E, CRC 0x0E/0x1F, the
+  // configuration CSRs through the CSR window 0x14..0x18).
+  loom_be u_be (
+      .clk(clk), .rst_n(rst_n),
+      .cm_sel({4{w_valid}} & woh_be),
+      .cm_sr_we(w_sr_we), .cm_sr(w_sr),
+      .cm_cnt_we(w_cnt_we), .cm_cnt(w_cnt),
+      .cm_crc_we(w_crc_we), .cm_crc(w_crc),
+      .cm_cfg_we(w_becfg_we), .cm_pins_we(w_bepins_we),
+      .cm_reload_we(w_bereload_we), .cm_poly_we(w_crcpoly_we),
+      .cm_init_we(w_crcinit_we), .cm_csr(w_csr_val),
+      .h_sel(dbg_we),
+      .h_sr_we((h_dbg_reg == 8'h0C) | (h_dbg_reg == 8'h1D)),
+      .h_cnt_we((h_dbg_reg == 8'h0D) | (h_dbg_reg == 8'h1E)),
+      .h_crc_we((h_dbg_reg == 8'h0E) | (h_dbg_reg == 8'h1F)),
+      .h_cfg_we(h_dbg_reg == 8'h14),
+      .h_pins_we(h_dbg_reg == 8'h15),
+      .h_reload_we(h_dbg_reg == 8'h16),
+      .h_poly_we(h_dbg_reg == 8'h17),
+      .h_init_we(h_dbg_reg == 8'h18),
+      .h_wdata(h_dbg_wdata),
+      .sr_all(be_sr_all), .cnt_all(be_cnt_all), .crc_all(be_crc_all),
+      .cfg_all(be_cfg_all), .pins_all(be_pins_all), .reload_all(be_reload_all),
+      .poly_all(be_poly_all), .init_all(be_init_all)
+  );
 
   // Per-thread commit strobes of the fields a slot writes only sometimes.
   wire [3:0] cw_rs  = cw_aux & {4{w_rs_we}};
   wire [3:0] cw_og  = cw_aux & {4{w_outgrp_we}};
   wire [3:0] cw_ig  = cw_aux & {4{w_ingrp_we}};
   wire [3:0] cw_hlt = cw_pc  & {4{w_halt}};
+  wire [3:0] cw_lat = {4{w_valid & w_lat}} & woh_lat;
+
+  // ======================================= deadline-latched SETP (6.10)
+  // lat_go[t]: thread t's staged write applies at the coming edge. It was
+  // valid before that edge (so never the write being armed at it) and
+  // CTRL.RESET discards instead of applying.
+  wire [3:0]  lat_go = lat_valid_all & lat_fire & ~h_reset;
+
+  // One pin write per thread (6.3), open drain from OD_MASK as visible now.
+  // The decode depends only on the latch registers; lat_go gates it last.
+  wire [55:0] lat_m14;
+  genvar gl;
+  generate
+    for (gl = 0; gl < 4; gl = gl + 1) begin : g_lat
+      wire [31:0] sel = 32'd1 << lat_pin_all[5*gl +: 5];
+      assign lat_m14[14*gl +: 14] = {sel[21:16], sel[7:0]} & {14{lat_go[gl]}};
+      wire _unused_sel = &{1'b0, sel[31:22], sel[15:8]};
+    end
+  endgenerate
+  wire [13:0] lm0 = lat_m14[13:0],  lm1 = lat_m14[27:14];
+  wire [13:0] lm2 = lat_m14[41:28], lm3 = lat_m14[55:42];
+  wire [13:0] lv0 = lm0 & {14{lat_val_all[0]}}, lv1 = lm1 & {14{lat_val_all[1]}};
+  wire [13:0] lv2 = lm2 & {14{lat_val_all[2]}}, lv3 = lm3 & {14{lat_val_all[3]}};
+  // Two threads on one pin at one edge: the higher thread wins.
+  wire [13:0] lw_m = lm0 | lm1 | lm2 | lm3;
+  wire [13:0] lw_b = lv3 | (~lm3 & (lv2 | (~lm2 & (lv1 | (~lm1 & lv0)))));
+  assign lw_out_mask = lw_m;
+  assign lw_out_data = lw_b & {6'h3F, ~od_mask_reg};
+  assign lw_oe_mask  = lw_m[7:0] & od_mask_reg;
+  assign lw_oe_data  = ~lw_b[7:0];
 
   // Every per-thread register below is written thread by thread with a
   // constant index: the commit of the slot in W (highest priority, the last
@@ -972,6 +1165,9 @@ module loom_core #(
       badop_r    <= 16'd0;
       sflags_r   <= 8'd0;
       swirq_r    <= 4'd0;
+      lat_valid_all <= 4'd0;
+      lat_val_all   <= 4'd0;
+      lat_pin_all   <= 20'd0;
     end else begin
       for (i = 0; i < 4; i = i + 1) begin
         // ---------------------------------------------- host RESET_PC write
@@ -1034,6 +1230,22 @@ module loom_core #(
 
         if (cw_hlt[i])                  halted_r[i] <= 1'b1;
         else if (h_run_we & h_run[i] & ~run_r[i]) halted_r[i] <= 1'b0;
+
+        // ------------------------------------------ deadline latch (6.10)
+        // A SETP D commit stages (replacing, and winning over the clear of
+        // a write applied at the same edge); a debug write of 0x25 sets it
+        // while halted; CTRL.RESET discards; an applied write clears VALID.
+        if (cw_lat[i]) begin
+          lat_valid_all[i]      <= 1'b1;
+          lat_pin_all[i*5 +: 5] <= w_lat_pin;
+          lat_val_all[i]        <= w_lat_val;
+        end else if (dbg_we[i] & dw_lat) begin
+          lat_valid_all[i]      <= h_dbg_wdata[6];
+          lat_pin_all[i*5 +: 5] <= h_dbg_wdata[4:0];
+          lat_val_all[i]        <= h_dbg_wdata[5];
+        end else if (h_reset[i] | lat_go[i]) begin
+          lat_valid_all[i]      <= 1'b0;
+        end
       end
 
       // ------------------------------------------------------------ STEP

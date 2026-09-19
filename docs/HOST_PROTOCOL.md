@@ -34,7 +34,14 @@ read:         byte 3    dummy (turnaround), then DATA words out on MISO, ADDR in
 
 Every word is 16 bits. A transaction may transfer any number of words; the
 address wraps within the space. Writes take effect at the end of each complete
-word (the falling SCK edge of its last bit, as seen in the core clock domain).
+word: if E is the first rising core clock edge at which the first flop of the
+SCK synchroniser samples HOST_SCK high for the word's last bit, every effect
+of the word is registered at edge **E + 4** and visible from the cycle after
+it. This holds for every write in every space, for the pop of a FIFO read word
+and for BADOP bit 14; a DEBUG write of r0..r7 may wait up to three more clocks
+for the register-file write port (the thread is halted, so it cannot tell).
+The falling SCK edge plays no part. (Measured on the RTL for twenty write
+paths, `docs/spec-questions/rtl-m2.md` item 7.)
 
 ## Address spaces
 

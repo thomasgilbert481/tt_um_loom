@@ -20,9 +20,10 @@ from tools.loomisa import load
 ISA = load()
 IMEM_WORDS = 256
 FIFO_DEPTH = 4
-VERSION = 0x0001
-#: What this build reports: FIFOs with depth 4 (log2 = 2).
-EXPECT_CAPS = 0x8000 | 0x08 | 0x02
+VERSION = 0x0002    # M2: FIFOs, host IRQ, manual bit engine, SETP D
+#: What this build reports: FIFOs with depth 4 (log2 = 2), the bit engine in
+#: manual mode and the deadline-latched SETP.
+EXPECT_CAPS = 0x8000 | 0x80 | 0x10 | 0x08 | 0x02
 
 
 @cocotb.test()
@@ -109,8 +110,13 @@ async def test_reset_pc_and_run_halted(dut):
     for t in range(4):
         assert await host.read1(SP_CTRL, CTRL_RESET_PC0 + t) == 0x40 + t
 
+    # 0x22 is where the second RUN resumes: a self-loop, so the thread keeps
+    # running until the host halts it, whatever an earlier test left in IMEM
+    # (instruction memory is not reset, and a stray HALT reached from 0x22
+    # would set HALTED again).
     await host.load_program({0x20: ISA.encode("NOP"),
-                             0x21: ISA.encode("HALT")})
+                             0x21: ISA.encode("HALT"),
+                             0x22: ISA.encode("JMP", abs=0x22)})
     await host.set_reset_pc(1, 0x20)
     await host.reset_thread(1)
     assert await host.read_debug(1, DBG_PC) == 0x20

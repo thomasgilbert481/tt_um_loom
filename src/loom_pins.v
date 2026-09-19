@@ -24,6 +24,10 @@
  *   On a bit written by both the core and the host at the same edge the core
  *   (thread) wins (SEMANTICS 7). Open drain is applied by loom_core before
  *   the write reaches this module.
+ *   The staged-write port (lw_*) carries the deadline-latched pin writes
+ *   that apply at this edge (SEMANTICS 6.10), open drain already applied.
+ *   It sits between the two: an ordinary pin write of a slot in W wins on
+ *   every bit it writes, and a staged write wins over the host.
  */
 
 `default_nettype none
@@ -43,6 +47,12 @@ module loom_pins (
     input  wire [7:0]  cw_oe_data,
     input  wire        cw_od_we,
     input  wire [7:0]  cw_od,
+
+    // Staged (deadline-latched) write port, bit-masked, open drain applied.
+    input  wire [13:0] lw_out_mask,
+    input  wire [13:0] lw_out_data,
+    input  wire [7:0]  lw_oe_mask,
+    input  wire [7:0]  lw_oe_data,
 
     // Host write port (CTRL space).
     input  wire        h_out_we,
@@ -85,12 +95,14 @@ module loom_pins (
       od_mask <= 8'd0;
     end else begin
       for (b = 0; b < 14; b = b + 1) begin
-        if (core_out_m[b])     pin_out[b] <= cw_out_data[b];
-        else if (h_out_mask[b]) pin_out[b] <= h_out[b];
+        if (core_out_m[b])       pin_out[b] <= cw_out_data[b];
+        else if (lw_out_mask[b]) pin_out[b] <= lw_out_data[b];
+        else if (h_out_mask[b])  pin_out[b] <= h_out[b];
       end
       for (b = 0; b < 8; b = b + 1) begin
-        if (core_oe_m[b])      pin_oe[b] <= cw_oe_data[b];
-        else if (h_oe_we)      pin_oe[b] <= h_oe[b];
+        if (core_oe_m[b])        pin_oe[b] <= cw_oe_data[b];
+        else if (lw_oe_mask[b])  pin_oe[b] <= lw_oe_data[b];
+        else if (h_oe_we)        pin_oe[b] <= h_oe[b];
       end
       if (cw_valid && cw_od_we) od_mask <= cw_od;
       else if (h_od_we)         od_mask <= h_od;

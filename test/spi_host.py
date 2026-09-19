@@ -144,11 +144,18 @@ class PadMonitor:
         """First cycle in which the effect of a host word is visible, given
         the cycle in which the SCK level of its last bit first appears.
 
-        Edge c+1: first synchroniser flop; c+2: second; the edge detector
-        fires during cycle c+2 and loom_spi_host raises byte_done at edge
-        c+3; loom_host_ctl registers the pulse at edge c+4; the register it
-        drives loads at edge c+5 (docs/HOST_PROTOCOL.md: a word takes effect
-        at the end of the word).
+        The host write commit rule (docs/spec-questions/rtl-m2.md 7): with E
+        the first clock edge at which the first synchroniser flop samples
+        SCK high for the word's last bit, every effect of the word (a write
+        in any space, the pop of a FIFO read word, BADOP[14]) is registered
+        at edge E + 4. This testbench changes inputs right after a rising
+        edge, so a level first seen in entry c is taken by the first flop at
+        edge E = c + 1 (measured on the RTL). The second flop has it at
+        c + 2, the edge detector fires during cycle c + 2, loom_spi_host
+        raises byte_done at edge c + 3, loom_host_ctl registers the pulse or
+        write strobe at edge c + 4 and the target register loads at edge
+        E + 4 = c + 5, first visible in entry c + 5. (A DEBUG write of
+        r0..r7 can wait up to three more edges for the register-file port.)
         """
         return sck_rise_cycle + 5
 

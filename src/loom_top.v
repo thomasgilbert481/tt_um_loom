@@ -19,7 +19,7 @@ module loom_top #(
     parameter [15:0]  IMEM_WORDS = 16'd256,
     parameter integer FIFO_DEPTH = 4,
     parameter [15:0]  ID_VALUE   = 16'h4C4D,
-    parameter [15:0]  VERSION    = 16'h0001
+    parameter [15:0]  VERSION    = 16'h0002
 ) (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
@@ -51,10 +51,10 @@ module loom_top #(
   // [2:0] log2(FIFO_DEPTH).
   localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 3'd0,
                                  1'b0,    // [8] bit engine auto mode (M3)
-                                 1'b0,    // [7] deadline-latched SETP
+                                 1'b1,    // [7] deadline-latched SETP
                                  1'b0,    // [6] boot ROM
                                  1'b0,    // [5] data memory
-                                 1'b0,    // [4] bit engine, manual mode
+                                 1'b1,    // [4] bit engine, manual mode
                                  1'b1,    // [3] FIFOs
                                  FIFO_LOG2[2:0]};
 
@@ -76,6 +76,8 @@ module loom_top #(
   wire        cw_valid, cw_od_we;
   wire [13:0] cw_out_mask, cw_out_data;
   wire [7:0]  cw_oe_mask, cw_oe_data, cw_od;
+  wire [13:0] lw_out_mask, lw_out_data;
+  wire [7:0]  lw_oe_mask, lw_oe_data;
   wire        h_pout_we, h_poe_we, h_od_we;
   wire [15:0] h_pout;
   wire [7:0]  h_poe, h_od;
@@ -87,6 +89,8 @@ module loom_top #(
       .cw_valid(cw_valid), .cw_out_mask(cw_out_mask), .cw_out_data(cw_out_data),
       .cw_oe_mask(cw_oe_mask), .cw_oe_data(cw_oe_data),
       .cw_od_we(cw_od_we), .cw_od(cw_od),
+      .lw_out_mask(lw_out_mask), .lw_out_data(lw_out_data),
+      .lw_oe_mask(lw_oe_mask), .lw_oe_data(lw_oe_data),
       .h_out_we(h_pout_we), .h_out(h_pout),
       .h_oe_we(h_poe_we), .h_oe(h_poe),
       .h_od_we(h_od_we), .h_od(h_od),
@@ -144,6 +148,8 @@ module loom_top #(
       .cw_valid(cw_valid), .cw_out_mask(cw_out_mask), .cw_out_data(cw_out_data),
       .cw_oe_mask(cw_oe_mask), .cw_oe_data(cw_oe_data),
       .cw_od_we(cw_od_we), .cw_od(cw_od),
+      .lw_out_mask(lw_out_mask), .lw_out_data(lw_out_data),
+      .lw_oe_mask(lw_oe_mask), .lw_oe_data(lw_oe_data),
       .h_run_we(h_run_we), .h_run(h_run), .h_reset(h_reset),
       .h_step_we(h_step_we), .h_step(h_step),
       .h_rpc_we(h_rpc_we), .h_rpc_sel(h_rpc_sel), .h_rpc(h_rpc),

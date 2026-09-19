@@ -26,9 +26,21 @@
  * BADOP[14] is set at the end of the word. 0x0100+t reads the status word.
  *
  * Timing contract:
- *   Every effect of a write word is a one-clock pulse on the corresponding
- *   output, asserted two clocks after the last SCK rising edge of that word,
- *   so it commits at a clock edge like any other register write (SEMANTICS 7).
+ *   Host write commit rule (docs/spec-questions/rtl-m2.md 7). Let E be the
+ *   first rising clock edge at which the first synchroniser flop samples
+ *   HOST_SCK high for the last (16th) bit of a word. The second flop has it
+ *   at E+1, the edge detector fires in cycle E+1, loom_spi_host raises
+ *   byte_done at edge E+2, and this module registers every effect of the
+ *   word at edge E+3: a one-clock pulse on the corresponding output, or a
+ *   one-clock write strobe for the two registers kept here (IRQ_EN,
+ *   IRQ_EN2). Either way the target register loads at edge E+4, so every
+ *   host write commits at edge E+4 and is visible from cycle E+4 on, like any
+ *   other register write (SEMANTICS 7). The pop of a FIFO read word, and
+ *   BADOP[14] for a word whose peek was empty, commit at edge E+4 of that
+ *   word's last bit as well. The one exception is a DEBUG write of r0..r7:
+ *   it needs the register-file write port, which a slot of another thread
+ *   may be using in cycle E+3, so it commits at E+4 or up to three edges
+ *   later (the target thread is halted, so it cannot tell).
  *   A read word is fetched as soon as the address byte completes (and, for
  *   the following words, one full byte time ahead), which is at least 8 SCK
  *   periods of slack for the first word and 2 byte times afterwards.
@@ -166,6 +178,10 @@ module loom_host_ctl #(
   // ------------------------------------------------------------- IRQ logic
   reg [15:0] irq_en;
   reg [3:0]  irq_en2;
+  // IRQ_EN and IRQ_EN2 are written one clock after the word's byte_done, from
+  // the word that is still held in wr_hi/rx_byte, so they commit at the same
+  // edge as every other host write (the pulses below), not one edge earlier.
+  reg        irq_en_wr, irq_en2_wr;
   // fifo_stat per thread: {OUTQ_COUNT, INQ_COUNT, OUTQ_EMPTY, OUTQ_FULL,
   // INQ_EMPTY, INQ_FULL}.
   wire [3:0]  inq_not_full   = ~{fifo_stat[36], fifo_stat[24], fifo_stat[12], fifo_stat[0]};
@@ -251,6 +267,8 @@ module loom_host_ctl #(
       fetch_go       <= 1'b0;
       irq_en         <= 16'd0;
       irq_en2        <= 4'd0;
+      irq_en_wr      <= 1'b0;
+      irq_en2_wr     <= 1'b0;
       h_run_we       <= 1'b0;
       h_run          <= 4'd0;
       h_reset        <= 4'd0;
@@ -303,6 +321,14 @@ module loom_host_ctl #(
       h_od_we        <= 1'b0;
       imem_wr_pulse  <= 1'b0;
       fetch_go       <= 1'b0;
+      irq_en_wr      <= 1'b0;
+      irq_en2_wr     <= 1'b0;
+
+      // The IRQ enables load one clock after their word completed. wr_hi and
+      // rx_byte still hold that word: neither changes before the next byte
+      // (at least 8 SCK periods later), whether or not CS_n has risen.
+      if (irq_en_wr)  irq_en  <= wr_word;
+      if (irq_en2_wr) irq_en2 <= wr_word[3:0];
 
       if (!cs_active) begin
         st       <= S_CMD;
@@ -379,7 +405,7 @@ module loom_host_ctl #(
               8'h09: begin h_rpc_we <= 1'b1; h_rpc_sel <= 2'd1; h_rpc <= wr_word[9:0]; end
               8'h0A: begin h_rpc_we <= 1'b1; h_rpc_sel <= 2'd2; h_rpc <= wr_word[9:0]; end
               8'h0B: begin h_rpc_we <= 1'b1; h_rpc_sel <= 2'd3; h_rpc <= wr_word[9:0]; end
-              8'h10: irq_en <= wr_word;
+              8'h10: irq_en_wr <= 1'b1;
               8'h13: begin h_sfset_we <= 1'b1; h_sfset <= wr_word[7:0]; end
               8'h14: begin h_sfclr_we <= 1'b1; h_sfclr <= wr_word[7:0]; end
               8'h15: begin h_od_we    <= 1'b1; h_od    <= wr_word[7:0]; end
@@ -387,7 +413,7 @@ module loom_host_ctl #(
               8'h17: begin h_poe_we   <= 1'b1; h_poe   <= wr_word[7:0]; end
               8'h1A: begin h_badop_clr_we <= 1'b1; h_badop_clr <= wr_word; end
               8'h1B: begin h_swirq_clr_we <= 1'b1; h_swirq_clr <= wr_word[3:0]; end
-              8'h1C: irq_en2 <= wr_word[3:0];
+              8'h1C: irq_en2_wr <= 1'b1;
               default: ;
             endcase
           end

@@ -183,15 +183,24 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       ISA 0.4.0 edits it needs (SETP `D` field, SHO/SHI set Z, canonical CRC
       presets) land together with the M2 RTL. Auto mode, NRZI, Manchester and
       stuffing are specified before M3.
-- [ ] `loom_spi_host` + `loom_host_ctl`: full `docs/HOST_PROTOCOL.md` including
+- [x] `loom_spi_host` + `loom_host_ctl`: full `docs/HOST_PROTOCOL.md` including
       the debug space, single-step, IRQ. 2026-09-18: FIFO space and IRQ
-      built; `test_irq` 3 of 5 pass, the two failures are a one-clock
-      disagreement about when a host write commits (held out of the default
-      list, see `docs/spec-questions/rtl-m2.md`).
+      built. Every host write now commits at edge E+4 after the word's last
+      SCK rise is sampled (measured on twenty paths; IRQ_EN/IRQ_EN2 were one
+      edge early and are fixed); rule written into HOST_PROTOCOL; `test_irq`
+      5 of 5.
 - [x] 2026-09-18: `loom_fifo` x 8, `PUSH`/`POP`, `WAITB`, host FIFO space
       (peek at load, pop at word end), BADOP[14], CTRL.RESET emptying: 8 cocotb
       tests. Generic netlist +2,274 cells, +619 flops.
-- [ ] Bit engine manual mode: `SHO`/`SHI`, SR/CNT, CRC with presets, NRZ only.
+- [x] 2026-09-18: bit engine manual mode (`loom_be.v`): `SHO`/`SHI`, SR/CNT
+      with Z, left-aligned serial CRC matching the catalogue check values for
+      the USB CRC5/CRC16, CAN CRC15 and SMBus CRC-8 presets, NRZ only.
+- [x] 2026-09-18: deadline-latched `SETP ... D` (SEMANTICS 6.10, D-016): at a
+      433.5-clock tick every edge lands exactly on a tick edge (gaps 433 and
+      434 only), where plain `SETP` stays on the 4-clock slot grid; 8 tests.
+      CAPS reports FIFO, bit engine and SETP D; VERSION 0x0002. 73 cocotb
+      tests. Co-simulation still avoids the M2 instructions until the golden
+      model's M2 branch is merged.
 - [x] 2026-09-18: `tools/loomhost`: protocol encoder, `Loom` API, transports
       (`ModelTransport` over the golden model as an executable reference of
       the host protocol, `PicoTransport`, `TTBoardTransport` using the RP2040's

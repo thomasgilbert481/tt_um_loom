@@ -1,8 +1,9 @@
-# Loom module interfaces (M1)
+# Loom module interfaces (M2)
 
 Every port of every hand-written module in `src/`, what it means, and the
-cycle in which it is valid. Written by the RTL implementer as part of M1
-(`docs/ARCHITECTURE.md` section 14 requires this file to match the RTL).
+cycle in which it is valid. Written by the RTL implementer as part of M1 and
+updated with the M2 RTL (`docs/ARCHITECTURE.md` section 14 requires this file
+to match the RTL).
 
 Cycle names follow `docs/SEMANTICS.md` section 2: a slot of thread `t` starts
 in cycle `k` with `k mod 4 == t` and has stages F (cycle k), D (k+1),
@@ -38,8 +39,10 @@ record is instantiated but unconnected here and collected in `_unused`.
 
 Instantiates everything; all parameters live here.
 
-Parameters: `IMEM_WORDS` (16 bits, default 256), `ID_VALUE` (0x4C4D),
-`VERSION` (0x0001). Derived: `IMEM_AW = $clog2(IMEM_WORDS)`, `CAPS_VAL`.
+Parameters: `IMEM_WORDS` (16 bits, default 256), `FIFO_DEPTH` (a power of
+two from 2 to 8, default 4), `ID_VALUE` (0x4C4D), `VERSION` (0x0001).
+Derived: `IMEM_AW = $clog2(IMEM_WORDS)`, `CAPS_VAL` (SEMANTICS 5: FIFOs with
+`log2(FIFO_DEPTH)` in bits 2:0, and one bit per M2 feature as it is built).
 
 Ports: the eight Tiny Tapeout pad signals above (minus `ena`), plus the
 retire record.
@@ -85,7 +88,7 @@ the protocol requires SCK period >= 8 core clocks.
 | `cs_n_pad`, `sck_pad`, `mosi_pad` | in | raw pads, synchronised inside |
 | `miso` | out | `tx_shift[7]` while CS is active, 0 when CS_n is high. Changes only on a detected falling SCK edge |
 | `cs_active` | out | synchronised CS_n low |
-| `byte_done` | out | one-clock pulse, two clocks after the eighth rising SCK edge of a byte |
+| `byte_done` | out | one-clock pulse registered at edge E+2, where E is the edge at which the first synchroniser flop takes SCK high for the byte's eighth bit |
 | `rx_byte[7:0]` | out | the received byte, valid with `byte_done` and held until the next one |
 | `tx_byte[7:0]` | in | byte to send next; must be stable from one clock after `byte_done` until the following falling SCK edge |
 
@@ -93,12 +96,18 @@ the protocol requires SCK period >= 8 core clocks.
 
 ## loom_host_ctl
 
-Command layer: CMD, 16-bit ADDR, 16-bit words, auto-increment, one dummy byte
-on reads. Parameters `IMEM_AW`, `ID_VALUE`, `VERSION`, `CAPS`.
+Command layer: CMD, 16-bit ADDR, 16-bit words, auto-increment (except in the
+FIFO space), one dummy byte on reads. Parameters `IMEM_AW`, `ID_VALUE`,
+`VERSION`, `CAPS`.
 
-Every control output is a **one-clock pulse** asserted in the cycle after the
-`byte_done` of the word that caused it, so it commits at a clock edge like any
-other register write.
+**Host write commit rule** (`docs/spec-questions/rtl-m2.md` 7). Let E be the
+first edge at which the first synchroniser flop takes SCK high for the last
+bit of a word. `byte_done` arrives at E+2 and every effect of the word is
+registered here at E+3: a one-clock pulse on the outputs below, or a write
+strobe for IRQ_EN and IRQ_EN2, which live in this module. So the target
+register loads at edge E+4 and the effect is visible from cycle E+4. The same
+edge applies to the pop of a FIFO read word and to BADOP[14]. A DEBUG write
+of r0..r7 may wait up to three more edges for the register-file write port.
 
 | Port | Dir | Meaning / validity |
 |---|---|---|
@@ -117,6 +126,11 @@ other register write.
 | `h_badop_clr_we`, `h_badop_clr[15:0]` | out | pulse: write 1 clears BADOP bits |
 | `h_badop_set15` | out | pulse: a refused IMEM access (read or write) |
 | `h_swirq_clr_we`, `h_swirq_clr[3:0]` | out | pulse: clear SWIRQ bits |
+| `h_inq_push[3:0]`, `h_fifo_wdata[15:0]` | out | pulse: push the word into INQ[t]; loom_core drops it and sets BADOP[14] if INQ[t] is full in that cycle |
+| `h_outq_pop[3:0]` | out | pulse: pop OUTQ[t], at the end of a read word whose peek found an entry |
+| `h_badop_set14` | out | pulse: a read word of the FIFO space found OUTQ empty when it was loaded |
+| `fifo_stat[47:0]` | in | per thread, 12 bits each: `{OUTQ_COUNT[3:0], INQ_COUNT[3:0], OUTQ_EMPTY, OUTQ_FULL, INQ_EMPTY, INQ_FULL}` |
+| `outq_head[63:0]`, `outq_next[63:0]` | in | per thread: the OUTQ head entry and the entry after it (for a word loaded at the edge where the previous word is popped) |
 | `h_dbg_req`, `h_dbg_wr` | out | level: debug request, held until `h_dbg_ack` |
 | `h_dbg_thread[1:0]`, `h_dbg_reg[7:0]`, `h_dbg_wdata[15:0]` | out | valid while `h_dbg_req` |
 | `h_dbg_ack` | in | one-clock pulse; on a read `h_dbg_rdata` is valid in the same cycle |
@@ -124,24 +138,31 @@ other register write.
 | `run`, `halted`, `badop`, `sflags`, `swirq`, `resetpc_all` | in | status, read back through CTRL |
 | `core_busy` | in | high while RUN, STEP_REQ or any valid slot is in flight; IMEM access is refused unless it is low |
 | `pin_out_reg`, `pin_oe_reg`, `od_mask_reg`, `pin_in_reg` | in | pin registers for CTRL reads |
-| `irq` | out | combinational: `\|(IRQ_STAT & IRQ_EN) \| \|SWIRQ`, drives uo_out[6] |
+| `irq` | out | HOST_IRQ (`uo_out[6]`), a register loaded at every edge with `\|(IRQ_STAT & IRQ_EN) \| \|(IRQ_STAT2 & IRQ_EN2) \| \|SWIRQ` from the values visible in the cycle before (SEMANTICS 6.8) |
 
-### Address map as built at M1
+### Address map as built
 
 SPACE 0 (CTRL): 0x00 ID (R), 0x01 VERSION (R), 0x02 RUN (RW), 0x03 HALTED (R),
 0x04 RESET (W), 0x08..0x0B RESET_PC[0..3] (RW), 0x10 IRQ_EN (RW),
-0x11 IRQ_STAT (R) = `{SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}`
-(the two FIFO fields read 0 until M2), 0x12 IRQ_STAT2 (R) = `{12'b0, HALTED}`,
-0x13 SFLAGS (RW, a write sets bits), 0x14 SFLAGS_CLR (W), 0x15 OD_MASK (RW),
-0x16 PIN_OUT (RW), 0x17 PIN_OE (RW), 0x18 PIN_IN (R), 0x19 CAPS (R),
-0x1A BADOP (RW, write 1 to clear), **0x1B SWIRQ (R, write 1 to clear)**.
+0x11 IRQ_STAT (R) = `{SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}`,
+0x12 IRQ_STAT2 (R) = `{12'b0, HALTED}`, 0x13 SFLAGS (RW, a write sets bits),
+0x14 SFLAGS_CLR (W), 0x15 OD_MASK (RW), 0x16 PIN_OUT (RW), 0x17 PIN_OE (RW),
+0x18 PIN_IN (R), 0x19 CAPS (R), 0x1A BADOP (RW, write 1 to clear; bits 3:0
+per thread, 14 host FIFO error, 15 host access error), 0x1B SWIRQ (R, write 1
+to clear), 0x1C IRQ_EN2 (RW, bits 3:0; bits 15:4 read 0).
 
-`CAPS` = `{log2(IMEM_WORDS)[3:0], 5'b0, BOOTROM, DMEM, BIT_ENGINE, FIFO,
-FIFO_DEPTH_LOG2[2:0]}`. The M1 256-word build reads `0x8000`.
+`CAPS` = `{log2(IMEM_WORDS)[3:0], 3'b0, BE_AUTO, SETP_D, BOOTROM, DMEM,
+BIT_ENGINE, FIFO, FIFO_DEPTH_LOG2[2:0]}` (SEMANTICS 5); a feature bit is set
+once the feature is built.
 
 SPACE 1 (IMEM): address 0..IMEM_WORDS-1. Reads and writes are accepted only
 while `core_busy` is low; otherwise the write is dropped, the read returns 0
 and BADOP[15] is set.
+
+SPACE 3 (FIFO): 0x0000+t, a write pushes INQ[t] and a read pops OUTQ[t]
+(peek when the word is loaded, pop at the end of the word, SEMANTICS 6.7);
+0x0100+t reads the status word `{4'b0, fifo_stat[t]}`. The address never
+increments in this space; other addresses read 0 and ignore writes.
 
 SPACE 4 (DEBUG): ADDR = `{thread[9:8], reg[7:0]}`.
 
@@ -152,19 +173,22 @@ SPACE 4 (DEBUG): ADDR = `{thread[9:8], reg[7:0]}`.
 | 0x09 | FLAGS `{T,C,Z}` in bits 2:0 | RW |
 | 0x0A | TD | RW |
 | 0x0B | NOW | R |
-| 0x0C..0x0E | SR, CNT, CRC | read 0, writes ignored (M2) |
+| 0x0C..0x0E | SR, CNT, CRC (the same registers as CSR 0x0D..0x0F at 0x1D..0x1F) | RW |
 | 0x0F | RS0 | RW |
-| 0x10..0x1F | CSR 0x00..0x0F of that thread | RW where the CSR is built |
+| 0x10..0x1F | CSR 0x00..0x0F of that thread, the bit-engine CSRs included (BE_CFG keeps bits 1, 7, 9) | RW where the CSR is writable |
 | 0x20 | STEPS | RW |
 | **0x21** | `{4'b0, DEPTH[1:0], RS1[9:0]}` | RW |
 | **0x22** | WAIT_ACTIVE in bit 0 | RW |
 | **0x23** | DT | RW |
+| 0x24 | TICK_SEEN in bit 0 | RW |
+| 0x26 | `{INQ_CNT, OUTQ_CNT}` as `{byte, byte}` | R |
 
 The three addresses in bold are the ones `docs/HOST_PROTOCOL.md` leaves to the
-implementation; 0x21 follows the note in that document.
+implementation; 0x21 follows the note in that document. Debug writes other
+than r0..r7 take effect only while the thread is not running.
 
 SPACE 5 (STEP): a write to ADDR = t sets STEP_REQ[t] (ignored if RUN[t]).
-SPACES 2 and 3 (DMEM, FIFO) read 0 and ignore writes at M1.
+SPACE 2 (DMEM) reads 0 and ignores writes.
 
 ---
 
@@ -187,7 +211,7 @@ ports and this one-cycle read latency.
 
 ## loom_core
 
-The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`.
+The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`, `FIFO_DEPTH`.
 
 | Port | Dir | Meaning / validity |
 |---|---|---|
@@ -201,6 +225,8 @@ The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`.
 | `cw_oe_mask[7:0]`, `cw_oe_data[7:0]` | out | bit-masked write to PIN_OE, valid during W |
 | `cw_od_we`, `cw_od[7:0]` | out | write to OD_MASK, valid during W |
 | `h_*` (run control, debug) | in | see loom_host_ctl; every pulse takes effect at the next edge |
+| `h_inq_push[3:0]`, `h_fifo_wdata[15:0]`, `h_outq_pop[3:0]`, `h_badop_set14` | in | the host FIFO port of loom_host_ctl; each pulse takes effect at the next edge. A push into a full INQ is dropped and sets BADOP[14] |
+| `fifo_stat[47:0]`, `outq_head[63:0]`, `outq_next[63:0]` | out | FIFO status words and OUTQ entries for the host, register values valid every cycle |
 | `h_dbg_ack` | out | one-clock pulse; `h_dbg_rdata` is valid in the same cycle. A read or write of r0..r7 waits for a bubble slot, which arrives within 4 cycles |
 | `h_dbg_rdata[15:0]` | out | debug read data, valid with `h_dbg_ack` |
 | `run[3:0]`, `halted[3:0]`, `badop[15:0]`, `sflags[7:0]`, `swirq[3:0]` | out | register values, valid every cycle |
@@ -211,7 +237,15 @@ The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`.
 Internals worth knowing: `ph` is the free-running 2-bit phase counter; the D
 stage decodes only far enough to address the register file, and a second
 `loom_decode` instance in X produces every strobe the execute logic uses. The
-wait-condition mux has a spare input reserved for `WAITB` at M2.
+W stage never decodes a thread number (D-019): each consumer group of
+per-thread state (PC and flags; the other per-thread core state; the register
+file; the timers; the FIFOs; the bit engine) has its own self-rotating one-hot
+ring, reset to `4'b0010`, qualified by `w_valid`. PUSH and POP decide in X and
+stall like waits; WAITB tests bit engine idle (0, always true in manual mode),
+OUTQ not full (1), INQ not empty (2) and TICK_SEEN (3). SHO, SHI, LDSR, CRCI
+and CSRW compute the new SR, CNT and CRC in X, and the W stage commits them
+into loom_be; SHO's pin write goes through the same single-pin path as SETP,
+so the open-drain rule and the writable-index check are shared.
 
 ---
 
@@ -223,7 +257,7 @@ wait-condition mux has a spare input reserved for `WAITB` at M2.
 |---|---|---|
 | `ra_thread[1:0]`, `ra_addr[2:0]`, `rd_a[15:0]` | in/out | read port A, combinational within the cycle. Driven from D, and borrowed by the host for debug reads of r0..r7 in cycles where the D stage is a bubble |
 | `rb_thread[1:0]`, `rb_addr[2:0]`, `rd_b[15:0]` | in/out | read port B, combinational |
-| `we`, `w_thread[1:0]`, `w_addr[2:0]`, `wdata[15:0]` | in | write port, takes effect at the next edge. Driven from W, and borrowed by the host for debug writes when no slot in W writes a register |
+| `we_oh[3:0]`, `w_addr[2:0]`, `wdata[15:0]` | in | write port, takes effect at the next edge; `we_oh` is one-hot (or zero) over threads, from loom_core's W-stage ring (D-019). Driven from W, and borrowed by the host for debug writes when no slot in W writes a register |
 
 Synchronous reset clears all 32 registers to 0, as SEMANTICS section 5
 requires. A read in the same cycle as a write returns the old value.
@@ -254,16 +288,53 @@ flattened: thread `t` occupies `[16t+15:16t]` of the 16-bit vectors and
 
 | Port | Dir | Meaning / validity |
 |---|---|---|
-| `cm_valid`, `cm_thread[1:0]` | in | a valid slot of that thread commits at this edge; clears TICK_SEEN |
+| `cm_sel[3:0]` | in | one-hot: a valid slot of thread t commits at this edge (from loom_core's ring, D-019); clears TICK_SEEN |
 | `cm_td_we`/`cm_td`, `cm_dt_we`/`cm_dt` | in | TD and DT writes from the W stage |
 | `cm_tint_we`/`cm_tint`, `cm_tfrac_we`/`cm_tfrac` | in | TICK_INT and TICK_FRAC writes; either also clears ACC and suppresses the tick at that edge |
 | `h_reset[3:0]` | in | CTRL RESET: `TD <= NOW` for that thread |
-| `h_we`, `h_thread[1:0]`, `h_td_we`, `h_dt_we`, `h_tint_we`, `h_tfrac_we`, `h_wdata[15:0]` | in | host debug writes; a TICK_INT/TICK_FRAC write clears ACC exactly as CSRW does |
+| `h_we`, `h_thread[1:0]`, `h_td_we`, `h_dt_we`, `h_tint_we`, `h_tfrac_we`, `h_tseen_we`, `h_wdata[15:0]` | in | host debug writes; a TICK_INT/TICK_FRAC write clears ACC exactly as CSRW does; `h_tseen_we` writes TICK_SEEN (debug 0x24) |
 | `now_all[63:0]`, `td_all[63:0]`, `dt_all[63:0]` | out | NOW, TD, DT per thread |
 | `tick_int_all[63:0]`, `tick_frac_all[31:0]` | out | the period CSRs as written (0 is stored, and treated as 1 by the divider) |
 | `tick_seen_all[3:0]` | out | sticky tick flag, cleared at each valid slot commit. Only WAITB (M2) reads it |
 
 Core writes win over host writes on the same register in the same cycle.
+
+---
+
+## loom_fifo
+
+One 16-bit FIFO of `DEPTH` entries (a power of two, at least 2; `AW =
+log2(DEPTH)`). loom_core has eight: INQ[t] (host pushes, thread pops) and
+OUTQ[t] (thread pushes, host pops).
+
+| Port | Dir | Meaning / validity |
+|---|---|---|
+| `clr` | in | CTRL.RESET of the owning thread: empties the FIFO at this edge, wins over push and pop |
+| `push`, `wdata[15:0]` | in | append `wdata` at this edge; the caller never pushes into a full FIFO |
+| `pop` | in | remove the head at this edge; the caller never pops an empty FIFO |
+| `count[AW:0]` | out | occupancy, a register; push and pop in the same cycle give `count + push - pop` |
+| `head[15:0]`, `next[15:0]` | out | the oldest entry (valid when count > 0) and the one after it (count > 1) |
+
+Entries are not reset (SEMANTICS 5); the count and pointers are.
+
+---
+
+## loom_be
+
+The per-thread bit-engine state, manual mode (SEMANTICS 6.9): SR (16), CNT
+(5), CRC (16), BE_CFG (only DIR bit 1, INV bit 7, CRC_EN bit 9 are stored;
+the other bits read 0 and ignore writes), BE_PINS (10), BE_RELOAD (5),
+CRC_POLY (16), CRC_INIT (16), all reset to 0. No arithmetic: loom_core's X
+stage computes the shifts and the CRC step, this module stores what the W
+stage commits.
+
+| Port | Dir | Meaning / validity |
+|---|---|---|
+| `cm_sel[3:0]` | in | one-hot: a valid slot of thread t commits at this edge (from loom_core's ring) |
+| `cm_sr_we`/`cm_sr`, `cm_cnt_we`/`cm_cnt`, `cm_crc_we`/`cm_crc` | in | SR, CNT, CRC written by SHO, SHI, LDSR, CRCI or CSRW |
+| `cm_cfg_we`, `cm_pins_we`, `cm_reload_we`, `cm_poly_we`, `cm_init_we`, `cm_csr[15:0]` | in | CSRW of a configuration CSR, with its 16-bit value |
+| `h_sel[3:0]`, `h_*_we`, `h_wdata[15:0]` | in | host debug writes (one-hot thread, only while it is not running); the commit wins if both ever hit one register |
+| `sr_all`, `cnt_all`, `crc_all`, `cfg_all`, `pins_all`, `reload_all`, `poly_all`, `init_all` | out | register values per thread (`cfg_all` is `{CRC_EN, INV, DIR}` per thread), what an instruction in X or a debug read sees |
 
 ---
 

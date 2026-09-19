@@ -21,6 +21,7 @@ PROJECT_SOURCES += loom_alu.v
 PROJECT_SOURCES += loom_timer.v
 PROJECT_SOURCES += loom_pins.v
 PROJECT_SOURCES += loom_fifo.v
+PROJECT_SOURCES += loom_be.v
 
 ifneq ($(GATES),yes)
 
@@ -60,9 +61,7 @@ export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 # proves the netlist end to end (host port, timing, UART). Run the full set at
 # gate level by hand with: make GATES=yes COCOTB_TEST_MODULES=<list>
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_cosim
-# test_irq is held out of the default list until its host-write timing question
-# (docs/spec-questions/rtl-m2.md) is settled; run it with COCOTB_TEST_MODULES=test_irq.
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim
 else
 COCOTB_TEST_MODULES ?= test_host,test_timing,test_uart
 endif

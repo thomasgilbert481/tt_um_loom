@@ -22,6 +22,17 @@
  *   thread number is decoded here.
  *   Writes arriving from the core (W stage) win over host writes on the same
  *   register in the same cycle (SEMANTICS 7).
+ *   Deadline latch (SEMANTICS 6.10): `lat_fire[t]` is high during the cycle
+ *   before an edge e at which thread t's staged pin write must be applied,
+ *   if one is staged (loom_core owns the latch and qualifies it):
+ *     rule 1: NOW ticks at e to exactly TD, and TD is not written at e;
+ *     rule 2: TD is written at e (commit port, or a host debug write) and
+ *             reached(NOW', TD') holds for the values after e.
+ *   Both use one subtraction, D = NOW - TD', where TD' is the value TD takes
+ *   at e: rule 1 is NOW + 1 == TD, i.e. D == 16'hFFFF with TD unchanged, and
+ *   NOW' - TD' = D + tick, whose bit 15 is D[15] ^ (tick & D[14:0] == 7FFF).
+ *   CTRL.RESET also writes TD (TD := NOW) but is not a rule-2 write: it
+ *   discards the staged write instead (loom_core).
  *
  * All per-thread outputs are flattened: thread t occupies bits
  * [16*t +: 16] of the 16-bit vectors and [8*t +: 8] of the 8-bit ones.
@@ -55,6 +66,7 @@ module loom_timer (
     input  wire        h_tseen_we,    // debug write of TICK_SEEN (0x24)
     input  wire [15:0] h_wdata,
 
+    output wire [3:0]  lat_fire,      // 6.10 rule 1 or 2 holds at the coming edge
     output wire [63:0] now_all,
     output wire [63:0] td_all,
     output wire [63:0] dt_all,
@@ -86,6 +98,19 @@ module loom_timer (
       wire        acc_clr  = (mine && (cm_tint_we || cm_tfrac_we))
                              || (h_mine && (h_tint_we || h_tfrac_we));
       wire        tick     = over && !acc_clr;
+
+      // ------------------------------------------ deadline latch (6.10)
+      // TD written at this edge in the sense of rule 2: a commit (WAITD
+      // first issue, SETD, CSRW TD) or a host debug write. CTRL.RESET is
+      // left out on purpose (it discards the staged write).
+      wire        td_w     = (mine && cm_td_we) || (h_mine && h_td_we);
+      wire [15:0] td_new   = (mine && cm_td_we) ? cm_td
+                           : (h_mine && h_td_we) ? h_wdata : td;
+      wire [15:0] lat_d    = now - td_new;
+      wire        lat_all1 = &lat_d[14:0];
+      wire        rule1    = tick && !td_w && !h_reset[t] && lat_d[15] && lat_all1;
+      wire        rule2    = td_w && !(lat_d[15] ^ (tick && lat_all1));
+      assign lat_fire[t] = rule1 || rule2;
 
       always @(posedge clk) begin
         if (!rst_n) begin

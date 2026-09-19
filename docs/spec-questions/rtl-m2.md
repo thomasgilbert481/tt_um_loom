@@ -100,3 +100,69 @@ CTRL 0x1C IRQ_EN2: "mask over IRQ_STAT2", which has 4 meaningful bits.
 writes.
 
 **Resolution (director, 2026-09-18):** accepted; HOST_PROTOCOL CTRL 0x1C says 4 bits.
+
+## 7. The edge at which a host write commits
+
+`docs/HOST_PROTOCOL.md`, transaction format: "Writes take effect at the end
+of each complete word (the falling SCK edge of its last bit, as seen in the
+core clock domain)." SEMANTICS 6.7 and 6.8 and the IRQ tests need the exact
+edge.
+
+**What the RTL does (measured, not inferred).** Let E be the first rising
+clock edge at which the first synchroniser flop samples HOST_SCK high for
+the last (16th) bit of a word. The second flop has it at E+1, the edge
+detector fires in cycle E+1, `loom_spi_host` raises `byte_done` at E+2,
+`loom_host_ctl` registers a one-clock pulse at E+3, and the target register
+loads at **edge E+4**; the effect is visible from cycle E+4 on. A scratch
+probe that samples the pads and the target registers every cycle shows
+E+4 for all twenty paths it tried: IRQ_EN, IRQ_EN2, SFLAGS, SFLAGS_CLR,
+RESET_PC, PIN_OUT and PIN_OE (on the pads), OD_MASK, RUN, RESET (PC), STEP,
+BADOP clear, SWIRQ clear, an IMEM write, DEBUG writes of TD and of r0, an
+INQ push, OUTQ pops (the count, for two successive read words) and BADOP[14]
+from a pop of an empty OUTQ. The falling SCK edge plays no part: with the
+protocol's minimum SCK (8 clocks, high for 4) E+4 happens to be the edge at
+which the first flop samples SCK low again, which is probably where the
+sentence comes from, but with any slower SCK the write commits long before
+the falling edge.
+
+One path did not follow the rule and was fixed: IRQ_EN and IRQ_EN2, which
+`loom_host_ctl` keeps itself, were loaded straight from `byte_done` and
+committed at E+3, one edge before everything else. That is why
+`test/test_irq.py` saw HOST_IRQ move one clock early after an IRQ_EN write
+(and only then: SFLAGS, SWIRQ and FIFO causes were already right). They now
+load through a one-clock write strobe like the others, at E+4, and HOST_IRQ
+changes at E+5, one edge after the cause is visible (6.8).
+
+The one exception to E+4 is a DEBUG write of r0..r7: it needs the register
+file's write port, which a slot of another thread may use in cycle E+3, so
+it commits at E+4 or up to three edges later (the target thread's own W
+slots are bubbles, so the wait never exceeds three). The thread is halted,
+so it cannot observe the difference, and the host cannot issue another
+access within 100 clocks.
+
+**Reading taken:** keep the RTL (the word is complete at its last rising
+SCK edge in mode 0; committing on the falling edge would hold every write
+path pending for another edge detection and change the timing of every
+host action for no gain). `test/spi_host.py` `PadMonitor.host_commit()`
+computes E+4 in monitor entries (a pad level first seen in entry c is taken
+by the first flop at E = c + 1 in this testbench, so the commit is entry
+c + 5), and `test/test_irq.py` checks HOST_IRQ against it.
+
+**Proposed replacement sentence for HOST_PROTOCOL** (transaction format):
+"Writes take effect at the end of each complete word: if E is the first
+rising core clock edge at which HOST_SCK is sampled high for the word's last
+bit (by the first flop of the synchroniser), every effect of the word is
+registered at edge E + 4 and visible from the cycle after it. This holds for
+every write in every space, for the pop of a FIFO read word and for BADOP
+bit 14; a DEBUG write of r0..r7 may wait up to three more clocks for the
+register-file write port. The falling SCK edge plays no part."
+
+**What another reading would change:** committing at the falling SCK edge
+as seen in the core (the literal text) would tie every host effect to the
+edge at which the core sees SCK fall after the last bit. That depends on the
+host's SCK duty cycle: with the minimum 8-clock SCK it is about the edge the
+RTL uses now, with a slower SCK it is later. Nothing in the M2 features
+needs that, and co-simulation takes the commit cycles from the RTL either
+way (SEMANTICS 10).
+
+**Resolution (director, 2026-09-18):** accepted. The proposed sentence is in HOST_PROTOCOL (transaction format), lightly edited.

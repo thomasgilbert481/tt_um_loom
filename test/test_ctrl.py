@@ -204,11 +204,17 @@ async def test_csr_read_write(dut):
     assert await host.read_reg(0, 5) == 0x1B, "CSRW SFLAGS must OR"
     assert await host.read1(SP_CTRL, CTRL_SFLAGS) == 0x1B
     await host.write(SP_CTRL, CTRL_SFLAGS_CLR, 0xFF)
-    # An unimplemented CSR reads 0 and its write is ignored (SEMANTICS 6.6).
-    await run_snippet(host, [asm("CSRW", csr=0x0D, ra=1),
-                             asm("CSRR", rd=2, csr=0x0D)],
-                      regs={1: 0xFFFF, 2: 0xFFFF})
-    assert await host.read_reg(0, 2) == 0
+    # An unimplemented CSR (no entry in isa.yaml) reads 0 and its write is
+    # ignored (SEMANTICS 6.6); so does a CSR of a feature this build lacks,
+    # such as SR (0x0D) when CAPS shows no bit engine.
+    unimplemented = [0x1F]
+    if not (await host.caps()) & CAPS_BE:
+        unimplemented.append(0x0D)
+    for csr in unimplemented:
+        await run_snippet(host, [asm("CSRW", csr=csr, ra=1),
+                                 asm("CSRR", rd=2, csr=csr)],
+                          regs={1: 0xFFFF, 2: 0xFFFF})
+        assert await host.read_reg(0, 2) == 0, f"CSR {csr:#04x}"
 
 
 @cocotb.test()

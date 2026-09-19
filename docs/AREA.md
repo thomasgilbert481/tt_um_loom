@@ -13,3 +13,15 @@ Reading of the M1 row: the design fits and is tape-out clean at the sign-off cor
 | Date | Milestone | Config | Cells | Flops | Util | Timing | Notes |
 |---|---|---|---|---|---|---|---|
 | 2026-09-18 | M0.5 SRAM smoke | branch sram-smoke 565673f, run 35377845679, 2x2, 512x16 macro FS at (12, 40) | 494 stdcells + 1 macro | (tester only) | 41.5% | setup +11.07 slow / +11.32 typ / +11.46 fast; hold +0.124 worst | macro 45,309 um2 of 126,685 um2 core; stdcells 7,203 um2; hardening about 5 min; precheck 9/9 incl. KLayout SG13CMOS5L DRC 0 violations; gl_test 5/5; recipe in facts section 11 |
+
+### M2 RTL, Yosys generic synthesis (not hardened), 2026-09-18
+
+| Step | Flat cells | Flops | Longest path (ltp, generic cells) | Notes |
+|---|---|---|---|---|
+| M1 baseline | 27,560 | 6,039 | 48 | timer compare path |
+| D-019 one-hot W rings | 26,966 | 6,076 | 48 | core 7,807 -> 6,512 cells; thread-select cone depth 22 -> 5, fanout 308 -> 33 |
+| + FIFOs | 29,240 | 6,695 | 48 | +2,274 cells, +619 flops |
+| + IRQ fix | 29,323 | 6,702 | 49 | |
+| + bit engine (manual) | 31,917 | 7,099 | 48 | loom_be 792 cells |
+| + deadline-latched SETP, VERSION 2 | 33,425 | 7,138 | 63 | watch: the latch-fire compare (NOW against the next TD) is a new deep path; imem is still 13,905 of the cells until the macro replaces it |
+
