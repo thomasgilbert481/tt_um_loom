@@ -502,6 +502,7 @@ tt_um_loom.v            TT wrapper: pad mapping, host pin split, unused-signal h
     loom_spi_host.v     SPI slave bit layer -> byte stream with CS framing
     loom_host_ctl.v     command FSM, address spaces, control regs, IRQ, debug mux
     loom_imem.v         parameterised memory wrapper (MACRO | FLOPS | SMALL)
+      loom_imem_macro.v the 512x16 SRAM macro behind one port (MACRO, D-020)
     loom_core.v         barrel pipeline: scheduler, fetch, decode, X, W
       loom_regfile.v    4 x 8 x 16, 2 read ports, 1 write port (thread-indexed)
       loom_alu.v        16-bit ALU + shifter + REV/PAR/SWAP

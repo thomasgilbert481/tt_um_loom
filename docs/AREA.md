@@ -24,4 +24,5 @@ Reading of the M1 row: the design fits and is tape-out clean at the sign-off cor
 | + IRQ fix | 29,323 | 6,702 | 49 | |
 | + bit engine (manual) | 31,917 | 7,099 | 48 | loom_be 792 cells |
 | + deadline-latched SETP, VERSION 2 | 33,425 | 7,138 | 63 | watch: the latch-fire compare (NOW against the next TD) is a new deep path; imem is still 13,905 of the cells until the macro replaces it |
+| + SRAM macro instruction memory, 512 words (D-020, branch macro-core) | 19,456 (19,455 + the macro) | 3,027 | 61 | the macro as a blackbox (read like LibreLane reads the MACROS `nl` view): -13,969 cells, -4,111 flops against the line above (4,096 array bits and 16 read-data flops go; the 9th host write-address bit adds one); `loom_imem_macro` is 11 generic cells (address mux, `~we`, the macro); flattened instance `u_loom.u_imem.g_macro.u_macro.sram` |
 
