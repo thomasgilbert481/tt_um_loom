@@ -1,0 +1,55 @@
+name: formal
+
+# The L4 proofs (docs/VERIFICATION.md, formal/README.md). Minutes, not hours,
+# so unlike the hardening this runs on every push that can change what they
+# prove. `quick` skips the bounded runs an unbounded proof in the same group
+# already subsumes; the full set is the workflow_dispatch below.
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'formal/**'
+      - 'scripts/formal.sh'
+      - 'scripts/dev_env.sh'
+      - 'isa/isa.yaml'
+      - '.github/workflows/formal.yaml'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'full or quick'
+        default: 'quick'
+
+concurrency:
+  group: formal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formal:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        # formal/gen_isa_props.py generates the ISA properties through
+        # tools.loomisa, which reads isa/isa.yaml.
+        run: pip install pyyaml
+
+      - name: Install the OSS CAD Suite (yosys, sby, yices, slang plugin)
+        uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: Run the proofs
+        run: bash scripts/formal.sh ${{ github.event.inputs.mode || 'quick' }}
+
+      - name: Upload the sby work directories on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal_work
+          path: formal/*/
+          retention-days: 7

@@ -115,8 +115,14 @@ module loom_pins (
   assign pin_oe_reg  = pin_oe;
   assign od_mask_reg = od_mask;
 
-  assign uio_out  = pin_out[7:0];
-  assign uio_oe   = pin_oe;
+  // The pads apply OD_MASK (SEMANTICS 3, D-023). A pin write under open drain
+  // already stores a 0 and releases through PIN_OE (6.3), but OD_MASK can be
+  // set after the bit was driven high, and OEP and the host write PIN_OE with
+  // no open-drain qualification, so without this gate an open-drain pin could
+  // drive high (BUGS 5, found by the formal property PIN-1). Under OD_MASK a
+  // 1 in PIN_OUT means "released", as it does in the 6.3 write rules.
+  assign uio_out  = pin_out[7:0] & ~od_mask;
+  assign uio_oe   = pin_oe & ~(od_mask & pin_out[7:0]);
   assign out_pins = pin_out[13:8];
 
 endmodule

@@ -20,6 +20,13 @@ any transport.
   until 4 clocks after the last.
 - CS_n rising ends the transaction and resets the byte counter, at any point.
   A transaction cut mid-word is discarded (no partial writes).
+- Release CS_n around a chip reset. The SCK edge detector and its synchroniser
+  reset to 0, so a reset released while SCK is high walks that high level
+  through the synchroniser and counts as a rising edge two clocks later. With
+  CS_n still low the byte boundary is then one bit early for the rest of that
+  CS_n low period (formal finding F-3 in `formal/README.md`); with CS_n high,
+  as after any normal reset, nothing is in flight and the phantom edge is
+  discarded.
 - HOST_MISO is driven 0 when CS_n is high (no tristate; the TT output is always
   driven).
 

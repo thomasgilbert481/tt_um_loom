@@ -131,6 +131,24 @@ def test_an_open_drain_pin_never_drives_a_one():
         assert not (uio_out & uio_oe & 0x01)
 
 
+def test_open_drain_set_after_a_pin_was_driving_high():
+    """PIN-1 with the registers written in the awkward order (D-023, BUGS 5).
+
+    `OEP` and a host `PIN_OE` write carry no open-drain qualification, and
+    `OD_MASK` can be set after a pin was driven high, so the pads apply the
+    mask (SEMANTICS 3): the pin lets go, and the registers keep their values.
+    """
+    program = [("SETP", dict(pin=0, val=1)),      # drives high: OD_MASK is 0
+               ("OEP", dict(pin=0, val=1)),
+               ("LDI", dict(rd=1, imm=1)),
+               ("CSRW", dict(csr=CSR_OD_MASK, ra=1)),   # now open drain
+               ("OEP", dict(pin=0, val=1)),       # an ordinary OEP, 6.3 allows it
+               ("HALT", {})]
+    machine, _ = run_pins(program)
+    assert machine.od_mask & 1 and machine.pin_out & 1  # the registers kept it
+    assert machine.uio_out & 1 == 0 and machine.uio_oe & 1 == 0
+
+
 def test_out_applies_the_open_drain_rule_to_every_bit():
     program = [("OUT", dict(ra=1)), ("HALT", {})]
 

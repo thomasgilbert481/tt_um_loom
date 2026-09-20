@@ -320,3 +320,53 @@ merged tree goes from 19,493 to 19,921 cells (+2.2 per cent), flops
 unchanged at 3,028, longest path 62 -> 60 generic cells. Behaviour is
 unchanged, so SEMANTICS, the model and the tests are untouched. The next
 hardening shows what it buys at the slow corner.
+
+**Outcome 2026-09-20: reverted, on routing cost.** The hardening of a33c403
+(run 35470401774) never reached a slow-corner number: GitHub cancelled the
+job at its six-hour limit, inside detailed routing. Against the same design
+without D-022 (run 35419160398) the two per cent more cells tripled the
+global router's congestion: Metal3 overflow 1,768 -> 5,776, total 1,804 ->
+5,883, Metal4 usage 29.8 -> 35.0 per cent, and detailed routing went from
+3 h 03 min (a 3 h 53 min gds job) to 5 h 15 min for the first pass alone,
+with the antenna-repair pass still to run when the job died. Twelve 16-bit
+subtractors per block, each tapping the shared `cm_td` and `h_wdata` buses,
+is a lot of wire in one corner of the floorplan.
+Tiny Tapeout re-runs this flow on submission, so a design that does not
+harden inside six hours is a submission risk. The slow corner is not a
+sign-off corner in this flow (`TIMING_VIOLATION_CORNERS` is `*typ*`) and the
+typical corner passes with +6.21 ns, so the trade went the other way:
+`src/loom_timer.v` is back to the one-subtraction version and the design is
+back to the shape that hardened in 3 h 53 min.
+If slow-corner closure is ever wanted, the cheaper shape to try first is two
+subtractors per thread rather than three (`NOW - TD` for rule 1, and
+`NOW - (w_cm ? cm_td : h_wdata)` for rule 2, so the host thread compare and
+its fanout still stay out of the wide path and only a 2:1 mux driven by the
+W-stage ring goes in front of the subtractor), together with cell padding or
+a lower `PL_TARGET_DENSITY_PCT`, and one hardening to measure each step.
+
+## D-023 2026-09-19 Opus 5: the pads apply OD_MASK, so an open-drain pin never drives high
+
+Decision: `loom_pins` drives `uio_out = PIN_OUT[7:0] & ~OD_MASK` and
+`uio_oe = PIN_OE & ~(OD_MASK & PIN_OUT[7:0])`. A BIDIR pin in open-drain mode
+pulls low when its `PIN_OUT` bit is 0 and its `PIN_OE` bit is 1, and is
+released otherwise. SEMANTICS 3 states the rule, the golden model applies it
+in the same place, and the register views still read back what was written.
+Why: the formal property PIN-1 ("an open-drain BIDIR pin never drives high",
+VERIFICATION.md L4) was false (BUGS 5, formal finding F-2). SEMANTICS 6.3
+makes every *pin write* open-drain-safe, but `OEP` and the host's `PIN_OE`
+write carry no open-drain qualification and `OD_MASK` can be set after a pin
+was driven high, so three ordinary slots (`SETP pin, 1`; `CSRW OD_MASK`;
+`OEP pin, 1`) leave an open-drain pin driving high. On a shared bus that is
+an electrical fault, not a firmware inconvenience: this chip exists to
+bit-bang I2C and similar buses, and `firmware/i2c_master.loom` drives SDA and
+SCL open drain.
+Rejected: clearing `PIN_OUT` on the bits a write to `OD_MASK` turns on (a
+later `CSRW PIN_OUT` sets them again, so the guarantee would still depend on
+the order); leaving the silicon and weakening the property (the property is
+the one a user of the chip needs).
+Consequences: sixteen gates on a non-critical path. Firmware that switches a
+pin into open-drain mode no longer has to clear `PIN_OUT` first. PIN-1,
+PIN-1CORE and PIN-1R are ordinary proofs in `formal/pins.sby` now, and the
+property that the pads are the plain register views (which they were) is
+replaced by the gated rule. A hardening after this change should show the
+same area to within a few cells.

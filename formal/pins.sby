@@ -1,0 +1,25 @@
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: depth 12
+cover: mode cover
+cover: depth 16
+timeout 600
+
+[engines]
+prove: smtbmc yices
+cover: smtbmc yices
+
+[script]
+plugin -i slang
+prove: read_slang --top loom_pins loom_pins.v loom_sync.v loom_pin_props.v
+cover: read_slang --top loom_pins loom_pins.v loom_sync.v loom_pin_props.v
+prep -top loom_pins
+
+[files]
+../src/loom_pins.v
+../src/loom_sync.v
+props/loom_pin_props.v

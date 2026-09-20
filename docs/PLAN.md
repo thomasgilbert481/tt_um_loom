@@ -226,6 +226,11 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       L3 tests re-run on hardware through `loomhost` (same scripts). The
       macro does not exist on the FPGA: build `tt_um_loom` with
       `IMEM_IMPL "FLOPS"` (or add an iCE40 block-RAM backend to `loom_imem`).
+      2026-09-19: confirmed that the template's own `fpga` workflow cannot do
+      it (run 35478423175: it reads the `info.yaml` source list with no
+      defines and stops at "Module `RM_IHPSG13_1P_512x16_c2_bm_bist`
+      referenced in module `loom_imem_macro`"), so the FPGA build is ours to
+      write, with a top that sets `IMEM_IMPL`. Hardware time needs Thomas.
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,
       with the latch array as fallback. Remaining conditions: Tiny Tapeout's
       view of the overlap waiver and power-script wrapper, and Jane Street's
@@ -484,3 +489,24 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   items came out of it: SEMANTICS 6.7 now names the edge the next FIFO read
   word is loaded at, and the model gained `host_fifo_error()`. M2's exit
   criterion is met except the FPGA box.
+- 2026-09-20 (night), Opus 5: the L4 formal agent landed `formal/` (7 sby
+  groups, 18 properties, `scripts/formal.sh`, a `formal` CI job) and two of
+  the L4 properties turned out to be false. **PIN-1 was a real bug**: an
+  open-drain pin could drive high if `OD_MASK` was set after the pin was
+  driven, or if `OEP` wrote the enable afterwards, which on a shared bus is an
+  electrical fault. Fixed in D-023 by applying the mask at the pads, in RTL,
+  model and SEMANTICS 3 together, with regression tests on both sides; the
+  property is proved now. TIMER-1 was a wording bug (the deadline compare is a
+  half window, so it is not monotone): VERIFICATION and SEMANTICS 4 corrected,
+  and SPI-1 gained the assumption it needs (no chip reset inside a host
+  transaction, now in HOST_PROTOCOL). Yosys's own Verilog frontend ignores
+  `bind` silently, so every proof reads the design through the `slang` plugin.
+  **D-022 was reverted**: its hardening (run 35470401774) was killed at
+  GitHub's six-hour limit inside detailed routing, and against the run before
+  it the two per cent of extra cells had tripled the global router's Metal3
+  overflow (1,768 -> 5,776) and taken routing from 3 h 03 min to over 5 h 15
+  min. Six hours is a hard budget because Tiny Tapeout re-runs the flow at
+  submission, and the slow corner is not a sign-off corner, so the design goes
+  back to the shape that hardened in 3 h 53 min (AREA.md has the numbers and
+  the cheaper shape to try if slow-corner closure is ever wanted). Also
+  confirmed that the template's `fpga` workflow cannot build this design.

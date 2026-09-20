@@ -80,6 +80,15 @@ BIDIR pins always read the pad through the synchroniser, even while driven.
 In simulation the testbench must loop `uio_out` back to `uio_in` for bits with
 `uio_oe == 1`, as the Tiny Tapeout pad does.
 
+The pads apply `OD_MASK`: for `i` in 0..7 the chip drives
+`uio_oe[i] = PIN_OE[i] & ~(OD_MASK[i] & PIN_OUT[i])` and
+`uio_out[i] = PIN_OUT[i] & ~OD_MASK[i]`. An open-drain pin therefore pulls low
+when `PIN_OUT[i]` is 0 and `PIN_OE[i]` is 1, and is released otherwise: **it
+never drives high**, whatever order the three registers were written in, and a
+1 in `PIN_OUT[i]` under `OD_MASK[i]` means "released" exactly as it does in the
+write rules of 6.3 (D-023; the register views still read back what was
+written, and `OUT0..5` are not affected).
+
 ## 4. Time
 
 Per thread: `ACC` (24 bits), `NOW` (16), `TD` (16), `DT` (16), `TICK_SEEN` (1).
@@ -100,7 +109,14 @@ at every edge:
   debug-space write, also sets `ACC <= 0` at the same edge (the clear wins over
   the accumulate; `NOW` does not tick at that edge).
 - `TICK_INT = 0` is stored and read back as 0; the divider treats it as 1.
-- `reached(a, b)` is `((a - b) mod 2^16) < 2^15`.
+- `reached(a, b)` is `((a - b) mod 2^16) < 2^15`. It is a half-window
+  comparison, so it is not monotone in `NOW`: with `TD` unchanged it goes true
+  at `NOW = TD` and back to false once `NOW - TD` reaches `2^15`, which is
+  where the window wraps (formal TIMER-1B proves that is the only way it can
+  fall). A deadline more than `2^15` ticks in the past therefore reads as not
+  reached again, and a `WAITD` against such a stale `TD` blocks instead of
+  completing at once; firmware that may sit idle that long re-anchors with
+  `SETD` first, as `firmware/uart_tx.loom` does after an idle `POP`.
 - At the commit edge of every valid slot of the thread, `TICK_SEEN` keeps only
   what the slot did not see: `TICK_SEEN <= tick | (TICK_SEEN & ~seen)`, where
   `seen` is the value the slot read in its X cycle. A tick at the same edge
@@ -199,6 +215,11 @@ are ignored. A "pin write of value `b` to index `i`" means:
 - `i` in 16..21: `PIN_OUT[i - 8] <= b` (register view in ARCHITECTURE 3.1).
 - `i` in 0..7 with `OD_MASK[i] == 0`: `PIN_OUT[i] <= b`; `PIN_OE` unchanged.
 - `i` in 0..7 with `OD_MASK[i] == 1`: `PIN_OUT[i] <= 0; PIN_OE[i] <= ~b`.
+
+`OEP` and the host write `PIN_OE` with no open-drain qualification, and
+`OD_MASK` can be set after a pin was driven high, so the promise that an
+open-drain pin never drives high is kept at the pads, not by these rules; see
+section 3.
 
 All pin commits are bit-masked: a slot changes only the bits it writes.
 

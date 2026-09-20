@@ -1,0 +1,21 @@
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: depth 12
+cover: mode cover
+cover: depth 20
+
+[engines]
+smtbmc yices
+
+[script]
+plugin -i slang
+read_slang --top loom_fifo loom_fifo.v loom_fifo_props.v
+prep -top loom_fifo
+
+[files]
+../src/loom_fifo.v
+props/loom_fifo_props.v

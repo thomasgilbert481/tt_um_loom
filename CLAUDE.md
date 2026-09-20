@@ -52,11 +52,16 @@ decision or configuring the flow; it is reference material.
   jobs in `.github/workflows/gds.yaml`, `docs.yaml`, `test.yaml`; add our own
   jobs in new files. The trigger block of `gds.yaml` (paths filter and
   concurrency) is ours under D-018.
-- **Hardening is expensive.** A 6x4 hardening plus precheck takes about eight
-  hours in CI at M1 density (about six with the macro: 3 h 53 min gds, about
-  2 h precheck). Commits that only touch docs or Python tools do
-  not trigger it (D-018). Before submission, run `gds` by hand on the exact
-  commit being submitted.
+- **Hardening is expensive, and six hours is a hard budget.** The `gds` job
+  took 3 h 53 min with the macro (plus about 2 h of precheck beside it), and
+  GitHub kills a job at six hours, as it did to run 35470401774. Detailed
+  routing is the long pole and grows superlinearly with congestion: two per
+  cent more cells in one corner of the floorplan tripled the Metal3 overflow
+  and nearly doubled the routing time (D-022's outcome, `docs/AREA.md`). Judge
+  an RTL change that adds wiring by the global router's overflow, not only by
+  cell count. Commits that only touch docs or Python tools do not trigger a
+  hardening (D-018). Before submission, run `gds` by hand on the exact commit
+  being submitted.
 - **Tiny Tapeout hygiene:** all outputs assigned; unused inputs listed in the
   `_unused` wire; `ena` ignored; pins documented in `info.yaml`; `source_files`
   and `test/Makefile` `PROJECT_SOURCES` kept in sync (the flow fails otherwise).

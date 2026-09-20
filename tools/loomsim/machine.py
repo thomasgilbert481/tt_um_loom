@@ -268,13 +268,23 @@ class Machine:
 
     @property
     def uio_out(self) -> int:
-        """``uio_out[7:0]``, i.e. ``PIN_OUT[7:0]``, during the current cycle."""
-        return self.pin_out & 0xFF
+        """``uio_out[7:0]`` during the current cycle.
+
+        ``PIN_OUT[7:0]`` with the open-drain pins masked out (SEMANTICS 3): a
+        pin in open-drain mode never drives high, whatever order the three
+        registers were written in.
+        """
+        return self.pin_out & 0xFF & ~self.od_mask & 0xFF
 
     @property
     def uio_oe(self) -> int:
-        """``uio_oe[7:0]``, i.e. ``PIN_OE[7:0]``, during the current cycle."""
-        return self.pin_oe & 0xFF
+        """``uio_oe[7:0]`` during the current cycle.
+
+        ``PIN_OE[7:0]``, except that an open-drain pin whose ``PIN_OUT`` bit is
+        1 is released: under ``OD_MASK`` a 1 means "let go" everywhere else
+        too (SEMANTICS 3 and 6.3).
+        """
+        return self.pin_oe & 0xFF & ~(self.od_mask & self.pin_out) & 0xFF
 
     @property
     def pads(self) -> PadState:

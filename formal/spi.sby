@@ -1,0 +1,37 @@
+[tasks]
+bmc
+prove
+cover
+xfail
+
+[options]
+bmc:   mode bmc
+bmc:   depth 70
+prove: mode prove
+prove: depth 20
+cover: mode cover
+cover: depth 140
+xfail: mode bmc
+xfail: depth 80
+xfail: expect fail
+timeout 1800
+
+[engines]
+bmc:   smtbmc --keep-going yices
+prove: abc pdr
+prove: smtbmc yices
+cover: smtbmc yices
+xfail: smtbmc --keep-going yices
+
+[script]
+plugin -i slang
+bmc:   read_slang --top loom_spi_host loom_spi_host.v loom_sync.v loom_spi_props.v
+prove: read_slang --top loom_spi_host loom_spi_host.v loom_sync.v loom_spi_props.v
+cover: read_slang --top loom_spi_host loom_spi_host.v loom_sync.v loom_spi_props.v
+xfail: read_slang -D LOOM_FV_SPI_RESET_IN_TRANSACTION --top loom_spi_host loom_spi_host.v loom_sync.v loom_spi_props.v
+prep -top loom_spi_host
+
+[files]
+../src/loom_spi_host.v
+../src/loom_sync.v
+props/loom_spi_props.v

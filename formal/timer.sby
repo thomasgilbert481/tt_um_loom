@@ -1,0 +1,30 @@
+[tasks]
+prove
+cover
+xfail
+
+[options]
+prove: mode prove
+prove: depth 12
+cover: mode cover
+cover: depth 16
+xfail: mode bmc
+xfail: depth 16
+xfail: expect fail
+timeout 600
+
+[engines]
+prove: smtbmc yices
+cover: smtbmc yices
+xfail: smtbmc --keep-going yices
+
+[script]
+plugin -i slang
+prove: read_slang --top loom_timer loom_timer.v loom_timer_props.v
+cover: read_slang --top loom_timer loom_timer.v loom_timer_props.v
+xfail: read_slang -D LOOM_FV_XFAIL --top loom_timer loom_timer.v loom_timer_props.v
+prep -top loom_timer
+
+[files]
+../src/loom_timer.v
+props/loom_timer_props.v

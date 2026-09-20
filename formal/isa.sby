@@ -1,0 +1,22 @@
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: depth 1
+cover: mode cover
+cover: depth 1
+timeout 600
+
+[engines]
+smtbmc yices
+
+[script]
+plugin -i slang
+read_slang --top loom_decode loom_decode.v loom_isa_props.v
+prep -top loom_decode
+
+[files]
+../src/loom_decode.v
+props/loom_isa_props.v

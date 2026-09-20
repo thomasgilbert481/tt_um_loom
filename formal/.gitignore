@@ -1,0 +1,13 @@
+# SymbiYosys work directories: one per task (<group>_<task>/), plus the
+# per-group status database sby keeps in <group>/.
+*_bmc/
+*_cover/
+*_prove/
+*_xfail/
+fifo/
+isa/
+isacore/
+pins/
+sched/
+spi/
+timer/

@@ -118,6 +118,47 @@ async def test_open_drain(dut):
 
 
 @cocotb.test()
+async def test_open_drain_never_drives_high(dut):
+    """A pin in OD_MASK never drives high, whatever wrote the registers first.
+
+    The 6.3 write rules keep PIN_OUT at 0 under open drain, but OD_MASK can be
+    set after a pin was driven high, and OEP writes PIN_OE with no open-drain
+    qualification: the pads apply the mask instead (SEMANTICS 3, D-023,
+    BUGS 5, formal PIN-1).
+    """
+    host = LoomHost(dut)
+    await host.start()
+    await host.write(SP_CTRL, CTRL_OD_MASK, 0)
+    host.set_uio_ext(0, pull=0)
+
+    # Firmware alone: drive BIDIR0 high, then declare it open drain, then OEP.
+    await run_snippet(host, [asm("SETP", pin=0, val=1), asm("OEP", pin=0, val=1)])
+    assert resolve(dut.uio_out) & 1 == 1 and resolve(dut.uio_oe) & 1 == 1
+    await run_snippet(host, [asm("LDI", rd=1, imm=1),
+                             asm("CSRW", csr=CSR_OD_MASK, ra=1),
+                             asm("OEP", pin=0, val=1)])
+    assert resolve(dut.uio_oe) & 1 == 0, "an open-drain pin must let go, not drive"
+    assert resolve(dut.uio_out) & 1 == 0
+
+    # Same through the host port, in the other order: OD_MASK first, then a
+    # whole-register PIN_OUT write with the bit set.
+    await host.write(SP_CTRL, CTRL_OD_MASK, 0b0000_0010)      # BIDIR1
+    await host.write(SP_CTRL, CTRL_PIN_OE, 0b0000_0010)
+    await host.write(SP_CTRL, CTRL_PIN_OUT, 0b0000_0010)
+    await ClockCycles(dut.clk, 4)
+    assert resolve(dut.uio_out) & 2 == 0 and resolve(dut.uio_oe) & 2 == 0
+
+    # The registers still read back what was written; only the pads are gated.
+    assert (await host.read1(SP_CTRL, CTRL_PIN_OUT)) & 2 == 2
+    assert (await host.read1(SP_CTRL, CTRL_PIN_OE)) & 2 == 2
+
+    await host.write(SP_CTRL, CTRL_OD_MASK, 0)
+    await host.write(SP_CTRL, CTRL_PIN_OE, 0)
+    await host.write(SP_CTRL, CTRL_PIN_OUT, 0)
+    await ClockCycles(dut.clk, 4)
+
+
+@cocotb.test()
 async def test_out_and_in_groups(dut):
     """OUT and IN use OUTGRP/INGRP: base[4:0], cnt[9:5], modulo 32."""
     host = LoomHost(dut)

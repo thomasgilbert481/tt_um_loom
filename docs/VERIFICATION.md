@@ -144,10 +144,17 @@ reference model, check data and timing.
   what other threads do (checked as a two-copy miter on a reduced configuration).
 - FIFO-1..3: never overflows or underflows; data out equals data in, in order
   (two-token method); flags correct.
-- TIMER-1: `reached` is monotone: once true it stays true until TD changes.
+- TIMER-1: the only way `reached(NOW, TD)` falls with `TD` unchanged is
+  `NOW - TD` passing `0x7FFF -> 0x8000`, where the half-window wraps. (The
+  first wording, "`reached` is monotone: once true it stays true until TD
+  changes", is false and was proved false: formal finding F-1, SEMANTICS 4.)
 - SPI-1: with SCK period >= 8 clocks, every MOSI byte is delivered exactly
-  once; CS high resets the byte counter.
-- PIN-1: a BIDIR pin with OD_MASK set never has OE=1 with OUT=1.
+  once; CS high resets the byte counter. Holds given that the chip is not
+  reset in the middle of a transaction; without that assumption a reset
+  while SCK is high inserts a phantom edge (formal finding F-3), which is
+  why HOST_PROTOCOL tells a host to release CS_n around a reset.
+- PIN-1: a BIDIR pin with OD_MASK set never has OE=1 with OUT=1. (Was false
+  until D-023 put the mask in the pads: formal finding F-2, BUGS 5.)
 - ISA-1: every 16-bit pattern decodes to exactly one instruction class
   (generated from `isa.yaml`); reserved patterns decode to NOP and set the bad
   opcode bit.
@@ -221,8 +228,9 @@ run it.
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 553 bins, 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 37 scenarios on the model, 29 on the RTL |
+| L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 18 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |
 | L7 mutation, by hand | `make SRC_DIR=<mutated copy>` | five mutants tried, four caught at seed 1 or 2 by co-simulation, one documented as equivalent in practice (`test/README.md`). `tools/mutate` itself is not written |
-| L4 formal, L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L4 and L6 are open |
+| L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is open |
 
 ## What "done" means for a check
 
