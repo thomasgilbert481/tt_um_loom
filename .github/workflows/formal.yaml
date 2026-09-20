@@ -42,6 +42,15 @@ jobs:
 
       - name: Install the OSS CAD Suite (yosys, sby, yices, slang plugin)
         uses: YosysHQ/setup-oss-cad-suite@v3
+        with:
+          # Pinned to the build the proofs were written and measured on, the
+          # one formal/README.md records engines and depths for. Newer builds
+          # leave x constants in the design that `abc pdr`'s AIGER export
+          # refuses (runs 35524275257, 35524620629, 35524842286), which no
+          # setundef in the script reached. Moving the pin is a deliberate
+          # step: re-run scripts/formal.sh locally on the new build first and
+          # update the README with what it reports.
+          version: '2026-03-21'
 
       - name: Run the proofs
         run: bash scripts/formal.sh ${{ github.event.inputs.mode || 'quick' }}
