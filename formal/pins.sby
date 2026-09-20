@@ -24,6 +24,9 @@ prep -top loom_pins
 # Replacing them with free variables rather than zeros keeps the proof an
 # over-approximation: anything proved still holds for every value they could
 # have had.
+# The undefined initial contents of a memory (the register file) become x
+# constants when it is mapped to flops, so map first, then clear them.
+memory_map
 setundef -undriven -anyseq
 
 [files]
