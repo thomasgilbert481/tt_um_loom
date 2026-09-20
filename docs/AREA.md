@@ -16,6 +16,7 @@ Reading of the M1 row: the design fits and is tape-out clean at the sign-off cor
 | 2026-09-19 | M2 + macro hardened | branch macro-core d41fe34 (M2 RTL of 52ee9f8 + D-020/D-021), run 35419160398, 6x4, macro FS at (12, 40) | 28,825 stdcells + 1 macro (75,908 instances with fill and taps) | 3,027 | 51.5% (stdcells 48.9%) | typ +6.21 ns; fast +11.07 ns; slow -2.07 ns (23 endpoints, TNS -26.9 ns); hold +0.28 typ / +0.61 slow / +0.10 fast, 0 violations | stdcell area 419,165 um2 + macro 45,309 um2 of 902,417 um2 core; DRC 0, LVS 0, antenna 0; precheck pass; gl_test 14/15 (a test bug, BUGS 4; 15/15 locally with the fix); max-slew 156 slow / 57 typ, max-cap 28-29; Magic illegal overlaps 10 (the smoke test's four stripe crossings, two boxes each, facts 12); worst path launched by the macro +2.07 ns slow; power 11.8 mW typ; wall time gds 3 h 53 min, precheck about 2 h |
 
 Reading of the macro row: the macro freed a third of the core (stdcell area 710,760 -> 419,165 um2) and the whole typical-corner margin came back (+1.45 -> +6.21 ns). The slow corner is down to two paths, both far more buffering than logic: 22 endpoints behind the deadline-latch fire logic, whose host thread decode went through `buf_1` fanout buffers with slews up to 1.85 ns ahead of a 16-bit subtract (D-022 moved the decode behind the subtract and was then reverted: it cost more in routing than it bought in slack, see the section below), and one `tx_th` path through a series chain of six `buf_1` (-0.26 ns). The flow's settings explain the weak buffering: `SYNTH_STRATEGY` "AREA 0", `MAX_FANOUT_CONSTRAINT` 10, `RUN_POST_GRT_RESIZER_TIMING` false, `PL_TIMING_DRIVEN` false; only the typical corner is sign-off (`TIMING_VIOLATION_CORNERS` `*typ*`). Knobs to try if slow-corner closure is wanted: a DELAY synthesis strategy, post-GRT resizer timing, timing-driven placement (each costs one 4-hour hardening to evaluate, and `src/config.json` changes need a DECISIONS entry).
+| 2026-09-20 | M2 + macro + D-023, everything green | main f081f4a (D-023 pads, D-022 reverted, TICK_SEEN fix), run 35524275302, 6x4 | 28,842 stdcells + 1 macro | 3,028 | 51.4% | typ +5.98 ns; fast +10.92 ns; slow -2.48 ns (23 endpoints, TNS -38.7 ns); hold +0.28 typ, 0 violations | **every job passed**: gds 4 h 45 min, precheck 1 h 47 min, gl_test 71/71 in 12.7 min (the widened list), viewer. DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10, the same four stripe crossings D-021 watches; stdcell area 418,678 um2; power 11.8 mW; detailed routing 3 h 37 min, Metal3 overflow 3,169; +17 cells against the run before it, which is D-023's pad gate |
 
 ### Routing time is the binding constraint, 2026-09-20
 
@@ -23,10 +24,16 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 |---|---|---|---|---|
 | 35419160398 | macro core, d41fe34 | 1,768 / 1,804 | 3 h 03 min | 3 h 53 min, finished |
 | 35470401774 | the same plus D-022 (+2.2% cells) | 5,776 / 5,883 | 5 h 15 min for the first pass, 0 violations, antenna pass still to run | **cancelled at GitHub's 6 h limit** |
+| 35524275302 | D-022 reverted, plus D-023's 17 cells | 3,169 / 3,271 | 3 h 37 min | 4 h 45 min, finished |
 
 Detailed routing is the long pole of the whole flow and it is superlinear in
 congestion: two per cent more cells, concentrated in the timers, tripled the
-Metal3 overflow and nearly doubled the routing time. Tiny Tapeout re-runs this
+Metal3 overflow and nearly doubled the routing time. The third run says how
+much of that to trust: two designs seventeen cells apart came out at 1,768 and
+3,169 Metal3 overflow and 3 h 03 min and 3 h 37 min of routing, so placement
+varies by that much on its own. D-022's 5,776 is still well outside that
+spread, but the practical reading is that the margin under the six-hour limit
+is one to two hours and partly luck, not a comfortable three. Tiny Tapeout re-runs this
 flow when a project is submitted, so six hours is a hard budget, not a CI
 inconvenience. Judge an RTL change that adds wiring by what it does to
 `Metal3 overflow` in the global-routing report, not only by cell count.

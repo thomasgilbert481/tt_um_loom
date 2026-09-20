@@ -510,3 +510,17 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   back to the shape that hardened in 3 h 53 min (AREA.md has the numbers and
   the cheaper shape to try if slow-corner closure is ever wanted). Also
   confirmed that the template's `fpga` workflow cannot build this design.
+- 2026-09-20 (evening), Opus 5: the hardening of that state (run 35524275302,
+  main f081f4a) **passed every job**: gds 4 h 45 min, precheck 1 h 47 min,
+  `gl_test` 71 of 71 on the widened list in 12.7 minutes, viewer. DRC, LVS and
+  antenna 0; the Magic overlap count is still the 10 boxes D-021 watches; typ
+  +5.98 ns, slow -2.48 ns on the same 23 endpoints. Detailed routing took
+  3 h 37 min with 3,169 Metal3 overflow, against 3 h 03 min and 1,768 for a
+  design seventeen cells away, so placement variance alone is worth half an
+  hour of routing and the margin under the six-hour limit is one to two hours,
+  not three (AREA.md). Mutation round 2 closed the three holes round 1 found
+  (`test_debug_register_cross_talk`, `test_csr_tick_frac_readback`,
+  `test_be_cfg_fields_readback`: ten mutants that had survived now die), and
+  the full pass is running.
+  Next: the FPGA prototype (brief written), then the M2 review with Fable
+  (`docs/reviews/m2-review.md`) before M3 starts.
