@@ -24,6 +24,13 @@ prove: read_slang --top loom_timer loom_timer.v loom_timer_props.v
 cover: read_slang --top loom_timer loom_timer.v loom_timer_props.v
 xfail: read_slang -D LOOM_FV_XFAIL --top loom_timer loom_timer.v loom_timer_props.v
 prep -top loom_timer
+# `abc pdr` exports AIGER, which refuses a design that still holds x or z
+# constants: newer Yosys builds than the one this was written on leave some
+# behind (CI run 35524275257 died here while the same proof passed locally).
+# Replacing them with free variables rather than zeros keeps the proof an
+# over-approximation: anything proved still holds for every value they could
+# have had.
+setundef -undriven -anyseq
 
 [files]
 ../src/loom_timer.v

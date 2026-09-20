@@ -15,6 +15,13 @@ smtbmc yices
 plugin -i slang
 read_slang --top loom_fifo loom_fifo.v loom_fifo_props.v
 prep -top loom_fifo
+# `abc pdr` exports AIGER, which refuses a design that still holds x or z
+# constants: newer Yosys builds than the one this was written on leave some
+# behind (CI run 35524275257 died here while the same proof passed locally).
+# Replacing them with free variables rather than zeros keeps the proof an
+# over-approximation: anything proved still holds for every value they could
+# have had.
+setundef -undriven -anyseq
 
 [files]
 ../src/loom_fifo.v

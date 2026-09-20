@@ -23,6 +23,13 @@ cover: smtbmc yices
 plugin -i slang
 read_slang --top loom_core loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_isa_core_props.v
 prep -top loom_core
+# `abc pdr` exports AIGER, which refuses a design that still holds x or z
+# constants: newer Yosys builds than the one this was written on leave some
+# behind (CI run 35524275257 died here while the same proof passed locally).
+# Replacing them with free variables rather than zeros keeps the proof an
+# over-approximation: anything proved still holds for every value they could
+# have had.
+setundef -undriven -anyseq
 
 [files]
 ../src/loom_core.v
