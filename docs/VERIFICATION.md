@@ -229,8 +229,34 @@ run it.
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 37 scenarios on the model, 29 on the RTL |
 | L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 18 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |
-| L7 mutation, by hand | `make SRC_DIR=<mutated copy>` | five mutants tried, four caught at seed 1 or 2 by co-simulation, one documented as equivalent in practice (`test/README.md`). `tools/mutate` itself is not written |
+| L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) and five mutants written by hand before it (`test/README.md`) | the tool runs; the first full pass over the six modules L7 names is still to finish, and its findings so far are below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is open |
+
+## What the first mutants say about the suite, 2026-09-20
+
+`tools/mutate` generates one-line faults in a copy of `src/`, runs a cheap-first
+ladder (Verilator lint, a short co-simulation, then the unit modules) and stops
+at the first check that fails. The first pass over 826 mutants was interrupted
+(the laptop slept), but 253 verdicts and their survivors already name three
+real holes, all of them read-back paths and host-debug behaviour that nothing
+compares:
+
+1. **Host debug registers are never checked for cross-talk.** Mutants that make
+   a debug write reach the wrong register, or that turn an unused alias into a
+   live one (`0x1A` for TD, `0x1B` for FLAGS), survive. One directed test in
+   `test_host.py` kills the whole group: write a distinctive value to one debug
+   register of one thread, then read every debug register of every thread and
+   assert that only the intended one moved.
+2. **`CSRR TICK_FRAC` is never compared.** `x_tfrac` feeds only that read, so a
+   mutant that returns rubbish survives. L2-COV lists `csr/CSRR:TICK_FRAC` as an
+   empty bin, and the mutant proves the hole is real.
+3. **`CSRR BE_CFG` bit 2 (CRC_EN) is never compared** on the read-back path.
+
+Two survivor groups are equivalent mutants rather than holes, and are recorded
+as such in `tools/mutate/equivalents.json`: the reset values of pipeline payload
+registers whose consumers are gated by a valid bit that resets to 0, and the
+`infl` busy gating, which only matters in the few cycles after `RUN` clears,
+a window the host port cannot reach at its specified SCK rate.
 
 ## What "done" means for a check
 

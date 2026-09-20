@@ -1,0 +1,6 @@
+{
+  "loom_fifo_L0031C031_const_8a1b": "dead default: loom_core always instantiates loom_fifo with #(.DEPTH(FIFO_DEPTH), .AW(FAW)) (loom_core.v:546, :554), so the parameter's default is never used",
+  "loom_fifo_L0031C031_const_b606": "dead default: loom_core always instantiates loom_fifo with #(.DEPTH(FIFO_DEPTH), .AW(FAW)) (loom_core.v:546, :554), so the parameter's default is never used",
+  "loom_fifo_L0054C034_const_e163": "same value at AW=2: {{(AW-2){1'b0}}, 1'b1} is {{0{1'b0}}, 1'b1} = 1'b1, which is the same increment of 1 as {{1{1'b0}}, 1'b1} = 2'b01",
+  "loom_fifo_L0062C034_const_8614": "same value at AW=2: {{(AW-2){1'b0}}, 1'b1} is {{0{1'b0}}, 1'b1} = 1'b1, which is the same increment of 1 as {{1{1'b0}}, 1'b1} = 2'b01"
+}
