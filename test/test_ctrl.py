@@ -9,7 +9,7 @@ from spi_host import (
     LoomHost, ISA, asm, run_snippet, SP_CTRL, CTRL_SFLAGS, CTRL_SFLAGS_CLR,
     DBG_PC, DBG_FLAGS, DBG_RS0, DBG_RS1_DEPTH, DBG_WAIT_ACTIVE, DBG_TD, DBG_DT,
     CSR_FLAGS, CSR_NOW, CSR_TD, CSR_TID, CSR_OUTGRP, CSR_INGRP, CSR_SFLAGS,
-    CSR_OD_MASK, CSR_TICK_INT, CAPS_FIFO, CAPS_BE, CAPS_DMEM,
+    CSR_OD_MASK, CSR_TICK_INT, CSR_TICK_FRAC, CAPS_FIFO, CAPS_BE, CAPS_DMEM,
 )
 
 BCC = {"BZ": ("Z", True), "BNZ": ("Z", False),
@@ -392,3 +392,36 @@ async def test_tick_csr_and_nop(dut):
     assert await host.read_csr(0, CSR_TICK_INT) == 100
     # With a 100-clock tick, three NOPs (12 clocks) advance NOW by 0 ticks.
     await host.write_csr(0, CSR_TICK_INT, 1)
+
+
+@cocotb.test()
+async def test_csr_tick_frac_readback(dut):
+    """CSRR TICK_FRAC returns that thread's fraction, zero extended.
+
+    The only reader of the X-stage TICK_FRAC slice is this CSR read, and
+    L2-COV lists `csr/CSRR:TICK_FRAC` as an empty bin, so the slice and its
+    zero extension are checked nowhere else. All four fractions differ, so a
+    slice that starts at the wrong bit returns a neighbour's byte, and the
+    reads are on threads 1..3, where a per-thread slice can be wrong at all.
+    """
+    host = LoomHost(dut)
+    await host.start()
+    fracs = {0: 0x33, 1: 0xA5, 2: 0x5C, 3: 0xC3}
+    for t, frac in fracs.items():
+        await host.write_csr(t, CSR_TICK_FRAC, frac)
+        assert await host.read_csr(t, CSR_TICK_FRAC) == frac
+    for t in (1, 2, 3):
+        await run_snippet(host, [asm("CSRR", rd=1, csr=CSR_TICK_FRAC)],
+                          thread=t, start=0x70, regs={1: 0xFFFF})
+        got = await host.read_reg(t, 1)
+        assert got == fracs[t], \
+            f"thread {t}: CSRR TICK_FRAC = {got:#06x}, want {fracs[t]:#06x}"
+    # CSRW then CSRR inside one thread: the write takes the low byte and the
+    # read is zero extended, so the high byte of the written word is gone.
+    await run_snippet(host, [asm("CSRW", csr=CSR_TICK_FRAC, ra=1),
+                             asm("CSRR", rd=2, csr=CSR_TICK_FRAC)],
+                      thread=2, start=0x78, regs={1: 0xFF96, 2: 0xFFFF})
+    assert await host.read_reg(2, 2) == 0x96
+    assert await host.read_csr(2, CSR_TICK_FRAC) == 0x96
+    assert await host.read_csr(1, CSR_TICK_FRAC) == fracs[1], "one thread only"
+    assert await host.badop() == 0

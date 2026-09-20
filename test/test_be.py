@@ -449,3 +449,31 @@ async def test_shi_crc(dut):
         if not inv:
             assert want >> 8 == rocksoft_crc(data, 8, preset["poly"], 0, False, False, 0)
     await ClockCycles(dut.clk, 2)
+
+
+@cocotb.test()
+async def test_be_cfg_fields_readback(dut):
+    """CSRR BE_CFG reports each of DIR, INV and CRC_EN in its own bit.
+
+    `test_be_csrs` writes 0xFFFF, which sets all three at once, so a read
+    that reported one field's bit in another field's position would still
+    read back 0x0282 there. CRC_EN (bit 9) is the one the RTL builds from a
+    separate slice of the packed per-thread word, and it is the only BE_CFG
+    bit whose read-back path nothing else covers: the datapath consumes it,
+    but no check compares it.
+    """
+    host = LoomHost(dut)
+    await host.start()
+    t = 2
+    for cfg in (CRC_EN, CRC_EN | DIR, INV, DIR, INV | DIR, CRC_EN | INV, 0):
+        # The high bits are not BE_CFG fields: they must be dropped.
+        await run_snippet(host, [asm("CSRW", csr=CSR_BE_CFG, ra=1),
+                                 asm("CSRR", rd=2, csr=CSR_BE_CFG)],
+                          thread=t, start=0x60,
+                          regs={1: cfg | 0xF454, 2: 0xFFFF})
+        got = await host.read_reg(t, 2)
+        assert got == cfg, f"CSRW BE_CFG {cfg:#06x} reads back {got:#06x}"
+        assert await host.read_csr(t, CSR_BE_CFG) == cfg, \
+            f"BE_CFG {cfg:#06x} through the debug space"
+        assert await host.read_csr(0, CSR_BE_CFG) == 0, "thread 0 is untouched"
+    assert await host.badop() == 0

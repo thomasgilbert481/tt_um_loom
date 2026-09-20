@@ -277,3 +277,188 @@ async def test_sck_at_the_limit(dut):
     slow.ui_ext = host.ui_ext
     assert await slow.read1(SP_CTRL, CTRL_ID) == 0x4C4D
     assert await slow.read(SP_IMEM, 0, 2) == [0x1357, 0x2468]
+
+
+
+# ------------------------------------------------- the debug register file
+DBG_LAST = 0x26                 # the highest debug register this build has
+
+#: Every debug register of a thread: the storage cell behind it, the register
+#: ids that reach that cell (TD answers both to 0x0A and to the 0x1A alias),
+#: the bits that read back, and whether a host debug write must leave it
+#: alone. Ordered by id, and covering 0x00..0x26 with no gaps.
+DBG_CELLS = [("r%d" % n, (n,), 0xFFFF, False) for n in range(8)] + [
+    # cell           ids            mask    read only
+    ("PC",          (0x08,),        0x03FF, False),
+    ("FLAGS",       (0x09, 0x1B),   0x0007, False),
+    ("TD",          (0x0A, 0x1A),   0xFFFF, False),
+    ("NOW",         (0x0B, 0x19),   0xFFFF, True),
+    ("SR",          (0x0C, 0x1D),   0xFFFF, False),
+    ("CNT",         (0x0D, 0x1E),   0x001F, False),
+    ("CRC",         (0x0E, 0x1F),   0xFFFF, False),
+    ("RS0",         (0x0F,),        0x03FF, False),
+    ("TICK_INT",    (0x10,),        0xFFFF, False),
+    ("TICK_FRAC",   (0x11,),        0x00FF, False),
+    ("OUTGRP",      (0x12,),        0x03FF, False),
+    ("INGRP",       (0x13,),        0x03FF, False),
+    ("BE_CFG",      (0x14,),        0x0282, False),
+    ("BE_PINS",     (0x15,),        0x03FF, False),
+    ("BE_RELOAD",   (0x16,),        0x001F, False),
+    ("CRC_POLY",    (0x17,),        0xFFFF, False),
+    ("CRC_INIT",    (0x18,),        0xFFFF, False),
+    ("TID",         (0x1C,),        0xFFFF, True),
+    ("STEPS",       (0x20,),        0xFFFF, False),
+    ("RS1_DEPTH",   (0x21,),        0x0FFF, False),
+    ("WAIT_ACTIVE", (0x22,),        0x0001, False),
+    ("DT",          (0x23,),        0xFFFF, False),
+    ("TICK_SEEN",   (0x24,),        0x0001, False),
+    ("LATCH",       (0x25,),        0x007F, False),
+    ("FIFO_COUNTS", (0x26,),        0xFFFF, True),
+]
+CELL_OF = {reg: name for name, ids, _m, _ro in DBG_CELLS for reg in ids}
+MASK_OF = {name: mask for name, _i, mask, _ro in DBG_CELLS}
+RO_CELLS = {name for name, _i, _m, ro in DBG_CELLS if ro}
+
+#: FLAGS takes Z, C and T from three separate bits of one written word, so a
+#: value with all three equal cannot tell the three flops apart. These two
+#: are complements of each other, so whichever the register already holds,
+#: the other one moves it.
+DBG_FORCE = {0x09: 0b010, 0x1B: 0b101}
+
+#: The tick period is max(TICK_INT,1) * 256 + TICK_FRAC clocks, and a
+#: TICK_INT write clears the accumulator, so parking TICK_INT at the top of
+#: the range buys 65 535 clocks in which NOW and TICK_SEEN hold still. Every
+#: pass below is parked at its start and is far shorter than that.
+TICK_PARK = 0xFFFF
+
+#: Register ids per pass. Within a pass every write goes to one thread, so
+#: nothing touches the other three and a value that leaked into one of them
+#: is still there when the pass ends and they are read. Reading all four
+#: threads after every single write instead costs three times the simulation
+#: time and finds the same faults, one write earlier.
+DBG_PASS = 5
+
+
+def dbg_value(reg, thread):
+    """A distinctive value for debug register `reg` of `thread`.
+
+    Different for every (register, thread) pair, so a write that lands in the
+    wrong register or in the wrong thread, and a read mux that slices the
+    wrong thread out of a packed vector, all leave a value somewhere it does
+    not belong instead of one that happens to match.
+    """
+    return ((reg + 1) * 0x0111 + (thread + 1) * 0x1249 + 0x0A35) & 0xFFFF
+
+
+async def dbg_read_thread(host, thread):
+    """Every debug register of one thread, in one auto-incrementing read."""
+    return await host.read(SP_DEBUG, thread << 8, DBG_LAST + 1)
+
+
+def dbg_want(model, thread):
+    """What `dbg_read_thread` must return for the modelled state."""
+    return [model[CELL_OF[r]][thread] for r in range(DBG_LAST + 1)]
+
+
+def dbg_diff(thread, got, want):
+    return ["t%d reg %#04x: %#06x not %#06x" % (thread, r, got[r], want[r])
+            for r in range(DBG_LAST + 1) if got[r] != want[r]]
+
+
+async def dbg_check(host, model, threads):
+    """Read `threads` back and return every register that is not as modelled."""
+    bad = []
+    for t in threads:
+        bad += dbg_diff(t, await dbg_read_thread(host, t), dbg_want(model, t))
+    return bad
+
+
+async def dbg_park_ticks(host, model):
+    """Re-arm every thread's tick accumulator, so NOW holds still."""
+    for t in range(4):
+        await host.write_debug(t, DBG_CSR0 + CSR_TICK_INT, TICK_PARK)
+        model["TICK_INT"][t] = TICK_PARK
+
+
+@cocotb.test()
+async def test_debug_register_cross_talk(dut):
+    """A debug write moves the register it names, of the thread it names, and
+    nothing else.
+
+    Every implemented debug register id is written with a distinctive value
+    and the whole 4 x 39 register picture is then required to be exactly what
+    was written: the register that was named, of the thread that was named,
+    and no other. Both aliases are written through the alias and read through
+    the primary id (0x1A for TD, 0x1B for FLAGS, and 0x1D..0x1F for the bit
+    engine), and the read-only ids are written too, where the intended change
+    is none at all. Threads hold different values in every register, so a
+    read mux that takes the wrong thread's slice is visible as well.
+
+    Nothing else in the suite writes one debug register and then looks at the
+    others, or at the other three threads, so this is the only check on the
+    decode of the debug register file.
+    """
+    host = LoomHost(dut)
+    await host.start()
+    model = {name: [0, 0, 0, 0] for name, _i, _m, _ro in DBG_CELLS}
+
+    # Give every writable cell a fingerprint that differs per thread. LATCH
+    # is written with LAT_VALID clear: a staged write would be applied (and
+    # cleared) by a later TD write, and this test owns the whole picture.
+    # TICK_INT is left parked.
+    for index, (name, ids, mask, ro) in enumerate(DBG_CELLS):
+        if ro or name == "TICK_INT":
+            continue
+        if index % 8 == 0:
+            await dbg_park_ticks(host, model)
+        for t in range(4):
+            value = dbg_value(ids[0], t) & (0x3F if name == "LATCH" else mask)
+            await host.write_debug(t, ids[0], value)
+            model[name][t] = value
+    for t in range(4):
+        model["TID"][t] = t
+    await dbg_park_ticks(host, model)
+    first = [await dbg_read_thread(host, t) for t in range(4)]
+    for t in range(4):
+        model["NOW"][t] = first[t][0x0B]     # read only, parked, not zero
+    bad = [d for t in range(4) for d in dbg_diff(t, first[t], dbg_want(model, t))]
+    assert not bad, "the fingerprints did not land: " + "; ".join(bad[:8])
+
+    ids = list(range(DBG_LAST + 1))
+    for start in range(0, len(ids), DBG_PASS):
+        chunk = ids[start:start + DBG_PASS]
+        th = (start // DBG_PASS) % 4
+        await dbg_park_ticks(host, model)
+        for reg in chunk:
+            cell = CELL_OF[reg]
+            mask = MASK_OF[cell]
+            value = DBG_FORCE.get(reg, dbg_value(reg, th))
+            if cell == "TICK_INT":
+                value |= 0xF000              # a long period, whatever it is
+            if (value & mask) == model[cell][th]:
+                value ^= mask                # never write back what is there
+            await host.write_debug(th, reg, value)
+            if cell not in RO_CELLS:
+                model[cell][th] = value & mask
+                if cell == "PC":
+                    model["WAIT_ACTIVE"][th] = 0   # a debug PC write clears it
+            bad = await dbg_check(host, model, [th])
+            assert not bad, \
+                "debug write %#04x = %#06x on thread %d also moved: %s" \
+                % (reg, value, th, "; ".join(bad[:8]))
+        others = [t for t in range(4) if t != th]
+        bad = await dbg_check(host, model, others)
+        assert not bad, \
+            "writing %s on thread %d reached another thread: %s" \
+            % (" ".join("%#04x" % r for r in chunk), th, "; ".join(bad[:8]))
+
+    # CTRL.RESET clears WAIT_ACTIVE, for the thread it names and no other.
+    for t in range(4):
+        await host.write_debug(t, DBG_WAIT_ACTIVE, 1)
+    assert [await host.read_debug(t, DBG_WAIT_ACTIVE) for t in range(4)] \
+        == [1, 1, 1, 1]
+    await host.reset_thread(2)
+    await ClockCycles(dut.clk, 8)
+    assert [await host.read_debug(t, DBG_WAIT_ACTIVE) for t in range(4)] \
+        == [1, 1, 0, 1], "CTRL.RESET clears WAIT_ACTIVE, for one thread only"
+    assert await host.badop() == 0
