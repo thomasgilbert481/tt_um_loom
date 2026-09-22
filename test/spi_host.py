@@ -63,6 +63,9 @@ DBG_TICK_SEEN, DBG_LATCH, DBG_FIFO_COUNTS = 0x24, 0x25, 0x26
 #: Bit-engine encoder state (docs/SEMANTICS.md 6.9.1, M3 slice A):
 #: {8'b0, FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}.
 DBG_ENC = 0x27
+#: Data-memory access in progress (docs/SEMANTICS.md 6.11, M3 slice B):
+#: {11'b0, MEM_PEND, MEM_LD, MEM_RD[2:0]}.
+DBG_MEM = 0x28
 
 CSR_TICK_INT, CSR_TICK_FRAC, CSR_OUTGRP, CSR_INGRP = 0x00, 0x01, 0x02, 0x03
 CSR_NOW, CSR_TD, CSR_FLAGS, CSR_TID = 0x09, 0x0A, 0x0B, 0x0C

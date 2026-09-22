@@ -39,7 +39,7 @@ from tools.loomgen import generate                               # noqa: E402
 IMEM_WORDS = 256
 #: CAPS of the FLOPS build: log2(256) = 8 in [15:12], and the same M2
 #: features as the MACRO build (SETP D, bit engine, FIFOs of depth 4).
-EXPECT_CAPS = 0x8000 | 0x200 | 0x80 | 0x10 | 0x08 | 0x02   # [9]: slice A
+EXPECT_CAPS = 0x8000 | 0x200 | 0x80 | 0x20 | 0x10 | 0x08 | 0x02   # [9] slice A, [5] slice B
 
 
 def _env_int(name: str, default: int) -> int:

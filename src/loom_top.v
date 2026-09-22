@@ -12,8 +12,16 @@
  * The retire record (tr_*) is simulation and debug only; it is exported so a
  * testbench can reach it, and left unconnected in tt_um_loom.
  *
- * VERSION reads 3 from M3 slice A on (SEMANTICS 6.9.1): the bit engine has
- * the NRZI and Manchester encoders, USB and CAN stuffing and the DIFF bit.
+ * VERSION reads 4 from M3 slice B on (SEMANTICS 6.11): the data memory is
+ * the instruction memory, reached by LD/ST through the thread's own fetch
+ * cycle. Slice A (VERSION 3) added the NRZI and Manchester encoders, USB and
+ * CAN stuffing and the DIFF bit.
+ *
+ * Instruction-memory port arbitration with slice B: the core now drives a
+ * write as well (an ST, `core_imem_we`/`core_imem_wdata`, presented in the
+ * F cycle of the thread's completion slot). The host still wins the port
+ * whenever it asks, which it may only do while `core_busy` is low, so the
+ * two writers never meet.
  *
  * Instruction memory (D-020): IMEM_IMPL "MACRO" (default) is the 512 x 16
  * IHP SRAM macro and needs IMEM_WORDS 512; "FLOPS" is the flip-flop array of
@@ -28,7 +36,7 @@ module loom_top #(
     parameter [15:0]  IMEM_WORDS = 16'd512,
     parameter integer FIFO_DEPTH = 4,
     parameter [15:0]  ID_VALUE   = 16'h4C4D,
-    parameter [15:0]  VERSION    = 16'h0003
+    parameter [15:0]  VERSION    = 16'h0004
 ) (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
@@ -64,7 +72,7 @@ module loom_top #(
                                  1'b0,    // [8] bit engine auto mode (M3)
                                  1'b1,    // [7] deadline-latched SETP
                                  1'b0,    // [6] boot ROM
-                                 1'b0,    // [5] data memory
+                                 1'b1,    // [5] data memory (slice B, 6.11)
                                  1'b1,    // [4] bit engine, manual mode
                                  1'b1,    // [3] FIFOs
                                  FIFO_LOG2[2:0]};
@@ -113,15 +121,15 @@ module loom_top #(
 
   // ------------------------------------------------------ instruction memory
   wire [IMEM_AW-1:0] core_imem_addr, h_imem_addr;
-  wire               core_imem_en, h_imem_req, h_imem_we;
-  wire [15:0]        imem_rdata, h_imem_wdata;
+  wire               core_imem_en, core_imem_we, h_imem_req, h_imem_we;
+  wire [15:0]        imem_rdata, h_imem_wdata, core_imem_wdata;
 
   loom_imem #(.IMPL(IMEM_IMPL), .WORDS(IMEM_WORDS), .AW(IMEM_AW)) u_imem (
       .clk(clk),
       .en   (h_imem_req | core_imem_en),
-      .we   (h_imem_req & h_imem_we),
-      .addr (h_imem_req ? h_imem_addr : core_imem_addr),
-      .wdata(h_imem_wdata),
+      .we   (h_imem_req ? h_imem_we    : core_imem_we),
+      .addr (h_imem_req ? h_imem_addr  : core_imem_addr),
+      .wdata(h_imem_req ? h_imem_wdata : core_imem_wdata),
       .rdata(imem_rdata)
   );
 
@@ -152,6 +160,7 @@ module loom_top #(
               .FIFO_DEPTH(FIFO_DEPTH)) u_core (
       .clk(clk), .rst_n(rst_n),
       .imem_addr(core_imem_addr), .imem_en(core_imem_en),
+      .imem_we(core_imem_we), .imem_wdata(core_imem_wdata),
       .imem_rdata(imem_rdata),
       .pin_in_vec(pin_in_vec), .pin_in_reg(pin_in_reg),
       .pin_out_reg(pin_out_reg), .pin_oe_reg(pin_oe_reg),

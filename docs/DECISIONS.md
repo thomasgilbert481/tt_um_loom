@@ -520,6 +520,19 @@ and a debug PC write clear `MEM_PEND` only; HOST_PROTOCOL's space 2 is
 reserved (the earlier dual-ported DMEM text predates this decision);
 `VERSION` reads 4 whenever slice B is built.
 
+Implemented, slice B, 2026-09-22 (Fable as director): golden model and RTL
+from SEMANTICS 6.11 by two agents that never saw each other's code
+(`docs/spec-questions/loomsim-m3b.md`, ten questions; `rtl-m3b.md`, nine),
+the model's first question settled the held-access design above before the
+RTL was finished. `CAPS[5]`, `VERSION` 4, debug 0x28. Model: 47 new tests;
+RTL: 14 new pin-level tests, one of them a thread stepped across an access
+while another streams `LD`/`ST`. The co-simulation generator gives every
+running thread a data window of 8 words at the top of its region and emits
+`LD`/`ST` into it, so the two implementations of 6.11 meet on random
+programs from the first seed. Generic synthesis +593 cells and +136 flops in
+`loom_core`, longest path unchanged (`docs/AREA.md`). Its hardening follows
+slice A's; slice B stays only if it routes inside four hours (D-025).
+
 ## D-028 2026-09-22 Fable: the host's TD write leaves rule 2 of the deadline latch
 
 Decision (proposed to Thomas at the M2 review; Thomas delegated the call the

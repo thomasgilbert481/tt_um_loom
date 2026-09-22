@@ -65,6 +65,11 @@ module loom_sched_props #(
     input wire [19:0] be_cnt_all,
     input wire [63:0] be_crc_all,
     input wire [31:0] be_enc_all,     // slice A encoder state (6.9.1)
+    // SCHED-4 (BUGS 6): the F stage's consumption of STEP_REQ wins over a
+    // host STEP write on the same edge (SEMANTICS 7).
+    input wire        valid_f,
+    input wire        h_step_we,
+    input wire [3:0]  h_step,
     input wire [3:0]  rf_we_oh,
 
     // Host port.
@@ -211,6 +216,19 @@ module loom_sched_props #(
     for (t = 0; t < 4; t = t + 1) begin : g_thread
 
       wire f_commit = f_vw && (f_wth == t[1:0]);
+      // ---- SCHED-4: a STEP_REQ consumed by thread t's F stage is clear in
+      // the next cycle whatever the host wrote at that edge (SEMANTICS 7:
+      // "A host STEP that commits on the same edge ... is lost"; BUGS 6).
+      wire       f_consume = valid_f && (ph == t[1:0]) && step_req_r[t];
+      reg        p_consume, p_host_step;
+      always @(posedge clk) begin
+        p_consume   <= f_consume;
+        p_host_step <= h_step_we && h_step[t] && !run_r[t];
+      end
+      always @(posedge clk) if (f_past_valid && $past(rst_n))
+        if (p_consume) assert (!step_req_r[t]);
+      always @(posedge clk) if (f_past_valid && $past(rst_n))
+        cover (p_consume && p_host_step);        // the coincidence itself
       wire f_host   = h_reset[t]
                       | (h_dbg_req & h_dbg_wr & (h_dbg_thread == t[1:0]));
 
@@ -310,6 +328,7 @@ bind loom_core loom_sched_props #(.FIFO_DEPTH(4), .FAW(2)) u_sched_props (
     .td_all(td_all_w),
     .be_sr_all(be_sr_all), .be_cnt_all(be_cnt_all), .be_crc_all(be_crc_all),
     .be_enc_all(be_enc_all),
+    .valid_f(valid_f), .h_step_we(h_step_we), .h_step(h_step),
     .rf_we_oh(rf_we_oh),
     .h_reset(h_reset), .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
     .h_dbg_thread(h_dbg_thread),

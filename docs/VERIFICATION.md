@@ -140,6 +140,9 @@ reference model, check data and timing.
   own W stage.
 - SCHED-3: a thread with RUN=0 never changes architectural state except through
   host debug writes.
+- SCHED-4: a `STEP_REQ` consumed by thread t's F stage is clear in the next
+  cycle whatever the host wrote at that edge: the thread wins the
+  coincidence SEMANTICS 7 describes (BUGS 6).
 - ISO-1: for any two traces that agree on thread t's inputs (its pins, its
   FIFOs, SFLAGS it waits on) thread t's state sequence is identical regardless
   of what other threads do, given that no other thread writes shared state
@@ -253,7 +256,7 @@ run it.
 | Check | Implemented in | State |
 |---|---|---|
 | L0 static | `scripts/check_all.sh`, CI `lint` | Verilator `-Wall` on the TT top and the generated decoder |
-| L1 unit | `test/test_{host,alu,ctrl,pins,timing,uart,fifo,irq,be,setpd}.py` | 78 cocotb tests (8 added with slice A, `test_be.py`, whose reference is a Python transcription of SEMANTICS 6.9.1), all of which also run on the netlist in CI's `gl_test` |
+| L1 unit | `test/test_{host,alu,ctrl,pins,timing,uart,fifo,irq,be,setpd,mem}.py` | 92 cocotb tests (8 added with slice A, `test_be.py`, whose reference is a Python transcription of SEMANTICS 6.9.1; 14 with slice B, `test_mem.py`), all of which also run on the netlist in CI's `gl_test` |
 | L2-RAND, L2-TRACE, L2-SLOT | `tools/loomgen` + `test/test_cosim.py` | lockstep on every cycle: retire record, pads, `HOST_IRQ`, guard registers, periodic full state. Both sides built from `CTRL.CAPS`, so the M2 features (FIFOs, bit engine, `SETP ... D`) are exercised, and two seeds drive the host port throughout the run. Slice A (2026-09-22): the generator drives `ENC`, `STUFF` and `DIFF` in a build with `CAPS[9]`; the default run and a 36 + 4 seed sweep at seed base 1000 (`LOOM_COSIM_SEEDS=36 LOOM_COSIM_SEED_BASE=1000 LOOM_COSIM_SPI_SEEDS=4`) both end with zero divergences between the two independently written implementations of 6.9.1, with every one of the 25 slice A bins hit |
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |

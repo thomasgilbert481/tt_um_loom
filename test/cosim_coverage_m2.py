@@ -66,7 +66,7 @@ BE_CFG_M2_MASK = BE_CFG_DIR | BE_CFG_INV | BE_CFG_CRC_EN
 BE_CFG_ENC_SHIFT, BE_CFG_STUFF_SHIFT, BE_CFG_DIFF = 3, 5, 1 << 10
 
 M2_GROUPS = ("m2_fifo", "m2_be", "m2_csr", "m2_setpd", "m2_irq", "m2_host",
-             "m3a_be")
+             "m3a_be", "m3b_mem")
 
 IRQ_CAUSES = ("SWIRQ", "SFLAGS", "INQ_NOT_FULL", "OUTQ_NOT_EMPTY", "HALTED")
 PIN_CLASSES = ("bidir", "bidir_od", "out", "readonly", "reserved")
@@ -135,16 +135,18 @@ class M2Coverage(Coverage):
                     name, "the bit engine is built, so no CSR of isa.yaml is unbuilt")
             else:
                 cosim_coverage.UNREACHABLE.pop(name, None)
-        # The slice-A bins exist only in a build with the encoders (CAPS[9]).
-        any_build_has_enc = any("BEENC" in f for f, _ in self.builds)
-        for group, bin_name in _m2_bins():
-            if group != "m3a_be":
-                continue
-            if any_build_has_enc:
-                cosim_coverage.UNREACHABLE.pop(bin_name, None)
-            else:
-                cosim_coverage.UNREACHABLE.setdefault(
-                    bin_name, "slice A (the encoders) is not built: CAPS[9] = 0")
+        # The slice-A bins exist only in a build with the encoders (CAPS[9]),
+        # the slice-B bins only with the data memory (CAPS[5]).
+        for group, feature, why in (("m3a_be", "BEENC", "slice A (the encoders) is not built: CAPS[9] = 0"),
+                                    ("m3b_mem", "DMEM", "slice B (LD/ST) is not built: CAPS[5] = 0")):
+            present = any(feature in f for f, _ in self.builds)
+            for g, bin_name in _m2_bins():
+                if g != group:
+                    continue
+                if present:
+                    cosim_coverage.UNREACHABLE.pop(bin_name, None)
+                else:
+                    cosim_coverage.UNREACHABLE.setdefault(bin_name, why)
 
     def _built(self, name: str, fields: Dict[str, int],
                features: Sequence[str]) -> bool:
@@ -153,6 +155,16 @@ class M2Coverage(Coverage):
     # ------------------------------------------------------------------ feed
     def note(self, record, ctx: SlotContext) -> None:            # type: ignore[override]
         """Account for one retired slot (M1 bins through the base class)."""
+        # Slice B (6.11): the model names both slots of an LD/ST by their
+        # mnemonic; the completion slot's `ir` is data, never decoded.
+        mem = getattr(record, "mnemonic", None)
+        if mem in ("LD", "ST") and "DMEM" in ctx.features:
+            self.slots += 1
+            self.hit("mnemonic", "%s@t%d" % (mem, record.thread))
+            self.hit("m3b_mem", "%s:%s" % (mem, "complete" if record.done else "issue"))
+            if record.done and mem == "LD" and record.we:
+                self.hit("m3b_mem", "LD:writes_rd")
+            return
         decoded = self.isa.decode(record.ir)
         if decoded is not None:
             name, fields = decoded[0].name, decoded[1]
@@ -351,6 +363,7 @@ def _m2_bins() -> List[Tuple[str, str]]:
     add("m3a_be", *["CSRW:BE_CFG:ENC%d" % v for v in range(4)])
     add("m3a_be", *["CSRW:BE_CFG:STUFF%d" % v for v in range(4)])
     add("m3a_be", "CSRW:BE_CFG:DIFF0", "CSRW:BE_CFG:DIFF1")
+    add("m3b_mem", "LD:issue", "LD:complete", "LD:writes_rd", "ST:issue", "ST:complete")
     add("m2_setpd", "staged:new", "staged:replaces", "fired:rule1", "fired:rule2",
         "fired:ordinary_write_wins")
     add("m2_setpd", *["staged:%s" % c for c in PIN_CLASSES])

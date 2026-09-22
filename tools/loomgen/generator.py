@@ -162,6 +162,12 @@ FIFO_DEPTHS: Tuple[int, ...] = (2, 4, 8)
 #: the only values it ever holds are the ones a ``LDI``/``LDIH`` or ``CSRR
 #: NOW`` in the same block put there.
 SCRATCH = 7
+#: Slice B (SEMANTICS 6.11, feature ``DMEM``): every running thread keeps the
+#: top DATA_WORDS words of its region as a data window that LD/ST address
+#: through the scratch register, so no store ever lands on code. The window
+#: is part of the image (random words), so a load never reads an unwritten
+#: word, which the RTL's memory would return as X.
+DATA_WORDS = 8
 VALUE_REGS = tuple(range(0, SCRATCH))           # r0..r6
 ALL_REGS = tuple(range(0, 8))
 
@@ -408,7 +414,7 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitp": 4, "waite": 4, "waits": 4, "sig": 4, "clr": 3,
         "csrr": 6, "csrw": 6, "reserved": 2, "unbuilt": 2,
         "fifo_push": 3, "fifo_pop": 3, "waitb": 2, "be_cfg": 1, "be_op": 3,
-        "be_loop": 1, "crc": 1, "setp_d": 3,
+        "be_loop": 1, "crc": 1, "setp_d": 3, "mem": 2,
     },
     "alu": {
         "alu3": 26, "alui": 24, "ldi": 8, "ldih": 6, "unary": 22,
@@ -419,7 +425,7 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitp": 1, "waite": 1, "waits": 2, "sig": 2, "clr": 1,
         "csrr": 4, "csrw": 4, "reserved": 2, "unbuilt": 2,
         "fifo_push": 1, "fifo_pop": 1, "waitb": 1, "be_cfg": 1, "be_op": 3,
-        "be_loop": 1, "crc": 1, "setp_d": 1,
+        "be_loop": 1, "crc": 1, "setp_d": 1, "mem": 2,
     },
     "timing": {
         "alu3": 5, "alui": 5, "ldi": 3, "ldih": 2, "unary": 4,
@@ -430,7 +436,7 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitp": 8, "waite": 8, "waits": 8, "sig": 7, "clr": 4,
         "csrr": 5, "csrw": 6, "reserved": 2, "unbuilt": 2,
         "fifo_push": 2, "fifo_pop": 2, "waitb": 5, "be_cfg": 1, "be_op": 2,
-        "be_loop": 2, "crc": 1, "setp_d": 8,
+        "be_loop": 2, "crc": 1, "setp_d": 8, "mem": 2,
     },
     "pins": {
         "alu3": 4, "alui": 4, "ldi": 5, "ldih": 3, "unary": 4,
@@ -441,7 +447,7 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitp": 10, "waite": 12, "waits": 4, "sig": 3, "clr": 2,
         "csrr": 5, "csrw": 6, "reserved": 2, "unbuilt": 2,
         "fifo_push": 1, "fifo_pop": 1, "waitb": 2, "be_cfg": 4, "be_op": 8,
-        "be_loop": 3, "crc": 1, "setp_d": 6,
+        "be_loop": 3, "crc": 1, "setp_d": 6, "mem": 2,
     },
     # The M2 features first: FIFOs, bit engine, deadline-latched SETP, with
     # enough of everything else around them to keep the slots varied.
@@ -454,7 +460,7 @@ PROFILES: Dict[str, Dict[str, int]] = {
         "waitp": 2, "waite": 2, "waits": 2, "sig": 2, "clr": 1,
         "csrr": 4, "csrw": 4, "reserved": 1, "unbuilt": 1,
         "fifo_push": 8, "fifo_pop": 7, "waitb": 5, "be_cfg": 3, "be_op": 9,
-        "be_loop": 4, "crc": 2, "setp_d": 9,
+        "be_loop": 4, "crc": 2, "setp_d": 9, "mem": 2,
     },
 }
 
@@ -479,7 +485,7 @@ class _ThreadBuilder:
                  others_running: bool, flag_pool: Sequence[int],
                  avoid: FrozenSet[str], features: Sequence[str] = (),
                  fifo_depth: int = DEFAULT_FIFO_DEPTH,
-                 host_traffic: bool = False):
+                 host_traffic: bool = False, entry: int = 0):
         self.rng = rng
         self.isa = isa
         self.thread = thread
@@ -493,6 +499,11 @@ class _ThreadBuilder:
         self.be_enc = "BEENC" in self.features
         self.be = "BE" in self.features
         self.setpd = "SETPD" in self.features
+        # Slice B: the top DATA_WORDS words of the region are data, never code.
+        self.dmem = "DMEM" in self.features
+        self.data_base = entry + size - DATA_WORDS
+        if self.dmem:
+            self.size = size - DATA_WORDS
         self.fifo_depth = fifo_depth
         # The host pushes INQ[t] and pops OUTQ[t] of every running thread in
         # every round of its plan (tools.loomgen.hostplan), which is what
@@ -1017,6 +1028,23 @@ class _ThreadBuilder:
         self._cond_wait("WAITB", live, force_timed=not live, cond=cond)
 
     # ------------------------------------------------- M2: bit engine (6.9)
+    # -------------------------------------------- slice B: LD/ST (6.11)
+    def _emit_mem(self) -> None:
+        """One ``LD`` or ``ST`` into the thread's data window (SEMANTICS 6.11):
+        ``LDI r7, lo; LDIH r7, hi; LD|ST rX, r7, imm5`` with ``imm5`` inside
+        the window, so the access is real and never touches code. Two slots
+        on both sides, the completion slot decoding nothing. In a build
+        without the feature it is an unbuilt instruction as before."""
+        if not self.dmem:
+            return self._emit_unbuilt_named(self.rng.choice(("LD", "ST")))
+        if self.room < 3:
+            return self._emit_nop()
+        name = self.rng.choice(("LD", "ST", "LD"))
+        block = self.load_scratch(self.data_base) + [
+            self.enc(name, rd=self.any_reg(), ra=SCRATCH,
+                     imm=self.rng.randrange(DATA_WORDS))]
+        self.push(block)
+
     def _emit_be_cfg(self) -> None:
         """``BE_CFG`` and/or ``BE_PINS`` from the scratch register."""
         if not self.be:
@@ -1277,6 +1305,11 @@ def check_program(prog: GeneratedProgram, isa: Optional[Isa] = None) -> None:
         if sorted(words) != list(range(start, end)):
             raise LoomgenError("thread %d region %#x..%#x is not fully written"
                                % (t, start, end))
+        # Slice B: the top DATA_WORDS words of a DMEM build's region are the
+        # data window, written but never code (SEMANTICS 6.11).
+        if "DMEM" in prog.features:
+            end -= DATA_WORDS
+            words = {a: w for a, w in words.items() if a < end}
         last = isa.decode(words[end - 1])
         if last is None or last[0].name != "JMP":
             raise LoomgenError("thread %d region does not end with JMP" % t)
@@ -1405,12 +1438,18 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
         builder = _ThreadBuilder(rng, isa, thread, stride, profile, plan,
                                  len(running) > 1, flag_pool, avoid,
                                  features=feature_names, fifo_depth=fifo_depth,
-                                 host_traffic=host_traffic)
+                                 host_traffic=host_traffic,
+                                 entry=entry_list[thread])
         blocks = builder.build(chosen_weights, rng.random() < HALT_RATE)
         _place(blocks, entry_list[thread])
         loop_head = blocks[builder.loop_head_index].addr
         image.update(_resolve(blocks, isa, rng, loop_head))
         heads += [b.addr for b in blocks if b.targetable]
+        if "DMEM" in feature_names:
+            # The data window is in the image, so a load reads a known word.
+            base = entry_list[thread] + stride - DATA_WORDS
+            for i in range(DATA_WORDS):
+                image.setdefault(base + i, rng.randrange(1 << 16))
 
     host = build_host_plan(rng, run_mask, fifo_depth) if host_traffic else None
     prog = GeneratedProgram(

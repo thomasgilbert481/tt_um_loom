@@ -328,7 +328,11 @@ result recorded, bounded or proved.
       `two_slot`, the deadline checker prices them at two slots (test added),
       generated files refreshed. Data placement uses the existing `.org` and
       `.word`; the host's existing IMEM commands load and dump an image.
-- [ ] Slice B: RTL and model, tests, hardening, the D-025 reading.
+- [ ] Slice B: 2026-09-22, RTL and model written from 6.11 by two agents
+      (per-thread held access after the model author's question 1; 14
+      cocotb and 47 model tests; the generator addresses a data window;
+      generic synthesis +593 cells, +136 flops in `loom_core`). Open: the
+      hardening and its D-025 reading, after slice A's.
 - [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
       in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a
       Python host model, enumeration to SET_ADDRESS and one HID report

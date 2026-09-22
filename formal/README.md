@@ -77,8 +77,9 @@ about 55 minutes between them, nearly all of it `iso:prove` (35) and
 | SCHED-1 | exactly one thread in each pipeline stage, the four distinct, every commit ring one-hot on the W thread | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
 | SCHED-2 | thread `t`'s regs, PC, flags, TD, SR, CNT, CRC and, from slice A (2026-09-22), its encoder state of 6.9.1 change only in its own W stage (or by a host write) | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** (21 s with the encoder state) | 26 s |
 | SCHED-3 | a thread the host has neither run nor stepped for four cycles changes nothing | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
-| SCHED-1..3, FIFO-1B | bounded cross-check | `sched.sby:bmc` | bmc | btor btormc | 24 | pass | 39 s |
-| — | 5 cover points | `sched.sby:cover` | cover | smtbmc yices | 20 | 5/5 | 7 s |
+| SCHED-4 | a `STEP_REQ` consumed by thread `t`'s F stage is clear in the next cycle whatever the host wrote at that edge (SEMANTICS 7, "the thread wins"; BUGS 6, added 2026-09-22) | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
+| SCHED-1..4, FIFO-1B | bounded cross-check | `sched.sby:bmc` | bmc | btor btormc | 24 | pass | 39 s |
+| — | 9 cover points (the five before, plus the SCHED-4 coincidence itself, per thread) | `sched.sby:cover` | cover | smtbmc yices | 20 | 9/9 | 7 s |
 | PIN-2 | pin commits are bit-masked; core beats staged beats host | `pins.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** | 7 s |
 | **PIN-1** | an open-drain BIDIR pin never drives high | `pins.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** (was FAILS, step 2, before D-023: finding F-2) | 3 s |
 | PIN-1CORE | same, firmware only (no host pin write in the trace) | `pins.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** (was F-2) | 3 s |

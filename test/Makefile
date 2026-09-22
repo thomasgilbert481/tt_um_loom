@@ -80,11 +80,13 @@ export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 # netlist, having none of the internal signals it compares), test_flops (it
 # drives the second, FLOPS-memory instance in tb.v) and test_fw (the L3
 # firmware tests of tools/tests/test_fw_*.py through rtl_bench.py, which
-# reads the retire record).
+# reads the retire record). test_mem runs on both: its one FLOPS-instance
+# test skips itself when GATES=yes, exactly as test_flops does, and
+# everything else in it goes through the pins.
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_cosim,test_fw,test_flops
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_mem,test_cosim,test_fw,test_flops
 else
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_mem
 endif
 
 # include cocotb's make rules to take care of the simulator setup

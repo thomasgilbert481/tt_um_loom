@@ -412,6 +412,9 @@ class _Probe:
             "be_sr_all", "be_cnt_all", "be_crc_all", "be_poly_all",
             "be_init_all", "be_reload_all", "be_cfg_all", "be_pins_all")}
         self.be_enc_all = _optional(core, "be_enc_all")     # slice A (6.9.1)
+        # Slice B (6.11): the per-thread MEM state of debug 0x28.
+        self.mem_state = {name: _optional(core, name) for name in (
+            "mem_pend_all", "mem_ld_all", "mem_rd_all")}
         self.lat_valid_all = _optional(core, "lat_valid_all")
         self.lat_pin_all = _optional(core, "lat_pin_all")
         self.lat_val_all = _optional(core, "lat_val_all")
@@ -478,9 +481,14 @@ def _diff_record(rtl, model):
     if model is None:
         return []
     mine = _model_tuple(model)
+    # SEMANTICS 8: the word an ST's completion slot received is unspecified
+    # (the memory backend's business), so tr_ir is not compared there.
+    st_done = getattr(model, "mnemonic", None) == "ST" and model.done
     out = []
     for name, got, want in zip(FIELDS, rtl, mine):
         if name in ("rd", "val") and not (rtl[4] and mine[4]):
+            continue
+        if name == "ir" and st_done:
             continue
         if got != want:
             out.append(("tr_" + name, got, want))
@@ -600,6 +608,15 @@ def _m2_state_pairs(p: _Probe, machine: Machine, build: _Build):
                 add(("t%d.BE_CFG.DIFF" % t, (cfg >> 7) & 1, (th.be_cfg >> 10) & 1))
             if "BEENC" in build.features:
                 add(("t%d.ENC" % t, _field(enc_all, t, 8), th.enc))
+    if "DMEM" in build.features:
+        mem = {name: _i(_needed(handle, "u_core." + name, "the data memory"))
+               for name, handle in p.mem_state.items()}
+        for t in range(THREADS):
+            th = machine.threads[t]
+            word = (((mem["mem_pend_all"] >> t) & 1) << 4) \
+                | (((mem["mem_ld_all"] >> t) & 1) << 3) \
+                | _field(mem["mem_rd_all"], t, 3)
+            add(("t%d.MEM" % t, word, th.mem))
     if "SETPD" in build.features:
         valid = _i(_needed(p.lat_valid_all, "u_core.lat_valid_all", "SETP D"))
         value = _i(_needed(p.lat_val_all, "u_core.lat_val_all", "SETP D"))
@@ -1192,10 +1209,14 @@ class _Run:
                                         % (rtl[1], gap_pc))
                 if not model.done:
                     decoded = ISA.decode(model.ir)
-                    if decoded is None or decoded[0].timing not in ("wait", "blocking") \
+                    # Waits and blocking FIFO ops re-issue; the first slot of
+                    # an LD/ST (timing class two_slot, SEMANTICS 6.11) holds PC
+                    # for its completion slot the same way.
+                    if decoded is None \
+                            or decoded[0].timing not in ("wait", "blocking", "two_slot") \
                             or model.next_pc != model.pc:
-                        problems.append("a stall that is not a wait or blocking "
-                                        "FIFO re-issue")
+                        problems.append("a stall that is not a wait, a blocking "
+                                        "FIFO re-issue or the first slot of LD/ST")
                 if problems:
                     self.fail(k, [], rtl, model, kind="L2-SLOT",
                               note="; ".join(problems))

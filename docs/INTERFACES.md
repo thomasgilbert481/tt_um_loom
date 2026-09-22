@@ -1,10 +1,11 @@
-# Loom module interfaces (M3 slice A)
+# Loom module interfaces (M3 slice B)
 
 Every port of every hand-written module in `src/`, what it means, and the
 cycle in which it is valid. Written by the RTL implementer as part of M1,
-updated with the M2 RTL and again with M3 slice A (the bit-engine encoders,
-stuffing and DIFF of `docs/SEMANTICS.md` 6.9.1); `docs/ARCHITECTURE.md`
-section 14 requires this file to match the RTL.
+updated with the M2 RTL, again with M3 slice A (the bit-engine encoders,
+stuffing and DIFF of `docs/SEMANTICS.md` 6.9.1) and again with M3 slice B
+(the data memory of 6.11); `docs/ARCHITECTURE.md` section 14 requires this
+file to match the RTL.
 
 Cycle names follow `docs/SEMANTICS.md` section 2: a slot of thread `t` starts
 in cycle `k` with `k mod 4 == t` and has stages F (cycle k), D (k+1),
@@ -44,7 +45,10 @@ Instantiates everything; all parameters live here.
 Parameters: `IMEM_IMPL` (`"MACRO"`, the default, or `"FLOPS"`; see
 loom_imem), `IMEM_WORDS` (16 bits, default 512; the macro needs 512),
 `FIFO_DEPTH` (a power of two from 2 to 8, default 4), `ID_VALUE` (0x4C4D),
-`VERSION` (0x0003: 3 from M3 slice A on, SEMANTICS 6.9.1).
+`VERSION` (0x0004: 4 from M3 slice B on, SEMANTICS 6.11; 3 was slice A).
+loom_top also arbitrates the single instruction-memory port between the host
+(which may only ask while `core_busy` is low) and the core, whose own write
+is the `ST` of 6.11.
 Derived: `IMEM_AW = $clog2(IMEM_WORDS)`, `CAPS_VAL` (SEMANTICS 5: FIFOs with
 `log2(FIFO_DEPTH)` in bits 2:0, and one bit per M2 feature as it is built).
 
@@ -188,13 +192,16 @@ SPACE 4 (DEBUG): ADDR = `{thread[9:8], reg[7:0]}`.
 | 0x25 | `{9'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]}` (6.10) | RW |
 | 0x26 | `{INQ_CNT, OUTQ_CNT}` as `{byte, byte}` | R |
 | 0x27 | `{8'b0, FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}`, the encoder state (6.9.1) | RW |
+| 0x28 | `{11'b0, MEM_PEND, MEM_LD, MEM_RD[2:0]}`, the data access in progress (6.11) | RW |
 
 The three addresses in bold are the ones `docs/HOST_PROTOCOL.md` leaves to the
 implementation; 0x21 follows the note in that document. Debug writes other
 than r0..r7 take effect only while the thread is not running.
 
 SPACE 5 (STEP): a write to ADDR = t sets STEP_REQ[t] (ignored if RUN[t]).
-SPACE 2 (DMEM) reads 0 and ignores writes.
+SPACE 2 (DMEM) reads 0 and ignores writes, in slice B as before: the data
+memory of 6.11 *is* the instruction memory, so a data image is loaded and
+dumped through SPACE 1 (`docs/spec-questions/rtl-m3b.md` question 6).
 
 ---
 
@@ -212,7 +219,7 @@ Both keep the ports and the one-cycle read latency below.
 | `we` | in | write enable, only with `en` |
 | `addr[AW-1:0]` | in | address, sampled at the edge that ends the cycle |
 | `wdata[15:0]` | in | write data |
-| `rdata[15:0]` | out | contents of `addr` as presented in the previous cycle: the address driven in F is returned in D. After a write cycle it is not defined by this contract (FLOPS: the old contents; MACRO: unchanged), and nothing reads it |
+| `rdata[15:0]` | out | contents of `addr` as presented in the previous cycle: the address driven in F is returned in D, whether that address was a `PC` or the data address of an `LD` (6.11). After a write cycle it is not defined by this contract (FLOPS: the old contents; MACRO: unchanged); the completion slot of an `ST` is the only reader and SEMANTICS 8 leaves its `tr_ir` uncompared |
 
 Parameters `IMPL`, `WORDS` (16 bits) and `AW`. The flattened path of the macro
 instance, which `src/config.json` names, is `u_loom.u_imem.g_macro.u_macro.sram`.
@@ -241,9 +248,11 @@ The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`, `FIFO_DEPTH`.
 
 | Port | Dir | Meaning / validity |
 |---|---|---|
-| `imem_addr[IMEM_AW-1:0]` | out | combinational `PC[ph]`, valid during F |
+| `imem_addr[IMEM_AW-1:0]` | out | combinational, valid during F: `PC[ph]`, or the held data address when this F cycle is the access of an `LD`/`ST` (6.11) |
 | `imem_en` | out | combinational slot validity, valid during F |
-| `imem_rdata[15:0]` | in | the instruction word, consumed in D |
+| `imem_we` | out | combinational, valid during F: this F cycle is the access of an `ST`. Never high without `imem_en` |
+| `imem_wdata[15:0]` | out | the `r[rd]` an `ST` writes, held in the shared register since the first slot's commit edge; valid with `imem_we` |
+| `imem_rdata[15:0]` | in | consumed in D: the instruction word, or the data word of an `LD` |
 | `pin_in_vec[31:0]` | in | the whole pin index space as an instruction sees it in X |
 | `pin_in_reg`, `pin_out_reg`, `pin_oe_reg`, `od_mask_reg` | in | register views for CSR reads and for the open-drain rule, as visible in X |
 | `cw_valid` | out | a valid slot is in W: its pin writes commit at the end of this cycle |
@@ -276,7 +285,38 @@ so the open-drain rule and the writable-index check are shared. M3 slice A
 them, selected by the same `xsel`, and an eighth commit strobe for the
 per-thread encoder state; `DIFF`'s second pin write joins the 32-bit mask
 the group write already builds, so a non-writable `out + 1` is dropped like
-any other. No port of loom_core changed.
+any other.
+
+M3 slice B (6.11, D-027) adds the data memory. Per thread it holds
+`MEM_PEND`, `MEM_LD` and `MEM_RD[2:0]` of SEMANTICS 5 and the access itself,
+`{address[IMEM_AW-1:0], store word[15:0], write}`, all committed on the PC
+ring. The first slot of an `LD`/`ST` adds `ra + imm5` in X and rides the
+existing wait machinery, so it holds `PC` and raises `WAIT_ACTIVE` exactly
+as a stalling wait does; its commit edge loads that thread's held access
+from the W stage (the store word travels in `w_rval`, which a memory slot
+never uses for a register write). The F stage then takes it:
+`mem_fetch = valid_f & MEM_PEND[ph]` selects the held address, `imem_we`
+and `imem_wdata` over `PC`, and no instruction is fetched for that slot. The
+completion slot is that same slot: it has `MEM_PEND` set in X and decodes
+nothing at all, because `xins` is low and the new `dec_ok` (which replaces
+`~bad_op` everywhere) suppresses every decode-driven effect. What is left is
+the `LD` write of `r[MEM_RD]` with the received word, `MEM_PEND` and
+`WAIT_ACTIVE` cleared and `PC <= next`.
+
+For a running thread that valid F cycle is the one right after the first
+slot's W edge, so the access lands exactly where 6.11 puts it. For a thread
+stepped one slot at a time it is the next `STEP`, which is what makes
+"stepping n times is observably identical to running n slots" (SEMANTICS 7)
+true of an access; this is why the access is held per thread rather than in
+one register shared by the four, which another thread's `LD`/`ST` could
+overwrite in between (the architect's ruling of 2026-09-22, superseding the
+single register D-027 costed; `docs/spec-questions/rtl-m3b.md` question 1).
+`MEM_PEND` is the valid bit of the held access, so there is no second one,
+and `CTRL.RESET` or a debug `PC` write clears `MEM_PEND` only, abandoning
+the access while `MEM_LD` and `MEM_RD` keep their values. A host write of
+debug 0x28 sets the three section-5 fields and leaves the held address and
+store word alone. Two ports were added to loom_core: `imem_we` and
+`imem_wdata`.
 
 ---
 

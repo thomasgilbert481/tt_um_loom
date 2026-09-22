@@ -20,9 +20,16 @@
  *   A write with `we` high takes effect at edge k+1. What `rdata` shows
  *   after a write cycle is not part of the contract (FLOPS: the old contents
  *   of the address; MACRO: unchanged, because the macro port does no read in
- *   a write cycle) and nothing reads it: host access is only permitted while
- *   no slot is in flight, and the host reads IMEM only in the cycle right
- *   after its own read request.
+ *   a write cycle). Nothing reads it for its value: host access is only
+ *   permitted while no slot is in flight, and the host reads IMEM only in
+ *   the cycle right after its own read request, while the completion slot
+ *   of an `ST` (docs/SEMANTICS.md 6.11, M3 slice B) is told by the same text
+ *   that the word its D stage receives is unspecified, and section 8 has the
+ *   co-simulation harness leave that `tr_ir` uncompared. Both backends do
+ *   return the *old* contents or a stale word rather than X once the address
+ *   has been written, which is what `test/tb.v`'s unwritten-word check
+ *   needs: a program that stores into a word the host never loaded stops the
+ *   run on the FLOPS backend.
  *   `en` gates both the read and the write, so a bubble slot leaves `rdata`
  *   unchanged. The array has no reset (SEMANTICS 5: "Instruction memory is
  *   not reset"); the macro powers up undefined, like the flops.
@@ -38,10 +45,13 @@
  * macro's model treats an X enable before that edge as no access, and a
  * stray access before the first reset edge in silicon only touches contents
  * that are undefined at power-up anyway. The wrapper's separate write
- * address is the same `addr` here, because the port is single: the host owns
- * it in the cycles where loom_top raises `we`, and `we` never rises without
- * `en`. The macro's A_DOUT is already a register, so no flop is added on
- * `rdata` and the read latency is the one cycle above.
+ * address is the same `addr` here, because the port is single: whoever owns
+ * the port in a cycle where loom_top raises `we` owns the write too, and
+ * `we` never rises without `en`. Since M3 slice B (6.11, D-027) that is
+ * either the host or the core's own `ST`, which loom_top arbitrates: the
+ * core's data access rides the thread's F cycle, where `en` is already high
+ * because the slot is valid. The macro's A_DOUT is already a register, so no
+ * flop is added on `rdata` and the read latency is the one cycle above.
  */
 
 `default_nettype none

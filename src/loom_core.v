@@ -86,8 +86,36 @@
  * reads {LAT_VALID, LAT_VAL, LAT_PIN} in bits 6:0 and writes it while the
  * thread is halted.
  *
- * Not built: LD/ST (data memory). They decode normally and execute as NOP
- * with BADOP[t] set (SEMANTICS section 9).
+ * Data memory (SEMANTICS 6.11, M3 slice B, D-027): the data memory is the
+ * instruction memory, reached through the thread's own fetch cycle, so `LD`
+ * and `ST` take two slots of their own thread and no cycle of any other's.
+ * The first slot (`MEM_PEND == 0` in X) adds `ra + imm5` in X, keeps `PC`,
+ * commits {MEM_PEND, MEM_LD, MEM_RD} and WAIT_ACTIVE, and at the same edge
+ * loads that thread's held {address, store word, write} from the W stage.
+ * In the thread's next valid F cycle `mem_fetch = valid_f & MEM_PEND[ph]`
+ * selects the held address instead of `PC` (and the write with it) and no
+ * instruction is fetched for that slot. The completion slot
+ * (`MEM_PEND == 1` in X) decodes nothing at all: `irx` holds the word the D
+ * stage received, `xins` is low and every decode-driven effect is gated by
+ * `dec_ok`, leaving only the `LD` write of `r[MEM_RD]`, `MEM_PEND` and
+ * WAIT_ACTIVE cleared and `PC <= next`. Per thread this costs MEM_PEND,
+ * MEM_LD, MEM_RD[2:0] and the held access; the adder that computes the
+ * address is the X stage's, shared by all four, and no new thread-number
+ * decode appears anywhere (D-019, D-025).
+ * The access waits for the thread's own next VALID slot, which for a
+ * running thread is the very next cycle and so is exactly the cycle count
+ * of 6.11 (F at x+2, X at x+4, commit at edge x+6). A thread stepped one
+ * slot at a time has no valid slot in that cycle, so it waits for the next
+ * STEP, which is what keeps "stepping n times is observably identical to
+ * running n slots" (SEMANTICS 7) true of an access too; debug 0x28 is
+ * readable in between. That is why the address, the store word and the
+ * write bit are held per thread and not in one register shared by the
+ * four: another thread's LD/ST in between would overwrite a shared one
+ * (the architect's ruling of 2026-09-22, which supersedes the single
+ * register D-027 costed; docs/spec-questions/rtl-m3b.md question 1).
+ * MEM_PEND is their valid bit, so there is no separate one, and
+ * `CTRL.RESET` or a debug `PC` write clearing MEM_PEND abandons the
+ * access: a thread never completes one it did not start.
  */
 
 `default_nettype none
@@ -103,6 +131,8 @@ module loom_core #(
     // ---------------------------------------------------------- imem port
     output wire [IMEM_AW-1:0] imem_addr,
     output wire              imem_en,
+    output wire              imem_we,      // data write of an ST (6.11)
+    output wire [15:0]       imem_wdata,
     input  wire [15:0]       imem_rdata,
 
     // ---------------------------------------------------------- pin unit
@@ -194,6 +224,14 @@ module loom_core #(
   reg [63:0] steps_all;
   reg [3:0]  lat_valid_all, lat_val_all;   // deadline latch (6.10)
   reg [19:0] lat_pin_all;
+  // Data memory (6.11). Per thread: MEM_PEND, MEM_LD and MEM_RD[2:0] of
+  // section 5, and the access itself - the address, the word an ST writes
+  // and the write bit - held until the thread's next valid slot takes it.
+  // MEM_PEND is the valid bit of the held access.
+  reg [3:0]  mem_pend_all, mem_ld_all, mem_we_all;
+  reg [11:0] mem_rd_all;
+  reg [4*IMEM_AW-1:0] mem_addr_all;
+  reg [63:0] mem_data_all;
 
   assign run         = run_r;
   assign halted      = halted_r;
@@ -207,8 +245,18 @@ module loom_core #(
   wire [9:0]  pc_f   = pc_all[fsel*10 +: 10];
   wire        valid_f = run_r[ph] | step_req_r[ph];
 
-  assign imem_addr = pc_f[IMEM_AW-1:0];
-  assign imem_en   = valid_f;
+  // The data access of 6.11 replaces this F cycle's fetch whenever the
+  // thread now in F has one pending. For a running thread that is the cycle
+  // right after the first slot's W edge; for a stepped or halted one it is
+  // its next valid slot, whenever that comes. CTRL.RESET and a debug PC
+  // write clear MEM_PEND and so abandon it.
+  wire mem_fetch = valid_f & mem_pend_all[ph];
+  wire [IMEM_AW-1:0] mem_f_addr = mem_addr_all[fsel*IMEM_AW +: IMEM_AW];
+
+  assign imem_addr  = mem_fetch ? mem_f_addr : pc_f[IMEM_AW-1:0];
+  assign imem_en    = valid_f;
+  assign imem_we    = mem_fetch & mem_we_all[ph];
+  assign imem_wdata = mem_data_all[fsel*16 +: 16];
 
   // ============================================================= D stage
   reg        vd;
@@ -321,6 +369,10 @@ module loom_core #(
   reg        w_lat;                 // a SETP D completes in this slot
   reg [4:0]  w_lat_pin;
   reg        w_lat_val;
+  reg        w_mem_req;             // first slot of an LD/ST (6.11)
+  reg        w_mem_st;              // ...and it is an ST, so the access writes
+  reg        w_mem_done;            // completion slot of an LD/ST
+  reg [IMEM_AW-1:0] w_mem_addr;
 
   // ============================================= W-stage thread rings (D-019)
   // Bit t of every ring is high in exactly the cycles whose W slot belongs to
@@ -629,17 +681,35 @@ module loom_core #(
   wire [7:0] sflags_x = (sflags_r | (w_valid ? w_sf_set : 8'd0))
                         & ~(w_valid ? w_sf_clr : 8'd0);
 
+  // ================================================= data memory (6.11)
+  // A thread with MEM_PEND set has its completion slot in X: the D stage
+  // received a data word, not an instruction, so nothing in `irx` may be
+  // decoded. `xins` is "an instruction is really in X" and `dec_ok` gates
+  // every effect the decode would otherwise have, exactly as `~bad_op`
+  // already did for an unbuilt or reserved word.
+  wire       x_mem_pend = mem_pend_all[tx_th];
+  wire       x_mem_ld   = mem_ld_all[tx_th];
+  wire [2:0] x_mem_rd   = mem_rd_all[xsel*3 +: 3];
+  wire       mem2       = x_mem_pend;      // this slot completes an access
+  wire       xins       = ~mem2;           // this slot decodes an instruction
+
   // ---------------------------------------------------------- not built
-  // Only LD/ST (data memory) are not built.
-  wire unbuilt = grp_mem;
-  wire bad_op  = is_reserved | unbuilt;
+  // Every instruction of the ISA is built from M3 slice B on.
+  wire bad_op = is_reserved & xins;
+  wire dec_ok = xins & ~bad_op;
+
+  // The first slot of an LD/ST: address (ra + imm5) mod 2^16, then modulo
+  // IMEM_WORDS, which is the low IMEM_AW bits. `op_b` is r[rd], the word an
+  // ST writes (loom_decode gives rb = rd for this group).
+  wire        mem_first  = dec_ok & grp_mem;
+  wire [15:0] mem_addr16 = op_a + f_imm;
 
   wire [9:0] x_next = pcx + 10'd1;
 
   // ------------------------------------------------------------- the ALU
-  wire        sel_alu   = grp_alu   & ~bad_op;
-  wire        sel_alui  = grp_alui  & ~bad_op;
-  wire        sel_unary = grp_unary & ~bad_op;
+  wire        sel_alu   = grp_alu   & dec_ok;
+  wire        sel_alui  = grp_alui  & dec_ok;
+  wire        sel_unary = grp_unary & dec_ok;
   wire [15:0] alu_a = (grp_alui | is_cmp | is_test) ? op_b : op_a;
   wire [15:0] alu_b = grp_alu ? op_b : (grp_alui ? f_imm : op_a);
   wire [15:0] alu_y;
@@ -888,17 +958,22 @@ module loom_core #(
                     | (is_waite & cond_waite)
                     | (is_waits & cond_waits)
                     | (is_waitb & cond_waitb);
-  wire is_cwait   = (is_waitp | is_waite | is_waits | is_waitb) & ~bad_op;
+  wire is_cwait   = (is_waitp | is_waite | is_waits | is_waitb) & dec_ok;
   wire timeout    = is_cwait & f_tmo & ~cond_hit & reach_td;
 
   // PUSH and POP block like waits (WAIT_ACTIVE, PC unchanged) and have no
-  // timeout (SEMANTICS 6.7).
-  wire wait_class = (tmg_wait | tmg_blocking) & ~bad_op;
-  wire wait_done  = (is_waitd & reach_td_new)
-                    | (is_dly  & reach_dt_new)
-                    | (is_cwait & (cond_hit | (f_tmo & reach_td)))
-                    | (is_push & x_outq_nf)
-                    | (is_pop  & x_inq_ne);
+  // timeout (SEMANTICS 6.7). The two slots of an LD/ST ride the same
+  // machinery (6.11): the first slot never completes, so it holds PC and
+  // raises WAIT_ACTIVE exactly as a stalling wait does, and the completion
+  // slot always completes, so it clears WAIT_ACTIVE and takes PC <= next.
+  wire wait_class = (dec_ok & (tmg_wait | tmg_blocking)) | mem_first | mem2;
+  wire wait_done  = mem2
+                    | (dec_ok
+                       & ((is_waitd & reach_td_new)
+                          | (is_dly  & reach_dt_new)
+                          | (is_cwait & (cond_hit | (f_tmo & reach_td)))
+                          | (is_push & x_outq_nf)
+                          | (is_pop  & x_inq_ne)));
   wire x_stall    = wait_class & ~wait_done;
   wire x_done     = ~x_stall;
 
@@ -908,11 +983,13 @@ module loom_core #(
                | (is_bt  &  x_t) | (is_bnt & ~x_t);
   wire [15:0] djnz_val = op_b - 16'd1;
   wire br_taken = (br_cond | (is_djnz & (djnz_val != 16'd0))
-                   | (is_jp & (pin_sel == f_val))) & ~bad_op;
+                   | (is_jp & (pin_sel == f_val))) & dec_ok;
 
   reg [9:0] x_next_pc;
   always @(*) begin
     if (x_stall)                 x_next_pc = pcx;
+    // A completion slot decodes nothing, so it can only take PC <= next.
+    else if (mem2)               x_next_pc = x_next;
     else if (bad_op)             x_next_pc = x_next;
     else if (is_jmp | is_call)   x_next_pc = f_abs;
     else if (is_ret)             x_next_pc = (x_depth != 2'd0) ? x_rs0 : x_next;
@@ -921,7 +998,7 @@ module loom_core #(
   end
 
   // ------------------------------------------------------- write back
-  wire x_reg_we = ~bad_op &
+  wire x_reg_we = dec_ok &
                   (grp_alu
                    | (grp_alui & ~is_cmpi)
                    | grp_ldi
@@ -931,7 +1008,12 @@ module loom_core #(
 
   reg [15:0] x_rval;
   always @(*) begin
-    if (is_ldi)       x_rval = f_imm;
+    // 6.11: the completion slot writes the word the D stage received; the
+    // first slot carries the ST data (r[rd]) to the holding register in the
+    // same register, which writes nothing (x_reg_we is 0 for either slot).
+    if (mem2)         x_rval = irx;
+    else if (mem_first) x_rval = op_b;
+    else if (is_ldi)  x_rval = f_imm;
     else if (is_ldih) x_rval = {f_imm[7:0], op_b[7:0]};
     else if (is_djnz) x_rval = djnz_val;
     else if (is_in)   x_rval = in_value;
@@ -943,14 +1025,14 @@ module loom_core #(
   end
 
   // ------------------------------------------------------------ flags
-  wire alu_flags = (grp_alu | grp_alui | (grp_unary & ~is_mov)) & ~bad_op;
-  wire csrw_fl   = is_csrw & csr_flags;
+  wire alu_flags = (grp_alu | grp_alui | (grp_unary & ~is_mov)) & dec_ok;
+  wire csrw_fl   = is_csrw & csr_flags & dec_ok;
   reg [2:0] x_flags;                      // {T, C, Z} after this slot
   always @(*) begin
     x_flags = {x_t, x_c, x_z};
     if (alu_flags)      x_flags = {x_t, alu_c, alu_z};
     else if (csrw_fl)   x_flags = op_a[2:0];
-    else if (is_shift & ~bad_op) x_flags = {x_t | be_t_set, x_c,
+    else if (is_shift & dec_ok) x_flags = {x_t | be_t_set, x_c,
                                             be_cnt_n == 5'd0};
     else if (is_cwait & f_tmo & wait_done) x_flags = {timeout, x_c, x_z};
   end
@@ -958,12 +1040,12 @@ module loom_core #(
   // -------------------------------------------------- shared flag ops
   wire [7:0] flag_1hot = 8'd1 << f_flag;
   wire [7:0] x_sf_set = ((is_sig ? flag_1hot : 8'd0)
-                         | ((is_csrw & csr_sflags) ? op_a[7:0] : 8'd0)) & {8{~bad_op}};
+                         | ((is_csrw & csr_sflags) ? op_a[7:0] : 8'd0)) & {8{dec_ok}};
   wire [7:0] x_sf_clr = ((is_clr ? flag_1hot : 8'd0)
-                         | ((is_waits & cond_hit) ? flag_1hot : 8'd0)) & {8{~bad_op}};
+                         | ((is_waits & cond_hit) ? flag_1hot : 8'd0)) & {8{dec_ok}};
 
   // ------------------------------------------------- return stack / misc
-  wire x_rs_we = ~bad_op & (is_call | (is_ret & (x_depth != 2'd0)));
+  wire x_rs_we = dec_ok & (is_call | (is_ret & (x_depth != 2'd0)));
   wire [9:0] x_rs0_n = is_call ? x_next : x_rs1;
   wire [9:0] x_rs1_n = is_call ? x_rs0  : x_rs1;
   wire [1:0] x_depth_n = is_call ? ((x_depth == 2'd2) ? 2'd2 : (x_depth + 2'd1))
@@ -971,9 +1053,9 @@ module loom_core #(
 
   // A re-issued WAITD has TD' = TD and writes nothing (6.10 counts only a
   // first issue as a TD write).
-  wire x_td_we = ~bad_op & ((is_waitd & first_issue) | is_setd | (is_csrw & csr_td));
+  wire x_td_we = dec_ok & ((is_waitd & first_issue) | is_setd | (is_csrw & csr_td));
   wire [15:0] x_td_val = (is_csrw & csr_td) ? op_a : td_new;
-  wire x_dt_we = ~bad_op & is_dly;
+  wire x_dt_we = dec_ok & is_dly;
 
   // ================================================== pipeline registers
   always @(posedge clk) begin
@@ -1016,14 +1098,18 @@ module loom_core #(
       w_crcpoly_we <= 1'b0; w_crcinit_we <= 1'b0;
       w_lat <= 1'b0; w_lat_pin <= 5'd0; w_lat_val <= 1'b0;
       w_tseen <= 1'b0;
+      w_mem_req <= 1'b0; w_mem_st <= 1'b0; w_mem_done <= 1'b0;
+      w_mem_addr <= {IMEM_AW{1'b0}};
     end else begin
       w_valid       <= vx;
       w_thread      <= tx_th;
       w_pc          <= pcx;
       w_ir          <= irx;
       w_done        <= x_done;
-      w_reg_we      <= x_reg_we;
-      w_rd          <= f_rd;
+      // The completion slot of an LD writes r[MEM_RD] and nothing else
+      // (6.11); the word is x_rval above.
+      w_reg_we      <= mem2 ? x_mem_ld : x_reg_we;
+      w_rd          <= mem2 ? x_mem_rd : f_rd;
       w_rval        <= x_rval;
       w_flags       <= x_flags;
       w_next_pc     <= x_next_pc;
@@ -1034,49 +1120,56 @@ module loom_core #(
       w_td          <= x_td_val;
       w_dt_we       <= x_dt_we;
       w_dt          <= dt_new;
-      w_tint_we     <= ~bad_op & is_csrw & csr_tick_int;
-      w_tfrac_we    <= ~bad_op & is_csrw & csr_tick_frac;
-      w_outgrp_we   <= ~bad_op & is_csrw & csr_outgrp;
-      w_ingrp_we    <= ~bad_op & is_csrw & csr_ingrp;
+      w_tint_we     <= dec_ok & is_csrw & csr_tick_int;
+      w_tfrac_we    <= dec_ok & is_csrw & csr_tick_frac;
+      w_outgrp_we   <= dec_ok & is_csrw & csr_outgrp;
+      w_ingrp_we    <= dec_ok & is_csrw & csr_ingrp;
       w_csr_val     <= op_a;
       w_rs_we       <= x_rs_we;
       w_rs0         <= x_rs0_n;
       w_rs1         <= x_rs1_n;
       w_depth       <= x_depth_n;
-      w_halt        <= ~bad_op & is_halt;
+      w_halt        <= dec_ok & is_halt;
       w_badop       <= bad_op;
       w_sf_set      <= x_sf_set;
       w_sf_clr      <= x_sf_clr;
-      w_out_mask    <= bad_op ? 14'd0 : x_out_mask;
+      w_out_mask    <= dec_ok ? x_out_mask : 14'd0;
       w_out_data    <= x_out_data;
-      w_oe_mask     <= bad_op ? 8'd0 : x_oe_mask;
+      w_oe_mask     <= dec_ok ? x_oe_mask : 8'd0;
       w_oe_data     <= x_oe_data;
-      w_od_we       <= ~bad_op & csrw_od;
+      w_od_we       <= dec_ok & csrw_od;
       w_od          <= op_a[7:0];
-      w_swirq       <= ~bad_op & is_csrw & csr_host_irq;
+      w_swirq       <= dec_ok & is_csrw & csr_host_irq;
       w_steps       <= x_steps1;
-      w_push        <= ~bad_op & is_push & x_outq_nf;
-      w_pop         <= ~bad_op & is_pop  & x_inq_ne;
+      w_push        <= dec_ok & is_push & x_outq_nf;
+      w_pop         <= dec_ok & is_pop  & x_inq_ne;
       // A stuff bit and a Manchester half are not data bits: they leave SR,
       // CNT and the CRC alone (6.9.1).
-      w_sr_we       <= ~bad_op & ((is_shift & be_data) | is_ldsr
+      w_sr_we       <= dec_ok & ((is_shift & be_data) | is_ldsr
                                   | (is_csrw & csr_sr));
       w_sr          <= is_shift ? be_sr_sh : op_a;
-      w_cnt_we      <= ~bad_op & ((is_shift & be_data) | (is_csrw & csr_cnt));
+      w_cnt_we      <= dec_ok & ((is_shift & be_data) | (is_csrw & csr_cnt));
       w_cnt         <= is_shift ? be_cnt_d : op_a[4:0];
-      w_crc_we      <= ~bad_op & ((is_shift & be_data & be_crcen) | is_crci
+      w_crc_we      <= dec_ok & ((is_shift & be_data & be_crcen) | is_crci
                                   | (is_csrw & csr_crc));
       w_crc         <= is_shift ? be_crc_n : (is_crci ? x_init : op_a);
-      w_enc_we      <= ~bad_op & is_shift;
+      w_enc_we      <= dec_ok & is_shift;
       w_enc         <= be_enc_n;
-      w_becfg_we    <= ~bad_op & is_csrw & csr_be_cfg;
-      w_bepins_we   <= ~bad_op & is_csrw & csr_be_pins;
-      w_bereload_we <= ~bad_op & is_csrw & csr_be_reload;
-      w_crcpoly_we  <= ~bad_op & is_csrw & csr_crc_poly;
-      w_crcinit_we  <= ~bad_op & is_csrw & csr_crc_init;
-      w_lat         <= ~bad_op & is_setp & f_lat;
+      w_becfg_we    <= dec_ok & is_csrw & csr_be_cfg;
+      w_bepins_we   <= dec_ok & is_csrw & csr_be_pins;
+      w_bereload_we <= dec_ok & is_csrw & csr_be_reload;
+      w_crcpoly_we  <= dec_ok & is_csrw & csr_crc_poly;
+      w_crcinit_we  <= dec_ok & is_csrw & csr_crc_init;
+      w_lat         <= dec_ok & is_setp & f_lat;
       w_lat_pin     <= f_pin;
       w_lat_val     <= f_val;
+      // Data memory (6.11). w_mem_req marks the first slot, whose commit
+      // edge also loads the shared holding register; w_mem_done marks the
+      // completion slot, which clears MEM_PEND.
+      w_mem_req     <= mem_first;
+      w_mem_st      <= mem_first & is_st;
+      w_mem_done    <= mem2;
+      w_mem_addr    <= mem_addr16[IMEM_AW-1:0];
     end
   end
 
@@ -1117,6 +1210,9 @@ module loom_core #(
   wire        g_lat_valid = lat_valid_all[h_dbg_thread];
   wire        g_lat_val   = lat_val_all[h_dbg_thread];
   wire [4:0]  g_lat_pin   = lat_pin_all[dsel*5 +: 5];
+  wire        g_mem_pend  = mem_pend_all[h_dbg_thread];
+  wire        g_mem_ld    = mem_ld_all[h_dbg_thread];
+  wire [2:0]  g_mem_rd    = mem_rd_all[dsel*3 +: 3];
   wire [FAW:0] g_icnt0 = inq_cnt_all[dsel*(FAW+1) +: FAW+1];
   wire [FAW:0] g_ocnt0 = outq_cnt_all[dsel*(FAW+1) +: FAW+1];
   wire [7:0]  g_icnt   = {{(7-FAW){1'b0}}, g_icnt0};
@@ -1158,6 +1254,8 @@ module loom_core #(
       8'h26:   dbg_rd_other = {g_icnt, g_ocnt};
       // {8'b0, FIRST, HALF, PEND, RVAL, RUN[2:0], LVL} (6.9.1).
       8'h27:   dbg_rd_other = {8'd0, g_enc};
+      // {11'b0, MEM_PEND, MEM_LD, MEM_RD[2:0]} (6.11).
+      8'h28:   dbg_rd_other = {11'd0, g_mem_pend, g_mem_ld, g_mem_rd};
       default: dbg_rd_other = 16'd0;
     endcase
   end
@@ -1209,6 +1307,7 @@ module loom_core #(
   wire       dw_rs1   = (h_dbg_reg == 8'h21);
   wire       dw_wa    = (h_dbg_reg == 8'h22);
   wire       dw_lat   = (h_dbg_reg == 8'h25);
+  wire       dw_mem   = (h_dbg_reg == 8'h28);
 
   // Bit-engine state: committed by the W stage, written by the host while
   // the thread is halted (SR 0x0C/0x1D, CNT 0x0D/0x1E, CRC 0x0E/0x1F, the
@@ -1306,6 +1405,12 @@ module loom_core #(
       lat_valid_all <= 4'd0;
       lat_val_all   <= 4'd0;
       lat_pin_all   <= 20'd0;
+      mem_pend_all  <= 4'd0;
+      mem_ld_all    <= 4'd0;
+      mem_we_all    <= 4'd0;
+      mem_rd_all    <= 12'd0;
+      mem_addr_all  <= {(4*IMEM_AW){1'b0}};
+      mem_data_all  <= 64'd0;
     end else begin
       for (i = 0; i < 4; i = i + 1) begin
         // ---------------------------------------------- host RESET_PC write
@@ -1384,11 +1489,39 @@ module loom_core #(
         end else if (h_reset[i] | lat_go[i]) begin
           lat_valid_all[i]      <= 1'b0;
         end
+
+        // ------------------------------------------- data memory (6.11)
+        // The first slot arms {MEM_PEND, MEM_LD, MEM_RD} and the held
+        // access, the completion slot clears MEM_PEND, the host writes the
+        // three section-5 fields at debug 0x28 while the thread is halted
+        // and leaves the held address and store word alone, and CTRL.RESET
+        // or a debug PC write clears MEM_PEND only, so a thread never
+        // completes an access it did not start (SEMANTICS 7).
+        if (cw_pc[i] & w_mem_req) begin
+          mem_pend_all[i]      <= 1'b1;
+          mem_ld_all[i]        <= ~w_mem_st;
+          mem_we_all[i]        <= w_mem_st;
+          mem_rd_all[i*3 +: 3] <= w_rd;
+          mem_addr_all[i*IMEM_AW +: IMEM_AW] <= w_mem_addr;
+          mem_data_all[i*16 +: 16]           <= w_rval;
+        end else if (cw_pc[i] & w_mem_done) begin
+          mem_pend_all[i]      <= 1'b0;
+        end else if (dbg_we[i] & dw_mem) begin
+          mem_pend_all[i]      <= h_dbg_wdata[4];
+          mem_ld_all[i]        <= h_dbg_wdata[3];
+          mem_rd_all[i*3 +: 3] <= h_dbg_wdata[2:0];
+        end else if ((dbg_we[i] & dw_pc) | h_reset[i]) begin
+          mem_pend_all[i]      <= 1'b0;
+        end
       end
 
       // ------------------------------------------------------------ STEP
-      if (valid_f && step_req_r[ph]) step_req_r[ph] <= 1'b0;
+      // SEMANTICS 7: a host STEP that commits on the edge at which the
+      // thread's F stage consumes an earlier STEP_REQ is lost (the thread
+      // wins), so the clear is the last assignment (BUGS 6: the order was
+      // the other way round, unreachable through the SPI port).
       if (h_step_we) step_req_r <= step_req_r | (h_step & ~run_r);
+      if (valid_f && step_req_r[ph]) step_req_r[ph] <= 1'b0;
 
       // --------------------------------------------------------- BADOP
       badop_r <= (badop_r & ~(h_badop_clr_we ? h_badop_clr : 16'd0))
@@ -1427,6 +1560,7 @@ module loom_core #(
   wire _unused_m2 = &{1'b0, inq_next_unused, og_m17[16], ig_m17[16],
                       ig_rot[63:16], pinw_mask[31:22], pinw_mask[15:8],
                       pinw_data[31:22], pinw_data[15:8],
-                      d_td_new[14:0], d_dt_new[14:0], d_td[14:0]};
+                      d_td_new[14:0], d_dt_new[14:0], d_td[14:0],
+                      mem_addr16[15:IMEM_AW]};
 
 endmodule

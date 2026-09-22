@@ -718,7 +718,7 @@ async def test_version_and_reserved_cfg(dut):
     host = LoomHost(dut)
     await host.start()
     mon = PadMonitor(dut).start()
-    assert await host.read1(SP_CTRL, CTRL_VERSION) == 3, "VERSION is 3 (6.9.1)"
+    assert await host.read1(SP_CTRL, CTRL_VERSION) == 4, "VERSION is 4: slice B on top of slice A (6.9.1, 6.11)"
     assert (await host.caps()) & 0x100 == 0, "auto mode (slice C) is not built"
     t = 1
     for cfg in (ENC_RSVD, STUFF_RSVD, ENC_RSVD | STUFF_RSVD,
