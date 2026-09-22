@@ -197,6 +197,83 @@ def test_waits_with_the_timeout_bit_are_bounded(instruction):
     assert result.pairs[0].slots == 2
 
 
+# ------------------------------------------------------- .bounded (declared)
+GUARD = "guarded by the WAITB above; only this thread pops INQ"
+
+
+def bounded_src(reason=GUARD, instruction="POP r0", declare=True):
+    lines = [".thread 0", ".tick 100", "SETD 0"]
+    if declare:
+        lines.append('.bounded "%s"' % reason)
+    lines += [instruction, "WAITD 1", "HALT"]
+    return src(*lines)
+
+
+@pytest.mark.parametrize("instruction", ["POP r0", "PUSH r0"])
+def test_a_declared_fifo_access_costs_one_slot_and_the_pair_is_proved(instruction):
+    result = report(bounded_src(instruction=instruction))
+    pair = result.pairs[0]
+    assert not pair.unbounded
+    assert pair.slots == 2                  # the POP/PUSH and the WAITD
+    assert pair.clocks == 8 and pair.slack == 92 and pair.feasible is True
+    assert result.unbounded == [] and result.infeasible == []
+
+
+@pytest.mark.parametrize("instruction", ["POP r0", "PUSH r0"])
+def test_an_undeclared_fifo_access_is_still_unbounded(instruction):
+    """Nothing changes for code that declares nothing."""
+    result = report(bounded_src(instruction=instruction, declare=False))
+    assert result.pairs[0].unbounded
+    assert result.declarations == []
+
+
+def test_a_declaration_is_refused_on_anything_but_push_or_pop():
+    """DLY stalls by design, so the directive does not accept it at all."""
+    from tools.loomasm import AsmError
+    with pytest.raises(AsmError) as info:
+        asm(src(".thread 0", ".tick 100", "SETD 0",
+                '.bounded "no"', "DLY 3", "WAITD 1", "HALT"))
+    messages = [d.message for d in info.value.diagnostics]
+    assert any("applies to POP or PUSH" in m and "DLY" in m for m in messages)
+
+
+def test_the_declaration_is_recorded_with_its_address_line_and_reason():
+    result = report(bounded_src())
+    assert len(result.declarations) == 1
+    declared = result.declarations[0]
+    assert (declared.addr, declared.name, declared.line) == (1, "POP", 5)
+    assert declared.reason == GUARD
+    assert str(declared) == "0x001 POP (line 5): %s" % GUARD
+
+
+def test_the_summary_says_where_it_trusted_a_declaration():
+    from tools.loomasm.deadline import summary_lines
+    text = "\n".join(summary_lines(report(bounded_src())))
+    assert "bounded by declaration: 0x001 POP (line 5): %s" % GUARD in text
+    assert "1 bounded by declaration" in text
+
+
+def test_the_listing_prints_the_reason_under_the_instruction():
+    program = asm(bounded_src())
+    body = [row for row in program.listing
+            if row.strip().startswith("| bounded by declaration")]
+    assert [row.strip() for row in body] == \
+        ["| bounded by declaration: %s" % GUARD]
+    # and again in the summary block, with the address and the line
+    assert any(row.strip() == "bounded by declaration: 0x001 POP (line 5): %s"
+               % GUARD for row in program.listing)
+    assert program.bounded == {1: GUARD}
+    info = [w for w in program.word_info if w.addr == 1][0]
+    assert info.bounded == GUARD and info.timing == "blocking"
+
+
+def test_a_reason_may_hold_a_comma_and_a_semicolon():
+    reason = "safe, because: nothing else pops; see SEMANTICS 6.7"
+    result = report(bounded_src(reason=reason))
+    assert result.declarations[0].reason == reason
+    assert not result.pairs[0].unbounded
+
+
 def test_setd_after_a_blocking_instruction_removes_the_pair():
     """The uart_tx.loom idiom: POP, then SETD re-anchors, so nothing is
     unbounded even though POP can stall for ever."""

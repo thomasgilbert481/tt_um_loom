@@ -4,8 +4,8 @@ import pytest
 
 from tools.loomasm.expr import (ExprError, UnresolvedSymbol, evaluate,
                                 symbols_in)
-from tools.loomasm.lexer import (NAME, NUMBER, PUNCT, LexError, split_commas,
-                                 tokenize_line)
+from tools.loomasm.lexer import (NAME, NUMBER, PUNCT, STRING, LexError,
+                                 split_commas, tokenize_line)
 
 
 def kinds(text):
@@ -181,3 +181,43 @@ def test_symbols_in_ignores_function_names():
     assert symbols_in(tokenize_line("lo8(BASE + 1)", 1)) == {"BASE"}
     assert symbols_in(tokenize_line("1 + 2", 1)) == set()
     assert symbols_in(tokenize_line("loop", 1)) == {"loop"}
+
+
+# ------------------------------------------------------------------ strings
+def test_a_string_is_one_token_holding_its_decoded_text():
+    tokens = tokenize_line('.bounded "a reason"', 1)
+    assert [t.kind for t in tokens] == [NAME, STRING]
+    assert tokens[1].text == "a reason"
+    assert tokens[1].col == 10 and tokens[1].value is None
+
+
+def test_a_comma_or_semicolon_inside_a_string_is_part_of_it():
+    tokens = tokenize_line('.bounded "one, two; three"', 1)
+    assert tokens[1].text == "one, two; three"
+    assert len(split_commas(tokens[1:])) == 1
+
+
+def test_a_string_takes_the_character_escapes():
+    token = tokenize_line(r'"tab\there\nand a \"quote\" and a \\"', 1)[0]
+    assert token.text == 'tab\there\nand a "quote" and a \\'
+
+
+def test_an_empty_string_is_a_token_with_empty_text():
+    token = tokenize_line('""', 1)[0]
+    assert token.kind == STRING and token.text == ""
+
+
+@pytest.mark.parametrize("text,fragment", [
+    ('"no end', "unterminated string"),
+    ('"trailing backslash \\', "unterminated string"),
+    (r'"bad \q escape"', "unknown escape"),
+])
+def test_a_malformed_string_is_a_lex_error(text, fragment):
+    with pytest.raises(LexError) as info:
+        tokenize_line(text, 1)
+    assert fragment in info.value.message
+
+
+def test_a_string_is_not_an_expression():
+    with pytest.raises(ExprError):
+        evaluate(tokenize_line('"text"', 1), lambda name: 0)

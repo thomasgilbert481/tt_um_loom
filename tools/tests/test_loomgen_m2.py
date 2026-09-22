@@ -88,7 +88,9 @@ def test_waitb_be_idle_needs_the_bit_engine():
 
 def test_bad_build_arguments():
     with pytest.raises(LoomgenError):
-        generate(seed=1, features=("DMEM",), isa=ISA)
+        generate(seed=1, features=("BOOTROM",), isa=ISA)   # not modelled
+    with pytest.raises(LoomgenError):
+        generate(seed=1, features=("NOSUCH",), isa=ISA)
     with pytest.raises(LoomgenError):
         generate(seed=1, features=("FIFO",), fifo_depth=3, isa=ISA)
     with pytest.raises(LoomgenError):

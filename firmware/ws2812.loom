@@ -1,0 +1,162 @@
+; ws2812.loom
+; WS2812B / NeoPixel driver on OUT0, fed by the host through INQ[0]. M3
+; firmware on M2 hardware: the FIFOs (POP, WAITB INQ_NE) and the
+; deadline-latched pin write of SEMANTICS 6.10 (SETP pin, v, D), nothing else.
+;
+; Host command format (FIFO space, thread 0): one word per byte.
+;     bits 7:0   the byte to send, MSB first on the wire
+;     bits 15:8  ignored (SWAP moves the byte to 15:8 and the junk below it
+;                never reaches the carry within the eight shifts of a byte)
+; Nothing is ever pushed to OUTQ. The bytes go out in the order they were
+; pushed, which for a WS2812B is G, R, B per LED, first LED of the chain
+; first. A word per LED was not used: 24 bits do not fit in one, and a
+; byte stream lets a frame be any length.
+;
+; A frame ends when INQ is empty at a byte boundary: the line then stays low
+; and the program waits RSTN * RSTW = 2750 clocks (55 us, the datasheet asks
+; for more than 50) before the first rise of the next frame, so the strip
+; always latches between frames. Bytes pushed while a frame is running are
+; part of that frame, which is exactly the WS2812 wire format: one reset, a
+; byte stream, one reset.
+;
+; Bit rate: the datasheet fixes it, so the program sets its own divider and
+; the host must not. TICK_INT = 1 and TICK_FRAC = 0 make one tick one clock,
+; so every WAITD counts clocks at 50 MHz (20 ns):
+;     T0H 20 clocks = 0.40 us      T1H 40 clocks = 0.80 us
+;     T0L 44 clocks = 0.88 us      T1L 24 clocks = 0.48 us
+;     period 64 clocks = 1.28 us for both bit values
+; Datasheet (WS2812B): T0H 0.4 +-0.15 us, T1H 0.8 +-0.15 us, T0L 0.85 +-0.15,
+; T1L 0.45 +-0.15, period 1.25 +-0.6 us, reset > 50 us. The high times are
+; exactly nominal; the two low times and the period are 0.03 us long, which
+; buys the four extra slots the byte fetch needs and stays well inside every
+; window.
+;
+; Which edges are latched. Every edge of the waveform is a deadline-latched
+; write: `SETP DOUT, v, D` stages it and the next `WAITD k` lands it on the
+; exact clock edge at which NOW reaches TD (SEMANTICS 6.10 rule 1), not on
+; the thread's 4-clock slot grid. So each high pulse is exactly 20 or 40
+; clocks and each period exactly 64, whatever the code between the deadlines
+; does. The only pin write that is not latched is the `SETP DOUT, 0` at
+; start, which only makes the reset value of the pad explicit.
+;
+; Which slots are used. Thread 0 owns one slot in four, so a deadline
+; interval of k clocks holds k/4 instructions. The tightest are:
+;     rise -> fall of a 0 bit    20 clocks = 5 slots, 3 used (slack 8)
+;     fall -> rise inside a byte 24 or 44 clocks, 4 or 5 used
+;     the byte fetch: WAITB INQ_NE / BT / POP / SWAP / LDI, five slots on top
+; of the loop. A 0 bit has room for them in its 44-clock low phase; a 1 bit
+; has only 24 clocks there, so on that path the fetch runs in the 40-clock
+; high phase instead, before the WAITD that lands the fall. Worst slack over
+; the whole program is one slot (4 clocks).
+;
+; `WAITB INQ_NE, T` is a test, not a wait: it is only ever reached right
+; after a WAITD has completed, so reached(NOW, TD) holds and it finishes in
+; its own slot with T = 1 when INQ is empty (SEMANTICS 6.4, the uart_rx.loom
+; idiom). The deadline checker counts it as one slot, which is exact here.
+;
+; The two POPs are declared bounded. `POP` has no static bound in general
+; (tools/loomasm/README.md 7, "Unbounded"), and the usual cure - a
+; re-anchoring `SETD` after it - is not available here: `SETD` would replace
+; the absolute deadline the next edge must land on, and putting it back with
+; `CSRW TD` costs three slots the low phase of a 0 bit does not have. But
+; neither POP can stall: each is reached only when the `WAITB INQ_NE, T` one
+; slot before it completed with T = 0, so INQ held a word in that slot's X
+; cycle, and between then and the POP nothing can remove it (only this thread
+; pops INQ; the host only pushes, SEMANTICS 6.7). Each therefore carries a
+; `.bounded` declaration of that argument, and the checker counts it as one
+; slot, which makes the two intervals it runs in the tightest in the program:
+;     0 bit, fall -> next rise: DJNZ WAITB BT POP SWAP LDI SETP SHLI BC WAITD
+;         = 10 slots = 40 clocks, budget T0L = 44, slack 4;
+;     1 bit, rise -> fall:      JMP SETP DJNZ WAITB BT POP SWAP LDI WAITD
+;         = 9 slots = 36 clocks, budget T1H = 40, slack 4.
+; So all nineteen pairs are proved, none is unbounded, and the worst slack is
+; one slot. A declaration is an assumption the checker does not verify, so
+; the listing prints both of them next to their POP and in the summary; the
+; argument above is the thing to review. See docs/spec-questions/
+; firmware-m3.md item 1; tools/tests/test_fw_ws2812.py measures every pulse
+; on the model and on the RTL, which is what actually tests the timing.
+;
+; Registers: r0 the bit shifter (the byte in 15:8, shifted left), r1 the
+; bits left in the byte, r2 the reset-gap counter, r7 the `.csr` scratch.
+
+        .thread 0
+        .pins   DOUT = OUT0
+        .equ    T0H  = 20               ; 0.40 us
+        .equ    T1H  = 40               ; 0.80 us
+        .equ    PER  = 64               ; 1.28 us
+        .equ    T0L  = PER - T0H        ; 44 = 0.88 us
+        .equ    T1L  = PER - T1H        ; 24 = 0.48 us
+        .equ    FIRST = 32              ; re-anchor to the first rise
+        .equ    RSTW = 250              ; reset gap = RSTN * RSTW clocks
+        .equ    RSTN = 11               ; 2750 clocks = 55 us > 50 us
+
+start:  .csr    TICK_INT, 1             ; one tick is one clock: the datasheet
+        .csr    TICK_FRAC, 0            ; fixes this rate, not the host
+        SETP    DOUT, 0                 ; the line idles low
+        SETD    0                       ; anchor the first deadline
+
+; The reset gap: the line is low and stays low for RSTN * RSTW clocks, so
+; the strip latches the frame that just ended before the next one starts.
+done:   LDI     r2, RSTN
+rst:    WAITD   RSTW
+        DJNZ    r2, rst
+
+; A frame starts with the first byte the host queues.
+idle:   POP     r0                      ; blocks while INQ is empty
+        SETD    0                       ; re-anchor after the unbounded POP
+        SWAP    r0, r0                  ; the byte to bits 15:8, MSB first
+        LDI     r1, 8
+        SETP    DOUT, 1, D              ; stage the first rise
+        SHLI    r0, 1                   ; C = the first bit
+        BC      first1
+        WAITD   FIRST                   ; the rise lands on this deadline
+        JMP     z_bit
+first1: WAITD   FIRST
+        JMP     o_bit
+
+; z_bit and o_bit are entered at the rise of a bit whose value they are named
+; for: the rise has just landed, TD is its deadline and is reached, r0 holds
+; the bits of the byte not yet sent and r1 how many are left, this one
+; included.
+
+; ---------------------------------------------------------------- a 0 bit
+z_bit:  SETP    DOUT, 0, D              ; stage the fall
+        WAITD   T0H                     ; 0.40 us high; the fall lands here
+        DJNZ    r1, z_next              ; more bits in this byte?
+        WAITB   INQ_NE, T               ; no: another byte? (a test, not a wait)
+        BT      done                    ; INQ empty: the frame ends here
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0                      ; one slot: it cannot stall
+        SWAP    r0, r0
+        LDI     r1, 8
+z_next: SETP    DOUT, 1, D              ; stage the next rise
+        SHLI    r0, 1                   ; C = the next bit
+        BC      z_one
+        WAITD   T0L                     ; the rise lands on the period boundary
+        JMP     z_bit
+z_one:  WAITD   T0L
+        JMP     o_bit
+
+; ---------------------------------------------------------------- a 1 bit
+; The low phase of a 1 bit is 24 clocks, six slots, which is two short of the
+; byte fetch, so the fetch happens in the 40-clock high phase instead. The
+; fall is staged before it and lands on its deadline whatever the fetch did.
+o_bit:  SETP    DOUT, 0, D              ; stage the fall
+        DJNZ    r1, o_next              ; more bits in this byte?
+        WAITB   INQ_NE, T               ; no: another byte? (a test, not a wait)
+        BT      o_last                  ; INQ empty: this is the last bit
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0                      ; one slot: it cannot stall
+        SWAP    r0, r0
+        LDI     r1, 8
+o_next: WAITD   T1H                     ; 0.80 us high; the fall lands here
+        SETP    DOUT, 1, D              ; stage the next rise
+        SHLI    r0, 1                   ; C = the next bit
+        BC      o_one
+        WAITD   T1L                     ; the rise lands on the period boundary
+        JMP     z_bit
+o_one:  WAITD   T1L
+        JMP     o_bit
+
+o_last: WAITD   T1H                     ; the fall of the frame's last bit;
+        JMP     done                    ; nothing is staged after it

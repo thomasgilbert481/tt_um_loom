@@ -581,6 +581,54 @@ def test_deadline_check_can_be_skipped_entirely():
     assert program.errors == []
 
 
+# ------------------------------------------------------------------ .bounded
+def test_bounded_attaches_a_reason_to_the_next_pop_and_emits_nothing():
+    program = asm(src(".thread 0", '.bounded "only this thread pops INQ"',
+                      "POP r0", "HALT"))
+    assert program.ok
+    assert [program.words[a] for a in sorted(program.words)] == \
+        [ISA.encode("POP", rd=0), ISA.encode("HALT")]
+    assert program.bounded == {0: "only this thread pops INQ"}
+
+
+def test_bounded_skips_labels_comments_and_equ_to_reach_the_instruction():
+    program = asm(src(".thread 0", '.bounded "why"', "; a comment",
+                      ".equ K = 3", "here:", "PUSH r1", "HALT"))
+    assert program.ok and program.bounded == {0: "why"}
+    assert program.symbols["here"] == 0
+
+
+def test_bounded_on_a_string_with_escapes_keeps_the_decoded_text():
+    program = asm(src(".thread 0", '.bounded "a \\"quoted\\" word, and a ; too"',
+                      "POP r0"))
+    assert program.bounded == {0: 'a "quoted" word, and a ; too'}
+
+
+@pytest.mark.parametrize("lines,expected", [
+    (['.bounded "no"', "ADD r0, r1, r2"], "applies to POP or PUSH"),
+    (['.bounded "no"', "MOV16 r0, 0x1234"], "is MOV16"),
+    (['.bounded "no"', ".word 0xA080"], "the data of a .word"),
+    (['.bounded ""', "POP r0"], "needs a reason"),
+    (['.bounded "  "', "POP r0"], "needs a reason"),
+    ([".bounded reason", "POP r0"], "one quoted reason"),
+    (['.bounded "a", "b"', "POP r0"], "one quoted reason"),
+    ([".bounded", "POP r0"], "exactly one quoted reason"),
+    (['.bounded "one"', '.bounded "two"', "POP r0"], "has not been used yet"),
+    (["POP r0", '.bounded "at the end"'], "and none follows"),
+])
+def test_bounded_is_refused_where_it_cannot_mean_anything(lines, expected):
+    diagnostics = errors_of(src(".thread 0", *lines))
+    assert any(expected in d.message for d in diagnostics), \
+        [d.message for d in diagnostics]
+    assert all(d.severity == "error" for d in diagnostics)
+
+
+def test_an_unterminated_string_is_a_lex_error_on_its_own_line():
+    diagnostics = errors_of(src(".thread 0", '.bounded "no end', "POP r0"))
+    assert "unterminated string" in diagnostics[0].message
+    assert diagnostics[0].line == 2
+
+
 # ---------------------------------------------------- disassembler round trip
 _SAMPLE = {
     "rd": "r1", "ra": "r2", "rb": "r3", "imm": "1", "rel": "0", "abs": "0",

@@ -10,7 +10,16 @@ it drives some pads and observes the resolved lines (see :mod:`.bench`).
   first) and ``SpiFlash`` (JEDEC ID 0x9F, READ 0x03);
 * :mod:`.i2c` - ``I2cEeprom`` (24C02-style: byte and page write, current
   and random read, clock stretching, forced NACK), ``I2cMaster`` and
-  ``I2cMonitor``; the open-drain wired-AND is resolved by the bench.
+  ``I2cMonitor``; the open-drain wired-AND is resolved by the bench;
+* :mod:`.ws2812` - ``Ws2812Rx`` (a WS2812B strip: every high and low pulse
+  measured against the datasheet window, bytes and LEDs reassembled);
+* :mod:`.ps2` - ``Ps2Keyboard`` (a device-clocked PS/2 keyboard with
+  settable rate and deliberate parity, stop and truncation faults) and
+  ``Ps2Monitor``;
+* :mod:`.jtag` - ``JtagTap`` (the whole sixteen-state IEEE 1149.1
+  controller, with IDCODE, BYPASS and the IR scan path);
+* :mod:`.swd` - ``SwdDp`` (an ADIv5 debug port: line reset, JTAG-to-SWD
+  select, packet requests with their parity, ACK, data and turnaround).
 """
 
 from .bench import Bench, Drive, Lines, Model, pad_of

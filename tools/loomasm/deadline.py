@@ -33,8 +33,15 @@ SLOT_CLOCKS = 4
 #: Mnemonics that can anchor an interval. ``WAITD 0`` is excluded at run time
 #: by :func:`is_anchor`, because it does not move ``TD``.
 ANCHOR_MNEMONICS = frozenset({"WAITD", "SETD"})
-#: Always unbounded: no static bound on how long they stall.
+#: Always unbounded: no static bound on how long they stall, unless the
+#: source discharges one with ``.bounded`` (see :data:`BOUNDABLE`).
 UNBOUNDED_ALWAYS = frozenset({"DLY", "PUSH", "POP"})
+#: The blocking instructions a ``.bounded "<reason>"`` declaration may
+#: discharge. A FIFO access guarded by a ``WAITB INQ_NE, T`` (or
+#: ``OUTQ_NF``) that completed by condition cannot stall, and only the author
+#: can see that; ``DLY`` is not here, because stalling is the whole point of
+#: it.
+BOUNDABLE = frozenset({"PUSH", "POP"})
 #: Unbounded unless the instruction carries the T (deadline timeout) bit.
 TIMED_WAITS = frozenset({"WAITP", "WAITE", "WAITS", "WAITB"})
 #: Conditional transfers: fall through or take the relative branch.
@@ -45,7 +52,12 @@ UNBOUNDED = math.inf
 
 @dataclasses.dataclass(frozen=True)
 class Node:
-    """One instruction of a thread's section, as the analysis sees it."""
+    """One instruction of a thread's section, as the analysis sees it.
+
+    ``bounded`` is the reason text of a ``.bounded`` declaration on this
+    instruction, or None. It is an assumption the checker takes from the
+    author and does not verify; see the README.
+    """
 
     addr: int
     name: str
@@ -54,6 +66,8 @@ class Node:
     #: The ``isa.yaml`` timing class; ``two_slot`` (``LD``/``ST``, SEMANTICS
     #: 6.11) costs two slots on every path, everything else one.
     timing: str = "one_slot"
+    #: The reason of a ``.bounded`` declaration on this PUSH/POP, if any.
+    bounded: Optional[str] = None
 
 
 def is_deadline_target(node: Node) -> bool:
@@ -129,6 +143,20 @@ class DeadlinePair:
         return None if slack is None else slack >= 0
 
 
+@dataclasses.dataclass(frozen=True)
+class Declaration:
+    """One ``.bounded`` declaration the analysis took on trust."""
+
+    addr: int
+    name: str                       # the mnemonic it was attached to
+    line: int
+    reason: str
+
+    def __str__(self) -> str:
+        return "0x%03X %s (line %d): %s" % (
+            self.addr, self.name, self.line, self.reason)
+
+
 @dataclasses.dataclass
 class ThreadDeadlines:
     thread: int
@@ -137,6 +165,7 @@ class ThreadDeadlines:
     slot_clocks: int = SLOT_CLOCKS
     pairs: List[DeadlinePair] = dataclasses.field(default_factory=list)
     notes: List[str] = dataclasses.field(default_factory=list)
+    declarations: List[Declaration] = dataclasses.field(default_factory=list)
 
     @property
     def infeasible(self) -> List[DeadlinePair]:
@@ -159,6 +188,8 @@ class ThreadDeadlines:
 
 def _slot_cost(node: Node) -> float:
     if node.name in UNBOUNDED_ALWAYS:
+        if node.bounded and node.name in BOUNDABLE:
+            return 1.0                  # discharged by a .bounded declaration
         return UNBOUNDED
     if node.name in TIMED_WAITS and not node.fields.get("tmo", 0):
         return UNBOUNDED
@@ -307,6 +338,9 @@ def analyse_thread(thread: int, nodes: Sequence[Node], period: Optional[int],
     """
     report = ThreadDeadlines(thread=thread, period=period, enabled=enabled,
                              slot_clocks=slot_clocks)
+    report.declarations = [
+        Declaration(addr=n.addr, name=n.name, line=n.line, reason=n.bounded)
+        for n in sorted(nodes, key=lambda n: n.addr) if n.bounded]
     if not enabled:
         report.notes.append("deadline check disabled by .deadline_check off")
         return report
@@ -387,6 +421,8 @@ def summary_lines(report: ThreadDeadlines) -> List[str]:
     lines = ["thread %d deadline analysis (tick period %s)" % (report.thread, period)]
     for note in report.notes:
         lines.append("  note: %s" % note)
+    for declared in report.declarations:
+        lines.append("  bounded by declaration: %s" % declared)
     if not report.pairs:
         if report.enabled and not report.notes:
             lines.append("  no deadline pairs found")
@@ -418,6 +454,8 @@ def summary_lines(report: ThreadDeadlines) -> List[str]:
         tail += ", worst slack %d clocks" % worst
     elif report.worst_slots is not None:
         tail += ", longest path %d slots" % report.worst_slots
+    if report.declarations:
+        tail += ", %d bounded by declaration" % len(report.declarations)
     lines.append(tail)
     return lines
 

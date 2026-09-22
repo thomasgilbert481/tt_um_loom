@@ -143,6 +143,32 @@ demo.loom:31: error: BZ cannot reach 0x180 from 0x004: offset 379, rel8 holds -1
 | `.csr NAME, expr [, rN]` | Load a constant into a CSR. **Clobbers the scratch register**, `r7` by default. |
 | `.tick CLOCKS` | Declare the current thread's tick period, for the deadline checker only. Emits nothing. |
 | `.deadline_check on\|off` | Enable or disable the deadline analysis for the current thread. Default `on`. |
+| `.bounded "REASON"` | Declare that the next `PUSH` or `POP` cannot stall, so the deadline checker counts it as one slot. Emits nothing. |
+
+**`.bounded`** is the one place where the source tells the checker something
+it cannot work out for itself. `PUSH` and `POP` have no static bound (see
+"Unbounded" in section 7), but one guarded by a `WAITB OUTQ_NF, T` or a
+`WAITB INQ_NE, T` that completed by condition cannot stall at all, and no
+analysis of this size will see that. The declaration applies to the **next
+statement that emits a word**, which must be a `PUSH` or a `POP`:
+
+```
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      empty
+        .bounded "guarded by the WAITB above; only this thread pops INQ"
+        POP     r0
+```
+
+The reason is mandatory and must not be empty: it is the argument the author
+is making, and it belongs where the next reader of the source will meet it.
+The assembler rejects a declaration on anything else (naming the mnemonic it
+found instead), one with no instruction after it, a second one before the
+first has been used, and an unquoted or empty reason. A string is a whole
+token, so a comma or a `;` inside one neither splits an operand list nor
+starts a comment.
+
+**A declaration is an assumption, not a proof.** Nothing checks it. See
+section 7.
 
 **Thread sections and the memory size.** Each thread's location counter starts
 at that thread's reset vector, which the hardware sets to
@@ -301,6 +327,28 @@ instruction is the correct idiom, and then no path reaches a `WAITD` without
 passing a `SETD`, so no pair is formed at all. That is what `uart_tx.loom` does
 after `POP`.
 
+**Declared bounded.** Some code cannot re-anchor: a `SETD` would replace the
+absolute deadline the next edge is latched on (`SEMANTICS.md` 6.10), and the
+interval still has to be proved. A `PUSH` or `POP` carrying a
+`.bounded "<reason>"` declaration (section 4) is counted as **one slot**
+instead, so the pair is analysed like any other. Nothing else changes, and an
+undeclared `PUSH` or `POP` stays unbounded.
+
+The checker does not verify the reason and cannot: that is the point of the
+directive. It is an assumption, taken from the author, that the guard before
+the instruction makes it non-blocking. So the analysis says where it was
+trusted, twice: under the instruction in the listing and in the thread's
+summary block, both as
+
+```
+  bounded by declaration: 0x019 POP (line 126): <reason>
+```
+
+and the summary's last line counts them (`..., 1 bounded by declaration`).
+A pair that is proved only because of a declaration is exactly as sound as
+that declaration; `firmware/ws2812.loom` is the program that needed this, and
+its header sets out the argument for each of its two.
+
 **Infeasible.** Reported as an *error*:
 
 ```
@@ -323,6 +371,11 @@ runs out.
 1. **Wait instructions with `T` count as one slot.** A timed-out wait can burn
    the whole budget up to `TD`. If a `WAITD` follows one in the same interval,
    the reported slack is optimistic. Anchor with `SETD` after a timed wait.
+1a. **A `.bounded` declaration is believed, never checked.** It turns a
+   `PUSH` or `POP` into one slot on the author's say-so, so a wrong one makes
+   the whole interval's verdict wrong in the optimistic direction. It is the
+   only input to the analysis that is not derived from the emitted words, and
+   the only reason the listing names its source line and prints its text.
 2. **A run-time `TD` is not tracked.** A `CSRW TD, rN` only withdraws the
    `SETD` credit (above); the checker does not try to work out what value the
    register held. That is conservative, never optimistic.

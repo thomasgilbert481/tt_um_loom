@@ -1,0 +1,108 @@
+; jtag_master.loom
+; IEEE 1149.1 JTAG master: reset the TAP and read its 32-bit IDCODE. M3
+; firmware on M2 hardware: the FIFOs (POP, PUSH), nothing else - no bit
+; engine, no deadline-latched SETP, because the master owns TCK and nothing
+; on this bus is timed against anything but TCK itself.
+;
+; Pins: TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0. The master drives
+; TMS and TDI while TCK is low; the TAP samples them on the rising edge of
+; TCK and moves TDO on the falling edge, so TDO is stable for a whole TCK
+; period and the master samples it in the low phase before the edge that
+; shifts it.
+;
+; Host command format (FIFO space, thread 0): one word per operation.
+;     bits 15:0  reserved, must be zero
+; Each word asks for the same operation: five TCK clocks with TMS high
+; (Test-Logic-Reset, which also selects the IDCODE instruction), the path
+; to Shift-DR, 32 shifts, and the path back to Run-Test/Idle.
+;
+; Result format (FIFO space read): two words per operation.
+;     first   IDCODE bits 15:0
+;     second  IDCODE bits 31:16
+; A TAP with no IDCODE register selects BYPASS at reset and gives 32 zeros
+; with a 0 in bit 0; a real IDCODE always has bit 0 set.
+;
+; Bit rate: one tick is half a TCK period, TCK = clk / (2 * TICK_INT). The
+; host sets TICK_INT (and TICK_FRAC) before RUN, as for the M2 programs.
+; The schedule is proved for ticks of 28 clocks or more (.tick below), which
+; is what the bit loop costs: 7 slots between the falling edge of TCK and
+; the next rising one.
+;
+; Leaving Shift-DR shifts one more bit (the clock that carries TMS = 1 is
+; still a shift clock, IEEE 1149.1 figure 6-5). For a read-only register
+; like IDCODE that is harmless: the 33rd bit comes from TDI and is thrown
+; away at Update-DR.
+;
+; Between operations, and between the two result words, TCK simply stops:
+; the master owns the clock, so the SETD that re-anchors after the
+; unbounded POP and PUSH costs nothing (the same argument as
+; spi_master.loom).
+;
+; Registers: r0 the receive shifter, r1 the bit count, r2 the state-walk
+; count, r3 the word count, r4 = 0x8000 (a received 1 enters at bit 15),
+; r7 the command word.
+
+        .thread 0
+        .pins   TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0
+        .tick   32                      ; the shortest half period proved
+        .equ    H = 1                   ; ticks per half TCK period
+        .equ    TLRN = 5                ; TMS-high clocks that force a reset
+
+start:  SETP    TCK, 0                  ; TCK idles low (JTAG is TCK-low idle)
+        SETP    TMS, 1
+        SETP    TDI, 1                  ; TDI is never meaningful here
+
+cmd:    POP     r7                      ; one word per operation
+        SETD    1                       ; re-anchor after the unbounded POP
+        LDI     r4, 0
+        LDIH    r4, 0x80                ; 0x8000: a received 1 enters at bit 15
+        LDI     r3, 2                   ; two result words (set here, not at
+                                        ; `word`, to keep the bit loop short)
+
+; Test-Logic-Reset: five clocks with TMS high from any state. The TAP
+; selects the IDCODE instruction there, so no IR scan is needed.
+        SETP    TMS, 1
+        LDI     r2, TLRN
+tlr:    CALL    tck
+        DJNZ    r2, tlr
+
+; Test-Logic-Reset -> Run-Test/Idle -> Select-DR-Scan -> Capture-DR -> Shift-DR
+        SETP    TMS, 0
+        CALL    tck
+        SETP    TMS, 1
+        CALL    tck
+        SETP    TMS, 0
+        CALL    tck
+        CALL    tck
+
+; Thirty-two shifts, least significant bit first, into two words.
+word:   LDI     r0, 0
+        LDI     r1, 16
+bit:    SHRI    r0, 1
+        JP      TDO, 0, b0
+        OR      r0, r0, r4              ; a 1 enters at bit 15
+b0:     CALL    tck                     ; the rising edge shifts the DR
+        DJNZ    r1, bit
+        PUSH    r0                      ; blocks while OUTQ is full: TCK waits
+        SETD    1                       ; re-anchor after the unbounded PUSH
+        DJNZ    r3, word
+
+; Shift-DR -> Exit1-DR -> Update-DR -> Run-Test/Idle, then the next command.
+        SETP    TMS, 1
+        CALL    tck
+        CALL    tck
+        SETP    TMS, 0
+        CALL    tck
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; tck: one TCK period. On entry TCK is low and TMS/TDI are already set, so
+; the TAP sees them at the rising edge; on exit TCK is low again, at a
+; deadline, and TDO holds the bit the falling edge produced.
+; ---------------------------------------------------------------------------
+tck:    WAITD   H
+        SETP    TCK, 1                  ; the TAP samples TMS and TDI here
+        WAITD   H
+        SETP    TCK, 0                  ; the TAP moves TDO here
+        SETD    0                       ; cuts the RET-to-RET loop the checker
+        RET                             ; would otherwise see (i2c_master.loom)

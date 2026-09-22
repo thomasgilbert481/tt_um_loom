@@ -306,10 +306,14 @@ result recorded, bounded or proved.
       +61 flops, longest path unchanged (`docs/AREA.md`). Open: the
       hardening and its D-025 reading, after run 35779039938 (D-028)
       finishes; a push before that would cancel it.
-- [ ] Firmware with no RTL, in parallel with slice A: `ws2812` (`SETP ... D`
-      pulses), `ps2_host`, `jtag_master` (IDCODE read), `swd_master` (DPIDR
-      read), each with a `protomodels` model and an L3 test on the model and
-      on the RTL.
+- [x] 2026-09-22: firmware with no RTL, by an agent in parallel with slice A:
+      `ws2812` (`SETP ... D` pulses, every edge clock-exact), `ps2_host`,
+      `jtag_master` (IDCODE read), `swd_master` (DPIDR read, bidirectional
+      turnaround), each with a `protomodels` model and an L3 test on the
+      model and on the RTL: 23 new RTL scenarios, no divergence anywhere.
+      The checker gained `.bounded "<reason>"` for a `PUSH`/`POP` the author
+      has discharged by hand (ws2812's byte fetch inside a frame; the listing
+      prints the declaration, `docs/spec-questions/firmware-m3.md` item 1).
 - [ ] ISO-1 (thread isolation), timeboxed to two sessions on a reduced
       configuration; a bounded result is recorded as bounded.
 - [x] 2026-09-22: SEMANTICS 6.11 and `isa.yaml` for D-027: `LD`/`ST` as

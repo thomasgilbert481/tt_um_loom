@@ -13,8 +13,9 @@ from typing import List, Optional
 NAME = "name"
 NUMBER = "number"
 PUNCT = "punct"
+STRING = "string"
 
-# Escapes accepted inside a character literal.
+# Escapes accepted inside a character literal or a string.
 ESCAPES = {
     "r": 0x0D, "n": 0x0A, "t": 0x09, "0": 0x00, "\\": 0x5C,
     "'": 0x27, '"': 0x22, "a": 0x07, "b": 0x08, "f": 0x0C, "v": 0x0B,
@@ -30,7 +31,13 @@ _NAME_BODY = _NAME_START + "0123456789"
 
 @dataclasses.dataclass(frozen=True)
 class Token:
-    """A single token. ``value`` is set for NUMBER tokens only."""
+    """A single token.
+
+    ``value`` is set for NUMBER tokens only. For a STRING token ``text`` is
+    the **decoded** content, without the quotes and with the escapes applied,
+    because that is what every user of one wants; the column still points at
+    the opening quote.
+    """
 
     kind: str
     text: str
@@ -106,6 +113,37 @@ def _scan_char(text: str, i: int, line: int) -> "tuple[Token, int]":
     return Token(NUMBER, text[start:i], line, start + 1, value), i
 
 
+def _scan_string(text: str, i: int, line: int) -> "tuple[Token, int]":
+    """A double-quoted string, with the same escapes as a character literal.
+
+    A string is a whole token, so a comma or a semicolon inside one is part of
+    it and neither splits an operand list nor starts a comment.
+    """
+    start = i
+    i += 1
+    out: List[str] = []
+    while True:
+        if i >= len(text):
+            raise LexError("unterminated string", line, start + 1)
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            break
+        if ch == "\\":
+            i += 1
+            if i >= len(text):
+                raise LexError("unterminated string", line, start + 1)
+            esc = text[i]
+            if esc not in ESCAPES:
+                raise LexError("unknown escape '\\%s'" % esc, line, i + 1)
+            out.append(chr(ESCAPES[esc]))
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return Token(STRING, "".join(out), line, start + 1), i
+
+
 def tokenize_line(text: str, line: int) -> List[Token]:
     """Tokenise one source line. Raises :class:`LexError` on a bad character."""
     tokens: List[Token] = []
@@ -129,6 +167,10 @@ def tokenize_line(text: str, line: int) -> List[Token]:
             continue
         if ch == "'":
             token, i = _scan_char(text, i, line)
+            tokens.append(token)
+            continue
+        if ch == '"':
+            token, i = _scan_string(text, i, line)
             tokens.append(token)
             continue
         if text[i:i + 2] in _PUNCT2:

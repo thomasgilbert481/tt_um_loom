@@ -1,0 +1,176 @@
+; swd_master.loom
+; ARM Serial Wire Debug master: bring a DP up from JTAG mode and read its
+; DPIDR. M3 firmware on M2 hardware: the FIFOs (POP, PUSH) and a
+; bidirectional pin, nothing else - the master owns SWCLK, so nothing here
+; is timed against anything but SWCLK itself.
+;
+; Pins: SWCLK = OUT0, SWDIO = BIDIR0, push-pull (OD_MASK stays 0) with a
+; pull-up on the board for the turnaround cycles, when neither end drives.
+; Both ends change SWDIO just after the falling edge of SWCLK and sample it
+; at the rising edge, so this program writes a bit while SWCLK is low and
+; reads the target's bit in the low phase before the edge that consumes it.
+;
+; The connect sequence runs once, before the first command, exactly as a
+; debug probe does it (ADIv5): at least 50 SWCLK cycles with SWDIO high (a
+; line reset), the 16-bit JTAG-to-SWD select sequence 0xE79E least
+; significant bit first (0111 1001 1110 0111 on the wire), another line
+; reset, and two idle cycles with SWDIO low.
+;
+; Host command format (FIFO space, thread 0): one word per operation.
+;     bits 15:0  reserved, must be zero
+; Each word asks for one DP read of register 0x00, DPIDR. The packet
+; request is 0xA5 least significant bit first: start 1, APnDP 0, RnW 1,
+; A[2:3] 00, parity 1, stop 0, park 1.
+;
+; Result format (FIFO space read): three words per operation, in this order.
+;     first    DPIDR bits 15:0   (zero if the ACK was not OK)
+;     second   DPIDR bits 31:16  (zero if the ACK was not OK)
+;     third    status: bits 2:0 the three ACK bits as received (1 = OK,
+;              2 = WAIT, 4 = FAULT, 0 or 7 = no target), bit 3 a parity
+;              error over the 32 data bits and the parity bit
+; The data comes first so that the common case is two pops and a status
+; check; the status cannot come first because the parity is only known at
+; the end of the packet.
+;
+; Bit rate: one tick is half a SWCLK period, SWCLK = clk / (2 * TICK_INT).
+; The host sets TICK_INT (and TICK_FRAC) before RUN, as for the M2
+; programs. The schedule is proved for ticks of 28 clocks or more (.tick
+; below), which is what the data loop costs between one falling edge of
+; SWCLK and the next rising one; the tests run at TICK_INT 32, so SWCLK is
+; 781 kHz at 50 MHz.
+;
+; Between packets, and while the host is taking result words out, SWCLK
+; simply stops: the master owns the clock, so the SETD that re-anchors
+; after each unbounded POP and PUSH costs nothing (spi_master.loom makes
+; the same argument). Only `clk` is a subroutine: a second level of CALL
+; would fit the two-entry return stack but not the deadline checker, which
+; lets every RET return to every call site and so composes paths through
+; both subroutines that no execution can take.
+;
+; The bits the host sends go out with `OUT`, not `SETP`: with
+; OUTGRP = {cnt 1, base SWDIO} one `OUT r0` drives SWDIO from bit 0 of the
+; shifter, which is the next bit to send because SWD is least significant
+; first. That is two slots a bit rather than four, and pin writes are
+; bit-masked, so SWCLK is untouched (SEMANTICS 6.3).
+;
+; Registers: r0 the shifter (both directions), r1 the bit count, r2 the
+; cycle-run count, r3 the result-word count, r4 = 0x8000 (a received 1
+; enters at bit 15), r5 the running data parity, r6 the status word, r7 the
+; command word and the `.csr` scratch.
+
+        .thread 0
+        .pins   SWCLK = OUT0, SWDIO = BIDIR0
+        .tick   28                      ; the shortest half period proved
+        .equ    H    = 1                ; ticks per half SWCLK period
+        .equ    LRN  = 56               ; line-reset cycles (the spec: 50)
+        .equ    SWSEQ = 0xE79E          ; JTAG-to-SWD, least significant first
+        .equ    REQ  = 0xA5             ; read DP 0x00 (DPIDR)
+        .equ    IDLE = 8                ; idle cycles after a packet
+
+start:  .csr    OUTGRP, (1 << 5) | 0    ; one pin wide, based at SWDIO
+        SETP    SWCLK, 0                ; SWCLK idles low
+        SETP    SWDIO, 1
+        OEP     SWDIO, 1                ; the host owns the line to begin with
+        SETD    0
+        LDI     r4, 0
+        LDIH    r4, 0x80                ; 0x8000
+
+        LDI     r2, LRN                 ; line reset
+lr1:    CALL    clk
+        DJNZ    r2, lr1
+        MOV16   r0, SWSEQ               ; JTAG-to-SWD select sequence
+        LDI     r1, 16
+        SETD    0                       ; the clock pauses here: re-anchor
+sw:     OUT     r0                      ; SWDIO = the next bit
+        SHRI    r0, 1
+        CALL    clk
+        DJNZ    r1, sw
+        SETP    SWDIO, 1
+        LDI     r2, LRN                 ; a second line reset
+lr2:    CALL    clk
+        DJNZ    r2, lr2
+        SETP    SWDIO, 0
+        LDI     r2, 2                   ; two idle cycles: the DP is ready
+idl:    CALL    clk
+        DJNZ    r2, idl
+
+; ------------------------------------------------------------- one packet
+cmd:    POP     r7                      ; one word per operation
+        SETD    1                       ; re-anchor after the unbounded POP
+        LDI     r0, REQ
+        LDI     r1, 8
+rq:     OUT     r0                      ; the packet request, LSB first
+        SHRI    r0, 1
+        CALL    clk
+        DJNZ    r1, rq
+
+        OEP     SWDIO, 0                ; turnaround: let go of the line
+        CALL    clk
+        LDI     r6, 0                   ; the ACK, three bits, LSB first
+        LDI     r1, 3
+        SETD    0                       ; the clock pauses here: re-anchor
+ack:    SHRI    r6, 1
+        JP      SWDIO, 0, ak0
+        ORI     r6, 4                   ; a 1 enters at bit 2
+ak0:    CALL    clk
+        DJNZ    r1, ack
+        CMPI    r6, 1                   ; 0b001 is OK; anything else has no
+        BNZ     bad                     ; data phase
+
+        LDI     r5, 0                   ; the parity of the data so far
+        LDI     r3, 2                   ; two result words
+dword:  LDI     r0, 0
+        LDI     r1, 16
+        SETD    0                       ; the clock pauses here: re-anchor
+dbit:   SHRI    r0, 1
+        JP      SWDIO, 0, db0
+        OR      r0, r0, r4              ; a 1 enters at bit 15
+db0:    CALL    clk
+        DJNZ    r1, dbit
+        PAR     r0, r0                  ; C = the parity of this half
+        BNC     dp0
+        XORI    r5, 1
+dp0:    PUSH    r0                      ; blocks while OUTQ is full: SWCLK waits
+        SETD    1
+        DJNZ    r3, dword
+
+        JP      SWDIO, 0, par0          ; the parity bit the target sends
+        XORI    r5, 1
+par0:   CALL    clk
+        TEST    r5, r5                  ; even over the 33 bits: correct
+        BZ      pok
+        ORI     r6, 8                   ; bit 3: parity error
+pok:    PUSH    r6
+        SETD    1
+
+; The trailing turnaround, then idle cycles with the line parked low.
+fin:    OEP     SWDIO, 1                ; the host takes the line back
+        SETP    SWDIO, 0
+        CALL    clk                     ; the turnaround cycle
+        LDI     r2, IDLE
+tail:   CALL    clk
+        DJNZ    r2, tail
+        JMP     cmd
+
+; A WAIT, a FAULT or no target at all: no data phase, so the two data words
+; are zero and only the status says what happened.
+bad:    LDI     r0, 0
+        PUSH    r0
+        SETD    1
+        PUSH    r0
+        SETD    1
+        PUSH    r6
+        SETD    1
+        JMP     fin
+
+; ---------------------------------------------------------------------------
+; clk: one SWCLK period. On entry SWCLK is low and SWDIO is already set or
+; released; on exit SWCLK is low again, at a deadline, and the target has
+; had its falling edge to change SWDIO.
+; ---------------------------------------------------------------------------
+clk:    WAITD   H
+        SETP    SWCLK, 1                ; both ends sample SWDIO here
+        WAITD   H
+        SETP    SWCLK, 0                ; both ends change SWDIO here
+        SETD    0                       ; cuts the RET-to-RET loop the checker
+        RET                             ; would otherwise see (i2c_master.loom)

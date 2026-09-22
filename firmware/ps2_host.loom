@@ -1,0 +1,123 @@
+; ps2_host.loom
+; PS/2 host receiver: takes device-to-host frames from a keyboard or a mouse
+; and delivers one word per frame through OUTQ[0]. M3 firmware on M2
+; hardware: the FIFOs (PUSH) and the timed waits of SEMANTICS 6.4, nothing
+; else. Nothing is read from INQ; this program only listens, so it never
+; drives either line and needs no open-drain configuration.
+;
+; Pins: CLK = IN0, DATA = IN1. Both idle high (the board's pull-ups; a real
+; PS/2 port is open collector, and a host that only listens simply lets go
+; of both lines).
+;
+; The wire format. The device owns the clock: 10 to 16.7 kHz, so a CLK
+; period is 60 to 100 us. It puts a bit on DATA and then pulls CLK low; the
+; host samples DATA at the falling edge (`WAITE CLK, FALL`). A frame is
+; eleven bits: a start bit 0, eight data bits least significant first, an
+; odd parity bit (the number of ones in the nine bits is odd) and a stop
+; bit 1.
+;
+; Result format (FIFO space read, thread 0): one word per frame.
+;     bits 7:0   the byte received
+;     bit 8      parity error: the nine bits did not have odd parity
+;     bit 9      framing error: the stop bit was low, the first bit of the
+;                frame was not a 0, or the frame stopped part-way
+;     bits 15:10 zero
+; A good frame is delivered with the flags clear. A frame with a bad stop
+; bit is still delivered, byte and all: it is eleven bits long like any
+; other, so the receiver stays in step and the next frame is taken
+; normally. The two ways of losing sync give a word with bit 9 and a zero
+; byte: a first edge with DATA already high (not a start bit), and a frame
+; that stops part-way, which the timed waits below catch. So one bad frame
+; costs exactly one word, never a stream of them.
+;
+; Timeouts. Every wait inside a frame is `SETD TMO` then `WAITE CLK, FALL,
+; T`: if the device stops clocking, NOW reaches TD, the T flag is set and
+; the frame is abandoned (SEMANTICS 6.4). TMO must be longer than the
+; slowest legal CLK period, 100 us at 10 kHz. One tick is TICKC = 64 clocks
+; = 1.28 us at 50 MHz, so TMO = 128 ticks is 164 us and IDLET = 200 ticks is
+; 256 us. The program writes its own divider, because the timeout is a
+; property of the PS/2 standard and not of the host: do not set TICK_INT
+; before RUN.
+;
+; After a first edge that was not a start bit the receiver is somewhere
+; inside a frame, so it drains the rest: `resync` waits for a CLK falling
+; edge with a timeout and repeats until it times out, that is, until the
+; device has been quiet for IDLET ticks. A frame cut short needs no drain:
+; the timeout that ended it already proves the line is quiet.
+;
+; There are no `WAITD` deadlines in this program: the device's clock sets
+; the pace and the host only follows it, so the deadline checker has no pair
+; to prove and reports none. Every wait that could block forever is either
+; timed (the T bit) or the deliberate `WAITE CLK, FALL` at `idle` that waits
+; for the next frame.
+;
+; Registers: r0 the frame being assembled and then the result word, r1 the
+; data-bit count, r2 = 0x0080 (a received 1 enters the shifter at bit 7),
+; r3 = 0x0100 (parity error), r4 = 0x0200 (framing error), r5 the parity
+; scratch, r7 the `.csr` scratch.
+
+        .thread 0
+        .pins   CLK = IN0, DATA = IN1
+        .equ    TICKC = 64              ; clocks per tick: 1.28 us at 50 MHz
+        .equ    TMO   = 128             ; 164 us: longer than a 10 kHz period
+        .equ    IDLET = 200             ; 256 us of quiet ends a resync
+
+start:  .csr    TICK_INT, TICKC         ; the timeout unit, not a bit rate
+        .csr    TICK_FRAC, 0
+        LDI     r2, 0x80                ; a received 1 enters at bit 7
+        LDI     r3, 0
+        LDIH    r3, 1                   ; 0x0100: parity error
+        LDI     r4, 0
+        LDIH    r4, 2                   ; 0x0200: framing error
+
+; The start bit. An untimed wait: there is nothing to do until the device
+; clocks again, and the schedule is re-anchored by the SETD of every bit.
+idle:   WAITE   CLK, FALL
+        JP      DATA, 1, nostart        ; DATA high: this is not a start bit
+        LDI     r0, 0
+        LDI     r1, 8
+
+; Eight data bits, least significant first.
+bit:    SETD    TMO
+        WAITE   CLK, FALL, T
+        BT      cut
+        SHRI    r0, 1
+        JP      DATA, 0, b0
+        OR      r0, r0, r2              ; a 1 enters at bit 7
+b0:     DJNZ    r1, bit
+
+; The parity bit: odd over the eight data bits and itself.
+        SETD    TMO
+        WAITE   CLK, FALL, T
+        BT      cut
+        MOV     r5, r0
+        JP      DATA, 0, p0
+        LDIH    r5, 1                   ; count the received parity bit too
+p0:     PAR     r5, r5                  ; C = 1 when the count of ones is odd
+        BC      pok
+        OR      r0, r0, r3              ; bit 8: parity error
+pok:
+
+; The stop bit, then the word.
+        SETD    TMO
+        WAITE   CLK, FALL, T
+        BT      cut
+        JP      DATA, 1, done           ; a high stop bit: a good frame
+        OR      r0, r0, r4              ; bit 9: the stop bit was low
+done:   PUSH    r0                      ; blocks while OUTQ is full
+        JMP     idle
+
+; A frame that stopped part-way: the line has been quiet for TMO ticks, so
+; the next frame will start cleanly and no drain is needed.
+cut:    MOV     r0, r4
+        PUSH    r0
+        JMP     idle
+
+; A first edge with DATA already high: we are somewhere inside a frame, so
+; report it once and drain the rest of the device's clocking.
+nostart: MOV    r0, r4
+        PUSH    r0
+resync: SETD    IDLET
+        WAITE   CLK, FALL, T
+        BNT     resync                  ; an edge: the device is still going
+        JMP     idle

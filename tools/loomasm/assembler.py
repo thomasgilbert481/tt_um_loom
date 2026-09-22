@@ -23,14 +23,14 @@ from .diag import (DEADLINE, ERROR, LAYOUT, PIN, RANGE, SYMBOL, SYNTAX,
                    WARNING, AsmError, Diagnostic)
 from .disasm import disassemble
 from .expr import ExprError, UnresolvedSymbol, evaluate, symbols_in
-from .lexer import NAME, Token
+from .lexer import NAME, STRING, Token
 from .names import (FLAG_TOKENS, TIMEOUT_TOKEN, csr_table, enum_tables, pin_table,
                     register_number)
 from .parser import Stmt, parse_source
 
 DIRECTIVES = frozenset({
     ".thread", ".org", ".equ", ".pins", ".word", ".csr", ".tick",
-    ".deadline_check", ".imem",
+    ".deadline_check", ".imem", ".bounded",
 })
 PSEUDO_OPS = frozenset({"MOV16", "BRA", "INC", "DEC"})
 
@@ -73,6 +73,8 @@ class WordInfo:
     line: int
     timing: str
     text: str
+    #: the reason of a ``.bounded`` declaration on this word, or None
+    bounded: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,6 +98,8 @@ class Program:
     diagnostics: List[Diagnostic] = dataclasses.field(default_factory=list)
     deadlines: Dict[int, "dl.ThreadDeadlines"] = dataclasses.field(default_factory=dict)
     word_info: List[WordInfo] = dataclasses.field(default_factory=list)
+    #: address -> the reason of the ``.bounded`` declaration on it
+    bounded: Dict[int, str] = dataclasses.field(default_factory=dict)
 
     @property
     def errors(self) -> List[Diagnostic]:
@@ -178,6 +182,10 @@ class _Assembler:
         self.check_enabled: Dict[int, bool] = {t: True for t in range(self.threads)}
         self.first_addr: Dict[int, int] = {}
         self.count: Dict[int, int] = {t: 0 for t in range(self.threads)}
+        #: address -> the reason text of the ``.bounded`` declaration on it
+        self.bounded: Dict[int, str] = {}
+        #: a ``.bounded`` seen but not yet attached to an instruction
+        self.pending_bounded: "Optional[Tuple[str, Stmt]]" = None
 
         self.thread = 0
         self.pcs: Dict[int, int] = {t: self.thread_origin(t)
@@ -300,6 +308,8 @@ class _Assembler:
                     self.do_tick(stmt)
                 elif lower == ".deadline_check":
                     self.do_deadline_check(stmt)
+                elif lower == ".bounded":
+                    self.do_bounded(stmt)
                 elif stmt.is_directive and lower not in DIRECTIVES:
                     raise _Bad("unknown directive '%s'" % stmt.name, stmt.head)
                 if lower == ".csr":
@@ -310,7 +320,14 @@ class _Assembler:
                 self.error(stmt, bad.message, bad.token, bad.kind)
                 stmt.size = 0
                 continue
+            if lower != ".bounded":
+                self.attach_bounded(stmt)
             self.reserve(stmt)
+        if self.pending_bounded is not None:
+            _, where = self.pending_bounded
+            self.pending_bounded = None
+            self.error(where, ".bounded applies to the instruction after it, "
+                              "and none follows", where.head)
 
     def reserve(self, stmt: Stmt) -> None:
         for offset in range(stmt.size):
@@ -420,6 +437,44 @@ class _Assembler:
                        stmt.head, RANGE)
         self.tick[self.thread] = value
 
+    def do_bounded(self, stmt: Stmt) -> None:
+        """``.bounded "<reason>"``: the next ``PUSH``/``POP`` cannot stall.
+
+        The reason is the author's argument, which the checker takes on trust
+        and never verifies (``tools/loomasm/README.md``, "Deadline checker").
+        It is mandatory so that the assumption is written down where a reader
+        of the source meets it.
+        """
+        group = self.one_arg(stmt, "quoted reason")
+        if len(group) != 1 or group[0].kind != STRING:
+            raise _Bad('.bounded takes one quoted reason, as .bounded "why '
+                       'this cannot stall"', group[0] if group else stmt.head)
+        reason = group[0].text.strip()
+        if not reason:
+            raise _Bad(".bounded needs a reason: it is the argument that the "
+                       "instruction cannot stall, and the checker cannot make "
+                       "it for you", group[0])
+        if self.pending_bounded is not None:
+            raise _Bad(".bounded from line %d has not been used yet: one "
+                       "declaration covers one instruction"
+                       % self.pending_bounded[1].line, stmt.head)
+        self.pending_bounded = (reason, stmt)
+
+    def attach_bounded(self, stmt: Stmt) -> None:
+        """Give a pending ``.bounded`` to the next statement that emits words."""
+        if self.pending_bounded is None or stmt.size == 0:
+            return
+        reason, where = self.pending_bounded
+        self.pending_bounded = None
+        what = "the data of a .word" if stmt.is_data else stmt.upper
+        if stmt.is_data or stmt.upper not in dl.BOUNDABLE:
+            self.error(where, ".bounded applies to %s, but the next "
+                              "instruction (line %d) is %s"
+                       % (" or ".join(sorted(dl.BOUNDABLE)), stmt.line, what),
+                       where.head)
+            return
+        self.bounded[stmt.addr] = reason
+
     def do_deadline_check(self, stmt: Stmt) -> None:
         group = self.one_arg(stmt, "setting")
         if len(group) != 1 or group[0].kind != NAME or \
@@ -482,10 +537,10 @@ class _Assembler:
                 text = disassemble(word, self.isa)
                 self.nodes[stmt.thread].append(dl.Node(
                     addr=addr, name=instr.name, fields=fields, line=stmt.line,
-                    timing=instr.timing))
+                    timing=instr.timing, bounded=self.bounded.get(addr)))
             self.word_info.append(WordInfo(
                 addr=addr, word=word, thread=stmt.thread, line=stmt.line,
-                timing=timing, text=text))
+                timing=timing, text=text, bounded=self.bounded.get(addr)))
 
     def data_word(self, group: Sequence[Token]) -> int:
         value = self.eval_tokens(group, "a .word value")
@@ -703,6 +758,7 @@ class _Assembler:
         program.symbols = dict(self.equs)
         program.symbols.update(self.labels)
         program.word_info = list(self.word_info)
+        program.bounded = dict(self.bounded)
         for thread in range(self.threads):
             if self.count[thread]:
                 program.threads[thread] = ThreadInfo(

@@ -13,6 +13,15 @@ the host writes `TICK_INT` (and `TICK_FRAC`) through the debug space before
 schedule is proved for. The reset value `TICK_INT = 1` is always too fast, so
 set the rate first.
 
+The four M3 programs at the bottom of the table are thread 0 as well and need
+nothing the M2 hardware does not have. Two of them break that convention:
+`ws2812` and `ps2_host` have a rate fixed by a datasheet rather than chosen
+by the host, so they write their own `TICK_INT` with `.csr` and **the host
+must not set it**. `ws2812` also uses the deadline-latched pin write of
+`SEMANTICS.md` 6.10 (`SETP pin, v, D`), which the M2 programs deliberately do
+not. `jtag_master` and `swd_master` keep the M2 convention: they own their
+clock, so the host sets its rate.
+
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
 | `uart_tx_fifo.loom` | TX = OUT0 | 18 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
@@ -20,10 +29,27 @@ set the rate first.
 | `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 72 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
 | `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 50 | 32 clocks per tick, 4 ticks per SCK period | 8 clocks | TICK 32: 390 kHz SCK, modes 0 and 3 |
 | `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 105 | 5 clocks per tick, 16 ticks per SCL period | 0 clocks | TICK 8: 390 kHz SCL; 100 kHz is TICK 31 + 64/256 |
+| `ws2812.loom` | DOUT = OUT0 | 52 | 1 clock per tick (set by the program) | 4 clocks (two `.bounded` POPs) | the WS2812B waveform at 50 MHz: T0H 20, T1H 40, period 64 clocks |
+| `ps2_host.loom` | CLK = IN0, DATA = IN1 | 45 | 64 clocks per tick (set by the program), timeouts only | no deadline pairs | 10 kHz and 16.67 kHz device clock |
+| `jtag_master.loom` | TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0 | 41 | 32 clocks per half TCK period | 0 clocks | TICK 32: 781 kHz TCK |
+| `swd_master.loom` | SWCLK = OUT0, SWDIO = BIDIR0 (push-pull, pull-up) | 92 | 28 clocks per half SWCLK period | 0 clocks | TICK 32: 781 kHz SWCLK |
 
-All five assemble with `--strict` and no diagnostic at all: every deadline
-pair is proved and none is unbounded (`tools/tests/test_fw_build.py`). Each
+Every program assembles with `--strict` and no diagnostic at all: each
+deadline pair is proved and none is unbounded (the M2 five in
+`tools/tests/test_fw_build.py`, the M3 four in their own test modules). Each
 fits in thread 0's quarter of the 512-word memory of D-020.
+
+`ws2812` gets there with two `.bounded` declarations
+(`tools/loomasm/README.md` sections 4 and 7). Its byte fetch needs a `POP`
+between two deadlines; `POP` has no static bound for the checker, and the
+usual cure, a re-anchoring `SETD`, would destroy the very deadline the next
+edge is latched on. Each `POP` is guarded by a `WAITB INQ_NE, T` one slot
+earlier, so it cannot stall, and the declaration states that argument in the
+source. **A declaration is believed, not verified**, so those two intervals
+are only as sound as the argument in the program header: 10 slots against a
+44-clock budget and 9 against 40, which is where the 4-clock worst slack in
+the table comes from. `docs/spec-questions/firmware-m3.md` item 1 has the
+history.
 
 ```
 python -m tools.loomasm firmware/uart_rx.loom --strict --listing
@@ -153,10 +179,103 @@ words = loom.pop(0, 4)                              # four received frames
   one: 8 ticks less up to one tick, plus a few slots of pin latency. Measured
   at TICK 8: low 68 clocks inside a byte (8 ticks and one slot), high 76.
 
+## ws2812.loom: WS2812B / NeoPixel strip driver
+
+- **Host command** (push to thread 0): one word per byte; bits 7:0 are sent
+  MSB first, bits 15:8 are ignored. The bytes go out in the order pushed,
+  which for a WS2812B is G, R, B per LED, first LED of the chain first. A
+  word per LED was not used: 24 bits do not fit in one, and a byte stream
+  lets a frame be any length.
+- **Results**: none.
+- **Rate**: fixed by the datasheet. The program writes `TICK_INT = 1` and
+  `TICK_FRAC = 0` itself, so one tick is one clock and every `WAITD` counts
+  clocks at 50 MHz: T0H 20, T1H 40, T0L 44, T1L 24, period 64 (1.28 us).
+  The high times are exactly nominal; the low times and the period are
+  0.03 us long, which buys the four extra slots the byte fetch needs and
+  stays well inside the +-0.15 us (pulse) and +-0.6 us (period) windows.
+- **Frames**: a frame ends when `INQ` is empty at a byte boundary. The line
+  then stays low for 2750 clocks (55 us, the datasheet asks for more than
+  50) before the next frame's first rise, so the strip always latches
+  between frames. Bytes pushed while a frame is running extend it, which is
+  exactly the wire format: one reset, a byte stream, one reset. The host
+  must keep up - a stall longer than one byte time (512 clocks) splits the
+  frame and the strip latches the first half.
+- **Every edge is a deadline-latched write** (`SETP DOUT, v, D` then the
+  `WAITD` that lands it, `SEMANTICS.md` 6.10), so each pulse is exact to the
+  clock rather than to the thread's 4-clock slot grid. The byte fetch runs
+  in the 44-clock low phase of a 0 bit and in the 40-clock high phase of a
+  1 bit, whose 24-clock low phase is two slots too short for it.
+
+## ps2_host.loom: PS/2 host receiver
+
+- **Host command**: none; this program only listens, so it never drives
+  either line and needs no open-drain configuration.
+- **Result** (pop thread 0): one word per frame. Bits 7:0 the byte; bit 8 a
+  parity error (the nine bits were not odd); bit 9 a framing error (the stop
+  bit was low, the first edge of a frame had DATA high, or the frame stopped
+  part-way). A frame with a bad stop bit is still delivered, byte and all:
+  it is eleven bits long like any other, so the receiver stays in step. The
+  two ways of losing sync give bit 9 with a zero byte, once per bad frame.
+- **Rate**: set by the device, 10 to 16.7 kHz (60 to 100 us per bit). The
+  program writes `TICK_INT = 64` itself; that tick is only the unit of its
+  timeouts, 128 ticks (164 us) for a bit that never comes and 200 ticks
+  (256 us) of quiet to end a resync.
+- DATA is sampled by the `JP` right after each `WAITE CLK, FALL`, one slot
+  after the edge, in the middle of a half period of setup. There is no
+  `WAITD` in the program: the device owns the clock and the host follows it,
+  so the checker has no deadline pair to prove. After a first edge that was
+  not a start bit the receiver drains the rest of the frame (`resync`); a
+  frame cut short needs no drain, because the timeout that ended it already
+  proves the line is quiet.
+
+## jtag_master.loom: JTAG master, TAP reset and IDCODE
+
+- **Host command** (push to thread 0): one word per operation, bits 15:0
+  reserved and zero. Each word asks for the same thing: five TCK clocks
+  with TMS high (Test-Logic-Reset, which also selects the IDCODE
+  instruction), the four-clock path to Shift-DR, 32 shifts, and the
+  three-clock path back to Run-Test/Idle.
+- **Result** (pop thread 0): two words per operation, IDCODE bits 15:0 then
+  bits 31:16. A part with no IDCODE register selects BYPASS at reset and
+  gives 32 zeros; a real IDCODE always has bit 0 set.
+- **Rate**: one tick is half a TCK period, TCK = clk / (2 `TICK_INT`).
+- TMS and TDI change while TCK is low, the TAP samples them at the rising
+  edge and moves TDO at the falling one, so TDO is read in the low phase
+  before the edge that shifts it. Leaving Shift-DR clocks one more bit
+  (IEEE 1149.1 figure 6-5), which is harmless for a read-only register.
+  Between operations TCK simply stops: the master owns the clock.
+
+## swd_master.loom: SWD master, connect and DPIDR
+
+- **Connect**: once, before the first command, as a debug probe does it
+  (ADIv5): at least 50 SWCLK cycles with SWDIO high, the 16-bit
+  JTAG-to-SWD select sequence `0xE79E` least significant bit first, a
+  second line reset, two idle cycles.
+- **Host command** (push to thread 0): one word per operation, bits 15:0
+  reserved and zero. Each word is one DP read of register 0x00, DPIDR: the
+  packet request is `0xA5` LSB first (start 1, APnDP 0, RnW 1, A[2:3] 00,
+  parity 1, stop 0, park 1).
+- **Result** (pop thread 0): three words. DPIDR bits 15:0, DPIDR bits
+  31:16, then a status word: bits 2:0 the three ACK bits as received
+  (1 OK, 2 WAIT, 4 FAULT, 0 or 7 no target), bit 3 a parity error over the
+  32 data bits and their parity bit. On anything but OK there is no data
+  phase and the two data words are zero. The status is last because the
+  parity is only known at the end of the packet.
+- **Rate**: one tick is half an SWCLK period, SWCLK = clk / (2 `TICK_INT`).
+- SWDIO is BIDIR0, push-pull (`OD_MASK` stays 0) with a board pull-up for
+  the two turnaround cycles, when neither end drives; `OEP` releases it and
+  takes it back. The bits the host sends go out with `OUT` and
+  `OUTGRP = {cnt 1, base SWDIO}`, which drives SWDIO from bit 0 of the
+  shifter (SWD is LSB first) in one slot instead of a branch and a `SETP`.
+  Only `clk` is a subroutine: a second level of `CALL` fits the two-entry
+  return stack but not the deadline checker, which lets every `RET` return
+  to every call site.
+
 ## Tests
 
-`tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py` and
-`test_fw_i2c.py` run each program end to end, loaded, configured and fed
+`tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
+`test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`
+and `test_fw_swd.py` run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks
 each, with the firmware running meanwhile), against the reference models in
 `tools/protomodels` on the pads. Each body takes a *backend*
@@ -171,6 +290,12 @@ it, so the same bodies run twice:
   pads of the design. That is the M2 exit criterion of `docs/PLAN.md`.
 
 A body marked `model_only` runs on the model alone, with the reason in the
-mark: the 115200-baud UART receive cases and most of the SPI master mode
-sweep, which would add minutes of simulation and prove what their faster
-siblings already prove.
+mark: the 115200-baud UART receive cases, most of the SPI master mode sweep,
+and the two longest PS/2 scenarios (a PS/2 frame is 33000 clocks at 16.7 kHz
+and 55000 at 10 kHz), which would add minutes of simulation and prove what
+their faster or shorter siblings already prove.
+
+`ws2812` needs the golden model built with the deadline latch
+(`features={"FIFO", "SETPD"}`), which the RTL has unconditionally, so
+`test_fw_ws2812.py` adds that feature for the model backend only; see
+`docs/spec-questions/firmware-m3.md` item 2.

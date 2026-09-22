@@ -47,9 +47,14 @@ def build_listing(program: "Program", stmts: "List[Stmt]", isa: Isa) -> List[str
         if not words:
             lines.append(_blank_row(str(stmt.line), stmt.text))
             continue
-        lines.append(_row(words[0], str(stmt.line), stmt.text))
-        for info in words[1:]:
-            lines.append(_row(info, "", "| %s" % info.text))
+        for index, info in enumerate(words):
+            if index == 0:
+                lines.append(_row(info, str(stmt.line), stmt.text))
+            else:
+                lines.append(_row(info, "", "| %s" % info.text))
+            if info.bounded:
+                lines.append(_blank_row(
+                    "", "| bounded by declaration: %s" % info.bounded))
 
     lines.append("")
     if program.deadlines:
