@@ -282,11 +282,11 @@ allows it after slices A and B; until then `MODE` reads 0.
 |---|---|---|
 | 0 | MODE | 0 manual, 1 auto (slot-injected, D-026; reads 0 until slice C exists) |
 | 1 | DIR | 0 LSB first, 1 MSB first |
-| 2 | RXTX | 0 transmit (drive out pin), 1 receive (sample in pin) |
+| 2 | RXTX | 0 transmit (drive out pin), 1 receive (sample in pin): auto mode only (slice C); `SHO` and `SHI` carry their own direction, so it reads 0 until slice C |
 | 4:3 | ENC | 0 NRZ, 1 NRZI (USB: 0 = toggle), 2 Manchester (IEEE 802.3: 0 = high-to-low), 3 reserved |
-| 6:5 | STUFF | 0 none, 1 USB (insert 0 after six 1s), 2 CAN (insert complement after five equal bits), 3 reserved |
+| 6:5 | STUFF | 0 none, 1 USB (a 0 after six 1s), 2 CAN (the complement after five equal bits; the stuff bit starts the next run), 3 reserved; cycle-exact rules in SEMANTICS 6.9.1 |
 | 7 | INV | invert the pin sense |
-| 8 | AUTOPULL / AUTOPUSH | reload from INQ (TX) or push to OUTQ (RX) at CNT==0 |
+| 8 | AUTOPULL / AUTOPUSH | reload from INQ (TX) or push to OUTQ (RX) at CNT==0; auto mode only (slice C), reads 0 until then |
 | 9 | CRC_EN | update CRC on data bits (stuffed bits never touch CRC) |
 | 10 | DIFF | `SHO` also drives the next pin index with the complement (USB D+/D-), through the group-write path (D-026, slice A) |
 | 12:11 | reserved | was PHASE; dropped at the M2 review (D-026): the sample lands a fixed few clocks after the tick and firmware places the tick |

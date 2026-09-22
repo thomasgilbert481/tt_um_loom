@@ -138,9 +138,11 @@ at every edge:
 | `NOW, TD, DT, ACC, TICK_SEEN` | section 4 | 0 | |
 | `TICK_INT, TICK_FRAC, OUTGRP, INGRP` | 16, 8, 10, 10 | 1, 0, 0, 0 | |
 | `STEPS` | 16 | 0 | +1 at the commit of every valid slot, done or stalled |
-| BE state (`SR, CNT, CRC, BE_*`, `CRC_*`) **[M2/M3]** | 16, 5, 16, ... | 0 | 6.9 |
+| BE state (`SR, CNT, CRC, BE_*`, `CRC_*`) **[M2]** | 16, 5, 16, ... | 0 | 6.9 |
+| BE encoder state `LVL, RUN, RVAL, PEND, HALF, FIRST` **[M3 slice A]** | 1, 3, 1, 1, 1, 1 | 0 | 6.9.1; also cleared by every write to `BE_CFG` |
 | `INQ_CNT, OUTQ_CNT` **[M2]** | log2(`FIFO_DEPTH`)+1 each | 0 | 6.7; entries are not reset |
 | `LAT_VALID, LAT_PIN, LAT_VAL` **[M2]** | 1, 5, 1 | 0 | 6.10 |
+| `MEM_PEND, MEM_LD, MEM_RD` **[M3 slice B]** | 1, 1, 3 | 0 | 6.11 |
 
 Global: `RUN[3:0] = 0`, `HALTED[3:0] = 0`, `STEP_REQ[3:0] = 0`, `SFLAGS = 0`,
 `OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`. `BADOP` is a 16-bit register, reset
@@ -339,8 +341,8 @@ Per-thread state: `SR` (16), `CNT` (5), `CRC` (16) and the CSRs `BE_CFG`,
 three `BE_CFG` fields exist: `DIR` (bit 1: 0 LSB first, 1 MSB first), `INV`
 (bit 7: invert the pin level) and `CRC_EN` (bit 9). Writes to the other
 `BE_CFG` bits are ignored and they read 0 until M3 builds them, so firmware can
-detect what the engine supports. `BE_PINS = {in[9:5], out[4:0]}` holds two pin
-indices.
+detect what the engine supports; slice A (6.9.1) adds `ENC`, `STUFF` and
+`DIFF`. `BE_PINS = {in[9:5], out[4:0]}` holds two pin indices.
 
 - `SHO`: `b = DIR ? SR[15] : SR[0]`. One pin write (6.3 rules, open drain
   included) of `b ^ INV` to pin index `BE_PINS.out`. `SR <= DIR ? {SR[14:0],
@@ -362,10 +364,82 @@ indices.
   `load: LDSR r0; CSRW CNT, r1; bit: SHO; WAITD 1; BNZ bit` is three slots per
   bit.
 
-Auto mode, NRZI and Manchester coding, bit stuffing, the RX sample phase and
-the stuffing-violation `T` flag are **[M3]** and get their cycle-exact text
-here before M3 work starts. `SHO`/`SHI` executed while the bit engine is not
-built are `NOP` + `BADOP`, as section 9 says.
+Auto mode (`MODE`, `RXTX`, `AUTOPULL`) is **[M3 slice C]**, optional under
+D-025 and D-026: if built, the engine acts in the thread's own slot as an
+implicit `SHO`/`SHI` alongside the slot's instruction, with the transmit edge
+applied through the deadline latch at the next tick edge and the receive
+sample taken in the slot's X cycle. Its cycle-exact text is written here when
+slice C is decided (2026-11-01), not before. `SHO`/`SHI` executed while the
+bit engine is not built are `NOP` + `BADOP`, as section 9 says.
+
+#### 6.9.1 Encoders, stuffing and the differential output **[M3 slice A]** (D-026)
+
+Slice A stores three more `BE_CFG` fields: `ENC` (bits 4:3: 0 NRZ, 1 NRZI,
+2 Manchester; 3 is reserved and is stored as 0), `STUFF` (bits 6:5: 0 none,
+1 USB, 2 CAN; 3 is reserved and is stored as 0) and `DIFF` (bit 10). `MODE`
+(bit 0), `RXTX` (bit 2), `AUTOPULL` (bit 8) and bits 12:11 still read 0 and
+ignore writes until slice C. `VERSION` reads 3 from slice A on.
+
+Per-thread encoder state, all reset to 0 and cleared by every write to
+`BE_CFG` (by `CSRW` or by the host) and by `CTRL.RESET`: `LVL` (1, the NRZI
+line level), `RUN` (3) and `RVAL` (1, the length and the value of the current
+run of equal bits), `PEND` (1, a stuff bit is due), `HALF` (1, the Manchester
+half-bit phase) and `FIRST` (1, the bit kept between the two halves). The
+host reads and writes them at debug 0x27 (`docs/HOST_PROTOCOL.md`).
+
+Both instructions stay one slot, leave `C` alone, and set `Z = (CNT == 0)`
+after the instruction whether or not `CNT` changed. A "data bit" is a bit
+that enters or leaves `SR`; a stuff bit is not one, never touches the CRC,
+and leaves `CNT` alone. With `STUFF == 0` the run state is not updated and
+`PEND` stays 0; with `ENC != 2`, `HALF` and `FIRST` are not touched.
+
+**Run accounting**, applied after a bit `x` has been sent or received, data
+or stuff, when `STUFF != 0`: if `x == RVAL` then `RUN <= min(RUN + 1, 7)`,
+else `RUN <= 1; RVAL <= x`. `PEND <= 1` when the new run is six 1s
+(`STUFF = 1`, USB) or five equal bits of either value (`STUFF = 2`, CAN). The
+stuff value is 0 for USB and `~RVAL` for CAN. A stuff bit starts the next run
+(CAN's rule; for USB it is a 0, so the count of 1s restarts at 0).
+
+`SHO`, in this order:
+
+1. The bit sent, `x`. With `ENC = 2` and `HALF == 1` there is none: this is
+   the second half of the bit kept in `FIRST` (step 3). Otherwise, if
+   `STUFF != 0` and `PEND == 1`, `x` is the stuff value and `PEND <= 0`, with
+   `SR`, `CNT` and the CRC unchanged; else `x = DIR ? SR[15] : SR[0]` is a
+   data bit and `SR`, `CNT` and the CRC follow 6.9.
+2. Run accounting on `x`, if there was one.
+3. Encoding into the level `l`: NRZ `l = x`; NRZI `l = x ? LVL : ~LVL` (a 0
+   toggles, as USB has it) and `LVL <= l`; Manchester (IEEE 802.3: a 0 is
+   high then low, a 1 low then high), with `HALF == 0`: `FIRST <= x`,
+   `l = ~x`, `HALF <= 1`, and with `HALF == 1`: `l = FIRST`, `HALF <= 0`. A
+   Manchester bit is two `SHO`.
+4. The pin write of `l ^ INV` to index `BE_PINS.out` (6.3 rules, open drain
+   included). With `DIFF == 1` a second pin write, of `~(l ^ INV)` to index
+   `(BE_PINS.out + 1) mod 32`, lands at the same edge, as one `OUT` of a
+   two-pin group would; an index that is not writable is ignored, as in 6.3.
+
+`SHI`, in this order:
+
+1. The sample `p = pin_in(BE_PINS.in) ^ INV`.
+2. Decoding into the bit received, `s`: NRZ `s = p`; NRZI `s = (p == LVL)`
+   and `LVL <= p`; Manchester, with `HALF == 0`: `FIRST <= p`, `HALF <= 1`
+   and there is no bit (steps 3 and 4 are skipped), and with `HALF == 1`:
+   `s = p`, `HALF <= 0`, and `T <= 1` if `FIRST == p` (no transition in the
+   middle of the bit).
+3. If `STUFF != 0` and `PEND == 1`, `s` is a stuff bit: it is dropped (`SR`,
+   `CNT` and the CRC unchanged), `PEND <= 0`, and `T <= 1` unless `s` is the
+   stuff value (0 for USB, `~RVAL` for CAN). Otherwise `s` is a data bit and
+   `SR`, `CNT` and the CRC follow 6.9.
+4. Run accounting on `s`.
+
+`T` is set by a violation and never cleared by `SHI`; firmware clears it with
+`CSRW FLAGS` or lets a timed wait clear it. The loops that result: USB
+low-speed transmit and receive are `SHO; WAITD 1; BNZ` and `SHI; WAITD 1;
+BNZ` at a tick of 33.33 clocks (`TICK_INT = 33, TICK_FRAC = 85`), three of
+the eight slots per bit, with NRZI, stuffing, CRC5/CRC16 and D+/D- done by
+the engine and SYNC, PID, EOP (an `SE0` written with two `SETP`) and the
+handshake done by firmware; Manchester is `SHO; WAITD 1; SHO; WAITD 1; BNZ`
+at a half-bit tick.
 
 ### 6.10 Deadline-latched pin write **[M2]** (D-016)
 
@@ -375,10 +449,20 @@ LAT_VAL}`: at the commit edge `LAT_VALID <= 1, LAT_PIN <= pin, LAT_VAL <= v`,
 replacing any write already staged. A staged write is applied, and
 `LAT_VALID` cleared, at the first later edge `e` at which either
 
-1. `NOW` ticks at `e` to exactly the value of `TD` (TD not written at `e`), or
-2. `TD` is written at `e` (by a `WAITD` first issue, `SETD`, `CSRW TD` or the
-   host) and `reached(NOW', TD')` holds for the values `NOW'` and `TD'` visible
-   after `e`.
+1. `NOW` ticks at `e` to exactly the value of `TD` (TD not written at `e` by
+   the thread's own slot), or
+2. `TD` is written at `e` by the thread's own slot (a `WAITD` first issue,
+   `SETD` or `CSRW TD`) and `reached(NOW', TD')` holds for the values `NOW'`
+   and `TD'` visible after `e`.
+
+A host debug write of `TD` is not a rule-2 write, and at its own edge it is
+invisible to rule 1, which compares against the `TD` value before the edge;
+from the next edge on rule 1 sees the written value. So a staged write lands
+on the thread's own deadlines and on the exact tick, never on a host action.
+(D-028, 2026-09-22. Until then a host `TD` write was a rule-2 write, which put
+the host's thread decode and write data in the latch-fire logic, the
+slow-corner path of `docs/AREA.md`. RTL and golden model changed in the same
+commit.)
 
 In words: the staged write lands on the thread's next deadline, whichever
 instruction set it. So `SETP TX, v, D` followed by `WAITD k` changes the pad
@@ -391,9 +475,49 @@ and a slot's ordinary pin writes both touch a pin, the ordinary write wins.
 `CTRL.RESET` of the thread clears `LAT_VALID`. The latch is readable through
 the debug space (`docs/HOST_PROTOCOL.md`, address 0x25).
 
-### 6.11 Data memory **[optional, not planned before M3]**
+### 6.11 Data memory **[M3 slice B]** (D-027)
 
-`LD`, `ST`: as in `isa.yaml`; one slot. Until built they are `NOP` + `BADOP`.
+Data memory is the instruction memory. `LD rd, ra, imm5` reads and
+`ST rd, ra, imm5` writes the word at address `a = (ra + imm5) mod 2^16`,
+taken modulo `IMEM_WORDS` (bits 8:0 with the 512-word macro); `imm5` is
+zero-extended. Each takes exactly two slots of its own thread and no cycle of
+any other thread's, and is never "late": the pair is the same length whatever
+the other threads do.
+
+1. **First slot** (`MEM_PEND == 0` in X, X cycle `x`): computes `a` and, for
+   `ST`, reads `rd`. Commit at edge `x+2`: `MEM_PEND <= 1`, `MEM_LD <= 1` for
+   `LD` and `0` for `ST`, `MEM_RD <= rd`, `WAIT_ACTIVE <= 1`, `PC` unchanged,
+   flags unchanged, and the access itself: in cycle `x+2`, which is the F
+   cycle of the thread's next slot, the memory port carries `a` instead of
+   `PC`, with a write of the `rd` value for `ST`, taking effect at edge `x+3`
+   and visible to fetches from cycle `x+3` on. No instruction is fetched for
+   that slot.
+2. **Completion slot** (the thread's next slot, `MEM_PEND == 1` in X, X cycle
+   `x+4`): no instruction is decoded. The word the D stage received in cycle
+   `x+3` is the word read for `LD` and unspecified for `ST`. Commit at edge
+   `x+6`: for `LD`, `r[MEM_RD] <= the word read`; `MEM_PEND <= 0`,
+   `WAIT_ACTIVE <= 0`, `PC <= next` (the `next` of the `LD`/`ST`); flags
+   unchanged. `STEPS` counts both slots.
+
+`MEM = {MEM_PEND, MEM_LD, MEM_RD[2:0]}` is per-thread state (section 5),
+readable and writable at debug 0x28. `CTRL.RESET` and a debug write of `PC`
+clear `MEM_PEND` (section 7), so a thread never completes an access it did
+not start. Host IMEM access stays as section 7 says: it needs no slot in
+flight, and a data access is a valid slot. A word written by `ST` is an
+instruction word like any other: a thread that writes its own code sees the
+new word at the next fetch of that address. The retire record of a
+completion slot is in section 8. `CAPS[5]` reads 1 from slice B on, and
+`VERSION` advances.
+
+The assembler places data with `.org` and `.word` in words the programs do
+not use (each thread's quarter of the memory is 128 words; the M2 programs
+use 18 to 105) and counts `LD`/`ST` as two slots in the deadline check
+(`isa.yaml` timing class `two_slot`). The host loads and reads back a data
+image with the IMEM space it already has, so a device-emulation program (a
+24C02: 256 bytes, one per word, or two per word packed) is loaded and dumped
+with no new host feature.
+
+Until slice B is built, `LD` and `ST` are `NOP` + `BADOP` (section 9).
 
 ## 7. Run control and the host **[M1 subset]**
 
@@ -412,8 +536,9 @@ the debug space (`docs/HOST_PROTOCOL.md`, address 0x25).
 - `CTRL.RESET` bit `t`: `PC <= RESET_PC[t]`, flags `<= 0`, `DEPTH <= 0` (the
   contents of `RS0`/`RS1` are left alone), `WAIT_ACTIVE <= 0`, and `TD <=` the
   `NOW` value visible in the cycle in which the host write commits. Registers
-  and CSRs are untouched. The host must only reset a halted thread; resetting a
-  running thread is undefined.
+  and CSRs are untouched. From M3, the encoder state of 6.9.1 and `MEM_PEND`
+  of 6.11 are cleared too. The host must only reset a halted thread; resetting
+  a running thread is undefined.
 - A host `STEP` that commits on the same edge at which the thread's F stage
   consumes an earlier `STEP_REQ` is lost (thread wins). The SPI port needs far
   more than 4 clocks per command, so this cannot happen through the pins.
@@ -421,7 +546,7 @@ the debug space (`docs/HOST_PROTOCOL.md`, address 0x25).
   next slot of thread `t` is valid and clears `STEP_REQ[t]` in its F cycle. A
   stepped wait that stalls leaves `WAIT_ACTIVE = 1`, exactly as in free
   running, so stepping `n` times is observably identical to running `n` slots.
-- Debug writes to `PC` also clear `WAIT_ACTIVE`.
+- Debug writes to `PC` also clear `WAIT_ACTIVE` (and `MEM_PEND`, 6.11).
 - Instruction memory is single-port. Host IMEM reads and writes are valid only
   while `RUN == 0` and no step is in flight; otherwise writes are dropped, reads
   return 0, and `BADOP[15]` (host access error) is set.
@@ -450,6 +575,13 @@ during the W cycle of every valid slot:
 
 The golden model produces the same record per slot, plus the X cycle number.
 The harness compares them slot by slot and reports the first difference.
+
+A completion slot of `LD`/`ST` (6.11, slice B) is a valid slot and produces
+a record: `tr_pc` is the instruction's `PC`, `tr_done` is 1, `tr_we`,
+`tr_rd` and `tr_val` are the `LD` write (none for `ST`), `tr_flags` and
+`tr_next_pc` are as after the slot, and `tr_ir` is the word the D stage
+received: the word read for `LD`, and for `ST` a value the memory backend
+leaves unspecified, which the harness does not compare.
 
 ## 9. Reserved and unbuilt instructions
 

@@ -60,7 +60,7 @@ paths, `docs/spec-questions/rtl-m2.md` item 7.)
 | 0x0001 | VERSION | R | {major[7:0], minor[7:0]} |
 | 0x0002 | RUN | RW | bit t = thread t running. Writing 1 starts at the current PC; writing 0 halts after the current instruction retires |
 | 0x0003 | HALTED | R | bit t = thread t halted by HALT (cleared by writing RUN bit) |
-| 0x0004 | RESET | W | bit t = reset thread t: PC := RESET_PC[t], flags := 0, TD := NOW, DEPTH := 0 (RS0/RS1 kept), WAIT_ACTIVE := 0, INQ/OUTQ emptied, staged pin write discarded; registers and CSRs untouched (`docs/SEMANTICS.md` 7) |
+| 0x0004 | RESET | W | bit t = reset thread t: PC := RESET_PC[t], flags := 0, TD := NOW, DEPTH := 0 (RS0/RS1 kept), WAIT_ACTIVE := 0, INQ/OUTQ emptied, staged pin write discarded, and from M3 the encoder state (6.9.1) and MEM_PEND (6.11) cleared; registers and CSRs untouched (`docs/SEMANTICS.md` 7) |
 | 0x0008..0x000B | RESET_PC[0..3] | RW | 10-bit reset vectors, default t * (IMEM_WORDS / 4) (D-017) |
 | 0x0010 | IRQ_EN | RW | mask over IRQ_STAT |
 | 0x0011 | IRQ_STAT | R | {SFLAGS[7:0], INQ_NOT_FULL[3:0], OUTQ_NOT_EMPTY[3:0]}; the FIFO fields read 0 until M2 |
@@ -119,7 +119,7 @@ state. (`docs/SEMANTICS.md` section 7.)
 | 0x00..0x07 | r0..r7 |
 | 0x08 | PC |
 | 0x09 | FLAGS: {T, C, Z} in bits 2:0 (bit 0 = Z), as in `docs/SEMANTICS.md` |
-| 0x0A | TD |
+| 0x0A | TD (a host write here, or through the CSR window at 0x1A, never applies a staged pin write: `docs/SEMANTICS.md` 6.10, D-028) |
 | 0x0B | NOW (read only) |
 | 0x0C | SR (reads 0 until the bit engine is built) |
 | 0x0D | CNT (same) |
@@ -131,8 +131,10 @@ state. (`docs/SEMANTICS.md` section 7.)
 | 0x22 | WAIT_ACTIVE in bit 0 |
 | 0x23 | DT (the hidden target of `DLY`) |
 | 0x24 | TICK_SEEN in bit 0 (M2) |
-| 0x25 | staged pin write: {9'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]}, i.e. bits 6:0 (M2, `docs/SEMANTICS.md` 6.10); writable while halted; LAT_PIN and LAT_VAL keep their values when LAT_VALID clears |
+| 0x25 | staged pin write: {9'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]}, i.e. bits 6:0 (M2, `docs/SEMANTICS.md` 6.10); writable while halted; LAT_PIN and LAT_VAL keep their values when LAT_VALID clears; a host TD write never applies it (D-028), the thread's own deadline writes and the exact tick do |
 | 0x26 | {INQ_CNT, OUTQ_CNT} as {byte, byte} (M2), read-only: a written count would expose entries never pushed |
+| 0x27 | bit-engine encoder state (M3 slice A, `docs/SEMANTICS.md` 6.9.1): {8'b0, FIRST, HALF, PEND, RVAL, RUN[2:0], LVL} in bits 7:0; writable while halted; reads 0 until slice A is built |
+| 0x28 | data-memory access in progress (M3 slice B, 6.11): {11'b0, MEM_PEND, MEM_LD, MEM_RD[2:0]} in bits 4:0; writable while halted; reads 0 until slice B is built |
 
 `CSRW PIN_OUT`, `CSRW PIN_OE` and the host's PIN_OUT/PIN_OE writes are raw
 register writes and do not apply the open-drain rule; only pin writes (`SETP`,
