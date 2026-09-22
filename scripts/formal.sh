@@ -16,10 +16,11 @@
 # commands passed through wsl.exe are expanded (to nothing) before bash sees
 # them.
 #
-# One property of VERIFICATION.md L4 does not hold and is recorded as a
-# finding in formal/README.md (F-1, TIMER-1). Its task (timer:xfail) carries
-# `expect fail` in the .sby file, so this script is green while the finding
-# stands and goes red the day the behaviour changes without the record being
+# Two properties of VERIFICATION.md L4 do not hold as worded and are recorded
+# as findings in formal/README.md (F-1, TIMER-1; F-4, ISO-1 with the host's
+# debug port in play). Their tasks (timer:xfail, iso:dbg, iso:xfail) carry
+# `expect fail` in the .sby file, so this script is green while the findings
+# stand and goes red the day the behaviour changes without the record being
 # updated. There is no separate list of expected failures to keep in sync.
 # F-2 (PIN-1) was a finding too until D-023 fixed the design; its assertions
 # are ordinary proofs now.
@@ -32,11 +33,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 # shellcheck disable=SC1091
 source scripts/dev_env.sh
 
-# Every group, cheapest first so a broken harness shows up in seconds.
-GROUPS_ALL="isa fifo timer pins spi isacore sched"
+# Every group, cheapest first so a broken harness shows up in seconds. `iso`
+# is last and is by far the most expensive: it is the only two-copy harness.
+GROUPS_ALL="isa fifo timer pins spi isacore sched wait iso"
 
-# Bounded runs that an unbounded proof in the same group already subsumes.
-QUICK_SKIP="sched:bmc isacore:bmc spi:bmc"
+# What `quick` leaves out: bounded runs that an unbounded proof in the same
+# group already subsumes, plus the long ISO-1 and WAIT-1 runs, which belong
+# to the `formal-full` nightly of docs/VERIFICATION.md and not to
+# `formal-quick` (iso:prove is 35 minutes, iso:bmc 14, wait:bmc 3).
+QUICK_SKIP="sched:bmc isacore:bmc spi:bmc iso:bmc iso:prove wait:bmc wait:cover"
 
 mode="full"
 case "${1:-}" in

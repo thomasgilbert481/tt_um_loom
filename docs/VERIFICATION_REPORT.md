@@ -83,8 +83,12 @@ miss". The state on 2026-09-22 is:]
   property); SCHED-1..3, FIFO-1B and SPI-1A..C proved unbounded by `abc pdr`,
   the rest by k-induction or exhaustively; every group has cover points
   against vacuity; SCHED-2 was extended to the slice A encoder state on
-  2026-09-22 and re-proved; ISO-1 (attempted from 2026-09-22 as a two-copy
-  miter, result to be recorded here) and WAIT-1 open.
+  2026-09-22 and re-proved; ISO-1, thread isolation, proved unbounded the
+  same day by `abc pdr` on a two-copy miter with the host debug port quiet
+  (thread 0's whole state compared every cycle, whatever the other three
+  threads run; 35 minutes; a depth-24 BMC cross-check); WAIT-1's completion
+  rule proved and its bound checked to depth 40. The L4 list has nothing
+  unattempted. Two more findings, F-4 and F-5, are wording corrections.
 - M3 slice A (2026-09-22) as a worked example of the method: the golden
   model and the RTL of the bit-engine encoders, stuffing and differential
   output were written from one paragraph of SEMANTICS (6.9.1) by two agents
@@ -144,10 +148,12 @@ hours and every hardware change since is judged by that rule (D-025).
 ## 7. Known limitations and open items
 
 - No hardware before silicon (section 2). L6 open.
-- ISO-1 (thread isolation as a two-copy formal miter) and WAIT-1 (bounded
-  liveness of timed waits) are not proved; isolation is checked in
-  simulation by the slot-grid assertion (L2-SLOT) and by the timing tests
-  that run other threads while measuring one.
+- ISO-1 is proved for thread 0 with the host debug port quiet; the other
+  three threads are re-runs of the same miter (35 minutes each, not yet
+  done), and with the debug port in use the property is false by design
+  (F-4: the port, the register-file write port and the staged-write port
+  are shared, as HOST_PROTOCOL already states). WAIT-1's bound is bounded
+  at depth 40, not proved unbounded.
 - One mutation survivor open (section 5).
 - The slow corner does not close at 20 ns (section 6); the datasheet states
   both clocks.

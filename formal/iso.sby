@@ -1,0 +1,81 @@
+[tasks]
+bmc
+dbg
+prove
+cover
+xfail
+
+[options]
+# ISO-1 with no host debug traffic at all: the claim about the threads.
+bmc:   mode bmc
+bmc:   depth 24
+bmc:   timeout 3600
+# ISO-1 with the host's whole debug traffic counted among thread t's inputs,
+# i.e. the same commands in the same cycles in the two traces
+# (ISO_DBG_FREE = 2). This still fails, and that is the sharp form of the
+# finding: it is not *which* debug transactions the host issues, it is that
+# the debug port and the register-file write port are shared. HOST_PROTOCOL:
+# "a DEBUG write of r0..r7 may wait up to three more clocks for the
+# register-file write port (the thread is halted, so it cannot tell)".
+dbg:   mode bmc
+dbg:   depth 16
+dbg:   timeout 3600
+dbg:   expect fail
+prove: mode prove
+prove: depth 12
+prove: timeout 3600
+cover: mode cover
+cover: depth 20
+cover: timeout 3600
+# ISO_DBG_FREE = 1: only the debug transactions addressed to thread t are the
+# same in the two traces, the other threads' are free. This is the L4 wording
+# taken literally. Both this and `dbg` are kept under `expect fail`, so the
+# counterexamples are reproduced on every run and the harness turns red the
+# day the behaviour changes (formal/README.md, F-4).
+xfail: mode bmc
+xfail: depth 16
+xfail: timeout 3600
+xfail: expect fail
+
+[engines]
+bmc:   btor btormc
+bmc:   smtbmc boolector
+dbg:   btor btormc
+prove: abc pdr
+prove: smtbmc boolector
+cover: smtbmc yices
+xfail: btor btormc
+
+[script]
+plugin -i slang
+# Yosys's own frontend ignores `bind`; slang implements it (formal/README.md).
+# ISO_T selects the thread under test; ISO_DBG_FREE says what the host's
+# debug port may do (0 nothing, 1 free per copy, 2 the same in both), see
+# the header of formal/iso_miter.v.
+bmc:   read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
+prove: read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
+cover: read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
+dbg:   read_slang --top loom_iso_miter -DISO_T=0 -DISO_DBG_FREE=2 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
+xfail: read_slang --top loom_iso_miter -DISO_T=0 -DISO_DBG_FREE=1 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
+prep -top loom_iso_miter
+# As in sched.sby: `abc pdr` exports AIGER, which refuses x or z constants,
+# and the undefined initial contents of the register file and of the FIFO
+# entry words become x constants when they are mapped to flops. Replacing
+# them with free variables rather than zeros keeps the proof an
+# over-approximation.
+memory_map
+setundef -undriven -anyseq
+
+[files]
+../src/loom_core.v
+../src/loom_decode.v
+../src/loom_isa.vh
+../src/loom_regfile.v
+../src/loom_alu.v
+../src/loom_be.v
+../src/loom_timer.v
+../src/loom_fifo.v
+../src/loom_pins.v
+../src/loom_sync.v
+iso_miter.v
+props/loom_iso_props.v

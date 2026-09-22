@@ -141,8 +141,18 @@ reference model, check data and timing.
 - SCHED-3: a thread with RUN=0 never changes architectural state except through
   host debug writes.
 - ISO-1: for any two traces that agree on thread t's inputs (its pins, its
-  FIFOs, SFLAGS it waits on) thread t's state sequence is identical regardless of
-  what other threads do (checked as a two-copy miter on a reduced configuration).
+  FIFOs, SFLAGS it waits on) thread t's state sequence is identical regardless
+  of what other threads do, given that no other thread writes shared state
+  (ARCHITECTURE 1's "except through explicit shared state"). Checked as a
+  two-copy miter on `loom_core` + `loom_pins`, thread 0: **proved unbounded**
+  by `abc pdr` in 35 minutes, with a depth-24 BMC cross-check. The host's
+  debug traffic has to be counted among
+  thread t's inputs, and even then the claim is false while the host uses the
+  debug port, because that port, the register-file write port and the deadline
+  latch's staged-write port are shared between the threads: formal finding
+  F-4, which `docs/HOST_PROTOCOL.md` already describes for one of the three
+  ("a DEBUG write of r0..r7 may wait up to three more clocks for the
+  register-file write port"). Two `expect fail` tasks hold the counterexample.
 - FIFO-1..3: never overflows or underflows; data out equals data in, in order
   (two-token method); flags correct.
 - TIMER-1: the only way `reached(NOW, TD)` falls with `TD` unchanged is
@@ -162,7 +172,17 @@ reference model, check data and timing.
 - ISA-1: every 16-bit pattern decodes to exactly one instruction class
   (generated from `isa.yaml`); reserved patterns decode to NOP and set the bad
   opcode bit.
-- WAIT-1: a timed wait terminates within TD-NOW+2 slots (bounded liveness).
+- WAIT-1: a timed wait terminates within `TD-NOW` **ticks**, and so within
+  `TD-NOW+2` of the thread's slots while a tick is at most one slot
+  (`TICK_INT <= 4`; the reset period is 1, SEMANTICS 5). Checked as a
+  bounded-liveness counter on all four threads: **bounded, depth 40**, with
+  the tick period at its reset value. The original wording, "within
+  `TD-NOW+2` slots" with no condition on the period, counts the deadline
+  distance in ticks and the budget in slots and is false — a tick is
+  `TICK_INT + TICK_FRAC/256` clocks against a slot's 4: formal finding F-5.
+- WAIT-1A: the completion rule itself (SEMANTICS 6.4): a `WAITD` is `done`
+  exactly when `reached(NOW, TD')`, a re-issue leaves `TD` where the first
+  issue put it, and a wait-class slot that stalls leaves `PC` unchanged.
 
 Proof depth and engines are recorded per property in `formal/README.md`. A
 property that only reaches bounded depth is listed as bounded, not proven.
@@ -238,7 +258,7 @@ run it.
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, and from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 75 scenarios on the model, 52 on the RTL (the rest marked `model_only` with the reason), no divergence between the sides |
-| L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 19 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |
+| L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` (35 min) with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit) |
 | L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; two open survivors; the results section below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
 

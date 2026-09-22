@@ -1,0 +1,62 @@
+[tasks]
+bmc
+prove
+cover
+xfail
+
+[options]
+# WAIT-1A and the bound with the tick period at its reset value
+# (SEMANTICS 5: "TICK_INT, TICK_FRAC ... Reset 1, 0").
+bmc:   mode bmc
+bmc:   depth 40
+bmc:   timeout 1800
+# WAIT-1A on its own is a safety property of the X stage and closes
+# unbounded (`-DWAIT_BOUND=0` drops the counter); the liveness bound needs
+# the counter, and neither `abc pdr` nor k-induction at 12 closes that, so
+# it stays a bounded run in `bmc`.
+prove: mode prove
+prove: depth 12
+prove: timeout 1800
+cover: mode cover
+cover: depth 32
+cover: timeout 1800
+# The same bound with the tick period free. False: "TD - NOW + 2 slots"
+# counts the deadline distance in ticks and the budget in slots, and a tick
+# is TICK_INT + TICK_FRAC/256 clocks against a slot's 4 (formal/README.md,
+# finding F-5).
+xfail: mode bmc
+xfail: depth 40
+xfail: timeout 1800
+xfail: expect fail
+
+[engines]
+bmc:   btor btormc
+prove: abc pdr
+prove: smtbmc boolector
+cover: smtbmc yices
+xfail: btor btormc
+
+[script]
+plugin -i slang
+# Yosys's own frontend ignores `bind`; slang implements it (formal/README.md).
+bmc:   read_slang --top loom_core loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_wait_props.v
+prove: read_slang --top loom_core -DWAIT_BOUND=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_wait_props.v
+cover: read_slang --top loom_core loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_wait_props.v
+xfail: read_slang --top loom_core -DWAIT_TICK1=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_wait_props.v
+prep -top loom_core
+# As in sched.sby: map the register file before clearing the x constants its
+# undefined initial contents leave behind, so `abc pdr` can export AIGER and
+# the replacement stays an over-approximation.
+memory_map
+setundef -undriven -anyseq
+
+[files]
+../src/loom_core.v
+../src/loom_decode.v
+../src/loom_isa.vh
+../src/loom_regfile.v
+../src/loom_alu.v
+../src/loom_be.v
+../src/loom_timer.v
+../src/loom_fifo.v
+props/loom_wait_props.v

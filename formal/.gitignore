@@ -2,12 +2,15 @@
 # per-group status database sby keeps in <group>/.
 *_bmc/
 *_cover/
+*_dbg/
 *_prove/
 *_xfail/
 fifo/
 isa/
 isacore/
+iso/
 pins/
 sched/
 spi/
 timer/
+wait/

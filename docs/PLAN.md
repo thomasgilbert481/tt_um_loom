@@ -314,8 +314,13 @@ result recorded, bounded or proved.
       The checker gained `.bounded "<reason>"` for a `PUSH`/`POP` the author
       has discharged by hand (ws2812's byte fetch inside a frame; the listing
       prints the declaration, `docs/spec-questions/firmware-m3.md` item 1).
-- [ ] ISO-1 (thread isolation), timeboxed to two sessions on a reduced
-      configuration; a bounded result is recorded as bounded.
+- [x] 2026-09-22: ISO-1 (thread isolation) **proved unbounded** by `abc pdr`
+      (35 min) on a two-copy miter of `loom_core` + `loom_pins`, thread 0's
+      whole state compared every cycle, with the host debug port quiet;
+      depth-24 BMC cross-check, 9 cover points. WAIT-1A (the completion
+      rule) proved, WAIT-1's bound checked to depth 40. Findings F-4 and F-5
+      are wording corrections (`formal/README.md`); BUGS 6 is an
+      observation from the same work. One formal agent, one run.
 - [x] 2026-09-22: SEMANTICS 6.11 and `isa.yaml` for D-027: `LD`/`ST` as
       two-slot instructions on the instruction memory through the thread's
       own fetch cycle (text in 6.11, state in section 5, debug 0x28, the
