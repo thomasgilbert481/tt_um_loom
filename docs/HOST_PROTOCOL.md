@@ -84,10 +84,13 @@ only while `RUN == 0` and no single-step is in flight. Otherwise a write is
 dropped, a read returns 0, and CTRL BADOP bit 15 (host access error) is set.
 (`docs/SEMANTICS.md` section 7.)
 
-### SPACE 2: DMEM
+### SPACE 2: DMEM (reserved)
 
-Only if built (CAPS.DMEM_PRESENT). Same rules as IMEM but writes are allowed
-while running (data memory is dual-ported or arbitrated; threads win).
+Reads 0 and ignores writes, in every build. Data memory is the instruction
+memory (D-027, `docs/SEMANTICS.md` 6.11): `CAPS[5]` means `LD`/`ST` exist,
+not that a second address space does, and a data image is loaded and read
+back through SPACE 1 under its rules (no step in flight). The earlier text
+here, a separate dual-ported memory writable while running, predates D-027.
 
 ### SPACE 3: FIFO
 

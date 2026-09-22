@@ -52,8 +52,13 @@ Optional features are chosen at construction, ``Machine(features=...)``:
   ``STUFF`` and ``DIFF`` fields of ``BE_CFG`` and the per-thread encoder
   state at debug 0x27, so ``SHO`` and ``SHI`` do NRZI and Manchester coding,
   USB and CAN stuffing and destuffing (with the ``T`` flag on a violation)
-  and the differential output.  ``CTRL.VERSION`` reads 3 in such a build.
+  and the differential output.  ``CTRL.VERSION`` reads 3 in such a build,
+  unless slice B is in it too.
 * ``"SETPD"``: the deadline-latched ``SETP pin, v, D`` (6.10).
+* ``"DMEM"`` (M3 slice B, 6.11, D-027): ``LD`` and ``ST``, which read and
+  write the instruction memory as data in two slots of their own thread, the
+  ``MEM_PEND``, ``MEM_LD`` and ``MEM_RD`` state and debug 0x28.
+  ``CTRL.VERSION`` reads 4 in such a build.
 
 ``Machine(features=())`` is the M1 build: every instruction of an unbuilt
 feature is a ``NOP`` that sets ``BADOP``, CSRs of unbuilt features read 0, and
@@ -65,7 +70,8 @@ from .alu import (add16, be_count, be_out_bit, be_run_step, be_shift_in,
                   ldih16, mask16, neg16, next_pc, not16, par16, reached,
                   rev16, ror16, shl16, shr16, sign_extend, sub16, swap16)
 from .hostmap import (BADOP_ACCESS, BADOP_FIFO, CLI_FEATURES, DEFAULT_VERSION,
-                      ENC_VERSION, FEATURES, FIFO_DEPTHS, ID_VALUE)
+                      DMEM_VERSION, ENC_VERSION, FEATURES, FIFO_DEPTHS,
+                      ID_VALUE)
 from .machine import (DEBUG_REGS, DEFAULT_FIFO_DEPTH, DEFAULT_IMEM_WORDS,
                       LoomsimError, Machine, RunResult, image_from_obj,
                       load_image_file)
@@ -78,7 +84,8 @@ __all__ = [
     "load_image_file", "image_from_obj",
     "THREADS", "SLOT_CLOCKS", "DEFAULT_IMEM_WORDS", "DEFAULT_FIFO_DEPTH",
     "DEBUG_REGS", "FEATURES", "CLI_FEATURES", "FIFO_DEPTHS", "ID_VALUE",
-    "DEFAULT_VERSION", "ENC_VERSION", "BADOP_FIFO", "BADOP_ACCESS",
+    "DEFAULT_VERSION", "ENC_VERSION", "DMEM_VERSION",
+    "BADOP_FIFO", "BADOP_ACCESS",
     "reached", "add16", "sub16", "shl16", "shr16", "ror16", "not16", "neg16",
     "rev16", "par16", "swap16", "ldih16", "mask16", "sign_extend",
     "branch_target", "next_pc",

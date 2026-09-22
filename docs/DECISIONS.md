@@ -505,6 +505,21 @@ register write mux, at the macro's pin edge, so its hardening is read under
 D-025. OPEN-3 is resolved; OPEN-2 (FIFO depth) stays at 4; OPEN-4 (boot ROM)
 and OPEN-5 (group-match wait, CRC-32) are closed as not built.
 
+Amended 2026-09-22 at the model's spec question (`loomsim-m3b.md` item 1):
+the held address and store word are **per thread** (26 flops each, 104 in
+all, a 4:1 select of 26 bits at the port), not one shared register, and the
+access is made in the F cycle of the thread's next **valid** slot. A shared
+register is sound only while the access is consumed the cycle after it is
+loaded, which is true of a running thread and false of one the host steps
+through the first slot, and SEMANTICS 7 promises that stepping is
+observably identical to running. For a running thread nothing changes: the
+next valid slot starts at x+2. Also ruled with it: `tr_done` is 0 for the
+first slot; the completion slot is a valid slot for `STEPS`, `TICK_SEEN` and
+`PREV_PINS`; a debug write of 0x28 sets the three bits only; `CTRL.RESET`
+and a debug PC write clear `MEM_PEND` only; HOST_PROTOCOL's space 2 is
+reserved (the earlier dual-ported DMEM text predates this decision);
+`VERSION` reads 4 whenever slice B is built.
+
 ## D-028 2026-09-22 Fable: the host's TD write leaves rule 2 of the deadline latch
 
 Decision (proposed to Thomas at the M2 review; Thomas delegated the call the

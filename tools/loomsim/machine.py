@@ -39,9 +39,13 @@ Optional features (SEMANTICS 9: an instruction of an unbuilt feature is a
   ``DIFF`` fields of ``BE_CFG``, the encoder state of section 5 at debug 0x27,
   and with them NRZI and Manchester coding, USB and CAN stuffing and the
   differential output on ``SHO``/``SHI``.  ``CTRL.VERSION`` reads 3 in such a
-  build and 2 without it;
+  build and 2 in one with neither M3 slice;
 * ``"SETPD"``: the deadline-latched ``SETP pin, v, D`` (6.10).  Without it the
-  ``D`` bit is ignored and the instruction is an ordinary ``SETP``.
+  ``D`` bit is ignored and the instruction is an ordinary ``SETP``;
+* ``"DMEM"`` (M3 slice B, 6.11, D-027): ``LD`` and ``ST`` on the instruction
+  memory as two-slot instructions, the ``MEM_PEND``/``MEM_LD``/``MEM_RD``
+  state of section 5 and debug 0x28.  ``CTRL.VERSION`` reads 4 in such a
+  build, whether or not slice A is in it.
 
 ``Machine(features=())`` is the M1 core: its instruction behaviour, pads and
 retire records are unchanged by everything above.  The host registers of
@@ -96,9 +100,11 @@ _DEBUG_VIEWS_WRITABLE = frozenset({"RS1", "DEPTH"})
 #: The six fields of debug 0x27 (SEMANTICS 6.9.1) by name, as model views.
 _ENC_VIEWS = ("ENC_LVL", "ENC_RUN", "ENC_RVAL", "ENC_PEND", "ENC_HALF",
               "ENC_FIRST")
+#: The three fields of debug 0x28 (SEMANTICS 6.11) by name, as model views.
+_MEM_VIEWS = ("MEM_PEND", "MEM_LD", "MEM_RD")
 _DEBUG_VIEWS_READ_ONLY = frozenset({"ACC", "PREV_PINS", "LAT_VALID", "LAT_PIN",
                                     "LAT_VAL", "INQ_CNT", "OUTQ_CNT"}
-                                   | set(_ENC_VIEWS))
+                                   | set(_ENC_VIEWS) | set(_MEM_VIEWS))
 #: HOST_PROTOCOL debug registers (by name) that are read-only.
 _DEBUG_READ_ONLY_NAMES = frozenset({"NOW", "TID", "FIFO_CNT"})
 
@@ -119,6 +125,12 @@ class _Slot:
     pc: int = 0
     ir: int = 0
     record: Optional[RetireRecord] = None
+    #: SEMANTICS 6.11: this slot carries a data access instead of a fetch.
+    #: Its F cycle puts :attr:`mem_addr` on the memory port (and an ``ST``'s
+    #: word with it), its D cycle receives the word into :attr:`ir`, and its X
+    #: cycle is the completion slot, which decodes nothing.
+    mem_access: bool = False
+    mem_addr: int = 0
 
 
 @dataclasses.dataclass
@@ -159,8 +171,8 @@ class Machine:
             memory is not reset, so anything not given reads 0.
         features: optional features that are built in this configuration,
             any of ``"FIFO"``, ``"BE"``, ``"BEENC"`` (which needs ``"BE"``),
-            ``"SETPD"`` (and ``"DMEM"``, ``"BOOTROM"``, which only set their
-            ``CAPS`` bits).  The default (nothing) is the M1 build: every
+            ``"SETPD"``, ``"DMEM"`` (and ``"BOOTROM"``, which only sets its
+            ``CAPS`` bit).  The default (nothing) is the M1 build: every
             instruction of an unbuilt feature is a ``NOP`` that sets
             ``BADOP``.
         imem_words: instruction memory size; addresses wrap within it.
@@ -171,8 +183,9 @@ class Machine:
         on_cycle: optional callable invoked once per cycle with a
             :class:`~tools.loomsim.state.CycleTrace`.
         isa: a preloaded :class:`tools.loomisa.Isa` (one is loaded if omitted).
-        version: what ``CTRL.VERSION`` reads; by default 3 in a ``"BEENC"``
-            build (SEMANTICS 6.9.1) and 2 (HOST_PROTOCOL 0.2) without it.
+        version: what ``CTRL.VERSION`` reads; by default 4 in a ``"DMEM"``
+            build (SEMANTICS 6.11), 3 in a ``"BEENC"`` build without it
+            (6.9.1) and 2 (HOST_PROTOCOL 0.2) in neither.
 
     The public state is :attr:`threads` (a list of
     :class:`~tools.loomsim.state.ThreadState`) plus the global registers
@@ -209,14 +222,22 @@ class Machine:
         self._be = "BE" in built
         self._be_enc = "BEENC" in built
         self._setpd = "SETPD" in built
+        self._dmem = "DMEM" in built
         self.imem_words = imem_words
         self.imem_mask = imem_words - 1
         self.fifo_depth = fifo_depth
         self.loopback = loopback
         self.on_cycle = on_cycle
         if version is None:
-            # SEMANTICS 6.9.1: VERSION reads 3 from slice A on.
-            version = H.ENC_VERSION if self._be_enc else H.DEFAULT_VERSION
+            # SEMANTICS 6.9.1: VERSION reads 3 from slice A on; 6.11: with
+            # slice B "VERSION advances" again, to 4, whether or not slice A
+            # is in the same build (loomsim-m3b.md item 2).
+            if self._dmem:
+                version = H.DMEM_VERSION
+            elif self._be_enc:
+                version = H.ENC_VERSION
+            else:
+                version = H.DEFAULT_VERSION
         self.version = version & WORD_MASK
         self.imem: Dict[int, int] = {}
         if image:
@@ -347,7 +368,7 @@ class Machine:
             value |= H.CAPS_FIFO
         if self._be:
             value |= H.CAPS_BE
-        if "DMEM" in self.features:
+        if self._dmem:
             value |= H.CAPS_DMEM
         if "BOOTROM" in self.features:
             value |= H.CAPS_BOOTROM
@@ -403,20 +424,37 @@ class Machine:
         if x_slot is not None and x_slot.valid:
             self._execute(x_slot, c)
 
-        # --- D: the synchronous instruction-memory read returns.
+        # --- D: the synchronous memory read returns.  For an access slot it
+        # is the data word at the access address (SEMANTICS 6.11: no
+        # instruction is fetched for that slot), read as it stands in this
+        # cycle, so an ``ST`` sees the word it wrote at the edge that ended
+        # the F cycle.
         d_slot = self._stage_d
         if d_slot is not None and d_slot.valid:
-            d_slot.ir = self.imem.get(d_slot.pc & self.imem_mask, 0)
+            addr = d_slot.mem_addr if d_slot.mem_access else d_slot.pc
+            d_slot.ir = self.imem.get(addr & self.imem_mask, 0)
 
         # --- F: a new slot starts for the thread that owns this phase.
         t = c % SLOT_CLOCKS
         valid = bool((self.run >> t) & 1) or bool((self.step_req >> t) & 1)
         f_slot = _Slot(thread=t, f_cycle=c, valid=valid)
         if valid:
-            f_slot.pc = self.threads[t].pc
+            th_f = self.threads[t]
+            f_slot.pc = th_f.pc
             # A valid slot consumes STEP_REQ[t] in its F cycle (SEMANTICS 7).
-            self._pending.append(
-                Commit(visible_from=c + 1, is_slot=True, step_req_clr=1 << t))
+            commit = Commit(visible_from=c + 1, is_slot=True,
+                            step_req_clr=1 << t)
+            if self._dmem and th_f.mem_pend:
+                # SEMANTICS 6.11: the memory port carries the access address
+                # instead of ``PC``, with an ``ST``'s word, which takes effect
+                # at the edge that ends this cycle and is visible to fetches
+                # from the next cycle on.
+                f_slot.mem_access = True
+                f_slot.mem_addr = th_f.mem_addr & self.imem_mask
+                if not th_f.mem_ld:
+                    commit.mem_store = (f_slot.mem_addr,
+                                        th_f.mem_data & WORD_MASK)
+            self._pending.append(commit)
         self._stage_f = f_slot
 
         if self.on_cycle is not None:
@@ -678,9 +716,10 @@ class Machine:
         HOST_PROTOCOL names (``PC``, ``STEPS``, ``LAT``, ``FIFO_CNT``, ``ENC``,
         the CSR names of the window 0x10..0x1F ...) the model offers the views
         ``RS1``, ``DEPTH``, ``ACC``, ``PREV_PINS``, ``LAT_VALID``,
-        ``LAT_PIN``, ``LAT_VAL``, ``INQ_CNT``, ``OUTQ_CNT`` and the six
+        ``LAT_PIN``, ``LAT_VAL``, ``INQ_CNT``, ``OUTQ_CNT``, the six
         encoder fields ``ENC_LVL``, ``ENC_RUN``, ``ENC_RVAL``, ``ENC_PEND``,
-        ``ENC_HALF`` and ``ENC_FIRST``.
+        ``ENC_HALF`` and ``ENC_FIRST``, and the three data-memory fields
+        ``MEM_PEND``, ``MEM_LD`` and ``MEM_RD`` (SEMANTICS 6.11).
         """
         self._check_thread(thread)
         if isinstance(reg, int):
@@ -709,6 +748,10 @@ class Machine:
             return len(th.inq) if key == "INQ_CNT" else len(th.outq)
         if key in _ENC_VIEWS:
             if not self._be_enc:
+                return 0
+            return getattr(th, key.lower())
+        if key in _MEM_VIEWS:
+            if not self._dmem:
                 return 0
             return getattr(th, key.lower())
         raise LoomsimError("unknown debug register " + str(reg))
@@ -787,6 +830,9 @@ class Machine:
         if number == H.DEBUG_ENC:
             # HOST_PROTOCOL 0x27: reads 0 until slice A is built.
             return th.enc if self._be_enc else 0
+        if number == H.DEBUG_MEM:
+            # HOST_PROTOCOL 0x28: reads 0 until slice B is built.
+            return th.mem if self._dmem else 0
         return 0
 
     def _debug_write(self, t: int, number: int, value: int) -> None:
@@ -794,8 +840,11 @@ class Machine:
         if 0 <= number <= 7:
             self._host(thread=t, reg_we=True, reg_rd=number, reg_val=value)
         elif number == 0x08:
-            # A debug PC write also clears WAIT_ACTIVE (SEMANTICS 7).
-            self._host(thread=t, pc=value & PC_MASK, wait_active=0)
+            # A debug PC write also clears WAIT_ACTIVE and, from slice B,
+            # MEM_PEND (SEMANTICS 7 and 6.11), so a thread never completes an
+            # access it did not start.  MEM_LD and MEM_RD keep their values,
+            # as LAT_PIN and LAT_VAL do when LAT_VALID clears.
+            self._host(thread=t, pc=value & PC_MASK, wait_active=0, mem_pend=0)
         elif number == 0x09:
             self._host(thread=t, flags=value & 7)
         elif number == 0x0A:
@@ -827,6 +876,14 @@ class Machine:
                 lvl, run, rval, pend, half, first = H.unpack_enc(value)
                 self._host(thread=t, enc_lvl=lvl, enc_run=run, enc_rval=rval,
                            enc_pend=pend, enc_half=half, enc_first=first)
+        elif number == H.DEBUG_MEM:
+            # SEMANTICS 6.11 / HOST_PROTOCOL 0x28: the whole MEM word, while
+            # the thread is halted.  The address and the word an ``ST`` would
+            # write are not host state and are left alone (loomsim-m3b.md
+            # item 6).
+            if self._dmem:
+                pend, ld, rd = H.unpack_mem(value)
+                self._host(thread=t, mem_pend=pend, mem_ld=ld, mem_rd=rd)
         # 0x0B NOW, 0x26 FIFO counts and unused numbers ignore writes.
 
     def _debug_csr_write(self, t: int, csr: int, value: int) -> None:
@@ -1088,6 +1145,11 @@ class Machine:
             else:
                 addr, word = cm.imem_write
                 self.imem[addr & self.imem_mask] = word
+        if cm.mem_store is not None:
+            # SEMANTICS 6.11: a thread's ``ST``.  Unlike a host IMEM write it
+            # is never refused; it is the access slot's own memory cycle.
+            addr, word = cm.mem_store
+            self.imem[addr & self.imem_mask] = word & WORD_MASK
         if cm.reset_pc is not None:
             thread, value = cm.reset_pc
             self.reset_pc[thread] = value
@@ -1104,6 +1166,10 @@ class Machine:
             th.outq.clear()
             th.lat_valid = 0
             th.clear_encoder()
+            # SEMANTICS 6.11: CTRL.RESET clears MEM_PEND, so a thread never
+            # completes an access it did not start.  MEM_LD and MEM_RD are
+            # not named and keep their values.
+            th.mem_pend = 0
         if cm.run_set is not None:
             rising = cm.run_set & ~self.run
             self.run = cm.run_set
@@ -1213,6 +1279,17 @@ class Machine:
         if cm.lat_set is not None:
             th.lat_valid, th.lat_pin, th.lat_val = (
                 cm.lat_set[0] & 1, cm.lat_set[1] & 0x1F, cm.lat_set[2] & 1)
+        # Data memory (SEMANTICS 6.11).
+        if cm.mem_pend is not None:
+            th.mem_pend = cm.mem_pend & 1
+        if cm.mem_ld is not None:
+            th.mem_ld = cm.mem_ld & 1
+        if cm.mem_rd is not None:
+            th.mem_rd = cm.mem_rd & 7
+        if cm.mem_addr is not None:
+            th.mem_addr = cm.mem_addr & PC_MASK
+        if cm.mem_data is not None:
+            th.mem_data = cm.mem_data & WORD_MASK
         # FIFOs (SEMANTICS 6.7).  Host pushes see the count from before the
         # edge because host commits are applied before the slot's; a thread
         # PUSH/POP decided in X can never be invalidated before its commit.
@@ -1271,16 +1348,28 @@ class Machine:
         done = True
         cm.pc = nxt
 
-        decoded = self.isa.decode(ir)
-        if decoded is None or not self._feature_built(decoded[0], decoded[1]):
-            # Reserved word, or a feature this build does not have.
-            cm.badop_set = 1 << t
-            name = None
+        if slot.mem_access:
+            # SEMANTICS 6.11 step 2: the completion slot of ``LD``/``ST``.  No
+            # instruction is decoded, so nothing sets BADOP and nothing
+            # touches the flags; ``ir`` is the word the D stage received.
+            name = "LD" if th.mem_ld else "ST"
+            if th.mem_ld:
+                cm.reg_we = True
+                cm.reg_rd = th.mem_rd & 7
+                cm.reg_val = ir & WORD_MASK
+            cm.mem_pend = 0
+            cm.wait_active = 0
         else:
-            instr, ops = decoded
-            name = instr.name
-            done = self._dispatch(instr, ops, cm, th, t, pc, nxt, x)
-            z, c_flag, t_flag = self._flags_out
+            decoded = self.isa.decode(ir)
+            if decoded is None or not self._feature_built(decoded[0], decoded[1]):
+                # Reserved word, or a feature this build does not have.
+                cm.badop_set = 1 << t
+                name = None
+            else:
+                instr, ops = decoded
+                name = instr.name
+                done = self._dispatch(instr, ops, cm, th, t, pc, nxt, x)
+                z, c_flag, t_flag = self._flags_out
         cm.flags = (t_flag << 2) | (c_flag << 1) | z
 
         slot.record = RetireRecord(
@@ -1504,6 +1593,23 @@ class Machine:
         elif name == "CSRW":
             z, c_flag, t_flag = self._csr_write(
                 cm, th, t, ops["csr"], regs[ops["ra"]], (z, c_flag, t_flag))
+
+        # ---------------------------------------------------------- data memory
+        elif instr.cls == "mem":
+            # SEMANTICS 6.11 step 1.  ``a = (ra + imm5) mod 2^16``, taken
+            # modulo IMEM_WORDS; ``imm5`` is zero-extended.  The slot holds
+            # PC, leaves the flags alone and is not done: the access rides the
+            # thread's next slot, whose X cycle completes it.
+            addr = ((regs[ops["ra"]] + ops["imm"]) & WORD_MASK) & self.imem_mask
+            cm.mem_pend = 1
+            cm.mem_ld = 1 if name == "LD" else 0
+            cm.mem_rd = ops["rd"] & 7
+            cm.mem_addr = addr
+            if name == "ST":
+                cm.mem_data = regs[ops["rd"]]
+            cm.wait_active = 1
+            cm.pc = pc
+            done = False
 
         # -------------------------------------------------------------- SFLAGS
         elif name == "SIG":
@@ -1781,11 +1887,16 @@ class Machine:
     def dump_debug_space(self, thread: int) -> Dict[int, int]:
         """Every DEBUG-space register of ``thread``, as the port reads it.
 
-        0x00..0x26 always, and 0x27 (the encoder state, SEMANTICS 6.9.1) in a
-        build that has the slice-A bit engine, where it stops reading 0.
+        0x00..0x26 always, 0x27 (the encoder state, SEMANTICS 6.9.1) in a
+        build that has the slice-A bit engine and 0x28 (the data-memory
+        access, 6.11) in one that has slice B, where each stops reading 0.
         """
         self._check_thread(thread)
-        last = H.DEBUG_ENC if self._be_enc else H.DEBUG_LAST
+        last = H.DEBUG_LAST
+        if self._be_enc:
+            last = max(last, H.DEBUG_ENC)
+        if self._dmem:
+            last = max(last, H.DEBUG_MEM)
         return {number: self._debug_read(thread, number)
                 for number in range(last + 1)}
 

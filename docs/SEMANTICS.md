@@ -142,7 +142,7 @@ at every edge:
 | BE encoder state `LVL, RUN, RVAL, PEND, HALF, FIRST` **[M3 slice A]** | 1, 3, 1, 1, 1, 1 | 0 | 6.9.1; also cleared by every write to `BE_CFG` |
 | `INQ_CNT, OUTQ_CNT` **[M2]** | log2(`FIFO_DEPTH`)+1 each | 0 | 6.7; entries are not reset |
 | `LAT_VALID, LAT_PIN, LAT_VAL` **[M2]** | 1, 5, 1 | 0 | 6.10 |
-| `MEM_PEND, MEM_LD, MEM_RD` **[M3 slice B]** | 1, 1, 3 | 0 | 6.11 |
+| `MEM_PEND, MEM_LD, MEM_RD` **[M3 slice B]** | 1, 1, 3 | 0 | 6.11; the held access address and store word (9, 16) are per-thread too but not host-visible |
 
 Global: `RUN[3:0] = 0`, `HALTED[3:0] = 0`, `STEP_REQ[3:0] = 0`, `SFLAGS = 0`,
 `OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`. `BADOP` is a 16-bit register, reset
@@ -491,22 +491,32 @@ the other threads do.
 1. **First slot** (`MEM_PEND == 0` in X, X cycle `x`): computes `a` and, for
    `ST`, reads `rd`. Commit at edge `x+2`: `MEM_PEND <= 1`, `MEM_LD <= 1` for
    `LD` and `0` for `ST`, `MEM_RD <= rd`, `WAIT_ACTIVE <= 1`, `PC` unchanged,
-   flags unchanged, and the access itself: in cycle `x+2`, which is the F
-   cycle of the thread's next slot, the memory port carries `a` instead of
-   `PC`, with a write of the `rd` value for `ST`, taking effect at edge `x+3`
-   and visible to fetches from cycle `x+3` on. No instruction is fetched for
-   that slot.
-2. **Completion slot** (the thread's next slot, `MEM_PEND == 1` in X, X cycle
-   `x+4`): no instruction is decoded. The word the D stage received in cycle
-   `x+3` is the word read for `LD` and unspecified for `ST`. Commit at edge
-   `x+6`: for `LD`, `r[MEM_RD] <= the word read`; `MEM_PEND <= 0`,
+   flags unchanged, and the thread's held access (`a`, and the `rd` value for
+   `ST`; per-thread state that is not host-visible). Its record has
+   `tr_done = 0`, as a stalled slot's does.
+2. **Completion slot**: the thread's next **valid** slot (`MEM_PEND == 1` in
+   X). Its F cycle makes the access: the memory port carries the held `a`
+   instead of `PC`, with a write of the held `rd` value for `ST`, taking
+   effect at the edge that ends that F cycle and visible to fetches from the
+   cycle after it. No instruction is fetched or decoded. The word the D stage
+   receives is the word read for `LD` and unspecified for `ST`. Commit at the
+   slot's W edge: for `LD`, `r[MEM_RD] <= the word read`; `MEM_PEND <= 0`,
    `WAIT_ACTIVE <= 0`, `PC <= next` (the `next` of the `LD`/`ST`); flags
-   unchanged. `STEPS` counts both slots.
+   unchanged. For a running thread that slot starts at `x+2`, so the access
+   is in cycle `x+2`, the word arrives in `x+3`, the X cycle is `x+4` and the
+   commit edge `x+6`; for a thread stepped through the first slot, the next
+   `STEP` is the completion slot, so stepping stays identical to running
+   (section 7) and debug 0x28 shows the pending access in between. The
+   completion slot is a valid slot for every rule that speaks of valid slots:
+   `STEPS` counts it, `TICK_SEEN` keeps only what it did not see in its X
+   cycle (section 4), `PREV_PINS` is refreshed.
 
 `MEM = {MEM_PEND, MEM_LD, MEM_RD[2:0]}` is per-thread state (section 5),
-readable and writable at debug 0x28. `CTRL.RESET` and a debug write of `PC`
-clear `MEM_PEND` (section 7), so a thread never completes an access it did
-not start. Host IMEM access stays as section 7 says: it needs no slot in
+readable and writable at debug 0x28; a host write there sets those three
+bits and leaves the held address and store word as the thread's last access
+left them. `CTRL.RESET` and a debug write of `PC` clear `MEM_PEND` and
+nothing else (section 7), so a thread never completes an access it did not
+start. Host IMEM access stays as section 7 says: it needs no slot in
 flight, and a data access is a valid slot. A word written by `ST` is an
 instruction word like any other: a thread that writes its own code sees the
 new word at the next fetch of that address. The retire record of a

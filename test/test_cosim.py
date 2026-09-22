@@ -291,7 +291,7 @@ class _Build:
     """The build ``CTRL.CAPS`` reports (SEMANTICS 5), for both sides.
 
     ``[2:0]`` log2 of the FIFO depth, ``[3]`` FIFOs, ``[4]`` bit engine
-    (manual mode), ``[5]`` data memory, ``[6]`` boot ROM, ``[7]``
+    (manual mode), ``[5]`` data memory (model feature ``"DMEM"``), ``[6]`` boot ROM, ``[7]``
     deadline-latched ``SETP``, ``[8]`` bit-engine auto mode, ``[9]`` the
     slice-A encoders, stuffing and DIFF (model feature ``"BEENC"``),
     ``[11:10]`` zero, ``[15:12]`` log2 of ``IMEM_WORDS``.
@@ -322,8 +322,9 @@ class _Build:
                 raise BuildError("CAPS %04X reports the slice-A encoders (bit 9) "
                                  "without the bit engine (bit 4)" % self.caps)
             features.append("BEENC")
-        for bit, what in ((5, "data memory"), (6, "a boot ROM"),
-                          (8, "bit-engine auto mode")):
+        if caps & (1 << 5):
+            features.append("DMEM")      # slice B: LD/ST on the instruction memory (6.11)
+        for bit, what in ((6, "a boot ROM"), (8, "bit-engine auto mode")):
             if caps & (1 << bit):
                 raise BuildError(
                     "CAPS %04X reports %s (bit %d); the golden model cannot be "

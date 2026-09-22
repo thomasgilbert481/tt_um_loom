@@ -21,15 +21,20 @@ DEFAULT_VERSION = 0x0002
 #: ``CTRL.VERSION`` of a build with the slice-A bit engine: "``VERSION`` reads
 #: 3 from slice A on" (SEMANTICS 6.9.1).
 ENC_VERSION = 0x0003
+#: ``CTRL.VERSION`` of a build with slice B's data memory: 6.11 says only that
+#: "``CAPS[5]`` reads 1 from slice B on, and ``VERSION`` advances", so the
+#: model advances it once more; see ``docs/spec-questions/loomsim-m3b.md``
+#: (item 2).  A build with both slices reads this value.
+DMEM_VERSION = 0x0004
 
 # ------------------------------------------------------------------ features
 #: Optional features a Machine can be built with.  ``FIFO`` (SEMANTICS 6.7:
 #: PUSH/POP/WAITB and the host FIFO space), ``BE`` (6.9: the bit engine in
 #: manual mode), ``BEENC`` (6.9.1, M3 slice A: the encoders, the stuffers and
 #: the differential output, which need ``BE``), ``SETPD`` (6.10:
-#: deadline-latched SETP).  ``DMEM`` and ``BOOTROM`` only set their CAPS bits;
-#: the model has no data memory, so ``LD``/``ST`` in a ``DMEM`` build raise
-#: :class:`LoomsimError`.
+#: deadline-latched SETP), ``DMEM`` (6.11, M3 slice B, D-027: ``LD``/``ST``
+#: on the instruction memory, the ``MEM`` state and debug 0x28).
+#: ``BOOTROM`` only sets its CAPS bit.
 FEATURES = frozenset({"FIFO", "BE", "BEENC", "SETPD", "DMEM", "BOOTROM"})
 #: The features the command line offers.
 CLI_FEATURES = ("FIFO", "BE", "BEENC", "SETPD")
@@ -111,6 +116,7 @@ DEBUG: Dict[str, int] = {
     "LAT": 0x25,
     "FIFO_CNT": 0x26,
     "ENC": 0x27,
+    "MEM": 0x28,
 }
 DEBUG_NAMES = {addr: name for name, addr in DEBUG.items()}
 DEBUG_CSR_BASE = 0x10
@@ -120,6 +126,9 @@ DEBUG_LAST = 0x26
 #: Debug 0x27, the bit-engine encoder state (M3 slice A).  It reads 0 until
 #: the encoders are built, so the M2 dump ends at :data:`DEBUG_LAST`.
 DEBUG_ENC = 0x27
+#: Debug 0x28, the data-memory access in progress (M3 slice B, SEMANTICS
+#: 6.11).  It reads 0 until slice B is built.
+DEBUG_MEM = 0x28
 
 
 def pack_fifo_status(inq: int, outq: int, depth: int) -> int:
@@ -167,3 +176,13 @@ def unpack_enc(word: int):
     """``(lvl, run, rval, pend, half, first)`` from a debug 0x27 word."""
     return (word & 1, (word >> 1) & 7, (word >> 4) & 1, (word >> 5) & 1,
             (word >> 6) & 1, (word >> 7) & 1)
+
+
+def pack_mem(pend: int, ld: int, rd: int) -> int:
+    """Debug 0x28: ``{MEM_PEND, MEM_LD, MEM_RD[2:0]}`` in bits 4:0."""
+    return ((pend & 1) << 4) | ((ld & 1) << 3) | (rd & 7)
+
+
+def unpack_mem(word: int):
+    """``(pend, ld, rd)`` from a debug 0x28 word."""
+    return (word >> 4) & 1, (word >> 3) & 1, word & 7

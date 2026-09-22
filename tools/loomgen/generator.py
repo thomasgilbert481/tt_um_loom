@@ -147,8 +147,10 @@ M2_CSR_NAMES: Tuple[str, ...] = UNBUILT_CSR_NAMES
 #: instruction does; ``DMEM`` and ``BOOTROM`` are not modelled). ``BEENC``
 #: (the slice-A encoders, SEMANTICS 6.9.1, CAPS[9]) is accepted so that a
 #: slice-A build co-simulates; the generator drives its ``BE_CFG`` bits only
-#: once :meth:`be_cfg_value` is taught them.
-FEATURES: FrozenSet[str] = frozenset(("FIFO", "BE", "SETPD", "BEENC"))
+#: once :meth:`be_cfg_value` is taught them. ``DMEM`` (slice B, CAPS[5]) is
+#: accepted the same way; ``LD``/``ST`` are emitted only through the unbuilt
+#: cycle until the generator learns a data area to address (integration).
+FEATURES: FrozenSet[str] = frozenset(("FIFO", "BE", "SETPD", "BEENC", "DMEM"))
 #: The M2 chip: ``CAPS`` reports the FIFOs (depth 4), the manual bit engine
 #: and the deadline-latched ``SETP``. What :func:`generate` assumes unless told.
 DEFAULT_FEATURES: Tuple[str, ...] = ("BE", "FIFO", "SETPD")

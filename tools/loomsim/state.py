@@ -183,10 +183,28 @@ class ThreadState:
     lat_pin: int = 0
     lat_val: int = 0
 
+    # --- data memory (SEMANTICS 6.11, feature "DMEM").  ``MEM_PEND``,
+    # ``MEM_LD`` and ``MEM_RD`` are the architectural state of section 5, read
+    # and written at debug 0x28.  ``mem_addr`` and ``mem_data`` are the model's
+    # side of D-027's holding register (the address the access presents and the
+    # word an ``ST`` writes); neither is host-visible and neither is named in
+    # section 5, so they are kept here rather than exposed.
+    mem_pend: int = 0
+    mem_ld: int = 0
+    mem_rd: int = 0
+    mem_addr: int = 0
+    mem_data: int = 0
+
     @property
     def lat(self) -> int:
         """Debug 0x25: ``{LAT_VALID, LAT_VAL, LAT_PIN[4:0]}`` in bits 6:0."""
         return ((self.lat_valid & 1) << 6) | ((self.lat_val & 1) << 5) | (self.lat_pin & 0x1F)
+
+    @property
+    def mem(self) -> int:
+        """Debug 0x28: ``{MEM_PEND, MEM_LD, MEM_RD[2:0]}`` in bits 4:0."""
+        return (((self.mem_pend & 1) << 4) | ((self.mem_ld & 1) << 3)
+                | (self.mem_rd & 7))
 
     @property
     def enc(self) -> int:
@@ -381,6 +399,16 @@ class Commit:
     #: Deadline latch load ``(valid, pin, val)``: a ``SETP ... D`` commit or a
     #: host write of debug 0x25 (SEMANTICS 6.10).
     lat_set: Optional[Tuple[int, int, int]] = None
+    #: Data memory (SEMANTICS 6.11).  The first slot of ``LD``/``ST`` sets
+    #: ``mem_pend``, ``mem_ld``, ``mem_rd`` and the model's holding-register
+    #: fields ``mem_addr``/``mem_data``; the completion slot clears
+    #: ``mem_pend``; ``CTRL.RESET`` and a debug ``PC`` write clear it too, and
+    #: a host write of debug 0x28 sets all three architectural bits.
+    mem_pend: Optional[int] = None
+    mem_ld: Optional[int] = None
+    mem_rd: Optional[int] = None
+    mem_addr: Optional[int] = None
+    mem_data: Optional[int] = None
     #: Host debug writes of ``STEPS`` and ``TICK_SEEN`` (HOST_PROTOCOL space 4).
     steps: Optional[int] = None
     tick_seen: Optional[int] = None
@@ -414,6 +442,11 @@ class Commit:
     irq_en2: Optional[int] = None
     reset_pc: Optional[Tuple[int, int]] = None
     imem_write: Optional[Tuple[int, int]] = None
+    #: ``(address, word)`` of an ``ST`` (SEMANTICS 6.11).  Unlike
+    #: :attr:`imem_write` it is a thread's access, not a host one, so it is
+    #: never refused: it lands at the edge that ends the access slot's F
+    #: cycle and is visible to fetches from the cycle after it.
+    mem_store: Optional[Tuple[int, int]] = None
     #: Host FIFO side: value pushed into INQ, and whether OUTQ is popped.
     inq_push: Optional[int] = None
     outq_pop: bool = False
