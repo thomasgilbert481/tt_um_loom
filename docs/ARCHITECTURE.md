@@ -255,17 +255,32 @@ the decoder), shifts it into SR, updates CRC, decrements CNT. One slot each. Wit
 `WAITD 1` between bits a thread reaches 6 Mbit/s; USB low-speed at 1.5 Mbit/s
 leaves 6 slots per bit for framing logic.
 
-**Auto mode.** The engine runs itself on ticks: TX shifts one bit per tick and,
-when CNT hits zero, reloads SR from INQ if `AUTOPULL` is set; RX samples one bit
-per tick at the configured phase and pushes SR to OUTQ when CNT hits zero if
-`AUTOPUSH` is set. The thread supervises with `WAITB` and handles framing. This
-is the path for 10 Mbit Manchester, where there is only about one slot per bit.
+The encoders (NRZI, Manchester), the stuffers (USB, CAN) and the differential
+output bit belong to manual mode and are M3 slice A (D-026): they are what
+USB low-speed needs, and at 1.5 Mbit/s the manual loop uses three of the
+eight slots per bit. Manchester in manual mode is two `SHO` per bit, one per
+half bit, with the engine tracking the phase.
+
+**Auto mode** (M3 slice C, optional, D-026). Revised at the M2 review: the
+engine does not run on its own datapath. When `MODE` and `TICK_SEEN` are
+set, the thread's slot performs an implicit `SHO` (TX) or `SHI` (RX)
+alongside its instruction, through the same X-stage logic manual mode uses.
+The transmit edge is applied through the thread's deadline latch with the
+next tick edge as a third fire condition, so it is clock-exact; the receive
+sample is the slot's X-cycle read, a fixed few clocks after the tick, and
+firmware places the tick with `SETD`. At CNT zero, TX reloads SR from INQ if
+`AUTOPULL` is set and RX pushes SR to OUTQ if `AUTOPUSH` is set, through the
+thread's own FIFO port. The thread supervises with `WAITB` and handles
+framing. One engine action per slot, so a tick period of at least 4 clocks:
+12.5 Mbit/s NRZ, about 6 Mbit/s Manchester at 50 MHz. 10 Mbit Manchester is
+not a target (D-029). Slice C is built only if the routing budget of D-025
+allows it after slices A and B; until then `MODE` reads 0.
 
 ### 8.1 BE_CFG bits
 
 | Bits | Field | Values |
 |---|---|---|
-| 0 | MODE | 0 manual, 1 auto |
+| 0 | MODE | 0 manual, 1 auto (slot-injected, D-026; reads 0 until slice C exists) |
 | 1 | DIR | 0 LSB first, 1 MSB first |
 | 2 | RXTX | 0 transmit (drive out pin), 1 receive (sample in pin) |
 | 4:3 | ENC | 0 NRZ, 1 NRZI (USB: 0 = toggle), 2 Manchester (IEEE 802.3: 0 = high-to-low), 3 reserved |
@@ -273,7 +288,8 @@ is the path for 10 Mbit Manchester, where there is only about one slot per bit.
 | 7 | INV | invert the pin sense |
 | 8 | AUTOPULL / AUTOPUSH | reload from INQ (TX) or push to OUTQ (RX) at CNT==0 |
 | 9 | CRC_EN | update CRC on data bits (stuffed bits never touch CRC) |
-| 12:10 | PHASE | RX sample position within the tick period, in eighths |
+| 10 | DIFF | `SHO` also drives the next pin index with the complement (USB D+/D-), through the group-write path (D-026, slice A) |
+| 12:11 | reserved | was PHASE; dropped at the M2 review (D-026): the sample lands a fixed few clocks after the tick and firmware places the tick |
 
 Stuffed bits consume a tick but not a data bit and never enter SR or CRC. In
 manual mode a pending stuff bit makes the next `SHO` emit the stuff bit instead
@@ -535,11 +551,14 @@ its timing contract (which cycle outputs change relative to inputs).
    `6x4`; `8x2`/`6x4` were never used on the first cmos5l shuttle). If Tiny
    Tapeout adds `8x4` before M4, switching is a one-line `info.yaml` change and
    a re-budget; do not design for it.
-2. OPEN: FIFO depth 4 vs 8. Decide after M1 synthesis numbers.
-3. OPEN: data memory (LD/ST) size and implementation. Needed for device
-   emulation demos (I2C EEPROM, SPI flash). Decide at M2 with the memory choice.
-4. OPEN: boot ROM demo. Include if the design is under 20K cells at M3.
-5. OPEN: group-match wait and CRC-32. M3/M4, area permitting.
+2. RESOLVED 2026-09-22 (M2 review): FIFO depth stays 4. A low-speed USB data
+   packet is at most 8 bytes, four words, and depth is wiring (D-025).
+3. RESOLVED 2026-09-22 (D-027): data memory is the instruction memory,
+   reached by `LD`/`ST` as two-slot instructions through the thread's own
+   fetch cycle. No second macro, no flop array.
+4. CLOSED 2026-09-22: no boot ROM. It is not a protocol, it is wiring
+   (D-025), and the host loads programs.
+5. CLOSED 2026-09-22: no group-match wait and no CRC-32 (D-025).
 6. Name: "Loom" (threads, weaving, and a Tiny Tapeout shuttle). Change before the
    first public push if you want something else; it is only in `info.yaml`,
    the module prefix and the docs.

@@ -266,41 +266,83 @@ FPGA prototype running the same tests; D-024 dropped it on 2026-09-21.)
       FLOPS, and keep the macro branch alive until M4. Results in
       `docs/AREA.md`; Jane Street's answer on macro acceptance in hand; record
       the pick in `docs/DECISIONS.md`.
-- [ ] Fable review: protocol coverage, host protocol, area and timing.
+- [x] 2026-09-22, Fable review (`docs/reviews/m2-review.md`, architect's
+      answer): M2 met. Decisions D-025 to D-030; M3 and M4 below rewritten.
 
-### M3: bit engines, device emulation, formal (by 2026-11-09)
+### M3: bit engine encoders, data memory, the M3 protocols (by 2026-11-01)
 
-Exit: I2C slave EEPROM emulation, WS2812, PS/2 and JTAG/SWD programs pass;
-formal properties SCHED, FIFO, TIMER, SPI, PIN proven; mutation score
-reported.
+Rewritten at the M2 review (2026-09-22, D-025 to D-030). The original exit's
+formal and mutation items were met in M2. Every hardware change below is one
+slice, hardened alone and judged by D-025 (detailed routing under 4 hours,
+Metal3 overflow the early warning).
 
-- [ ] Bit engine complete: auto mode, NRZI, Manchester, USB and CAN stuffing,
-      sample phase, stuffing-violation T flag.
-- [ ] Data memory decision implemented (LD/ST) if chosen at M2.
-- [ ] Firmware: `i2c_slave_eeprom`, `ws2812`, `ps2_host`, `jtag_master`
-      (IDCODE read), `swd_master` (DPIDR read), each with L3 tests.
-- [ ] Formal: `formal/` SymbiYosys jobs for SCHED-1..3, FIFO-1..3, TIMER-1,
-      SPI-1, PIN-1, ISA-1 (decode completeness generated from `isa.yaml`).
-- [ ] `tools/mutate`: mutation testing over `src/`, kill ratio reported in CI
-      artefacts; target 90 percent, survivors triaged in `docs/BUGS.md`.
-- [ ] Boot ROM demo if area allows (OPEN-4).
-- [ ] Fable review: what stretch goals are affordable in time and area.
+Exit: slices A and B hardened inside the D-025 budget; `ws2812`, `ps2_host`,
+`jtag_master`, `swd_master`, `i2c_slave_eeprom` and `usb_ls_device` pass
+their L3 tests on the golden model and on the RTL; ISO-1 attempted and its
+result recorded, bounded or proved.
 
-### M4: stretch protocols and closure (by 2026-11-30, feature freeze Dec 1)
+- [ ] Thomas: yes or no on D-028 (the host's TD write leaves rule 2). If yes:
+      SEMANTICS 6.10, HOST_PROTOCOL, model, `loom_timer`, a regression test,
+      the formal property, one hardening. It removes logic, so it goes first
+      and sets the baseline the slices are read against.
+- [ ] One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
+      the pinned PDK) to the end of global routing and stop? Record the answer
+      in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow
+      there before it goes to CI.
+- [ ] SEMANTICS 6.9 M3 text (D-026 slice A): NRZI, Manchester as two `SHO`
+      per bit, USB and CAN stuffing and destuffing with the pending-stuff
+      rule, the T flag, the differential output bit. ARCHITECTURE 8.1 kept in
+      step.
+- [ ] Slice A: RTL and golden model written separately from that text,
+      L1-BE-ENC and L1-BE-STUFF, the co-simulation generator over the new
+      `BE_CFG` bits with coverage bins, hardening, the D-025 reading in
+      `docs/AREA.md`.
+- [ ] Firmware with no RTL, in parallel with slice A: `ws2812` (`SETP ... D`
+      pulses), `ps2_host`, `jtag_master` (IDCODE read), `swd_master` (DPIDR
+      read), each with a `protomodels` model and an L3 test on the model and
+      on the RTL.
+- [ ] ISO-1 (thread isolation), timeboxed to two sessions on a reduced
+      configuration; a bounded result is recorded as bounded.
+- [ ] SEMANTICS 6.11 and `isa.yaml` for D-027: `LD`/`ST` as two-slot
+      instructions on the instruction memory through the thread's own fetch
+      cycle; the assembler's data directive and the deadline checker's count;
+      the host's existing IMEM commands load and dump an image.
+- [ ] Slice B: RTL and model, tests, hardening, the D-025 reading.
+- [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
+      in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a
+      Python host model, enumeration to SET_ADDRESS and one HID report
+      (L3-USB-LS), `can_loopback` with stuffing and CRC15 (L3-CAN).
+- [ ] 2026-11-01, slice C decided by the numbers: auto mode in the
+      slot-injected shape (D-026) only if slice B's hardening shows Metal3
+      overflow under 3,500 and detailed routing under 3 h 45 min, and Thomas
+      wants it. If built: SEMANTICS text, model, RTL, co-simulation,
+      hardening, all before 2026-11-08.
+- [ ] Fable review, M3: the slices' numbers, ISO-1's state, the freeze commit.
 
-Exit: at least one of USB LS or CAN passes an L3 test; 10 Mbit Manchester
-loopback at 60 MHz in simulation; STA clean at 20 ns on the final netlist; GL
-simulation passes the full L3 suite.
+### M4: RTL freeze and the evidence (freeze 2026-11-08; by 2026-12-01)
 
-- [ ] USB low-speed device: enumeration as a HID with a Python host model
-      (tokens, CRC5/16, NRZI, stuffing, EOP, handshake). Stretch within stretch:
-      real enumeration on a PC through the FPGA with resistor-level D+/D-.
-- [ ] CAN frame TX and RX loopback with stuffing and CRC15.
-- [ ] 10 Mbit Manchester TX/RX loopback in auto mode at 60 MHz (sim only; real
-      10BASE-T needs a transceiver and is documented as future work).
-- [ ] Timing closure: worst negative slack 0 at 20 ns, report at 16.7 ns.
-- [ ] Gate-level simulation (TT `gl_test` job) runs the L3 suite.
-- [ ] Feature freeze 2026-12-01. Bug fixes only after that.
+Exit: RTL frozen on 2026-11-08 and the final `gds` run of the freeze commit
+finished inside six hours; the L3 suite passes at gate level on that netlist;
+`docs/VERIFICATION_REPORT.md` complete in draft.
+
+- [ ] 2026-11-08: RTL freeze (D-030). Final `gds` run by hand on the freeze
+      commit; if it does not finish inside six hours the last slice comes out
+      and the run repeats. After the freeze, RTL changes only for a bug found
+      by verification, each with a re-hardening.
+- [ ] Manchester loopback at the manual-mode rate (L3-MANCH, in place of the
+      10 Mbit target, D-029).
+- [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
+      remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
+      the RTL, the two open timer mutants closed (one by D-028 if taken).
+- [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
+      the mutation table, the formal findings, the routing budget, D-024's
+      statement that nothing ran on hardware and what stands in for it.
+- [ ] If the `gds` artefact includes SDF (unverified; check first): one
+      timing-annotated gate-level run of the L3 suite at the typical corner,
+      recorded as PHY-GL-SDF.
+- [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
+      measured slow-corner clock, both with their slack.
+- [ ] Firmware freeze 2026-12-01.
 
 ### M5: documentation and submission package (by 2026-12-20)
 
@@ -311,8 +353,10 @@ simulation passes the full L3 suite.
       build, how to program, honest limitations.
 - [ ] `docs/VERIFICATION_REPORT.md`: numbers, bug ledger, what AI did and how
       it was checked.
-- [ ] Demo material: FPGA video of two or three protocols on real devices,
-      waveform screenshots, the assembler listing with slot annotations.
+- [ ] Demo material (no FPGA, D-024): the assembler listing with slot
+      annotations, waveforms from the RTL L3 runs (the 433- and 434-clock
+      `SETP ... D` edges at a 433.5-clock tick), the gate-level log, the
+      mutation table.
 - [ ] Tag `v1.0-rc1`; final `gds` run archived as a release asset.
 
 ### M6: submit (by 2027-01-11)
@@ -352,8 +396,8 @@ simulation passes the full L3 suite.
 | Register-file read mux limits clock | medium | close at 60 MHz target in STA; if needed, split X into two cycles per slot (5-stage, still hazard-free with 4 threads only if we add one bubble; prefer shrinking to 6 registers per thread instead) |
 | LibreLane linter (Verilator) rejects code | medium | `verilator --lint-only -Wall` in CI from day one |
 | Host SPI sampling errors at high SCK | low | spec SCK <= clk/8; formal SPI-1; test at the limit |
-| Scope creep on stretch protocols | high | feature freeze Dec 1; USB LS is the only stretch with a fixed slot |
-| Semester crunch (564 project, finals) | high | RTL done by Nov 30; December is docs; buffer week before the deadline |
+| Scope creep on stretch protocols | high | RTL freeze 2026-11-08 (D-030); USB LS is the only stretch with a fixed slot; slice C only under D-025's numbers |
+| Semester crunch (564 project, finals) | high | RTL frozen 2026-11-08, before the crunch; November is firmware and the report; December is docs; buffer week before the deadline |
 | Model rate limits stall sessions | medium | milestones are small; every session ends with a committed, green state; `CLAUDE.md` explains how to resume |
 | TT precheck failures (pin hygiene, unused signals, `ena`) | medium | run precheck on every push from M0 |
 | Verification looks impressive but is hollow | medium | mutation testing and a public bug ledger; reviewers can see what was caught and by what |
@@ -368,7 +412,8 @@ simulation passes the full L3 suite.
    sim/Pico/TT-board transports, mutation tool, codegen.
 4. Firmware library: UART, SPI, I2C (master and slave), WS2812, PS/2, JTAG,
    SWD, plus USB LS and CAN as far as they got, each with tests.
-5. FPGA build and a short demo video.
+5. The iCEBreaker attempt as measured (`fpga/icebreaker/`, D-024); no FPGA
+   build and no video.
 
 ## Session log
 
@@ -534,3 +579,15 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   the full pass is running.
   Next: the FPGA prototype (brief written), then the M2 review with Fable
   (`docs/reviews/m2-review.md`) before M3 starts.
+- 2026-09-22, Fable 5.1, M2 review (`docs/reviews/m2-review.md`, architect's
+  answer): M2 met. Routing time gates every hardware change, one per
+  hardening (D-025). The bit engine is built encoders-and-stuffing first, in
+  manual mode, and auto mode, if at all, acts in the thread's slot on the
+  shared datapath (D-026); data memory is `LD`/`ST` on the instruction memory
+  through the thread's own fetch cycle (D-027); taking the host's TD write
+  out of rule 2 is proposed to Thomas as the slow-corner fix (D-028); USB LS
+  stays, CAN is firmware, 10 Mbit Manchester is cut as a target (D-029); RTL
+  freeze moved to 2026-11-08 and the verification report starts now (D-030).
+  M3 and M4 rewritten, ARCHITECTURE 8, 8.1 and 15 updated. Next: Thomas
+  answers D-028; the implementer starts with the local global-routing check
+  and the SEMANTICS 6.9 M3 text, then slice A.

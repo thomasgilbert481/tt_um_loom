@@ -398,3 +398,168 @@ board is bought later; the L6 check IDs stay in VERIFICATION.md, marked not
 done, so the report lists them as open rather than dropping them silently.
 The silicon, when it arrives, is the first hardware test: the bench scripts
 L6 describes become the chip's bring-up plan.
+
+## D-025 2026-09-22 Fable: every hardware change is gated by routing time, one change per hardening
+
+Decision: an RTL change is accepted only if the hardening after it finishes
+detailed routing in under 4 hours; the global-routing report's Metal3
+overflow is the early warning, and a value above about 4,000 marks a change
+that will not make it. One hardware change per hardening. Before a further
+change is stacked on the design (slice C of D-026), the baseline must show
+Metal3 overflow under 3,500 and detailed routing under 3 h 45 min. One
+session is spent finding out whether LibreLane runs locally (the Docker image
+in `CLAUDE.md`, the pinned PDK) to the end of global routing; if it does,
+that run is the pre-check for every slice.
+Why: GitHub kills a job at six hours and Tiny Tapeout re-runs the flow at
+submission (`docs/AREA.md`, "Routing time is the binding constraint"). The
+three measured points (Metal3 overflow 1,768, 3,169 and 5,776 against
+routing of 3 h 03 min, 3 h 37 min and more than 5 h 15 min) with 50 to 70
+minutes of non-routing work per job and about half an hour of placement
+variance leave one to two hours of margin, so a change is judged by what it
+does to routing, not to cell count.
+Rejected: judging by cell count (D-022 was +2.2 per cent of cells and tripled
+the overflow); raising `PL_TARGET_DENSITY_PCT` or adding cell padding ahead
+of a need (each is a `src/config.json` change and its own six-hour reading).
+Consequences: M3 is built as slices, each hardened alone (PLAN M3). Wide
+buses tapped by per-thread logic are the pattern to avoid; narrow per-thread
+control state and shared X-stage logic are the pattern to use. The final
+`gds` run on the freeze commit is the last gate (D-030).
+
+## D-026 2026-09-22 Fable: the bit engine is built as encoders and stuffing in manual mode first; auto mode, if built, acts in the thread's slot
+
+Decision: the M3 bit-engine work is two slices. Slice A, built first: NRZI
+and Manchester encoding on `SHO` and decoding on `SHI`, USB and CAN
+stuffing and destuffing with the pending-stuff rule of ARCHITECTURE 8.1, the
+stuffing-violation T flag, and a differential output bit (one `SHO` drives
+`BE_PINS.out` and the next pin index complementary, through the group-write
+path) for USB D+/D-. One copy of the logic in the X stage next to the
+shifter and CRC, selected by `xsel`; per thread only the narrow state the
+encoder needs. Manchester in manual mode is two `SHO` per bit with the engine
+tracking the half-bit phase. Slice C, optional and last: auto mode in which
+the engine acts in the thread's own slot when `MODE` and `TICK_SEEN` are set,
+as an implicit `SHO`/`SHI` alongside the slot's instruction through the same
+X-stage logic; the transmit edge goes through the thread's deadline latch
+with the next tick edge as a third fire condition; the receive sample is the
+slot's X-cycle read; `AUTOPULL`/`AUTOPUSH` use the thread's own FIFO port.
+The PHASE field (BE_CFG 12:10) is dropped; its bits hold the differential
+bit. Slice C is built only under D-025's stacking condition, before the
+D-030 freeze, and if Thomas wants it.
+Why: USB low-speed at 1.5 Mbit/s is eight slots per bit and the manual loop
+is three, so the protocols the stretch list names need the encoder and the
+stuffer, not an engine that runs by itself; without hardware NRZI and
+stuffing the per-bit firmware is nine or ten slots. An autonomous per-thread
+engine is four copies of the X-stage datapath, a third writer on every SR,
+CNT and CRC flop and a second requester on every FIFO port: the wiring
+pattern D-025 forbids, and it would falsify SCHED-2 as proved. The
+slot-injected shape keeps every proved property and costs control bits.
+Rejected: auto mode as specified in ARCHITECTURE 8 (per-thread autonomous
+engines); a half-period tick for Manchester's mid-bit edge (a 24-bit compare
+per thread, the wide pattern again).
+Consequences: one engine action per slot, so 12.5 Mbit/s NRZ and about
+6 Mbit/s Manchester at 50 MHz at most; 10 Mbit Manchester is not reachable
+(D-029). SEMANTICS 6.9 gets the slice A text before any RTL, ARCHITECTURE 8
+and 8.1 are updated, and `BE_CFG.MODE` reads 0 until slice C exists, as the
+CAPS convention already provides.
+
+## D-027 2026-09-22 Fable: data memory is the instruction memory, reached by LD/ST through the thread's own fetch cycle
+
+Decision: `LD` and `ST` are built as two-slot instructions on the 512-word
+instruction memory. The first slot computes `ra + imm5` in X, holds PC, and
+at its W edge loads one shared holding register (valid, write, 9-bit
+address, 16-bit data); the thread's next F cycle, which is the cycle after
+its W edge, presents that address (and write) to the memory instead of PC;
+the D cycle receives the word; the second slot writes `rd` for `LD` and
+advances PC. `isa.yaml` moves them from `one_slot` to a two-slot timing
+class, the assembler's deadline checker counts two, and the assembler gains a
+data directive. Data lives in instruction words a program does not use; the
+host loads and dumps it through the IMEM space it already has.
+Why: the device-emulation claim in ARCHITECTURE's differentiator table needs
+memory a register-backed variant cannot supply (a 24C02 is 256 bytes), and
+the two obvious implementations are out: a second macro repeats the PDN and
+precheck risk of D-020 and a flop array is thousands of cells of the wiring
+D-025 forbids. Because a thread's F cycle immediately follows its own W edge,
+one holding register serves all four threads, no other thread's slot is
+used, and SCHED-1, SCHED-2 and the host's halted-only IMEM rule hold
+unchanged.
+Rejected: a second SRAM macro; a flop or latch array; register-backed
+16-byte emulation (too small to demonstrate anything).
+Consequences: SEMANTICS 6.11 is written before the RTL; the cost is one
+holding register, a wider mux at the macro port and one more source in the
+register write mux, at the macro's pin edge, so its hardening is read under
+D-025. OPEN-3 is resolved; OPEN-2 (FIFO depth) stays at 4; OPEN-4 (boot ROM)
+and OPEN-5 (group-match wait, CRC-32) are closed as not built.
+
+## D-028 2026-09-22 Fable, proposed to Thomas: the host's TD write leaves rule 2 of the deadline latch
+
+Proposal (not in force until Thomas says yes): SEMANTICS 6.10 rule 2 becomes
+"TD is written at e by the thread (a `WAITD` first issue, `SETD` or
+`CSRW TD`) and `reached(NOW', TD')` holds". A host debug write to `TD` still
+writes `TD` but no longer fires a staged pin write; rule 1 (NOW ticks to
+exactly TD) is unchanged and still fires on the new value at the exact tick.
+In `loom_timer`, `td_new` and `td_w` lose their `h_mine && h_td_we` terms.
+Why: 22 of the 23 slow-corner violations (-2.48 ns, run 35524275302) start
+at the host thread decode and go through `h_mine`, its buffer chain and the
+`td_new` mux into the subtractor (D-022's analysis). Removing the host term
+takes the thread compare and `h_wdata` out of that cone and leaves a mux
+selected by the D-019 ring. It deletes logic, so under D-025 it cannot cost
+routing; it can only fail to close the corner, and one hardening says which.
+It also settles the open mutation survivor at `loom_timer.v` line 112 by
+construction and makes "a thread's staged write fires only on its own TD
+writes" a provable property. The cost is a debug-only corner: a host `TD`
+write while the thread is halted no longer applies a staged write.
+Rejected: the flow knobs in `docs/AREA.md` (DELAY synthesis, post-GRT
+resizer timing, timing-driven placement), each a whole-design change in cell
+selection and a six-hour reading, for a corner that is not sign-off;
+D-022's two-subtractor shape (still eight subtractors on shared buses).
+Consequences if taken: SEMANTICS 6.10, HOST_PROTOCOL's note on 0x0A and
+0x25, the golden model, `loom_timer`, a regression test, a formal property,
+and one hardening, done first in M3 so the slices are read against the
+lower baseline. Whatever the result, the datasheet states both clocks: 50
+MHz at the typical corner and the measured slow-corner clock.
+
+## D-029 2026-09-22 Fable: stretch scope: USB low-speed stays, CAN is firmware, 10 Mbit Manchester is cut as a target
+
+Decision: USB low-speed device keeps its slot, in manual mode at 1.5 Mbit/s
+on slice A, with a Python host model and enumeration to SET_ADDRESS plus one
+HID report in simulation. CAN is firmware after slice A (loopback with
+stuffing and CRC15); if the CAN stuffer variant costs more than a handful of
+cells, the hardware variant is dropped and firmware stuffs. 10 Mbit
+Manchester at 60 MHz is no longer a target; the Manchester encoder stays and
+`L3-MANCH` becomes a loopback at the manual-mode rate. 10 Mbit Ethernet is
+not attempted. WS2812, PS/2 host, JTAG master, SWD master and the I2C slave
+EEPROM (on D-027) stay as M3 firmware.
+Why: 10 Mbit Manchester was the one protocol that needed the autonomous
+engine D-026 rejects, it needs a transceiver the project does not have, and
+with D-024 there is no bench for it either; it would have been a number in a
+simulation log. USB low-speed is the brief's named stretch and slice A is
+exactly its hardware. The four firmware-only protocols are cheap and are the
+evidence for the "reprogrammable after fabrication" claim.
+Rejected: keeping 10 Mbit Manchester as a reason to build the autonomous
+engine; dropping CAN (it costs nothing once the USB stuffer exists).
+Consequences: PLAN M3 and M4 rewritten; the write-up lists Ethernet and
+10 Mbit Manchester as not attempted and says why.
+
+## D-030 2026-09-22 Fable: RTL freeze 2026-11-08; the write-up starts now
+
+Decision: the RTL is frozen on 2026-11-08 instead of 2026-12-01. The final
+`gds` run is made by hand on the freeze commit and must finish inside six
+hours; if it does not, the last slice comes out and the run repeats. After
+the freeze, RTL changes only for a bug found by verification, each with a
+re-hardening. Firmware, tests, tools and docs continue to 2026-12-01 (they
+trigger no hardening, D-018). `docs/VERIFICATION_REPORT.md` is started now
+as a living document whose first section is D-024's statement. ISO-1 is
+attempted in M3, timeboxed to two sessions on a reduced configuration, and
+reported as bounded if that is what it is. If the `gds` artefact includes
+SDF, one timing-annotated gate-level run of the L3 suite at the typical
+corner is added to the report (unverified that it does; check first).
+Why: the plan's calendar puts course deadlines in late November and finals in
+the first week of December, so a 2026-12-01 freeze lands the last hardening
+where there is least time to react to a killed run; M2 finished four weeks
+early, so 2026-11-08 still leaves seven weeks for M3's slices; with no bench
+the write-up is the evidence and must describe one netlist; and the RTL
+freeze does not stop the protocol list growing.
+Rejected: keeping 2026-12-01 and spending the difference on another protocol
+(after D-029 there is no RTL-bearing protocol left to spend it on).
+Consequences: PLAN M3 ends 2026-11-01 with the slice C decision, M4 is the
+freeze and the evidence, M5's demo material is listings, waveforms, the
+gate-level log and the mutation table, with no video.
