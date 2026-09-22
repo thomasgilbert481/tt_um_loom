@@ -370,3 +370,31 @@ PIN-1CORE and PIN-1R are ordinary proofs in `formal/pins.sby` now, and the
 property that the pads are the plain register views (which they were) is
 replaced by the gated rule. A hardening after this change should show the
 same area to within a few cells.
+
+## D-024 2026-09-21 Thomas: M2 drops its FPGA half; verification rests on simulation, gate level, formal and mutation
+
+Decision: the FPGA prototype leaves M2's exit criterion and the plan. There is
+no FPGA build of the full design before the submission, and L6 (FPGA and
+bench) is out of scope until the Tiny Tapeout silicon arrives, which is after
+the 2027-01-18 deadline.
+Why: the full design does not fit the board on hand. Synthesis for the
+iCEBreaker's iCE40UP5K needs 7,732 LUT4 against 5,280 (`fpga/icebreaker/`),
+and no build knob or small trim closes the gap. A board that fits exists (an
+ECP5-25F uses 32 per cent of its LUTs and closes at 47 MHz; the iCESugar-Pro
+costs about $60 and ships from China, the ULX3S does not ship before December),
+but it would buy a bench demonstration, not a check the project lacks: the
+same RTL is already exercised by lockstep co-simulation against an
+independent golden model, by 71 gate-level tests on the hardened netlist, by
+18 formal properties, and by a mutation pass that kills 99.7 per cent of the
+non-equivalent mutants.
+Rejected: buying the ECP5 board (cost and a delivery that would push the
+milestone for a demonstration); an FPGA-only reduced build, such as two
+threads, which is an RTL change that stops the FPGA running the silicon's
+design.
+Consequences: M2 is complete. The write-up says plainly that nothing has run
+on hardware before silicon and names the checks that stand in for a bench.
+`fpga/icebreaker/` stays as the measured attempt and the pin-map template if a
+board is bought later; the L6 check IDs stay in VERIFICATION.md, marked not
+done, so the report lists them as open rather than dropping them silently.
+The silicon, when it arrives, is the first hardware test: the bench scripts
+L6 describes become the chip's bring-up plan.

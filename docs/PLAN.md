@@ -165,7 +165,9 @@ same cocotb UART model as M0; first synthesis numbers recorded.
 ### M2: host interface and the three required protocols (by 2026-10-19)
 
 Exit: UART RX/TX, SPI master and slave, I2C master all pass their L3 tests with
-data moving through the SPI host port; FPGA prototype runs the same tests.
+data moving through the SPI host port. (The original criterion also asked for an
+FPGA prototype running the same tests; D-024 dropped it on 2026-09-21.)
+**Met 2026-09-21.**
 
 - [x] 2026-09-18: D-019 built. Four self-rotating one-hot rings replace the
       decoded W-stage thread (Yosys merges identical flops, so the replicas
@@ -222,7 +224,7 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       pads (`SimTransport`). 37 scenarios on the model, 29 of them on the RTL
       (the 8 left out are slow 115200-baud and mode-sweep cases, marked with
       the reason); no divergence between the two sides.
-- [ ] FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
+- [x] ~~FPGA: `fpga/icebreaker/` build with Yosys + nextpnr, host over Pico SPI,
       L3 tests re-run on hardware through `loomhost` (same scripts). The
       macro does not exist on the FPGA: build `tt_um_loom` with
       `IMEM_IMPL "FLOPS"` (or add an iCE40 block-RAM backend to `loom_imem`).
@@ -236,10 +238,9 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       does go to block RAM; the gap is logic, and no build knob closes it),
       so `fpga/icebreaker/` stays as the measured attempt and the pin-map
       template. The same RTL on an ECP5-25F uses 32 per cent of the LUTs and
-      closes at 47 MHz. Thomas's call: buy a 25F-class ECP5 board (ULX3S,
-      OrangeCrab or iCESugar-Pro, all supported by the OSS CAD Suite's
-      nextpnr-ecp5), or drop the FPGA half of the exit criterion and rely on
-      simulation, gate level and formal until the silicon.
+      closes at 47 MHz.~~ **Dropped 2026-09-21 (D-024, Thomas's call):** no
+      FPGA before silicon; verification rests on co-simulation, gate level,
+      formal and mutation, and the write-up says so.
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,
       with the latch array as fallback. Remaining conditions: Tiny Tapeout's
       view of the overlap waiver and power-script wrapper, and Jane Street's

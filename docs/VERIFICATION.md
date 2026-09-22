@@ -174,6 +174,12 @@ property that only reaches bounded depth is listed as bounded, not proven.
 
 ### L6: FPGA and bench
 
+**Not done, by decision (D-024, 2026-09-21).** The full design does not fit
+the iCEBreaker's iCE40UP5K (7,732 LUT4 against 5,280), and the project will
+not buy a larger board. Nothing runs on hardware before the Tiny Tapeout
+silicon, which arrives after the submission deadline; these IDs stay listed
+so the report shows them as open, and they become the chip's bring-up plan.
+
 - FPGA-BUILD: iCEBreaker bitstream from the same RTL, imem in block RAM,
   host over the Pico SPI bridge.
 - FPGA-COSIM: `loomhost` single-steps a random program on the FPGA and
@@ -230,7 +236,7 @@ run it.
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 37 scenarios on the model, 29 on the RTL |
 | L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 18 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |
 | L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; two open survivors; the results section below |
-| L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is open |
+| L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
 
 ## Mutation testing results (L7), 2026-09-21
 

@@ -11,18 +11,19 @@ Exit criterion (PLAN, M2): "UART RX/TX, SPI master and slave, I2C master all
 pass their L3 tests with data moving through the SPI host port; FPGA prototype
 runs the same tests."
 
-- Met, except the FPGA half. The four programs plus the new `spi_slave` pass
-  their L3 scenarios on the golden model (37) and on the RTL through the real
-  SPI pads (29 of them), with the same test bodies on both sides.
-- The FPGA half is not started. Tiny Tapeout's own `fpga` workflow cannot
-  build this design (run 35478423175: the SRAM macro has no FPGA model and the
-  action passes no defines), so `fpga/icebreaker/` with `IMEM_IMPL "FLOPS"` is
-  ours to write, and the bench run needs Thomas at the board.
+- **Met.** The four programs plus the new `spi_slave` pass their L3 scenarios
+  on the golden model (37) and on the RTL through the real SPI pads (29 of
+  them), with the same test bodies on both sides.
+- The FPGA half is dropped (D-024, Thomas, 2026-09-21): the full design needs
+  7,732 LUT4 and the iCEBreaker's UP5K has 5,280, and the project will not buy
+  a larger board. Nothing runs on hardware before silicon.
 
-Verification beyond the milestone: lockstep co-simulation covers the M2
-features with the model built from `CTRL.CAPS`; 18 formal properties (L4);
-`tools/mutate` (L7) with its first findings. `docs/VERIFICATION.md` has the
-table of what lives where.
+Verification beyond the milestone, which now has to stand in for a bench:
+lockstep co-simulation covers the M2 features with the model built from
+`CTRL.CAPS`; 71 gate-level tests on the hardened netlist; 18 formal
+properties (L4), one of which found a real bug (D-023); a full mutation pass
+(L7) killing 99.7 per cent of the non-equivalent mutants.
+`docs/VERIFICATION.md` has the table of what lives where.
 
 ## The constraint that changed since M1
 
@@ -63,12 +64,15 @@ flow signs off at the typical corner, where the design has +6.21 ns.
 4. **What does "done" look like for the submission?** The plan's M5 and M6 are
    docs and submission. Given that the verification story is already the
    strongest part of this project, is there a case for freezing RTL earlier
-   than 2026-12-01 and spending the difference on the write-up and on the
-   bench, rather than on another protocol?
+   than 2026-12-01 and spending the difference on the write-up, which with no
+   FPGA (D-024) is what has to carry the case that the design works, rather
+   than on another protocol?
 
 ## What the implementing session recommends
 
-Build the FPGA prototype next (it closes M2 and it is the last thing that
-needs Thomas's hands before the write-up), then take auto mode in one slice,
-hardening after it, and decide the rest of M3 on what that slice costs in
-routing rather than on the feature list.
+Take auto mode in one slice, harden after it, and decide the rest of M3 on
+what that slice costs in routing rather than on the feature list. With no
+FPGA before silicon (D-024), the write-up carries more weight: it has to show
+a reader why the simulation, gate-level, formal and mutation evidence is
+enough, so starting it before the RTL freeze rather than after is worth
+considering too.
