@@ -202,3 +202,35 @@ async def test_other_threads_do_not_move_the_edges(dut):
         f"thread 1 did not run the busy loop (r7 = {loops})"
     await host.halt()
     await ClockCycles(dut.clk, 8)
+
+
+@cocotb.test()
+async def test_tick_int_zero_is_one(dut):
+    """TICK_INT = 0 is stored as 0 and the divider treats it as 1 (SEMANTICS 4),
+    with and without a fraction. Nothing set it to 0 until a mutant that read
+    it as 2 survived."""
+    host = LoomHost(dut)
+    await host.start()
+    for frac in (0, 128):
+        one = await run_toggles(host, dut, 1, frac, 16, 3)
+        zero = await run_toggles(host, dut, 0, frac, 16, 3)
+        gaps_one = [b - a for a, b in zip(one, one[1:])]
+        gaps_zero = [b - a for a, b in zip(zero, zero[1:])]
+        assert gaps_zero == gaps_one, (frac, gaps_zero, gaps_one)
+    await host.halt()
+    await ClockCycles(dut.clk, 8)
+
+
+@cocotb.test()
+async def test_long_tick_period(dut):
+    """A 32,768-clock tick keeps its period. The accumulator's top bit only
+    matters for TICK_INT >= 0x8000; a mutant that dropped it made the timer
+    tick on every clock after the first tick, and nothing used a tick that
+    long."""
+    host = LoomHost(dut)
+    await host.start()
+    edges = await run_toggles(host, dut, 0x8000, 0, 1, 1)
+    gaps = [b - a for a, b in zip(edges, edges[1:])]
+    assert gaps == [0x8000], gaps
+    await host.halt()
+    await ClockCycles(dut.clk, 8)

@@ -218,6 +218,11 @@ async def test_pin_csrs(dut):
                       regs={1: 0x1234, 2: 0x00F0, 3: 0x0000})
     assert await host.read_reg(0, 4) == 0x1234
     assert await host.read_reg(0, 5) == 0x00F0
+    # PIN_IN = {3'b0, IN4, IN3..IN0, BIDIR7..0} (SEMANTICS 3): the top three
+    # bits read 0 through the CSR and through the host port alike. r6 was
+    # read and never checked until a mutant that set them survived.
+    assert await host.read_reg(0, 6) >> 13 == 0
+    assert (await host.read1(SP_CTRL, CTRL_PIN_IN)) >> 13 == 0
     assert resolve(dut.uio_out) == 0x34
     assert resolve(dut.uio_oe) == 0xF0
     assert outs(dut) == 0x12

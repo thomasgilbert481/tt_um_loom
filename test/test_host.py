@@ -462,3 +462,68 @@ async def test_debug_register_cross_talk(dut):
     assert [await host.read_debug(t, DBG_WAIT_ACTIVE) for t in range(4)] \
         == [1, 1, 0, 1], "CTRL.RESET clears WAIT_ACTIVE, for one thread only"
     assert await host.badop() == 0
+
+
+# --------------------------------------------------- the SPI byte layer
+# Two HOST_PROTOCOL promises the mutation run (tools/mutate, round 2) found
+# nothing checking: loom_spi_host survived with MISO idling high, and with the
+# byte state never cleared while CS_n is high.
+
+@cocotb.test()
+async def test_miso_idles_low(dut):
+    """HOST_MISO is driven 0 while CS_n is high (HOST_PROTOCOL)."""
+    host = LoomHost(dut)
+    await host.start()
+    # A read that ends on a data bit of 1 leaves the shifter full of ones:
+    # the case where a MISO that followed the shifter while idle would be high.
+    await host.write(SP_IMEM, 0, [0xFFFF])
+    assert await host.read(SP_IMEM, 0, 1) == [0xFFFF]
+    for _ in range(24):                  # CS_n has been high for 4 clocks
+        await ClockCycles(dut.clk, 1)
+        miso = str(dut.uo_out.value)[0]  # uo_out[7:0], MSB first; X must fail too
+        assert miso == "0", "MISO is %r while CS_n is high" % miso
+
+
+@cocotb.test()
+async def test_cs_rising_mid_byte_voids_the_byte(dut):
+    """CS_n rising resets the byte counter at any point, and a word cut short
+    is discarded (HOST_PROTOCOL): framing survives, nothing half-written lands."""
+    host = LoomHost(dut)
+    await host.start()
+    ident = await host.read1(SP_CTRL, CTRL_ID)
+    await host.set_reset_pc(2, 0x055)
+
+    # Bare partial bytes: the next transaction must frame from bit 0 again.
+    for nbits in (1, 3, 7):
+        await host.transfer(b"", tail_bits=nbits, tail=0xA5)
+        assert await host.read1(SP_CTRL, CTRL_ID) == ident, \
+            "a byte cut after %d bits shifted the framing" % nbits
+
+    # A write of RESET_PC2 cut inside its data word: nothing may land.
+    addr = CTRL_RESET_PC0 + 2
+    head = bytes([0x80 | (SP_CTRL << 4), (addr >> 8) & 0xFF, addr & 0xFF, 0x00])
+    for nbits in (1, 4, 7):
+        await host.transfer(head, tail_bits=nbits, tail=0xAA)
+        assert await host.read1(SP_CTRL, addr) == 0x055, \
+            "a data word cut after %d bits of its low byte was written" % nbits
+
+
+@cocotb.test()
+async def test_reset_sets_td_to_now(dut):
+    """CTRL.RESET sets TD := NOW for the thread it resets (HOST_PROTOCOL
+    0x0004). Nothing read TD after a reset until a mutant that skipped the
+    assignment survived."""
+    host = LoomHost(dut)
+    await host.start()
+    # A slow tick first, so NOW holds still across the transactions below
+    # (writing TICK_INT clears the accumulator, SEMANTICS 4).
+    await host.write_debug(1, DBG_CSR0 + CSR_TICK_INT, 60000)
+    await host.write_debug(1, DBG_TD, 0x1234)
+    now0 = await host.read_debug(1, DBG_NOW)
+    assert now0 != 0x1234
+    await host.reset_thread(1)
+    td = await host.read_debug(1, DBG_TD)
+    now1 = await host.read_debug(1, DBG_NOW)
+    assert td in (now0, now1), "TD %#x after CTRL.RESET, NOW %#x..%#x" % (td, now0, now1)
+    assert await host.read_debug(0, DBG_TD) != td or now0 == 0, \
+        "CTRL.RESET of thread 1 must leave thread 0's TD alone"

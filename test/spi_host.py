@@ -233,16 +233,25 @@ class LoomHost:
     def _miso(self):
         return (resolve(self.dut.uo_out) >> 7) & 1
 
-    async def transfer(self, data):
-        """One CS-framed transaction. Returns the bytes shifted out on MISO."""
+    async def transfer(self, data, tail_bits=0, tail=0):
+        """One CS-framed transaction. Returns the bytes shifted out on MISO.
+
+        With ``tail_bits`` (1..7) the transaction ends mid-byte: after the
+        whole bytes of ``data``, only the first ``tail_bits`` bits of ``tail``
+        are clocked before CS_n rises, which HOST_PROTOCOL says voids the
+        partial byte and any word it belonged to.
+        """
         clk = self.dut.clk
         self._cs = 0
         self._drive_ui()
         await ClockCycles(clk, 4)
         out = bytearray()
-        for byte in data:
+        frames = [(byte, 8) for byte in data]
+        if tail_bits:
+            frames.append((tail, tail_bits))
+        for byte, nbits in frames:
             rx = 0
-            for i in range(8):
+            for i in range(nbits):
                 self._mosi = (byte >> (7 - i)) & 1
                 self._drive_ui()
                 await ClockCycles(clk, self.half)
@@ -252,7 +261,8 @@ class LoomHost:
                 await ClockCycles(clk, self.sck_clocks - self.half)
                 self._sck = 0
                 self._drive_ui()
-            out.append(rx)
+            if nbits == 8:
+                out.append(rx)
         await ClockCycles(clk, 8)
         self._cs = 1
         self._drive_ui()
