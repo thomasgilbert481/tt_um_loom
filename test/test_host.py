@@ -20,10 +20,11 @@ from tools.loomisa import load
 ISA = load()
 IMEM_WORDS = 512    # the SRAM macro (D-020); test_flops.py covers the 256-word flops
 FIFO_DEPTH = 4
-VERSION = 0x0002    # M2: FIFOs, host IRQ, manual bit engine, SETP D
-#: What this build reports: log2(IMEM_WORDS) = 9 in [15:12], FIFOs with depth
-#: 4 (log2 = 2), the bit engine in manual mode and the deadline-latched SETP.
-EXPECT_CAPS = 0x9000 | 0x80 | 0x10 | 0x08 | 0x02
+VERSION = 0x0003    # M3 slice A: the bit-engine encoders, stuffing and DIFF (6.9.1)
+#: What this build reports: log2(IMEM_WORDS) = 9 in [15:12], the slice-A
+#: encoders [9], FIFOs with depth 4 (log2 = 2), the bit engine in manual mode
+#: and the deadline-latched SETP.
+EXPECT_CAPS = 0x9000 | 0x200 | 0x80 | 0x10 | 0x08 | 0x02
 
 
 @cocotb.test()
@@ -33,12 +34,13 @@ async def test_id_version_caps(dut):
     await host.start()
     assert await host.read1(SP_CTRL, CTRL_ID) == 0x4C4D
     assert await host.read1(SP_CTRL, CTRL_VERSION) == VERSION
-    # CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:9] zero,
-    # [8] BE auto mode, [7] deadline-latched SETP, [6] ROM, [5] DMEM,
-    # [4] BE manual mode, [3] FIFO, [2:0] log2(FIFO_DEPTH).
+    # CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:10] zero,
+    # [9] slice-A encoders, [8] BE auto mode, [7] deadline-latched SETP,
+    # [6] ROM, [5] DMEM, [4] BE manual mode, [3] FIFO, [2:0] log2(FIFO_DEPTH).
     caps = await host.read1(SP_CTRL, CTRL_CAPS)
     assert caps >> 12 == IMEM_WORDS.bit_length() - 1, f"CAPS {caps:#06x}"
-    assert (caps >> 9) & 0x7 == 0, "CAPS bits 11:9 are reserved"
+    assert (caps >> 10) & 0x3 == 0, "CAPS bits 11:10 are reserved"
+    assert caps & 0x200, "slice A (encoders, stuffing, DIFF) must report present"
     assert caps & 0x100 == 0, "no bit-engine auto mode before M3"
     assert caps & 0x40 == 0, "no boot ROM"
     assert caps & 0x20 == 0, "DMEM must report absent"

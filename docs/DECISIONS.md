@@ -461,6 +461,22 @@ Consequences: one engine action per slot, so 12.5 Mbit/s NRZ and about
 and 8.1 are updated, and `BE_CFG.MODE` reads 0 until slice C exists, as the
 CAPS convention already provides.
 
+Implemented, slice A, 2026-09-22 (Fable as director): the cycle-exact text is
+SEMANTICS 6.9.1; the golden model and the RTL were written from it the same
+evening by two agents in separate worktrees, neither allowed to open the
+other's code (`docs/spec-questions/loomsim-m3a.md`, eight questions, and
+`rtl-m3a.md`, nine; the readings agree everywhere they overlap and the
+architect's rulings are appended to each). Slice A reports as `CAPS[9]`
+(added at integration so the co-simulation harness builds the model from
+CAPS as before) and `VERSION` 3. Model: 67 new tests; RTL: 8 new pin-level
+tests with a Python transcription of 6.9.1 as the reference; the whole
+suite is green (121 cocotb, 1,451 tool tests) and the co-simulation, whose
+generator now drives ENC, STUFF and DIFF, finds no divergence between the
+two implementations. Generic synthesis +686 cells (+3.6 per cent) and +61
+flops, longest path unchanged (`docs/AREA.md`); the hardening after run
+35779039938 is the D-025 reading, and slice A stays only if it routes
+inside four hours.
+
 ## D-027 2026-09-22 Fable: data memory is the instruction memory, reached by LD/ST through the thread's own fetch cycle
 
 Decision: `LD` and `ST` are built as two-slot instructions on the 512-word

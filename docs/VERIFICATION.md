@@ -232,9 +232,9 @@ run it.
 | Check | Implemented in | State |
 |---|---|---|
 | L0 static | `scripts/check_all.sh`, CI `lint` | Verilator `-Wall` on the TT top and the generated decoder |
-| L1 unit | `test/test_{host,alu,ctrl,pins,timing,uart,fifo,irq,be,setpd}.py` | 70 cocotb tests, all of which also run on the netlist in CI's `gl_test` |
+| L1 unit | `test/test_{host,alu,ctrl,pins,timing,uart,fifo,irq,be,setpd}.py` | 78 cocotb tests (8 added with slice A, `test_be.py`, whose reference is a Python transcription of SEMANTICS 6.9.1), all of which also run on the netlist in CI's `gl_test` |
 | L2-RAND, L2-TRACE, L2-SLOT | `tools/loomgen` + `test/test_cosim.py` | lockstep on every cycle: retire record, pads, `HOST_IRQ`, guard registers, periodic full state. Both sides built from `CTRL.CAPS`, so the M2 features (FIFOs, bit engine, `SETP ... D`) are exercised, and two seeds drive the host port throughout the run |
-| L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 553 bins, 33 empty at the default run, each listed with its reason |
+| L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 37 scenarios on the model, 29 on the RTL |
 | L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 19 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |

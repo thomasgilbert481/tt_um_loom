@@ -293,14 +293,19 @@ result recorded, bounded or proved.
       the pinned PDK) to the end of global routing and stop? Record the answer
       in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow
       there before it goes to CI.
-- [ ] SEMANTICS 6.9 M3 text (D-026 slice A): NRZI, Manchester as two `SHO`
-      per bit, USB and CAN stuffing and destuffing with the pending-stuff
-      rule, the T flag, the differential output bit. ARCHITECTURE 8.1 kept in
-      step.
-- [ ] Slice A: RTL and golden model written separately from that text,
-      L1-BE-ENC and L1-BE-STUFF, the co-simulation generator over the new
-      `BE_CFG` bits with coverage bins, hardening, the D-025 reading in
-      `docs/AREA.md`.
+- [x] 2026-09-22: SEMANTICS 6.9.1 (D-026 slice A): NRZI, Manchester as two
+      `SHO` per bit, USB and CAN stuffing and destuffing with a uniform run
+      rule, the T flag, the differential output bit, the encoder state at
+      debug 0x27, `CAPS[9]`. ARCHITECTURE 8.1 kept in step.
+- [ ] Slice A: 2026-09-22, RTL and golden model written from that text by
+      two agents that never saw each other's code (spec questions and
+      rulings in `docs/spec-questions/{rtl,loomsim}-m3a.md`); L1-BE-ENC and
+      L1-BE-STUFF on both sides (8 cocotb, 67 model tests); the
+      co-simulation generator drives `ENC`, `STUFF` and `DIFF` with 25 new
+      coverage bins and finds no divergence; generic synthesis +686 cells,
+      +61 flops, longest path unchanged (`docs/AREA.md`). Open: the
+      hardening and its D-025 reading, after run 35779039938 (D-028)
+      finishes; a push before that would cancel it.
 - [ ] Firmware with no RTL, in parallel with slice A: `ws2812` (`SETP ... D`
       pulses), `ps2_host`, `jtag_master` (IDCODE read), `swd_master` (DPIDR
       read), each with a `protomodels` model and an L3 test on the model and
@@ -609,3 +614,13 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   read that run against the slow corner (-2.48 ns before) and the D-025
   routing numbers; then the SEMANTICS 6.9 M3 text for slice A and 6.11 for
   slice B, and the local global-routing check.
+- 2026-09-22 (night), Fable 5.1 as director: slice A landed from two agents
+  that wrote the golden model and the RTL from SEMANTICS 6.9.1 without
+  seeing each other's code; the readings in their spec-question files agree
+  everywhere they overlap, and the co-simulation with the generator driving
+  ENC, STUFF and DIFF finds no divergence. `CAPS[9]` added for slice A at
+  integration. Suite: 121 cocotb, 1,451 tool tests, lint clean. Committed
+  locally and NOT pushed: run 35779039938 (D-028's measurement) is still
+  going and a src push would cancel it. Firmware agent (ws2812, ps2_host,
+  then jtag/swd) still running. Next: read run 35779039938 (AREA.md, D-028
+  outcome), push, and its follow-on hardening is slice A's D-025 reading.

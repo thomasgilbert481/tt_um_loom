@@ -12,6 +12,9 @@
  * The retire record (tr_*) is simulation and debug only; it is exported so a
  * testbench can reach it, and left unconnected in tt_um_loom.
  *
+ * VERSION reads 3 from M3 slice A on (SEMANTICS 6.9.1): the bit engine has
+ * the NRZI and Manchester encoders, USB and CAN stuffing and the DIFF bit.
+ *
  * Instruction memory (D-020): IMEM_IMPL "MACRO" (default) is the 512 x 16
  * IHP SRAM macro and needs IMEM_WORDS 512; "FLOPS" is the flip-flop array of
  * any power-of-two size (see loom_imem). IMEM_WORDS sets the address width,
@@ -25,7 +28,7 @@ module loom_top #(
     parameter [15:0]  IMEM_WORDS = 16'd512,
     parameter integer FIFO_DEPTH = 4,
     parameter [15:0]  ID_VALUE   = 16'h4C4D,
-    parameter [15:0]  VERSION    = 16'h0002
+    parameter [15:0]  VERSION    = 16'h0003
 ) (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
@@ -51,11 +54,13 @@ module loom_top #(
   localparam integer IMEM_AW = $clog2(IMEM_WORDS);
   localparam [31:0]  IMEM_LOG2 = $clog2(IMEM_WORDS);
   localparam [31:0]  FIFO_LOG2 = $clog2(FIFO_DEPTH);
-  // CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:9] zero,
+  // CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:10] zero,
+  // [9] bit-engine encoders, stuffing and DIFF (M3 slice A, 6.9.1),
   // [8] bit engine auto mode, [7] deadline-latched SETP, [6] boot ROM,
   // [5] data memory, [4] bit engine (manual mode), [3] FIFOs,
   // [2:0] log2(FIFO_DEPTH).
-  localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 3'd0,
+  localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 2'd0,
+                                 1'b1,    // [9] encoders, stuffing, DIFF (slice A)
                                  1'b0,    // [8] bit engine auto mode (M3)
                                  1'b1,    // [7] deadline-latched SETP
                                  1'b0,    // [6] boot ROM

@@ -1,9 +1,10 @@
-# Loom module interfaces (M2)
+# Loom module interfaces (M3 slice A)
 
 Every port of every hand-written module in `src/`, what it means, and the
-cycle in which it is valid. Written by the RTL implementer as part of M1 and
-updated with the M2 RTL (`docs/ARCHITECTURE.md` section 14 requires this file
-to match the RTL).
+cycle in which it is valid. Written by the RTL implementer as part of M1,
+updated with the M2 RTL and again with M3 slice A (the bit-engine encoders,
+stuffing and DIFF of `docs/SEMANTICS.md` 6.9.1); `docs/ARCHITECTURE.md`
+section 14 requires this file to match the RTL.
 
 Cycle names follow `docs/SEMANTICS.md` section 2: a slot of thread `t` starts
 in cycle `k` with `k mod 4 == t` and has stages F (cycle k), D (k+1),
@@ -43,7 +44,7 @@ Instantiates everything; all parameters live here.
 Parameters: `IMEM_IMPL` (`"MACRO"`, the default, or `"FLOPS"`; see
 loom_imem), `IMEM_WORDS` (16 bits, default 512; the macro needs 512),
 `FIFO_DEPTH` (a power of two from 2 to 8, default 4), `ID_VALUE` (0x4C4D),
-`VERSION` (0x0002).
+`VERSION` (0x0003: 3 from M3 slice A on, SEMANTICS 6.9.1).
 Derived: `IMEM_AW = $clog2(IMEM_WORDS)`, `CAPS_VAL` (SEMANTICS 5: FIFOs with
 `log2(FIFO_DEPTH)` in bits 2:0, and one bit per M2 feature as it is built).
 
@@ -178,13 +179,15 @@ SPACE 4 (DEBUG): ADDR = `{thread[9:8], reg[7:0]}`.
 | 0x0B | NOW | R |
 | 0x0C..0x0E | SR, CNT, CRC (the same registers as CSR 0x0D..0x0F at 0x1D..0x1F) | RW |
 | 0x0F | RS0 | RW |
-| 0x10..0x1F | CSR 0x00..0x0F of that thread, the bit-engine CSRs included (BE_CFG keeps bits 1, 7, 9) | RW where the CSR is writable |
+| 0x10..0x1F | CSR 0x00..0x0F of that thread, the bit-engine CSRs included (BE_CFG keeps bits 1, 4:3, 6:5, 7, 9, 10; a write to it also clears the encoder state) | RW where the CSR is writable |
 | 0x20 | STEPS | RW |
 | **0x21** | `{4'b0, DEPTH[1:0], RS1[9:0]}` | RW |
 | **0x22** | WAIT_ACTIVE in bit 0 | RW |
 | **0x23** | DT | RW |
 | 0x24 | TICK_SEEN in bit 0 | RW |
+| 0x25 | `{9'b0, LAT_VALID, LAT_VAL, LAT_PIN[4:0]}` (6.10) | RW |
 | 0x26 | `{INQ_CNT, OUTQ_CNT}` as `{byte, byte}` | R |
+| 0x27 | `{8'b0, FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}`, the encoder state (6.9.1) | RW |
 
 The three addresses in bold are the ones `docs/HOST_PROTOCOL.md` leaves to the
 implementation; 0x21 follows the note in that document. Debug writes other
@@ -268,7 +271,12 @@ stall like waits; WAITB tests bit engine idle (0, always true in manual mode),
 OUTQ not full (1), INQ not empty (2) and TICK_SEEN (3). SHO, SHI, LDSR, CRCI
 and CSRW compute the new SR, CNT and CRC in X, and the W stage commits them
 into loom_be; SHO's pin write goes through the same single-pin path as SETP,
-so the open-drain rule and the writable-index check are shared.
+so the open-drain rule and the writable-index check are shared. M3 slice A
+(6.9.1) adds one copy of the encoder, the stuffer and the decoder beside
+them, selected by the same `xsel`, and an eighth commit strobe for the
+per-thread encoder state; `DIFF`'s second pin write joins the 32-bit mask
+the group write already builds, so a non-writable `out + 1` is dropped like
+any other. No port of loom_core changed.
 
 ---
 
@@ -344,20 +352,25 @@ Entries are not reset (SEMANTICS 5); the count and pointers are.
 
 ## loom_be
 
-The per-thread bit-engine state, manual mode (SEMANTICS 6.9): SR (16), CNT
-(5), CRC (16), BE_CFG (only DIR bit 1, INV bit 7, CRC_EN bit 9 are stored;
-the other bits read 0 and ignore writes), BE_PINS (10), BE_RELOAD (5),
-CRC_POLY (16), CRC_INIT (16), all reset to 0. No arithmetic: loom_core's X
-stage computes the shifts and the CRC step, this module stores what the W
-stage commits.
+The per-thread bit-engine state, manual mode (SEMANTICS 6.9 and 6.9.1): SR
+(16), CNT (5), CRC (16), BE_CFG (only DIR bit 1, ENC bits 4:3, STUFF bits
+6:5, INV bit 7, CRC_EN bit 9 and DIFF bit 10 are stored, and the reserved
+value 3 of ENC and of STUFF is stored as 0; the other bits read 0 and ignore
+writes), BE_PINS (10), BE_RELOAD (5), CRC_POLY (16), CRC_INIT (16), and the
+8-bit encoder state `{FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}`, all reset to
+0. No arithmetic: loom_core's X stage computes the shifts, the CRC step and
+the encoder, stuffer and decoder; this module stores what the W stage
+commits.
 
 | Port | Dir | Meaning / validity |
 |---|---|---|
 | `cm_sel[3:0]` | in | one-hot: a valid slot of thread t commits at this edge (from loom_core's ring) |
 | `cm_sr_we`/`cm_sr`, `cm_cnt_we`/`cm_cnt`, `cm_crc_we`/`cm_crc` | in | SR, CNT, CRC written by SHO, SHI, LDSR, CRCI or CSRW |
-| `cm_cfg_we`, `cm_pins_we`, `cm_reload_we`, `cm_poly_we`, `cm_init_we`, `cm_csr[15:0]` | in | CSRW of a configuration CSR, with its 16-bit value |
-| `h_sel[3:0]`, `h_*_we`, `h_wdata[15:0]` | in | host debug writes (one-hot thread, only while it is not running); the commit wins if both ever hit one register |
-| `sr_all`, `cnt_all`, `crc_all`, `cfg_all`, `pins_all`, `reload_all`, `poly_all`, `init_all` | out | register values per thread (`cfg_all` is `{CRC_EN, INV, DIR}` per thread), what an instruction in X or a debug read sees |
+| `cm_cfg_we`, `cm_pins_we`, `cm_reload_we`, `cm_poly_we`, `cm_init_we`, `cm_csr[15:0]` | in | CSRW of a configuration CSR, with its 16-bit value. `cm_cfg_we` also clears the encoder state (6.9.1) |
+| `cm_enc_we`, `cm_enc[7:0]` | in | the encoder state after an SHO or SHI, from the X stage |
+| `h_sel[3:0]`, `h_*_we`, `h_wdata[15:0]` | in | host debug writes (one-hot thread, only while it is not running); the commit wins if both ever hit one register. `h_cfg_we` (debug 0x14) clears the encoder state, `h_enc_we` is debug 0x27 |
+| `h_reset[3:0]` | in | CTRL.RESET of a thread: clears its encoder state, last in the priority chain |
+| `sr_all`, `cnt_all`, `crc_all`, `cfg_all`, `pins_all`, `reload_all`, `poly_all`, `init_all`, `enc_all` | out | register values per thread, what an instruction in X or a debug read sees. `cfg_all` is `{DIFF, STUFF[1:0], ENC[1:0], CRC_EN, INV, DIR}` and `enc_all` is `{FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}`, eight bits each |
 
 ---
 

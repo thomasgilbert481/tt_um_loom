@@ -56,6 +56,18 @@
  * the open-drain rule and the index checks are shared. WAITB 0 (bit engine
  * idle) is always true until auto mode exists.
  *
+ * Encoders, stuffing and DIFF (SEMANTICS 6.9.1, M3 slice A, D-026): one
+ * copy of the encoder, the stuffer and the decoder sits in X next to the
+ * shifter and the CRC and is selected by `xsel` the same way, so no new
+ * wide bus is tapped per thread (D-025). Per thread loom_be holds only the
+ * eight encoder bits {FIRST, HALF, PEND, RVAL, RUN, LVL}, committed through
+ * its own port with the W-stage ring, cleared by any BE_CFG write and by
+ * CTRL.RESET. A stuff bit and a Manchester half-bit are not data bits: they
+ * drive the pin but leave SR, CNT and the CRC alone, while Z still reports
+ * CNT after the instruction. DIFF adds a second pin write of the complement
+ * to (BE_PINS.out + 1) mod 32 through the same 32-bit mask the group write
+ * (OUT) uses, so a non-writable index is dropped exactly as in 6.3.
+ *
  * Deadline-latched SETP (SEMANTICS 6.10): `SETP pin, v, D` writes no pin;
  * its commit stages {LAT_VALID, LAT_PIN, LAT_VAL} in the thread's latch,
  * replacing what was staged. loom_timer raises lat_fire[t] in the cycle
@@ -301,9 +313,10 @@ module loom_core #(
   reg        w_swirq;
   reg [15:0] w_steps;
   reg        w_push, w_pop;         // a PUSH / POP completes in this slot
-  reg        w_sr_we, w_cnt_we, w_crc_we;
+  reg        w_sr_we, w_cnt_we, w_crc_we, w_enc_we;
   reg [15:0] w_sr, w_crc;
   reg [4:0]  w_cnt;
+  reg [7:0]  w_enc;               // the encoder state after an SHO/SHI
   reg        w_becfg_we, w_bepins_we, w_bereload_we, w_crcpoly_we, w_crcinit_we;
   reg        w_lat;                 // a SETP D completes in this slot
   reg [4:0]  w_lat_pin;
@@ -581,7 +594,7 @@ module loom_core #(
   // =========================================================== bit engine
   wire [63:0] be_sr_all, be_crc_all, be_poly_all, be_init_all;
   wire [19:0] be_cnt_all, be_reload_all;
-  wire [11:0] be_cfg_all;
+  wire [31:0] be_cfg_all, be_enc_all;
   wire [39:0] be_pins_all;
   wire [15:0] x_sr     = be_sr_all[xsel*16 +: 16];
   wire [4:0]  x_cnt    = be_cnt_all[xsel*5 +: 5];
@@ -589,8 +602,22 @@ module loom_core #(
   wire [15:0] x_poly   = be_poly_all[xsel*16 +: 16];
   wire [15:0] x_init   = be_init_all[xsel*16 +: 16];
   wire [4:0]  x_reload = be_reload_all[xsel*5 +: 5];
-  wire [2:0]  x_becfg  = be_cfg_all[xsel*3 +: 3];     // {CRC_EN, INV, DIR}
+  // {DIFF, STUFF[1:0], ENC[1:0], CRC_EN, INV, DIR}
+  wire [7:0]  x_becfg  = be_cfg_all[xsel*8 +: 8];
+  // {FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}
+  wire [7:0]  x_enc    = be_enc_all[xsel*8 +: 8];
   wire [9:0]  x_bepins = be_pins_all[xsel*10 +: 10];  // {in, out}
+
+  // The BE_CFG register view (ARCHITECTURE 8.1): the six stored fields in
+  // their own bits, MODE (0), RXTX (2), AUTOPULL (8) and 12:11 reading 0
+  // until slice C. Used by CSRR BE_CFG and by debug 0x14.
+  function [15:0] becfg_word;
+    input [7:0] cfg;                // {DIFF, STUFF, ENC, CRC_EN, INV, DIR}
+    begin
+      becfg_word = {5'd0, cfg[7], cfg[2], 1'b0, cfg[1],
+                    cfg[6:5], cfg[4:3], 1'b0, cfg[0], 1'b0};
+    end
+  endfunction
 
   // STEPS + 1 is formed here and registered, so the commit only loads it.
   // The host cannot write STEPS between this X cycle and the commit edge,
@@ -659,31 +686,126 @@ module loom_core #(
   wire [63:0] ig_rot  = {pin32, pin32} >> ig_base;
   wire [15:0] in_value = ig_rot[15:0] & ig_m17[15:0];
 
-  // ------------------------------------------------- bit engine (6.9)
+  // ------------------------------------- bit engine (6.9, 6.9.1 slice A)
+  // One copy of the encoder, stuffer and decoder, in X, selected by xsel
+  // exactly as the shifter and the CRC are (D-025, D-026). Per thread only
+  // the eight narrow encoder bits in loom_be.
   wire        be_dir   = x_becfg[0];
   wire        be_inv   = x_becfg[1];
   wire        be_crcen = x_becfg[2];
+  wire [1:0]  be_enc   = x_becfg[4:3];      // 0 NRZ, 1 NRZI, 2 Manchester
+  wire [1:0]  be_stuff = x_becfg[6:5];      // 0 none, 1 USB, 2 CAN
+  wire        be_diff  = x_becfg[7];
   wire        is_shift = is_sho | is_shi;
-  wire        sho_b    = be_dir ? x_sr[15] : x_sr[0];
-  wire        shi_s    = pin32[x_bepins[9:5]] ^ be_inv;
-  wire        be_bit   = is_shi ? shi_s : sho_b;          // shifted and CRC'd
-  wire [15:0] be_sr_sh = be_dir ? {x_sr[14:0], is_shi & shi_s}
-                                : {is_shi & shi_s, x_sr[15:1]};
-  wire [4:0]  be_cnt_n = (x_cnt == 5'd0) ? 5'd0 : (x_cnt - 5'd1);
+
+  wire        e_lvl   = x_enc[0];
+  wire [2:0]  e_run   = x_enc[3:1];
+  wire        e_rval  = x_enc[4];
+  wire        e_pend  = x_enc[5];
+  wire        e_half  = x_enc[6];
+  wire        e_first = x_enc[7];
+
+  wire        be_manch = (be_enc == 2'd2);
+  wire        be_nrzi  = (be_enc == 2'd1);
+  wire        be_stfg  = (be_stuff != 2'd0);
+  // The stuff value: 0 for USB, ~RVAL for CAN (6.9.1).
+  wire        stuff_v  = (be_stuff == 2'd2) ? ~e_rval : 1'b0;
+
+  // ---- SHO step 1: the bit sent, x. With ENC = 2 and HALF = 1 there is
+  // none (the second half of the bit kept in FIRST); otherwise a pending
+  // stuff bit pre-empts the data bit and leaves SR, CNT and the CRC alone.
+  wire        sho_b     = be_dir ? x_sr[15] : x_sr[0];
+  wire        sho_half2 = be_manch & e_half;
+  wire        sho_has   = ~sho_half2;
+  wire        sho_stuff = sho_has & be_stfg & e_pend;
+  wire        sho_data  = sho_has & ~sho_stuff;
+  wire        sho_x     = sho_stuff ? stuff_v : sho_b;
+
+  // ---- SHI steps 1 and 2: the sample p and the bit received, s. With
+  // ENC = 2 and HALF = 0 there is no bit (steps 3 and 4 are skipped).
+  wire        shi_p      = pin32[x_bepins[9:5]] ^ be_inv;
+  wire        shi_half1  = be_manch & ~e_half;
+  wire        shi_has    = ~shi_half1;
+  wire        shi_s      = be_nrzi ? (shi_p == e_lvl) : shi_p;
+  // Manchester: no transition in the middle of the bit is a violation.
+  wire        shi_mviol  = be_manch & e_half & (e_first == shi_p);
+  // ---- SHI step 3: a pending stuff bit is dropped, and is a violation
+  // unless it carries the stuff value.
+  wire        shi_stuff  = shi_has & be_stfg & e_pend;
+  wire        shi_data   = shi_has & ~shi_stuff;
+  wire        shi_sviol  = shi_stuff & (shi_s != stuff_v);
+
+  // ---- common: was there a bit, was it a data bit, and what was it.
+  wire        be_has  = is_shi ? shi_has  : sho_has;
+  wire        be_data = is_shi ? shi_data : sho_data;
+  wire        be_bit  = is_shi ? shi_s    : sho_x;     // shifted and CRC'd
+  wire        be_took_stuff = is_shi ? shi_stuff : sho_stuff;
+
+  wire [15:0] be_sr_sh = be_dir ? {x_sr[14:0], is_shi & be_bit}
+                                : {is_shi & be_bit, x_sr[15:1]};
+  wire [4:0]  be_cnt_d = (x_cnt == 5'd0) ? 5'd0 : (x_cnt - 5'd1);
+  // A stuff bit and a Manchester half without a data bit leave CNT alone,
+  // but Z still reports CNT after the instruction (6.9.1).
+  wire [4:0]  be_cnt_n = be_data ? be_cnt_d : x_cnt;
   // Serial CRC, MSB first on a left-aligned register.
   wire        be_fb    = x_crc[15] ^ be_bit;
   wire [15:0] be_crc_n = {x_crc[14:0], 1'b0} ^ (be_fb ? x_poly : 16'd0);
+
+  // ---- run accounting, on the bit sent or received, data or stuff.
+  wire        ra_en    = is_shift & be_has & be_stfg;
+  wire        ra_same  = (be_bit == e_rval);
+  wire [2:0]  run_inc  = (e_run == 3'd7) ? 3'd7 : (e_run + 3'd1);
+  wire [2:0]  run_n    = ra_same ? run_inc : 3'd1;
+  wire        rval_n   = be_bit;
+  // A new run of six 1s (USB) or of five equal bits (CAN) makes a stuff
+  // bit due. A stuff bit itself starts a run of one, so it never chains.
+  wire        pend_ra  = (be_stuff == 2'd1) ? ((run_n == 3'd6) & rval_n)
+                                            : (run_n == 3'd5);
+  wire        pend_s1  = be_took_stuff ? 1'b0 : e_pend;
+  wire        enc_pend_n = ra_en ? (pend_s1 | pend_ra) : pend_s1;
+  wire [2:0]  enc_run_n  = ra_en ? run_n  : e_run;
+  wire        enc_rval_n = ra_en ? rval_n : e_rval;
+
+  // ---- encoding into the level l (SHO step 3) and the state it carries.
+  wire        nrzi_l = sho_x ? e_lvl : ~e_lvl;    // a 0 toggles, as USB has it
+  reg         sho_l;
+  always @(*) begin
+    case (be_enc)
+      2'd1:    sho_l = nrzi_l;
+      // IEEE 802.3: a 0 is high then low, a 1 low then high.
+      2'd2:    sho_l = e_half ? e_first : ~sho_x;
+      default: sho_l = sho_x;                     // NRZ (3 is stored as 0)
+    endcase
+  end
+  wire        enc_lvl_n   = be_nrzi ? (is_shi ? shi_p : nrzi_l) : e_lvl;
+  wire        enc_half_n  = be_manch ? ~e_half : e_half;
+  wire        enc_first_n = (be_manch & ~e_half) ? (is_shi ? shi_p : sho_x)
+                                                 : e_first;
+  wire [7:0]  be_enc_n = {enc_first_n, enc_half_n, enc_pend_n, enc_rval_n,
+                          enc_run_n, enc_lvl_n};
+
+  // T is set by an SHI violation and never cleared by SHI (6.9.1).
+  wire        be_t_set = is_shi & (shi_mviol | shi_sviol);
 
   // ------------------------------------------------------- pin writes
   // One single-pin write path (6.3) for SETP and for SHO, which drives
   // b ^ INV onto BE_PINS.out. SETP D writes no pin: it stages (6.10).
   wire        sp_en   = (is_setp & ~f_lat) | is_sho;
   wire [4:0]  sp_pin  = is_sho ? x_bepins[4:0] : f_pin;
-  wire        sp_val  = is_sho ? (sho_b ^ be_inv) : f_val;
+  wire        sp_val  = is_sho ? (sho_l ^ be_inv) : f_val;
   wire [31:0] setp_mask32 = 32'd1 << sp_pin;
+  // DIFF (6.9.1): the same SHO also writes the complement to
+  // (BE_PINS.out + 1) mod 32 at the same edge, as one OUT of a two-pin
+  // group would. An index that is not writable falls out of pw_m14, which
+  // keeps only 0..7 and 16..21, so it is ignored exactly as in 6.3.
+  wire [4:0]  diff_pin = x_bepins[4:0] + 5'd1;
+  wire        diff_en  = is_sho & be_diff;
+  wire [31:0] diff_mask32 = 32'd1 << diff_pin;
   wire [31:0] pinw_mask = (sp_en ? setp_mask32 : 32'd0)
+                          | (diff_en ? diff_mask32 : 32'd0)
                           | (is_out ? out_mask32 : 32'd0);
   wire [31:0] pinw_data = ((sp_en & sp_val) ? setp_mask32 : 32'd0)
+                          | ((diff_en & ~sp_val) ? diff_mask32 : 32'd0)
                           | (is_out ? out_data32 : 32'd0);
   wire [13:0] pw_m14 = {pinw_mask[21:16], pinw_mask[7:0]};
   wire [13:0] pw_d14 = {pinw_data[21:16], pinw_data[7:0]};
@@ -723,8 +845,7 @@ module loom_core #(
     else if (csr_pin_oe)    csr_rdata = {8'd0, pin_oe_reg};
     else if (csr_pin_in)    csr_rdata = pin_in_reg;
     else if (csr_sflags)    csr_rdata = {8'd0, sflags_x};
-    else if (csr_be_cfg)    csr_rdata = {6'd0, x_becfg[2], 1'b0, x_becfg[1],
-                                         5'd0, x_becfg[0], 1'b0};
+    else if (csr_be_cfg)    csr_rdata = becfg_word(x_becfg);
     else if (csr_be_pins)   csr_rdata = {6'd0, x_bepins};
     else if (csr_be_reload) csr_rdata = {11'd0, x_reload};
     else if (csr_crc_poly)  csr_rdata = x_poly;
@@ -829,7 +950,8 @@ module loom_core #(
     x_flags = {x_t, x_c, x_z};
     if (alu_flags)      x_flags = {x_t, alu_c, alu_z};
     else if (csrw_fl)   x_flags = op_a[2:0];
-    else if (is_shift & ~bad_op) x_flags = {x_t, x_c, be_cnt_n == 5'd0};
+    else if (is_shift & ~bad_op) x_flags = {x_t | be_t_set, x_c,
+                                            be_cnt_n == 5'd0};
     else if (is_cwait & f_tmo & wait_done) x_flags = {timeout, x_c, x_z};
   end
 
@@ -889,6 +1011,7 @@ module loom_core #(
       w_steps <= 16'd0; w_push <= 1'b0; w_pop <= 1'b0;
       w_sr_we <= 1'b0; w_cnt_we <= 1'b0; w_crc_we <= 1'b0;
       w_sr <= 16'd0; w_crc <= 16'd0; w_cnt <= 5'd0;
+      w_enc_we <= 1'b0; w_enc <= 8'd0;
       w_becfg_we <= 1'b0; w_bepins_we <= 1'b0; w_bereload_we <= 1'b0;
       w_crcpoly_we <= 1'b0; w_crcinit_we <= 1'b0;
       w_lat <= 1'b0; w_lat_pin <= 5'd0; w_lat_val <= 1'b0;
@@ -934,12 +1057,18 @@ module loom_core #(
       w_steps       <= x_steps1;
       w_push        <= ~bad_op & is_push & x_outq_nf;
       w_pop         <= ~bad_op & is_pop  & x_inq_ne;
-      w_sr_we       <= ~bad_op & (is_shift | is_ldsr | (is_csrw & csr_sr));
+      // A stuff bit and a Manchester half are not data bits: they leave SR,
+      // CNT and the CRC alone (6.9.1).
+      w_sr_we       <= ~bad_op & ((is_shift & be_data) | is_ldsr
+                                  | (is_csrw & csr_sr));
       w_sr          <= is_shift ? be_sr_sh : op_a;
-      w_cnt_we      <= ~bad_op & (is_shift | (is_csrw & csr_cnt));
-      w_cnt         <= is_shift ? be_cnt_n : op_a[4:0];
-      w_crc_we      <= ~bad_op & ((is_shift & be_crcen) | is_crci | (is_csrw & csr_crc));
+      w_cnt_we      <= ~bad_op & ((is_shift & be_data) | (is_csrw & csr_cnt));
+      w_cnt         <= is_shift ? be_cnt_d : op_a[4:0];
+      w_crc_we      <= ~bad_op & ((is_shift & be_data & be_crcen) | is_crci
+                                  | (is_csrw & csr_crc));
       w_crc         <= is_shift ? be_crc_n : (is_crci ? x_init : op_a);
+      w_enc_we      <= ~bad_op & is_shift;
+      w_enc         <= be_enc_n;
       w_becfg_we    <= ~bad_op & is_csrw & csr_be_cfg;
       w_bepins_we   <= ~bad_op & is_csrw & csr_be_pins;
       w_bereload_we <= ~bad_op & is_csrw & csr_be_reload;
@@ -982,7 +1111,8 @@ module loom_core #(
   wire [15:0] g_poly   = be_poly_all[dsel*16 +: 16];
   wire [15:0] g_init   = be_init_all[dsel*16 +: 16];
   wire [4:0]  g_reload = be_reload_all[dsel*5 +: 5];
-  wire [2:0]  g_becfg  = be_cfg_all[dsel*3 +: 3];
+  wire [7:0]  g_becfg  = be_cfg_all[dsel*8 +: 8];
+  wire [7:0]  g_enc    = be_enc_all[dsel*8 +: 8];
   wire [9:0]  g_bepins = be_pins_all[dsel*10 +: 10];
   wire        g_lat_valid = lat_valid_all[h_dbg_thread];
   wire        g_lat_val   = lat_val_all[h_dbg_thread];
@@ -1007,7 +1137,7 @@ module loom_core #(
       8'h11:   dbg_rd_other = {8'd0, g_tfrac};
       8'h12:   dbg_rd_other = {6'd0, g_outgrp};
       8'h13:   dbg_rd_other = {6'd0, g_ingrp};
-      8'h14:   dbg_rd_other = {6'd0, g_becfg[2], 1'b0, g_becfg[1], 5'd0, g_becfg[0], 1'b0};
+      8'h14:   dbg_rd_other = becfg_word(g_becfg);
       8'h15:   dbg_rd_other = {6'd0, g_bepins};
       8'h16:   dbg_rd_other = {11'd0, g_reload};
       8'h17:   dbg_rd_other = g_poly;
@@ -1026,6 +1156,8 @@ module loom_core #(
       8'h24:   dbg_rd_other = {15'd0, g_tseen};
       8'h25:   dbg_rd_other = {9'd0, g_lat_valid, g_lat_val, g_lat_pin};
       8'h26:   dbg_rd_other = {g_icnt, g_ocnt};
+      // {8'b0, FIRST, HALF, PEND, RVAL, RUN[2:0], LVL} (6.9.1).
+      8'h27:   dbg_rd_other = {8'd0, g_enc};
       default: dbg_rd_other = 16'd0;
     endcase
   end
@@ -1090,6 +1222,7 @@ module loom_core #(
       .cm_cfg_we(w_becfg_we), .cm_pins_we(w_bepins_we),
       .cm_reload_we(w_bereload_we), .cm_poly_we(w_crcpoly_we),
       .cm_init_we(w_crcinit_we), .cm_csr(w_csr_val),
+      .cm_enc_we(w_enc_we), .cm_enc(w_enc),
       .h_sel(dbg_we),
       .h_sr_we((h_dbg_reg == 8'h0C) | (h_dbg_reg == 8'h1D)),
       .h_cnt_we((h_dbg_reg == 8'h0D) | (h_dbg_reg == 8'h1E)),
@@ -1099,10 +1232,12 @@ module loom_core #(
       .h_reload_we(h_dbg_reg == 8'h16),
       .h_poly_we(h_dbg_reg == 8'h17),
       .h_init_we(h_dbg_reg == 8'h18),
+      .h_enc_we(h_dbg_reg == 8'h27),
       .h_wdata(h_dbg_wdata),
+      .h_reset(h_reset),
       .sr_all(be_sr_all), .cnt_all(be_cnt_all), .crc_all(be_crc_all),
       .cfg_all(be_cfg_all), .pins_all(be_pins_all), .reload_all(be_reload_all),
-      .poly_all(be_poly_all), .init_all(be_init_all)
+      .poly_all(be_poly_all), .init_all(be_init_all), .enc_all(be_enc_all)
   );
 
   // Per-thread commit strobes of the fields a slot writes only sometimes.
