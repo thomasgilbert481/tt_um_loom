@@ -292,8 +292,9 @@ class _Build:
 
     ``[2:0]`` log2 of the FIFO depth, ``[3]`` FIFOs, ``[4]`` bit engine
     (manual mode), ``[5]`` data memory, ``[6]`` boot ROM, ``[7]``
-    deadline-latched ``SETP``, ``[8]`` bit-engine auto mode, ``[11:9]`` zero,
-    ``[15:12]`` log2 of ``IMEM_WORDS``.
+    deadline-latched ``SETP``, ``[8]`` bit-engine auto mode, ``[9]`` the
+    slice-A encoders, stuffing and DIFF (model feature ``"BEENC"``),
+    ``[11:10]`` zero, ``[15:12]`` log2 of ``IMEM_WORDS``.
     """
 
     def __init__(self, caps: int):
@@ -316,6 +317,11 @@ class _Build:
             features.append("BE")
         if caps & (1 << 7):
             features.append("SETPD")
+        if caps & (1 << 9):
+            if not caps & (1 << 4):
+                raise BuildError("CAPS %04X reports the slice-A encoders (bit 9) "
+                                 "without the bit engine (bit 4)" % self.caps)
+            features.append("BEENC")
         for bit, what in ((5, "data memory"), (6, "a boot ROM"),
                           (8, "bit-engine auto mode")):
             if caps & (1 << bit):
@@ -324,8 +330,8 @@ class _Build:
                     "built for it, so this run would compare nothing. Teach "
                     "tools/loomsim the feature (or take the bit out of the RTL)."
                     % (self.caps, what, bit))
-        if caps & 0x0E00:
-            raise BuildError("CAPS %04X sets a reserved bit (11:9)" % self.caps)
+        if caps & 0x0C00:
+            raise BuildError("CAPS %04X sets a reserved bit (11:10)" % self.caps)
         self.features = tuple(sorted(features))
         #: Width of one ``INQ_CNT``/``OUTQ_CNT`` field in the RTL vectors.
         self.fifo_width = self.fifo_depth.bit_length()

@@ -13,9 +13,10 @@ pad change (``irq`` is the registered HOST_IRQ output, pad ``uo_out[6]``),
 which is enough to eyeball a protocol program without a waveform viewer.
 
 ``--feature`` builds an optional feature and may be repeated: ``FIFO``
-(PUSH/POP/WAITB, SEMANTICS 6.7), ``BE`` (the bit engine in manual mode, 6.9)
-and ``SETPD`` (the deadline-latched ``SETP ... D``, 6.10).  Without any, the
-model is the M1 build.
+(PUSH/POP/WAITB, SEMANTICS 6.7), ``BE`` (the bit engine in manual mode, 6.9),
+``BEENC`` (M3 slice A: the encoders, the stuffers and the differential
+output, 6.9.1; needs ``BE``) and ``SETPD`` (the deadline-latched
+``SETP ... D``, 6.10).  Without any, the model is the M1 build.
 """
 
 from __future__ import annotations

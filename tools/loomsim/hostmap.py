@@ -18,16 +18,21 @@ ID_VALUE = 0x4C4D
 #: implements (HOST_PROTOCOL 0.2).  The document does not say what the
 #: register holds; see ``docs/spec-questions/loomsim.md`` (M2 item 1).
 DEFAULT_VERSION = 0x0002
+#: ``CTRL.VERSION`` of a build with the slice-A bit engine: "``VERSION`` reads
+#: 3 from slice A on" (SEMANTICS 6.9.1).
+ENC_VERSION = 0x0003
 
 # ------------------------------------------------------------------ features
 #: Optional features a Machine can be built with.  ``FIFO`` (SEMANTICS 6.7:
 #: PUSH/POP/WAITB and the host FIFO space), ``BE`` (6.9: the bit engine in
-#: manual mode), ``SETPD`` (6.10: deadline-latched SETP).  ``DMEM`` and
-#: ``BOOTROM`` only set their CAPS bits; the model has no data memory, so
-#: ``LD``/``ST`` in a ``DMEM`` build raise :class:`LoomsimError`.
-FEATURES = frozenset({"FIFO", "BE", "SETPD", "DMEM", "BOOTROM"})
+#: manual mode), ``BEENC`` (6.9.1, M3 slice A: the encoders, the stuffers and
+#: the differential output, which need ``BE``), ``SETPD`` (6.10:
+#: deadline-latched SETP).  ``DMEM`` and ``BOOTROM`` only set their CAPS bits;
+#: the model has no data memory, so ``LD``/``ST`` in a ``DMEM`` build raise
+#: :class:`LoomsimError`.
+FEATURES = frozenset({"FIFO", "BE", "BEENC", "SETPD", "DMEM", "BOOTROM"})
 #: The features the command line offers.
-CLI_FEATURES = ("FIFO", "BE", "SETPD")
+CLI_FEATURES = ("FIFO", "BE", "BEENC", "SETPD")
 #: Legal ``FIFO_DEPTH`` build parameters (SEMANTICS 6.7): the counts must fit
 #: the 4-bit fields of the host status word.
 FIFO_DEPTHS = (2, 4, 8)
@@ -45,6 +50,7 @@ CAPS_DMEM = 1 << 5
 CAPS_BOOTROM = 1 << 6
 CAPS_SETPD = 1 << 7
 CAPS_BE_AUTO = 1 << 8        # M3; never set by this model
+CAPS_BEENC = 1 << 9          # M3 slice A: encoders, stuffing and DIFF (SEMANTICS 6.9.1)
 
 # ----------------------------------------------------------------- CTRL space
 CTRL: Dict[str, int] = {
@@ -104,12 +110,16 @@ DEBUG: Dict[str, int] = {
     "TICK_SEEN": 0x24,
     "LAT": 0x25,
     "FIFO_CNT": 0x26,
+    "ENC": 0x27,
 }
 DEBUG_NAMES = {addr: name for name, addr in DEBUG.items()}
 DEBUG_CSR_BASE = 0x10
 DEBUG_CSR_COUNT = 16
-#: The highest register number HOST_PROTOCOL defines; above it reads 0.
+#: The highest register number the M2 build has; above it reads 0.
 DEBUG_LAST = 0x26
+#: Debug 0x27, the bit-engine encoder state (M3 slice A).  It reads 0 until
+#: the encoders are built, so the M2 dump ends at :data:`DEBUG_LAST`.
+DEBUG_ENC = 0x27
 
 
 def pack_fifo_status(inq: int, outq: int, depth: int) -> int:
@@ -144,3 +154,16 @@ def pack_lat(valid: int, value: int, pin: int) -> int:
 def unpack_lat(word: int):
     """``(valid, value, pin)`` from a debug 0x25 word."""
     return (word >> 6) & 1, (word >> 5) & 1, word & 0x1F
+
+
+def pack_enc(lvl: int, run: int, rval: int, pend: int, half: int,
+             first: int) -> int:
+    """Debug 0x27: ``{FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}`` in bits 7:0."""
+    return (((first & 1) << 7) | ((half & 1) << 6) | ((pend & 1) << 5)
+            | ((rval & 1) << 4) | ((run & 7) << 1) | (lvl & 1))
+
+
+def unpack_enc(word: int):
+    """``(lvl, run, rval, pend, half, first)`` from a debug 0x27 word."""
+    return (word & 1, (word >> 1) & 7, (word >> 4) & 1, (word >> 5) & 1,
+            (word >> 6) & 1, (word >> 7) & 1)

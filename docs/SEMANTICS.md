@@ -154,8 +154,10 @@ words; `t * 0x100` for 1024). Instruction memory is **not** reset.
 `CAPS` (read-only, 16 bits): `[2:0]` log2 of the FIFO depth, `[3]` FIFOs built,
 `[4]` bit engine built (manual mode), `[5]` data memory built, `[6]` boot ROM
 built, `[7]` deadline-latched `SETP` built (M2), `[8]` bit engine auto mode
-built (M3), `[11:9]` zero, `[15:12]` log2 of `IMEM_WORDS`. The M1 build with
-256 words reads 0x8000.
+built (M3 slice C), `[9]` bit-engine encoders, stuffing and DIFF built (M3
+slice A, 6.9.1), `[11:10]` zero, `[15:12]` log2 of `IMEM_WORDS`. The M1
+build with 256 words reads 0x8000; the M2 build with the 512-word macro reads
+0x909A, and 0x929A with slice A.
 
 ISA note: ISA 0.4.0 (2026-09-18) carries the encoding side of the M2 text:
 bit 0 of `SETP` is the `D` field (assembler token `D`), `SHO` and `SHI` list
@@ -378,7 +380,9 @@ Slice A stores three more `BE_CFG` fields: `ENC` (bits 4:3: 0 NRZ, 1 NRZI,
 2 Manchester; 3 is reserved and is stored as 0), `STUFF` (bits 6:5: 0 none,
 1 USB, 2 CAN; 3 is reserved and is stored as 0) and `DIFF` (bit 10). `MODE`
 (bit 0), `RXTX` (bit 2), `AUTOPULL` (bit 8) and bits 12:11 still read 0 and
-ignore writes until slice C. `VERSION` reads 3 from slice A on.
+ignore writes until slice C. `CAPS[9]` reads 1 and `VERSION` reads 3 from
+slice A on; a build without slice A is the M2 engine of 6.9 exactly (the
+golden model builds it as the feature `BEENC` on top of `BE`).
 
 Per-thread encoder state, all reset to 0 and cleared by every write to
 `BE_CFG` (by `CSRW` or by the host) and by `CTRL.RESET`: `LVL` (1, the NRZI

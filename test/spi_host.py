@@ -46,6 +46,7 @@ CTRL_IRQ_EN2 = 0x1C
 # CAPS bits (docs/SEMANTICS.md 5)
 CAPS_FIFO, CAPS_BE, CAPS_DMEM = 0x08, 0x10, 0x20
 CAPS_ROM, CAPS_LAT, CAPS_AUTO = 0x40, 0x80, 0x100
+CAPS_BEENC = 0x200                    # M3 slice A: encoders, stuffing, DIFF (SEMANTICS 5)
 
 # FIFO space (docs/HOST_PROTOCOL.md SPACE 3)
 FIFO_QUEUE = 0x0000                   # + t: write pushes INQ[t], read pops OUTQ[t]

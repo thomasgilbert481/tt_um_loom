@@ -35,6 +35,11 @@ Optional features (SEMANTICS 9: an instruction of an unbuilt feature is a
 * ``"BE"``: the bit engine in manual mode, ``SHO``, ``SHI``, ``LDSR``,
   ``STSR``, ``CRCI``, ``STCRC`` and its CSRs (6.9), plus ``WAITB 0`` (which
   needs ``"FIFO"`` as well, because ``WAITB`` is built with the FIFOs);
+* ``"BEENC"`` (M3 slice A, 6.9.1, needs ``"BE"``): the ``ENC``, ``STUFF`` and
+  ``DIFF`` fields of ``BE_CFG``, the encoder state of section 5 at debug 0x27,
+  and with them NRZI and Manchester coding, USB and CAN stuffing and the
+  differential output on ``SHO``/``SHI``.  ``CTRL.VERSION`` reads 3 in such a
+  build and 2 without it;
 * ``"SETPD"``: the deadline-latched ``SETP pin, v, D`` (6.10).  Without it the
   ``D`` bit is ignored and the instruction is an ordinary ``SETP``.
 
@@ -61,9 +66,11 @@ from .state import (
     CSR_CRC_POLY, CSR_FLAGS, CSR_HOST_IRQ, CSR_INGRP, CSR_NOW, CSR_OD_MASK,
     CSR_OUTGRP, CSR_PIN_IN, CSR_PIN_OE, CSR_PIN_OUT, CSR_SFLAGS, CSR_SR,
     CSR_TD, CSR_TICK_FRAC, CSR_TICK_INT, CSR_TID,
-    BE_CFG_CRC_EN, BE_CFG_DIR, BE_CFG_INV, BE_CFG_M2_MASK, BE_CSRS,
+    BE_CFG_CRC_EN, BE_CFG_DIFF, BE_CFG_DIR, BE_CFG_ENC, BE_CFG_ENC_SHIFT,
+    BE_CFG_INV, BE_CFG_STUFF, BE_CFG_STUFF_SHIFT, BE_CSRS,
     BE_PINS_MASK, BE_RELOAD_MASK, CNT_MASK,
-    Commit, CycleTrace, PadState, RetireRecord, ThreadState,
+    ENC_MANCHESTER, ENC_NRZI, STUFF_NONE,
+    Commit, CycleTrace, PadState, RetireRecord, ThreadState, be_cfg_stored,
 )
 
 #: Pin index groups (ARCHITECTURE 3.1 / isa.yaml ``pins``).
@@ -86,8 +93,12 @@ DEBUG_REGS = ("r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "PC", "FLAGS",
 #: Debug-register names that are model views rather than HOST_PROTOCOL
 #: addresses, and whether the host may write them.
 _DEBUG_VIEWS_WRITABLE = frozenset({"RS1", "DEPTH"})
+#: The six fields of debug 0x27 (SEMANTICS 6.9.1) by name, as model views.
+_ENC_VIEWS = ("ENC_LVL", "ENC_RUN", "ENC_RVAL", "ENC_PEND", "ENC_HALF",
+              "ENC_FIRST")
 _DEBUG_VIEWS_READ_ONLY = frozenset({"ACC", "PREV_PINS", "LAT_VALID", "LAT_PIN",
-                                    "LAT_VAL", "INQ_CNT", "OUTQ_CNT"})
+                                    "LAT_VAL", "INQ_CNT", "OUTQ_CNT"}
+                                   | set(_ENC_VIEWS))
 #: HOST_PROTOCOL debug registers (by name) that are read-only.
 _DEBUG_READ_ONLY_NAMES = frozenset({"NOW", "TID", "FIFO_CNT"})
 
@@ -147,10 +158,11 @@ class Machine:
         image: instruction memory contents, ``{address: word}``.  Instruction
             memory is not reset, so anything not given reads 0.
         features: optional features that are built in this configuration,
-            any of ``"FIFO"``, ``"BE"``, ``"SETPD"`` (and ``"DMEM"``,
-            ``"BOOTROM"``, which only set their ``CAPS`` bits).  The default
-            (nothing) is the M1 build: every instruction of an unbuilt feature
-            is a ``NOP`` that sets ``BADOP``.
+            any of ``"FIFO"``, ``"BE"``, ``"BEENC"`` (which needs ``"BE"``),
+            ``"SETPD"`` (and ``"DMEM"``, ``"BOOTROM"``, which only set their
+            ``CAPS`` bits).  The default (nothing) is the M1 build: every
+            instruction of an unbuilt feature is a ``NOP`` that sets
+            ``BADOP``.
         imem_words: instruction memory size; addresses wrap within it.
         fifo_depth: INQ and OUTQ depth per thread, a power of two from 2 to 8
             (SEMANTICS 6.7); checked when ``"FIFO"`` is built.
@@ -159,7 +171,8 @@ class Machine:
         on_cycle: optional callable invoked once per cycle with a
             :class:`~tools.loomsim.state.CycleTrace`.
         isa: a preloaded :class:`tools.loomisa.Isa` (one is loaded if omitted).
-        version: what ``CTRL.VERSION`` reads (default: HOST_PROTOCOL 0.2).
+        version: what ``CTRL.VERSION`` reads; by default 3 in a ``"BEENC"``
+            build (SEMANTICS 6.9.1) and 2 (HOST_PROTOCOL 0.2) without it.
 
     The public state is :attr:`threads` (a list of
     :class:`~tools.loomsim.state.ThreadState`) plus the global registers
@@ -176,7 +189,7 @@ class Machine:
                  loopback: bool = False,
                  on_cycle: Optional[Callable[[CycleTrace], None]] = None,
                  isa: Optional[Isa] = None,
-                 version: int = H.DEFAULT_VERSION):
+                 version: Optional[int] = None):
         if imem_words & (imem_words - 1) or not 1 <= imem_words <= 1024:
             raise LoomsimError("imem_words must be a power of two up to 1024")
         built = frozenset(str(f).upper() for f in features)
@@ -187,16 +200,23 @@ class Machine:
         if "FIFO" in built and fifo_depth not in H.FIFO_DEPTHS:
             raise LoomsimError("fifo_depth must be 2, 4 or 8 (SEMANTICS 6.7), not %r"
                                % (fifo_depth,))
+        if "BEENC" in built and "BE" not in built:
+            raise LoomsimError("BEENC is the slice-A part of the bit engine "
+                               "(SEMANTICS 6.9.1); build it with BE")
         self.isa = isa if isa is not None else load_isa()
         self.features = built
         self._fifo = "FIFO" in built
         self._be = "BE" in built
+        self._be_enc = "BEENC" in built
         self._setpd = "SETPD" in built
         self.imem_words = imem_words
         self.imem_mask = imem_words - 1
         self.fifo_depth = fifo_depth
         self.loopback = loopback
         self.on_cycle = on_cycle
+        if version is None:
+            # SEMANTICS 6.9.1: VERSION reads 3 from slice A on.
+            version = H.ENC_VERSION if self._be_enc else H.DEFAULT_VERSION
         self.version = version & WORD_MASK
         self.imem: Dict[int, int] = {}
         if image:
@@ -316,8 +336,10 @@ class Machine:
         ``[2:0]`` log2 of the FIFO depth (0 when the FIFOs are not built),
         ``[3]`` FIFOs, ``[4]`` bit engine (manual mode), ``[5]`` data memory,
         ``[6]`` boot ROM, ``[7]`` deadline-latched ``SETP``, ``[8]`` bit engine
-        auto mode (M3, never set here), ``[11:9]`` zero, ``[15:12]`` log2 of
-        ``IMEM_WORDS``.  The M1 build with 256 words reads 0x8000.
+        auto mode (M3 slice C, never set here), ``[9]`` the slice-A encoders,
+        stuffing and DIFF (feature ``"BEENC"``, 6.9.1), ``[11:10]`` zero,
+        ``[15:12]`` log2 of ``IMEM_WORDS``.  The M1 build with 256 words reads
+        0x8000.
         """
         value = ((self.imem_words.bit_length() - 1) & 0xF) << 12
         if self._fifo:
@@ -331,6 +353,8 @@ class Machine:
             value |= H.CAPS_BOOTROM
         if self._setpd:
             value |= H.CAPS_SETPD
+        if self._be_enc:
+            value |= H.CAPS_BEENC
         return value & 0xFFFF
 
     @property
@@ -651,10 +675,12 @@ class Machine:
         ``r0..r7`` read 0 unless the thread is halted in the sense of
         :meth:`thread_halted_for_debug`; everything else reads at any time.
         Registers of a feature that is not built read 0.  Besides the
-        HOST_PROTOCOL names (``PC``, ``STEPS``, ``LAT``, ``FIFO_CNT``, the CSR
-        names of the window 0x10..0x1F ...) the model offers the views
+        HOST_PROTOCOL names (``PC``, ``STEPS``, ``LAT``, ``FIFO_CNT``, ``ENC``,
+        the CSR names of the window 0x10..0x1F ...) the model offers the views
         ``RS1``, ``DEPTH``, ``ACC``, ``PREV_PINS``, ``LAT_VALID``,
-        ``LAT_PIN``, ``LAT_VAL``, ``INQ_CNT`` and ``OUTQ_CNT``.
+        ``LAT_PIN``, ``LAT_VAL``, ``INQ_CNT``, ``OUTQ_CNT`` and the six
+        encoder fields ``ENC_LVL``, ``ENC_RUN``, ``ENC_RVAL``, ``ENC_PEND``,
+        ``ENC_HALF`` and ``ENC_FIRST``.
         """
         self._check_thread(thread)
         if isinstance(reg, int):
@@ -681,6 +707,10 @@ class Machine:
             if not self._fifo:
                 return 0
             return len(th.inq) if key == "INQ_CNT" else len(th.outq)
+        if key in _ENC_VIEWS:
+            if not self._be_enc:
+                return 0
+            return getattr(th, key.lower())
         raise LoomsimError("unknown debug register " + str(reg))
 
     def host_write_debug(self, thread: int, reg: RegRef, value: int) -> None:
@@ -754,6 +784,9 @@ class Machine:
             return th.lat if self._setpd else 0
         if number == 0x26:
             return H.pack_fifo_counts(len(th.inq), len(th.outq)) if self._fifo else 0
+        if number == H.DEBUG_ENC:
+            # HOST_PROTOCOL 0x27: reads 0 until slice A is built.
+            return th.enc if self._be_enc else 0
         return 0
 
     def _debug_write(self, t: int, number: int, value: int) -> None:
@@ -789,6 +822,11 @@ class Machine:
             if self._setpd:
                 valid, val, pin = H.unpack_lat(value)
                 self._host(thread=t, lat_set=(valid, pin, val))
+        elif number == H.DEBUG_ENC:
+            if self._be_enc:
+                lvl, run, rval, pend, half, first = H.unpack_enc(value)
+                self._host(thread=t, enc_lvl=lvl, enc_run=run, enc_rval=rval,
+                           enc_pend=pend, enc_half=half, enc_first=first)
         # 0x0B NOW, 0x26 FIFO counts and unused numbers ignore writes.
 
     def _debug_csr_write(self, t: int, csr: int, value: int) -> None:
@@ -810,11 +848,10 @@ class Machine:
                 self._host(thread=t, **self._be_csr_fields(csr, value))
         # NOW and TID are read-only.
 
-    @staticmethod
-    def _be_csr_fields(csr: int, value: int) -> Dict[str, int]:
+    def _be_csr_fields(self, csr: int, value: int) -> Dict[str, int]:
         """Commit fields for a write of bit-engine CSR ``csr`` (truncated to width)."""
         if csr == CSR_BE_CFG:
-            return {"be_cfg": value & BE_CFG_M2_MASK}
+            return {"be_cfg": be_cfg_stored(value, self._be_enc)}
         if csr == CSR_BE_PINS:
             return {"be_pins": value & BE_PINS_MASK}
         if csr == CSR_BE_RELOAD:
@@ -1060,11 +1097,13 @@ class Machine:
             th.td = pre_now[cm.thread]
             th.depth = 0
             th.wait_active = 0
-            # SEMANTICS 6.7 and 6.10: the FIFOs are emptied and the staged pin
-            # write is discarded (both are always empty in builds without them).
+            # SEMANTICS 6.7, 6.9.1 and 6.10: the FIFOs are emptied, the staged
+            # pin write is discarded and the encoder state is cleared (all are
+            # already empty or zero in builds without those features).
             th.inq.clear()
             th.outq.clear()
             th.lat_valid = 0
+            th.clear_encoder()
         if cm.run_set is not None:
             rising = cm.run_set & ~self.run
             self.run = cm.run_set
@@ -1148,7 +1187,21 @@ class Machine:
         if cm.crc is not None:
             th.crc = cm.crc & WORD_MASK
         if cm.be_cfg is not None:
-            th.be_cfg = cm.be_cfg & BE_CFG_M2_MASK
+            th.be_cfg = be_cfg_stored(cm.be_cfg, self._be_enc)
+            # SEMANTICS 6.9.1: every write to BE_CFG clears the encoder state.
+            th.clear_encoder()
+        if cm.enc_lvl is not None:
+            th.enc_lvl = cm.enc_lvl & 1
+        if cm.enc_run is not None:
+            th.enc_run = cm.enc_run & 7
+        if cm.enc_rval is not None:
+            th.enc_rval = cm.enc_rval & 1
+        if cm.enc_pend is not None:
+            th.enc_pend = cm.enc_pend & 1
+        if cm.enc_half is not None:
+            th.enc_half = cm.enc_half & 1
+        if cm.enc_first is not None:
+            th.enc_first = cm.enc_first & 1
         if cm.be_pins is not None:
             th.be_pins = cm.be_pins & BE_PINS_MASK
         if cm.be_reload is not None:
@@ -1432,21 +1485,10 @@ class Machine:
             cm.pc = nxt if done else pc
 
         # ---------------------------------------------------------- bit engine
-        elif name in ("SHO", "SHI"):
-            cfg = th.be_cfg
-            msb_first = bool(cfg & BE_CFG_DIR)
-            inv = 1 if cfg & BE_CFG_INV else 0
-            if name == "SHO":
-                bit = alu.be_out_bit(th.sr, msb_first)
-                cm.write_pin(th.be_pins & 0x1F, bit ^ inv, self.od_mask)
-                cm.sr = alu.be_shift_out(th.sr, msb_first)
-            else:
-                bit = self.pin_in((th.be_pins >> 5) & 0x1F) ^ inv
-                cm.sr = alu.be_shift_in(th.sr, bit, msb_first)
-            cm.cnt = alu.be_count(th.cnt)
-            z = 1 if cm.cnt == 0 else 0                  # C and T unchanged
-            if cfg & BE_CFG_CRC_EN:
-                cm.crc = alu.crc_step(th.crc, bit, th.crc_poly)
+        elif name == "SHO":
+            z = self._bit_engine_out(cm, th)             # C and T unchanged
+        elif name == "SHI":
+            z, t_flag = self._bit_engine_in(cm, th, t_flag)      # C unchanged
         elif name == "LDSR":
             cm.sr = regs[ops["ra"]]
         elif name == "STSR":
@@ -1479,6 +1521,129 @@ class Machine:
     def _group(reg: int) -> Tuple[int, int]:
         """``OUTGRP``/``INGRP``: base in bits 4:0, count in 9:5 capped at 16."""
         return reg & 0x1F, min((reg >> 5) & 0x1F, 16)
+
+    # ------------------------------------------ the bit engine (6.9, 6.9.1)
+    def _be_config(self, th: ThreadState) -> Tuple[int, int, int, int, int, int]:
+        """``BE_CFG`` as ``(DIR, INV, CRC_EN, ENC, STUFF, DIFF)``.
+
+        The fields slice A adds read 0 in a build without it, so one code path
+        serves both: ``ENC`` and ``STUFF`` are then 0 (NRZ, no stuffing) and
+        ``DIFF`` is 0, which is exactly 6.9.
+        """
+        cfg = be_cfg_stored(th.be_cfg, self._be_enc)
+        return (1 if cfg & BE_CFG_DIR else 0,
+                1 if cfg & BE_CFG_INV else 0,
+                1 if cfg & BE_CFG_CRC_EN else 0,
+                (cfg & BE_CFG_ENC) >> BE_CFG_ENC_SHIFT,
+                (cfg & BE_CFG_STUFF) >> BE_CFG_STUFF_SHIFT,
+                1 if cfg & BE_CFG_DIFF else 0)
+
+    def _bit_engine_out(self, cm: Commit, th: ThreadState) -> int:
+        """``SHO``: the four ordered steps of SEMANTICS 6.9.1.  Returns ``Z``.
+
+        Step 1 picks the bit sent (none for the second half of a Manchester
+        bit, the stuff bit when one is due, else the data bit of 6.9), step 2
+        does the run accounting, step 3 encodes it into a line level and step
+        4 writes the pin (and, with ``DIFF``, the complement on the next
+        index at the same edge).
+        """
+        msb_first, inv, crc_en, enc, stuff, diff = self._be_config(th)
+        cnt = th.cnt
+
+        # 1. The bit sent, ``x``.
+        if enc == ENC_MANCHESTER and th.enc_half:
+            bit = None                          # the second half of ``FIRST``
+        elif stuff != STUFF_NONE and th.enc_pend:
+            bit = alu.be_stuff_value(stuff, th.enc_rval)
+            cm.enc_pend = 0                     # SR, CNT and the CRC stand still
+        else:
+            bit = alu.be_out_bit(th.sr, bool(msb_first))
+            cm.sr = alu.be_shift_out(th.sr, bool(msb_first))
+            cm.cnt = cnt = alu.be_count(th.cnt)
+            if crc_en:
+                cm.crc = alu.crc_step(th.crc, bit, th.crc_poly)
+
+        # 2. Run accounting on ``x``, if there was one.
+        if bit is not None and stuff != STUFF_NONE:
+            run, rval, due = alu.be_run_step(th.enc_run, th.enc_rval, bit, stuff)
+            cm.enc_run, cm.enc_rval = run, rval
+            if due:
+                cm.enc_pend = 1
+
+        # 3. Encoding into the level ``l``.
+        if enc == ENC_NRZI:
+            level = th.enc_lvl if bit else 1 - th.enc_lvl    # a 0 toggles
+            cm.enc_lvl = level
+        elif enc == ENC_MANCHESTER:
+            if th.enc_half:
+                level = th.enc_first & 1
+                cm.enc_half = 0
+            else:
+                cm.enc_first = bit
+                cm.enc_half = 1
+                level = 1 - bit                 # 802.3: a 0 is high then low
+        else:
+            level = bit
+
+        # 4. The pin write of ``l ^ INV`` (6.3 rules, open drain included).
+        out = th.be_pins & 0x1F
+        cm.write_pin(out, level ^ inv, self.od_mask)
+        if diff:
+            cm.write_pin((out + 1) % 32, 1 - (level ^ inv), self.od_mask)
+        return 1 if cnt == 0 else 0
+
+    def _bit_engine_in(self, cm: Commit, th: ThreadState,
+                       t_flag: int) -> Tuple[int, int]:
+        """``SHI``: the four ordered steps of 6.9.1.  Returns ``(Z, T)``.
+
+        Step 1 samples the pin, step 2 decodes it into the bit received (none
+        for the first half of a Manchester bit, whose second half also sets
+        ``T`` when the line did not change in the middle), step 3 drops a
+        stuff bit or shifts a data bit into ``SR``, and step 4 does the run
+        accounting.  ``T`` is set by a violation and never cleared here.
+        """
+        msb_first, inv, crc_en, enc, stuff, _diff = self._be_config(th)
+        cnt = th.cnt
+
+        # 1. The sample.
+        p = self.pin_in((th.be_pins >> 5) & 0x1F) ^ inv
+
+        # 2. Decoding into the bit received, ``s``.
+        if enc == ENC_NRZI:
+            s = 1 if p == th.enc_lvl else 0
+            cm.enc_lvl = p
+        elif enc == ENC_MANCHESTER:
+            if th.enc_half:
+                s = p
+                cm.enc_half = 0
+                if (th.enc_first & 1) == p:
+                    t_flag = 1                  # no transition in mid-bit
+            else:
+                cm.enc_first = p
+                cm.enc_half = 1
+                s = None                        # steps 3 and 4 are skipped
+        else:
+            s = p
+
+        if s is not None:
+            # 3. A stuff bit is dropped; a data bit goes into ``SR``.
+            if stuff != STUFF_NONE and th.enc_pend:
+                cm.enc_pend = 0
+                if s != alu.be_stuff_value(stuff, th.enc_rval):
+                    t_flag = 1                  # a stuffing violation
+            else:
+                cm.sr = alu.be_shift_in(th.sr, s, bool(msb_first))
+                cm.cnt = cnt = alu.be_count(th.cnt)
+                if crc_en:
+                    cm.crc = alu.crc_step(th.crc, s, th.crc_poly)
+
+            # 4. Run accounting on ``s``.
+            if stuff != STUFF_NONE:
+                run, rval, due = alu.be_run_step(th.enc_run, th.enc_rval, s, stuff)
+                cm.enc_run, cm.enc_rval = run, rval
+                if due:
+                    cm.enc_pend = 1
+        return (1 if cnt == 0 else 0), t_flag
 
     def _wait_condition(self, name: str, ops: Dict[str, int],
                         th: ThreadState, x: int) -> bool:
@@ -1531,7 +1696,7 @@ class Machine:
             return th.tid & 3
         if number in BE_CSRS and self._be:
             if number == CSR_BE_CFG:
-                return th.be_cfg & BE_CFG_M2_MASK
+                return be_cfg_stored(th.be_cfg, self._be_enc)
             if number == CSR_BE_PINS:
                 return th.be_pins & BE_PINS_MASK
             if number == CSR_BE_RELOAD:
@@ -1614,10 +1779,15 @@ class Machine:
         return out
 
     def dump_debug_space(self, thread: int) -> Dict[int, int]:
-        """Every DEBUG-space register 0x00..0x26 of ``thread``, as the port reads it."""
+        """Every DEBUG-space register of ``thread``, as the port reads it.
+
+        0x00..0x26 always, and 0x27 (the encoder state, SEMANTICS 6.9.1) in a
+        build that has the slice-A bit engine, where it stops reading 0.
+        """
         self._check_thread(thread)
+        last = H.DEBUG_ENC if self._be_enc else H.DEBUG_LAST
         return {number: self._debug_read(thread, number)
-                for number in range(H.DEBUG_LAST + 1)}
+                for number in range(last + 1)}
 
     def __repr__(self) -> str:
         return ("<Machine cycle=%d run=%X halted=%X pc=%s>"

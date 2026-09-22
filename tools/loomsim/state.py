@@ -69,6 +69,47 @@ BE_CFG_INV = 1 << 7          # invert the pin level
 BE_CFG_CRC_EN = 1 << 9       # update the CRC with every shifted bit
 BE_CFG_M2_MASK = BE_CFG_DIR | BE_CFG_INV | BE_CFG_CRC_EN
 
+#: ``BE_CFG`` fields slice A adds (SEMANTICS 6.9.1, D-026).  ``MODE`` (bit 0),
+#: ``RXTX`` (bit 2), ``AUTOPULL`` (bit 8) and bits 12:11 still read 0 and
+#: ignore writes until slice C.
+BE_CFG_ENC = 0b11 << 3       # bits 4:3: 0 NRZ, 1 NRZI, 2 Manchester (3 reserved)
+BE_CFG_ENC_SHIFT = 3
+BE_CFG_STUFF = 0b11 << 5     # bits 6:5: 0 none, 1 USB, 2 CAN (3 reserved)
+BE_CFG_STUFF_SHIFT = 5
+BE_CFG_DIFF = 1 << 10        # the complement on the next pin index
+BE_CFG_ENC_MASK = BE_CFG_M2_MASK | BE_CFG_ENC | BE_CFG_STUFF | BE_CFG_DIFF
+
+#: ``ENC`` values.  3 is reserved and is stored as 0 (6.9.1).
+ENC_NRZ = 0
+ENC_NRZI = 1
+ENC_MANCHESTER = 2
+ENC_RESERVED = 3
+#: ``STUFF`` values.  3 is reserved and is stored as 0 (6.9.1).
+STUFF_NONE = 0
+STUFF_USB = 1
+STUFF_CAN = 2
+STUFF_RESERVED = 3
+#: Run length at which a stuff bit becomes due, by ``STUFF`` value: six 1s for
+#: USB, five equal bits of either value for CAN (6.9.1).
+STUFF_RUN = {STUFF_USB: 6, STUFF_CAN: 5}
+
+
+def be_cfg_stored(value: int, encoders: bool) -> int:
+    """``BE_CFG`` as the CSR stores a written ``value`` (SEMANTICS 6.9, 6.9.1).
+
+    Bits that are not built are dropped; with the slice-A encoders built the
+    reserved value 3 of ``ENC`` and of ``STUFF`` is stored as 0, so a field
+    never reads back a value the engine cannot act on.
+    """
+    if not encoders:
+        return value & BE_CFG_M2_MASK
+    value &= BE_CFG_ENC_MASK
+    if (value & BE_CFG_ENC) == BE_CFG_ENC:
+        value &= ~BE_CFG_ENC
+    if (value & BE_CFG_STUFF) == BE_CFG_STUFF:
+        value &= ~BE_CFG_STUFF
+    return value
+
 #: Register widths of the bit-engine state.
 CNT_MASK = 0x1F              # CNT is 5 bits
 BE_PINS_MASK = 0x3FF         # {in[9:5], out[4:0]}
@@ -127,6 +168,16 @@ class ThreadState:
     crc_poly: int = 0
     crc_init: int = 0
 
+    # --- bit-engine encoder state (SEMANTICS 6.9.1, feature "BEENC").  The
+    # names of the document are ``LVL``, ``RUN``, ``RVAL``, ``PEND``, ``HALF``
+    # and ``FIRST``; the prefix keeps ``RUN`` apart from the global run state.
+    enc_lvl: int = 0             # the NRZI line level
+    enc_run: int = 0             # length of the current run of equal bits (3 bits)
+    enc_rval: int = 0            # the value of that run
+    enc_pend: int = 0            # a stuff bit is due
+    enc_half: int = 0            # the Manchester half-bit phase
+    enc_first: int = 0           # the bit kept between the two halves
+
     # --- deadline-latched pin write (SEMANTICS 6.10, feature "SETPD")
     lat_valid: int = 0
     lat_pin: int = 0
@@ -136,6 +187,18 @@ class ThreadState:
     def lat(self) -> int:
         """Debug 0x25: ``{LAT_VALID, LAT_VAL, LAT_PIN[4:0]}`` in bits 6:0."""
         return ((self.lat_valid & 1) << 6) | ((self.lat_val & 1) << 5) | (self.lat_pin & 0x1F)
+
+    @property
+    def enc(self) -> int:
+        """Debug 0x27: ``{FIRST, HALF, PEND, RVAL, RUN[2:0], LVL}`` in bits 7:0."""
+        return (((self.enc_first & 1) << 7) | ((self.enc_half & 1) << 6)
+                | ((self.enc_pend & 1) << 5) | ((self.enc_rval & 1) << 4)
+                | ((self.enc_run & 7) << 1) | (self.enc_lvl & 1))
+
+    def clear_encoder(self) -> None:
+        """Clear the 6.9.1 encoder state (a ``BE_CFG`` write, ``CTRL.RESET``)."""
+        self.enc_lvl = self.enc_run = self.enc_rval = 0
+        self.enc_pend = self.enc_half = self.enc_first = 0
 
     @property
     def flags(self) -> int:
@@ -305,6 +368,16 @@ class Commit:
     be_reload: Optional[int] = None
     crc_poly: Optional[int] = None
     crc_init: Optional[int] = None
+    #: Bit-engine encoder state (SEMANTICS 6.9.1).  Only the fields the
+    #: instruction's rules touch are set; a commit that writes ``be_cfg``
+    #: clears all six before these apply, because every write to ``BE_CFG``
+    #: clears the encoder state (no instruction and no host write does both).
+    enc_lvl: Optional[int] = None
+    enc_run: Optional[int] = None
+    enc_rval: Optional[int] = None
+    enc_pend: Optional[int] = None
+    enc_half: Optional[int] = None
+    enc_first: Optional[int] = None
     #: Deadline latch load ``(valid, pin, val)``: a ``SETP ... D`` commit or a
     #: host write of debug 0x25 (SEMANTICS 6.10).
     lat_set: Optional[Tuple[int, int, int]] = None

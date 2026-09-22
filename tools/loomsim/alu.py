@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Tuple
 
+from .state import STUFF_CAN, STUFF_RUN, STUFF_USB
+
 WORD_BITS = 16
 WORD_MASK = (1 << WORD_BITS) - 1
 PC_BITS = 10
@@ -135,7 +137,8 @@ def reached(now: int, deadline: int) -> bool:
 
 
 # ---------------------------------------------------------------- bit engine
-# SEMANTICS 6.9, manual mode.  ``msb_first`` is BE_CFG.DIR.
+# SEMANTICS 6.9, manual mode, and the encoder arithmetic of 6.9.1 (M3 slice
+# A).  ``msb_first`` is BE_CFG.DIR; ``stuff`` is BE_CFG.STUFF.
 
 def be_out_bit(sr: int, msb_first: bool) -> int:
     """``SHO``'s data bit: ``DIR ? SR[15] : SR[0]`` (before any inversion)."""
@@ -161,6 +164,29 @@ def be_count(cnt: int) -> int:
     """``CNT <= (CNT == 0) ? 0 : CNT - 1`` (5 bits); ``Z`` is the result == 0."""
     cnt &= 0x1F
     return 0 if cnt == 0 else cnt - 1
+
+
+def be_stuff_value(stuff: int, rval: int) -> int:
+    """The value of a stuff bit: 0 for USB, ``~RVAL`` for CAN (SEMANTICS 6.9.1)."""
+    return (~rval) & 1 if stuff == STUFF_CAN else 0
+
+
+def be_run_step(run: int, rval: int, bit: int, stuff: int) -> Tuple[int, int, int]:
+    """Run accounting of SEMANTICS 6.9.1 after one bit, data or stuff.
+
+    ``if x == RVAL: RUN <= min(RUN + 1, 7); else: RUN <= 1; RVAL <= x``.  The
+    third result is 1 when the new run makes a stuff bit due: six 1s for USB,
+    five equal bits of either value for CAN.  A stuff bit therefore starts the
+    next run, which is CAN's rule and (the stuff bit being a 0) restarts USB's
+    count of 1s at 0.  Returns ``(RUN, RVAL, due)``.
+    """
+    bit &= 1
+    if bit == (rval & 1):
+        run = min((run & 7) + 1, 7)
+    else:
+        run, rval = 1, bit
+    due = run == STUFF_RUN.get(stuff, 0) and (stuff != STUFF_USB or rval == 1)
+    return run, rval, int(due)
 
 
 def crc_step(crc: int, bit: int, poly: int) -> int:
