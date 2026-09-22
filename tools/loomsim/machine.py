@@ -766,7 +766,7 @@ class Machine:
         elif number == 0x09:
             self._host(thread=t, flags=value & 7)
         elif number == 0x0A:
-            self._host(thread=t, td=value, td_written=True)
+            self._host(thread=t, td=value)      # not a rule-2 write (D-028)
         elif number in (0x0C, 0x0D, 0x0E):
             if self._be:
                 csr = {0x0C: CSR_SR, 0x0D: CSR_CNT, 0x0E: CSR_CRC}[number]
@@ -802,7 +802,7 @@ class Machine:
         elif csr == CSR_INGRP:
             self._host(thread=t, ingrp=value & 0x3FF)
         elif csr == CSR_TD:
-            self._host(thread=t, td=value, td_written=True)
+            self._host(thread=t, td=value)      # not a rule-2 write (D-028)
         elif csr == CSR_FLAGS:
             self._host(thread=t, flags=value & 7)
         elif csr in BE_CSRS:
@@ -929,6 +929,7 @@ class Machine:
         pre_now = [th.now for th in self.threads]
         pre_od_mask = self.od_mask
         pre_lat = [(th.lat_valid, th.lat_pin, th.lat_val) for th in self.threads]
+        pre_td = [th.td for th in self.threads]
         pad_sample = self._sample_pads()
 
         # Host first, thread second: on a same-edge conflict the thread wins.
@@ -973,7 +974,7 @@ class Machine:
                         th.tick_seen &= ~cm.seen_tick & 1
 
         if self._setpd:
-            self._deadline_latches(landing, pre_lat, pre_od_mask, ticked,
+            self._deadline_latches(landing, pre_lat, pre_td, pre_od_mask, ticked,
                                    slot_out, slot_oe, slot_index)
 
         self.host_irq = irq_next
@@ -981,18 +982,23 @@ class Machine:
         self._ff1 = pad_sample
 
     def _deadline_latches(self, landing: List[Commit],
-                          pre_lat: List[Tuple[int, int, int]], od_mask: int,
+                          pre_lat: List[Tuple[int, int, int]],
+                          pre_td: List[int], od_mask: int,
                           ticked: List[int], slot_out: int, slot_oe: int,
                           slot_index: int) -> None:
         """SEMANTICS 6.10 at one edge, after every commit and the tick have landed.
 
         A latch valid before the edge fires when (rule 1) ``NOW`` ticked to
-        exactly ``TD`` and ``TD`` was not written at this edge, or (rule 2)
-        ``TD`` was written at this edge and ``reached(NOW', TD')`` holds for the
-        values after it.  A latch loaded at this edge (``SETP ... D`` or a host
-        write of debug 0x25) cannot fire before the next edge; the old content
-        may still fire at the loading edge.  ``CTRL.RESET`` discards: a latch
-        whose thread is reset at this edge does not fire.
+        exactly ``TD`` and the thread's own slot did not write ``TD`` at this
+        edge, or (rule 2) the thread's own slot wrote ``TD`` at this edge and
+        ``reached(NOW', TD')`` holds for the values after it.  A host debug
+        write of ``TD`` is neither (D-028): it is not a rule-2 write, and at
+        its own edge rule 1 compares against ``TD`` as it was before the edge
+        (``pre_td``); from the next edge on rule 1 sees the written value.
+        A latch loaded at this edge (``SETP ... D`` or a host write of debug
+        0x25) cannot fire before the next edge; the old content may still fire
+        at the loading edge.  ``CTRL.RESET`` discards: a latch whose thread is
+        reset at this edge does not fire.
 
         The staged write uses the pin-write rule of 6.3 with ``OD_MASK`` as
         visible before the edge.  A slot's ordinary pin write (SETP, OUT, SHO)
@@ -1010,7 +1016,7 @@ class Machine:
             if any(cm.td_written for cm in mine):
                 fire = alu.reached(th.now, th.td)                  # rule 2
             else:
-                fire = bool(ticked[t]) and th.now == th.td         # rule 1
+                fire = bool(ticked[t]) and th.now == pre_td[t]     # rule 1
             if not fire:
                 continue
             if not (slot_index >> pin) & 1:

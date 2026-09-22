@@ -281,10 +281,11 @@ Exit: slices A and B hardened inside the D-025 budget; `ws2812`, `ps2_host`,
 their L3 tests on the golden model and on the RTL; ISO-1 attempted and its
 result recorded, bounded or proved.
 
-- [ ] Thomas: yes or no on D-028 (the host's TD write leaves rule 2). If yes:
-      SEMANTICS 6.10, HOST_PROTOCOL, model, `loom_timer`, a regression test,
-      the formal property, one hardening. It removes logic, so it goes first
-      and sets the baseline the slices are read against.
+- [ ] D-028 (the host's TD write leaves rule 2; Thomas delegated the call,
+      Fable took it 2026-09-22). Done the same day: SEMANTICS 6.10,
+      HOST_PROTOCOL, model, `loom_timer`, regression tests on both sides,
+      formal TIMER-2 proved. Open: its hardening, which is the slow-corner
+      measurement and sets the baseline the slices are read against.
 - [ ] One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
       the pinned PDK) to the end of global routing and stop? Record the answer
       in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow
@@ -337,6 +338,9 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
       the mutation table, the formal findings, the routing budget, D-024's
       statement that nothing ran on hardware and what stands in for it.
+      Started 2026-09-22: sections 1 to 3 and 5 to 7 describe `main` after
+      the M2 review; sections 4 (evidence by layer) and 8 (what the AI did)
+      are outlines to fill at the freeze; updated with each slice.
 - [ ] If the `gds` artefact includes SDF (unverified; check first): one
       timing-annotated gate-level run of the L3 suite at the typical corner,
       recorded as PHY-GL-SDF.
@@ -591,3 +595,11 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   M3 and M4 rewritten, ARCHITECTURE 8, 8.1 and 15 updated. Next: Thomas
   answers D-028; the implementer starts with the local global-routing check
   and the SEMANTICS 6.9 M3 text, then slice A.
+- 2026-09-22 (later), Fable 5.1: Thomas delegated the three open calls of the
+  review ("proceed based off your best judgement"): D-028 taken, the
+  2026-11-08 freeze kept, slice C by the numbers with no as the default.
+  D-028 implemented in RTL, model, both test suites and formal (TIMER-2
+  proved, 7 covers); `check_all` green; pushed so the hardening runs. Next:
+  read that run against the slow corner (-2.48 ns before) and the D-025
+  routing numbers; then the SEMANTICS 6.9 M3 text for slice A and 6.11 for
+  slice B, and the local global-routing check.

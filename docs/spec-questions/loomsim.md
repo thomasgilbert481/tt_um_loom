@@ -356,6 +356,10 @@ not running. **Chosen:** writable, and a write loads `{LAT_VALID, LAT_VAL,
 LAT_PIN}` exactly as a `SETP ... D` commit would, so it cannot land at its
 own edge. A debugger must be able to save and restore a thread. Pinned by
 `test_loomsim_setpd.py::test_a_latch_loaded_by_the_host_cannot_fire_at_its_loading_edge`.
+Updated 2026-09-22 (D-028): a host write of `TD` no longer applies a staged
+write, so the test pins the same reading with rule 1 instead: the latch is
+loaded at the very edge `NOW` ticks to a host-written `TD` and does not land
+there; it lands on the next host-written deadline, by rule 1, on the tick.
 
 ### 10. Two threads' staged writes to one pin at one edge
 

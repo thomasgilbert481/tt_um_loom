@@ -5,7 +5,8 @@
 commit edge, replacing what was staged. A staged write is applied, and
 LAT_VALID cleared, at the first LATER edge e at which
   rule 1: NOW ticks at e to exactly TD (TD not written at e), or
-  rule 2: TD is written at e (WAITD first issue, SETD, CSRW TD, the host)
+  rule 2: TD is written at e by the thread's own slot (WAITD first issue,
+          SETD, CSRW TD; a host write is not a rule-2 write, D-028)
           and reached(NOW', TD') holds for the values after e.
 It follows 6.3 (open drain included); an ordinary pin write of a slot wins
 at the same edge; CTRL.RESET discards it; debug 0x25 reads and writes it.
@@ -294,9 +295,9 @@ async def test_setpd_ctrl_reset_discards(dut):
 @cocotb.test()
 async def test_setpd_debug_latch_and_host_td(dut):
     """Debug 0x25 is {LAT_VALID, LAT_VAL, LAT_PIN} in bits 6:0, writable while
-    halted. A host TD write is a rule-2 TD write: with a staged write and a
-    deadline already reached, the pin changes at that write's commit edge;
-    with a future deadline nothing happens until then."""
+    halted. A host TD write is not a rule-2 write (D-028): a staged write
+    stays staged whatever TD the host writes, reached or not, and lands by
+    rule 1 on the exact tick edge at which NOW reaches the written TD."""
     host, mon = await fresh(dut)
     t = 2
     await host.write_debug(t, DBG_LATCH, 0xFFFF)
@@ -305,18 +306,18 @@ async def test_setpd_debug_latch_and_host_td(dut):
     assert await host.read_debug(t, DBG_LATCH) == 0
     await host.write(SP_CTRL, CTRL_PIN_OUT, 0)
 
-    # Armed by the host, then TD written in the past: applied at the commit
-    # edge of the TD write (docs/spec-questions/rtl-m2.md 7).
+    # Armed by the host, then TD written in the past: nothing happens at the
+    # write's commit edge and the staged write stays. (Before D-028 this was
+    # a rule-2 write and the pin changed at that edge.)
     await host.write_debug(t, DBG_LATCH, LAT_VALID | LAT_VAL | OUT0)
     now = await host.read_debug(t, DBG_NOW)
     start = mon.now
     await host.write_debug(t, DBG_TD, (now - 100) & 0xFFFF)
-    visible = PadMonitor.host_commit(mon.sck_rises(start)[-1])
-    await ClockCycles(dut.clk, 10)
-    assert mon.changes(mon.uo, 0, start) == [(visible, 1)]
-    assert await host.read_debug(t, DBG_LATCH) == LAT_VAL | OUT0
+    await ClockCycles(dut.clk, 100)
+    assert mon.changes(mon.uo, 0, start) == []
+    assert await host.read_debug(t, DBG_LATCH) == LAT_VALID | LAT_VAL | OUT0
 
-    # A future deadline: nothing at the TD write; the staged write stays.
+    # A future deadline: nothing at the TD write either; the staged write stays.
     await host.write_debug(t, DBG_LATCH, LAT_VALID | OUT0)      # value 0
     now = await host.read_debug(t, DBG_NOW)
     start = mon.now
@@ -324,6 +325,23 @@ async def test_setpd_debug_latch_and_host_td(dut):
     await ClockCycles(dut.clk, 100)
     assert mon.changes(mon.uo, 0, start) == []
     assert await host.read_debug(t, DBG_LATCH) == LAT_VALID | OUT0
+
+    # Rule 1 still applies to a host-written TD. With 4000 clocks per tick
+    # (the divider write clears ACC at its commit edge w, section 4, so the
+    # ticks are at w + 4000 n), TD = NOW + 2 lands the write at edge w + 8000,
+    # a tick edge, and not at the TD write's own commit edge.
+    await host.write_debug(t, DBG_LATCH, LAT_VALID | LAT_VAL | OUT0)
+    start = mon.now
+    await host.write_csr(t, CSR_TICK_INT, 4000)
+    w = PadMonitor.host_commit(mon.sck_rises(start)[-1])
+    now = await host.read_debug(t, DBG_NOW)
+    await host.write_debug(t, DBG_TD, (now + 2) & 0xFFFF)
+    await ClockCycles(dut.clk, 8200)
+    assert mon.changes(mon.uo, 0, start) == [(w + 8000, 1)]
+    assert await host.read_debug(t, DBG_LATCH) == LAT_VAL | OUT0
+
+    # CTRL.RESET discards a staged write.
+    await host.write_debug(t, DBG_LATCH, LAT_VALID | OUT0)
     await host.reset_thread(t)
     assert await host.read_debug(t, DBG_LATCH) == OUT0
     mon.stop()

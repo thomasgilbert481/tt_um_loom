@@ -4,7 +4,8 @@
 replacing anything staged.  The staged write lands, and ``LAT_VALID`` clears,
 at the first *later* edge at which either (rule 1) ``NOW`` ticks to exactly
 ``TD`` with ``TD`` not written at that edge, or (rule 2) ``TD`` is written at
-that edge (``WAITD`` first issue, ``SETD``, ``CSRW TD``, the host) and
+that edge by the thread's own slot (``WAITD`` first issue, ``SETD``,
+``CSRW TD``; a host write of ``TD`` is not a rule-2 write, D-028) and
 ``reached(NOW', TD')`` holds after it.  It follows 6.3; an ordinary pin write
 to the same pin at the same edge wins; ``CTRL.RESET`` clears ``LAT_VALID``;
 debug 0x25 reads ``{LAT_VALID, LAT_VAL, LAT_PIN[4:0]}`` in bits 6:0
@@ -195,17 +196,34 @@ TD_WRITERS = {
     ("CSRW", 30, 30),
     ("WAITD", 1, 16),    # TD = 0 + 1, already passed: done on first issue
     ("WAITD", 30, 30),   # lands at the tick, while the WAITD is still waiting
-    ("host", 5, 21),     # debug write in cycle 20 commits at edge 21
-    ("host", 40, 40),
 ])
-def test_the_write_lands_on_the_next_deadline_whoever_sets_it(writer, value, fire):
-    def host(machine):
-        if writer == "host" and machine.cycle == 20:
-            machine.host_write_debug(0, "TD", value)
-
-    watch = Watch().run(started(TD_WRITERS[writer](value)), 60, host)
+def test_the_write_lands_on_the_next_deadline_whichever_instruction_sets_it(writer, value, fire):
+    watch = Watch().run(started(TD_WRITERS[writer](value)), 60)
     assert watch.edges(0) == [fire]
     assert watch.valid()[8:] == [1] * (fire - 8) + [0] * (60 - fire)
+
+
+@pytest.mark.parametrize("value,fire", [
+    (5, None),           # already passed: not a rule-2 write (D-028), never lands
+    (40, 40),            # ahead: rule 1 when NOW ticks to 40, not at the write's edge 21
+])
+def test_a_host_td_write_is_not_a_rule_2_write(value, fire):
+    """D-028: a host debug write of TD (in cycle 20, committing at edge 21)
+    never applies the staged write by itself, whatever it writes.  The write
+    stays staged, and a host-written deadline still lands by rule 1, on the
+    exact tick at which NOW reaches it."""
+    def host(machine):
+        if machine.cycle == 20:
+            machine.host_write_debug(0, "TD", value)
+
+    watch = Watch().run(started(TD_WRITERS["host"](value)), 60, host)
+    assert watch.td[21:] == [value] * 39
+    if fire is None:
+        assert watch.edges(0) == []
+        assert watch.valid()[8:] == [1] * 52
+    else:
+        assert watch.edges(0) == [fire]
+        assert watch.valid()[8:] == [1] * (fire - 8) + [0] * (60 - fire)
 
 
 @pytest.mark.parametrize("fourth,fire", [
@@ -240,17 +258,25 @@ def test_the_arming_edge_never_applies_the_new_write():
 
 def test_a_latch_loaded_by_the_host_cannot_fire_at_its_loading_edge():
     """The model's reading (M2 update item 9): a host write of debug 0x25 loads
-    the latch as a SETP ... D commit would, so a TD write by the host at the
-    same edge does not apply it; the next one does."""
+    the latch as a SETP ... D commit would, so it cannot land at its own edge
+    even when rule 1 holds there: TD = 3 (written at edge 1) and the latch
+    loaded at edge 3, the edge at which NOW ticks to 3.  NOW is past 3 from
+    then on, so the write waits, still staged, for the next deadline the host
+    sets (TD = 20 at edge 11) and lands by rule 1 at edge 20.  (Before D-028
+    the same reading was pinned with a host TD write as a rule-2 write.)"""
     def host(machine):
-        if machine.cycle in (0, 5):
-            machine.host_write_debug(0, "TD", 0)     # reached at once: rule 2
         if machine.cycle == 0:
+            machine.host_write_debug(0, "TD", 3)
+        if machine.cycle == 2:
             machine.host_write_debug(0, LAT, lat_word(1, 1, OUT0))
+        if machine.cycle == 10:
+            machine.host_write_debug(0, "TD", 20)
 
-    watch = Watch().run(machine_for([("HALT", {})]), 12, host)
-    assert watch.edges(0) == [6]
-    assert watch.lat[1:7] == [lat_word(1, 1, OUT0)] * 5 + [lat_word(0, 1, OUT0)]
+    watch = Watch().run(machine_for([("HALT", {})]), 24, host)
+    assert (watch.now[3], watch.td[3]) == (3, 3)
+    assert watch.edges(0) == [20]
+    assert watch.lat[3:20] == [lat_word(1, 1, OUT0)] * 17
+    assert watch.lat[20] == lat_word(0, 1, OUT0)
 
 
 def test_an_older_write_still_lands_at_the_edge_a_newer_one_is_staged():
@@ -304,15 +330,17 @@ def test_another_threads_ordinary_setp_at_that_edge_wins_too():
 def test_ctrl_reset_discards_the_staged_write(reset):
     """Staged at edge 12 for TD = 106, thread halted at edge 16.  With a reset
     in cycle 30 the latch is gone: neither the reset's own TD write (TD <=
-    NOW, reached) nor a host TD write in cycle 40 applies it; without the
-    reset that host write does."""
+    NOW, reached) nor the deadline the host then sets (TD = 60 in cycle 40)
+    applies it; without the reset the write lands by rule 1 when NOW ticks to
+    that host-written TD at edge 60 (the host write itself is not a rule-2
+    write, D-028)."""
     program = [("SETD", dict(imm=100)), setp(OUT0, 1, 1), ("HALT", {})]
 
     def host(machine):
         if reset and machine.cycle == 30:
             machine.host_write_ctrl("RESET", 0b0001)
         if machine.cycle == 40:
-            machine.host_write_debug(0, "TD", 40)
+            machine.host_write_debug(0, "TD", 60)
 
     watch = Watch().run(started(program), 120, host)
     assert watch.lat[30] == lat_word(1, 1, OUT0)
@@ -322,7 +350,8 @@ def test_ctrl_reset_discards_the_staged_write(reset):
         # Only LAT_VALID is cleared; the pin and level stay readable.
         assert watch.lat[31:] == [lat_word(0, 1, OUT0)] * 89
     else:
-        assert watch.edges(0) == [41]
+        assert watch.edges(0) == [60]
+        assert watch.valid()[41:60] == [1] * 19      # nothing at the write's edge 41
 
 
 # ------------------------------------------------------------- debug 0x25
@@ -332,8 +361,8 @@ def test_debug_0x25_reads_back_the_latch():
                ("HALT", {})]
 
     def host(machine):
-        if machine.cycle == 20:
-            machine.host_write_debug(0, "TD", 0)     # lands at edge 21
+        if machine.cycle == 19:
+            machine.host_write_debug(0, "TD", 21)    # NOW ticks to 21 at edge 21: rule 1
 
     machine = started(program)
     machine.host_write_pin_out(1 << 5)

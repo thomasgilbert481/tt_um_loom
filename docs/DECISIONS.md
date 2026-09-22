@@ -489,9 +489,10 @@ register write mux, at the macro's pin edge, so its hardening is read under
 D-025. OPEN-3 is resolved; OPEN-2 (FIFO depth) stays at 4; OPEN-4 (boot ROM)
 and OPEN-5 (group-match wait, CRC-32) are closed as not built.
 
-## D-028 2026-09-22 Fable, proposed to Thomas: the host's TD write leaves rule 2 of the deadline latch
+## D-028 2026-09-22 Fable: the host's TD write leaves rule 2 of the deadline latch
 
-Proposal (not in force until Thomas says yes): SEMANTICS 6.10 rule 2 becomes
+Decision (proposed to Thomas at the M2 review; Thomas delegated the call the
+same day, "proceed based off your best judgement"): SEMANTICS 6.10 rule 2 becomes
 "TD is written at e by the thread (a `WAITD` first issue, `SETD` or
 `CSRW TD`) and `reached(NOW', TD')` holds". A host debug write to `TD` still
 writes `TD` but no longer fires a staged pin write; rule 1 (NOW ticks to
@@ -511,11 +512,24 @@ Rejected: the flow knobs in `docs/AREA.md` (DELAY synthesis, post-GRT
 resizer timing, timing-driven placement), each a whole-design change in cell
 selection and a six-hour reading, for a corner that is not sign-off;
 D-022's two-subtractor shape (still eight subtractors on shared buses).
-Consequences if taken: SEMANTICS 6.10, HOST_PROTOCOL's note on 0x0A and
-0x25, the golden model, `loom_timer`, a regression test, a formal property,
-and one hardening, done first in M3 so the slices are read against the
-lower baseline. Whatever the result, the datasheet states both clocks: 50
-MHz at the typical corner and the measured slow-corner clock.
+Consequences: SEMANTICS 6.10, HOST_PROTOCOL's note on 0x0A and 0x25, the
+golden model, `loom_timer`, a regression test, a formal property, and one
+hardening, done first in M3 so the slices are read against the lower
+baseline. Whatever the result, the datasheet states both clocks: 50 MHz at
+the typical corner and the measured slow-corner clock.
+
+Implemented 2026-09-22 (Fable, RTL and model in one commit as D-023 was):
+`loom_timer` loses the host terms of `td_w` and `td_new` (a pure deletion;
+rule 1 at a host write's own edge compares against the TD before the edge,
+which the text now says); the golden model treats a host TD write as a plain
+write and evaluates rule 1 against the pre-edge TD; `test_setpd.
+test_setpd_debug_latch_and_host_td` now shows a reached and an unreached
+host TD write both leaving the staged write in place and a host-written
+deadline landing by rule 1 on the tick edge (`w + 8000` at 4000 clocks per
+tick); `test_loomsim_setpd` gains `test_a_host_td_write_is_not_a_rule_2_write`
+and re-pins the loading-edge reading through rule 1; formal TIMER-2 proved
+(`timer.sby:prove`, k-induction, 1 s) with three new cover points. The
+hardening of this commit is the slow-corner measurement.
 
 ## D-029 2026-09-22 Fable: stretch scope: USB low-speed stays, CAN is firmware, 10 Mbit Manchester is cut as a target
 

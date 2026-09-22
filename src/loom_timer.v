@@ -28,9 +28,15 @@
  *   Deadline latch (SEMANTICS 6.10): `lat_fire[t]` is high during the cycle
  *   before an edge e at which thread t's staged pin write must be applied,
  *   if one is staged (loom_core owns the latch and qualifies it):
- *     rule 1: NOW ticks at e to exactly TD, and TD is not written at e;
- *     rule 2: TD is written at e (commit port, or a host debug write) and
+ *     rule 1: NOW ticks at e to exactly TD, and the thread's own slot does
+ *             not write TD at e;
+ *     rule 2: the thread's own slot writes TD at e (commit port) and
  *             reached(NOW', TD') holds for the values after e.
+ *   A host debug write of TD is neither (D-028): it is not a rule-2 write,
+ *   and at its own edge rule 1 compares against the TD value before the
+ *   edge, so the host thread compare and h_wdata never enter this cone
+ *   (they were the slow-corner path, docs/AREA.md). From the next edge on
+ *   rule 1 sees the written value.
  *   Both use one subtraction, D = NOW - TD', where TD' is the value TD takes
  *   at e: rule 1 is NOW + 1 == TD, i.e. D == 16'hFFFF with TD unchanged, and
  *   NOW' - TD' = D + tick, whose bit 15 is D[15] ^ (tick & D[14:0] == 7FFF).
@@ -105,11 +111,10 @@ module loom_timer (
 
       // ------------------------------------------ deadline latch (6.10)
       // TD written at this edge in the sense of rule 2: a commit (WAITD
-      // first issue, SETD, CSRW TD) or a host debug write. CTRL.RESET is
-      // left out on purpose (it discards the staged write).
-      wire        td_w     = (mine && cm_td_we) || (h_mine && h_td_we);
-      wire [15:0] td_new   = (mine && cm_td_we) ? cm_td
-                           : (h_mine && h_td_we) ? h_wdata : td;
+      // first issue, SETD, CSRW TD). A host debug write is not one (D-028),
+      // and CTRL.RESET is left out on purpose (it discards the staged write).
+      wire        td_w     = mine && cm_td_we;
+      wire [15:0] td_new   = td_w ? cm_td : td;
       wire [15:0] lat_d    = now - td_new;
       wire        lat_all1 = &lat_d[14:0];
       wire        rule1    = tick && !td_w && !h_reset[t] && lat_d[15] && lat_all1;

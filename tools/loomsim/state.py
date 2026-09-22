@@ -289,8 +289,9 @@ class Commit:
     ingrp: Optional[int] = None
     acc_clear: bool = False
     #: ``TD`` is written at this edge in the sense of SEMANTICS 6.10 rule 2:
-    #: a ``WAITD`` first issue, ``SETD``, ``CSRW TD`` or a host write.  A
-    #: ``WAITD`` re-issue commits ``TD <= TD`` and does not count.
+    #: a ``WAITD`` first issue, ``SETD`` or ``CSRW TD`` by the thread's own
+    #: slot.  A ``WAITD`` re-issue commits ``TD <= TD`` and does not count,
+    #: and a host debug write of ``TD`` is not a rule-2 write (D-028).
     td_written: bool = False
     #: Thread FIFOs: value pushed into OUTQ, and whether INQ is popped.
     outq_push: Optional[int] = None

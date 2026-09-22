@@ -305,6 +305,11 @@ and the mutation table. No video.
 
 ### What Thomas decides
 
+2026-09-22, Thomas: "proceed based off your best judgement". Fable's calls:
+D-028 taken (it deletes logic, and the debug corner has no user); the
+2026-11-08 freeze stands; slice C is decided by the numbers on 2026-11-01,
+and the default is no. The three items as put to him, for the record:
+
 - D-028 (host `TD` writes leave rule 2): yes or no. The implementer does not
   start it without a yes.
 - The freeze date, if 2026-11-08 collides with something the plan does not

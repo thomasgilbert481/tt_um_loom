@@ -50,9 +50,10 @@ bound: `abc pdr` (property-directed reachability) or k-induction in
 
 ## Results
 
-Recorded 2026-09-19, OSS CAD Suite: SBY 0.63, Yosys 0.63+161, yices 2.6,
-btormc (boolector), abc pdr. Times are wall clock on the laptop. The whole of
-`scripts/formal.sh` is 20 sby tasks in about 5 minutes, the slowest single task
+Recorded 2026-09-19 (TIMER-2 added 2026-09-22 with D-028), OSS CAD Suite: SBY
+0.63, Yosys 0.63+161, yices 2.6, btormc (boolector), abc pdr. Times are wall
+clock on the laptop. The whole of `scripts/formal.sh` is 20 sby tasks in about
+5 minutes, the slowest single task
 being `sched:bmc` at 62 s — inside the `formal-quick` budget of the CI matrix in
 `docs/VERIFICATION.md`, with nothing left for a `formal-full` nightly to do
 except ISO-1 and WAIT-1.
@@ -85,7 +86,8 @@ except ISO-1 and WAIT-1.
 | **TIMER-1** | `reached` is monotone: once true it stays true until TD changes | `timer.sby:xfail` | bmc | smtbmc yices | 16 | **FAILS, step 4, all four threads** — finding F-1 | 1 s |
 | TIMER-1B | the only way `reached` falls with TD unchanged is `NOW - TD` going `0x7FFF -> 0x8000` | `timer.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** | 2 s |
 | TIMER-1C | `NOW` only ever advances by one | `timer.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** | 2 s |
-| — | 4 cover points | `timer.sby:cover` | cover | smtbmc yices | 16 | 4/4 | 1 s |
+| TIMER-2 | a thread's `lat_fire` needs a tick at the closing edge or a TD write by its own slot; a host TD write alone never raises it (D-028, added 2026-09-22) | `timer.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** | 1 s |
+| — | 7 cover points (the four above, rule 1 fired, rule 2 fired, a host TD write on a quiet edge with no fire) | `timer.sby:cover` | cover | smtbmc yices | 16 | 7/7 | 1 s |
 | SPI-1A | `byte_done` only pulses for a byte the pads completed and that is unreported | `spi.sby:prove` | prove | abc pdr | unbounded | **proved** | 10 s |
 | SPI-1B | `rx_byte` is that byte, MSB first | `spi.sby:prove` | prove | abc pdr | unbounded | **proved** | 10 s |
 | SPI-1C | a completed byte is reported before the next SCK rise and before `CS_n` is released; `CS_n` high voids a partial byte | `spi.sby:prove` | prove | abc pdr | unbounded | **proved** | 10 s |

@@ -148,6 +148,9 @@ reference model, check data and timing.
   `NOW - TD` passing `0x7FFF -> 0x8000`, where the half-window wraps. (The
   first wording, "`reached` is monotone: once true it stays true until TD
   changes", is false and was proved false: formal finding F-1, SEMANTICS 4.)
+- TIMER-2: thread `t`'s `lat_fire` is high only for an edge at which `NOW`
+  ticks or at which `t`'s own slot writes `TD`; a host `TD` write alone never
+  raises it, whatever it writes and to whichever thread (D-028).
 - SPI-1: with SCK period >= 8 clocks, every MOSI byte is delivered exactly
   once; CS high resets the byte counter. Holds given that the chip is not
   reset in the middle of a transaction; without that assumption a reset
@@ -234,7 +237,7 @@ run it.
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 553 bins, 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 37 scenarios on the model, 29 on the RTL |
-| L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 18 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |
+| L4 formal | `formal/` (7 groups, `scripts/formal.sh`) | 19 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. Two findings: F-1 (the TIMER-1 wording, corrected above) and F-2 (PIN-1, a real bug, D-023). ISO-1 and WAIT-1 open |
 | L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; two open survivors; the results section below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
 
@@ -289,16 +292,18 @@ five came out of the full pass and account for the "new tests" column:
 | `test_timing.test_tick_int_zero_is_one`, `test_long_tick_period` | `TICK_INT = 0` means 1; ticks of 32,768 clocks and more (the accumulator's top bit) | 4 |
 | `test_host.test_reset_sets_td_to_now` | CTRL.RESET sets TD := NOW | 1 |
 
-**Still open, two timer mutants**, both needing a coincidence no directed test
-arranges: `loom_timer.v:112` lets a host debug write to *another* thread's TD
-(or any host write to this thread) feed this thread's deadline-latch compare,
-so a staged `SETP ... D` could fire early if that value happens to equal
-`NOW + 1` at a tick; `loom_timer.v:141` makes a commit that does not write TD
-write it back anyway, which differs only if CTRL.RESET of a *running* thread
-lands on the edge one of its slots commits. A formal property ("a thread's
-latch fire depends only on its own TD writes") would settle the first; the
-second needs the protocol to say whether RESET of a running thread is legal
-at all.
+**Still open, one timer mutant** (two until 2026-09-22), each needing a
+coincidence no directed test arranges. The first, at the old
+`loom_timer.v:112`, let a host debug write to *another* thread's TD (or any
+host write to this thread) feed this thread's deadline-latch compare, so a
+staged `SETP ... D` could fire early if that value happened to equal
+`NOW + 1` at a tick. D-028 removed the host terms from that compare, so the
+line and its mutant no longer exist, and TIMER-2 proves what the mutant
+exposed: a thread's latch fire depends only on the tick and its own TD
+writes. The second, the `td` register's commit branch written even by a
+commit that does not write TD, differs only if CTRL.RESET of a *running*
+thread lands on the edge one of its slots commits, and needs the protocol to
+say whether RESET of a running thread is legal at all.
 
 Cost for the next pass: a run that skips the 44 recorded equivalents saves
 about 33 CPU-hours of the 68, because an equivalent is a survivor and pays for
