@@ -481,7 +481,8 @@ class _Assembler:
                 timing = instr.timing
                 text = disassemble(word, self.isa)
                 self.nodes[stmt.thread].append(dl.Node(
-                    addr=addr, name=instr.name, fields=fields, line=stmt.line))
+                    addr=addr, name=instr.name, fields=fields, line=stmt.line,
+                    timing=instr.timing))
             self.word_info.append(WordInfo(
                 addr=addr, word=word, thread=stmt.thread, line=stmt.line,
                 timing=timing, text=text))

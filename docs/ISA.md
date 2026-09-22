@@ -72,8 +72,8 @@ behaviour is defined in `docs/SEMANTICS.md`.
 | `CSRW` | csr, ra | `1011 1CCC CCaa a---` | `F800` / `B800` | - | one_slot | CSR[csr] = ra (read-only CSRs ignore the write) |
 | `CLR` | flag | `1100 0nnn ---- ----` | `F800` / `C000` | - | one_slot | SFLAGS[n] = 0 |
 | `SIG` | flag | `1100 1nnn ---- ----` | `F800` / `C800` | - | one_slot | SFLAGS[n] = 1 |
-| `LD` | rd, ra, imm5 | `1101 0ddd aaai iiii` | `F800` / `D000` | - | one_slot | rd = DMEM[ra + imm5]; NOP with BADOP if DMEM not built (needs DMEM) |
-| `ST` | rd, ra, imm5 | `1101 1ddd aaai iiii` | `F800` / `D800` | - | one_slot | DMEM[ra + imm5] = rd; NOP with BADOP if DMEM not built (needs DMEM) |
+| `LD` | rd, ra, imm5 | `1101 0ddd aaai iiii` | `F800` / `D000` | - | two_slot | rd = IMEM[(ra + imm5) mod IMEM_WORDS], the data memory being the instruction memory (SEMANTICS 6.11); two slots; NOP with BADOP if DMEM not built (needs DMEM) |
+| `ST` | rd, ra, imm5 | `1101 1ddd aaai iiii` | `F800` / `D800` | - | two_slot | IMEM[(ra + imm5) mod IMEM_WORDS] = rd (SEMANTICS 6.11); two slots; NOP with BADOP if DMEM not built (needs DMEM) |
 
 64 instructions. 49664 of 65536 words decode to an
 instruction; every other word is reserved and executes as `NOP` with `BADOP` set.

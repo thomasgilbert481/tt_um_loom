@@ -463,7 +463,7 @@ localparam [15:0] ISA_SIG_MATCH = 16'hC800;
 localparam integer ISA_SIG_FLAG_HI = 10;
 localparam integer ISA_SIG_FLAG_LO = 8;
 
-// LD: 11010dddaaaiiiii  (one_slot)
+// LD: 11010dddaaaiiiii  (two_slot)
 localparam [15:0] ISA_LD_MASK  = 16'hF800;
 localparam [15:0] ISA_LD_MATCH = 16'hD000;
 localparam integer ISA_LD_RD_HI = 10;
@@ -473,7 +473,7 @@ localparam integer ISA_LD_RA_LO = 5;
 localparam integer ISA_LD_IMM_HI = 4;
 localparam integer ISA_LD_IMM_LO = 0;
 
-// ST: 11011dddaaaiiiii  (one_slot)
+// ST: 11011dddaaaiiiii  (two_slot)
 localparam [15:0] ISA_ST_MASK  = 16'hF800;
 localparam [15:0] ISA_ST_MATCH = 16'hD800;
 localparam integer ISA_ST_RD_HI = 10;

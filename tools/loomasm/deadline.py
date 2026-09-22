@@ -51,6 +51,9 @@ class Node:
     name: str
     fields: Dict[str, int]
     line: int
+    #: The ``isa.yaml`` timing class; ``two_slot`` (``LD``/``ST``, SEMANTICS
+    #: 6.11) costs two slots on every path, everything else one.
+    timing: str = "one_slot"
 
 
 def is_deadline_target(node: Node) -> bool:
@@ -159,6 +162,8 @@ def _slot_cost(node: Node) -> float:
         return UNBOUNDED
     if node.name in TIMED_WAITS and not node.fields.get("tmo", 0):
         return UNBOUNDED
+    if node.timing == "two_slot":
+        return 2.0
     return 1.0
 
 

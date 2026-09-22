@@ -304,10 +304,13 @@ result recorded, bounded or proved.
       on the RTL.
 - [ ] ISO-1 (thread isolation), timeboxed to two sessions on a reduced
       configuration; a bounded result is recorded as bounded.
-- [ ] SEMANTICS 6.11 and `isa.yaml` for D-027: `LD`/`ST` as two-slot
-      instructions on the instruction memory through the thread's own fetch
-      cycle; the assembler's data directive and the deadline checker's count;
-      the host's existing IMEM commands load and dump an image.
+- [x] 2026-09-22: SEMANTICS 6.11 and `isa.yaml` for D-027: `LD`/`ST` as
+      two-slot instructions on the instruction memory through the thread's
+      own fetch cycle (text in 6.11, state in section 5, debug 0x28, the
+      completion slot's retire record in section 8); `isa.yaml` timing class
+      `two_slot`, the deadline checker prices them at two slots (test added),
+      generated files refreshed. Data placement uses the existing `.org` and
+      `.word`; the host's existing IMEM commands load and dump an image.
 - [ ] Slice B: RTL and model, tests, hardening, the D-025 reading.
 - [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
       in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a

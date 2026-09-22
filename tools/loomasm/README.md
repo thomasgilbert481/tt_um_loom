@@ -266,7 +266,9 @@ For each thread the checker
    `k != 0`;
 3. for every anchor, finds each `WAITD k` reachable along a path with no other
    anchor on it, and takes the **longest** such path, counting one slot per
-   instruction strictly between them plus the target `WAITD` itself;
+   instruction strictly between them plus the target `WAITD` itself (two
+   for an instruction of the `two_slot` timing class, `LD` and `ST`,
+   whose second slot completes the memory access: SEMANTICS 6.11);
 4. compares `slots * 4` clocks against the budget, which is `P` clocks per
    tick times
 

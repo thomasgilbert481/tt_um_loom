@@ -49,6 +49,17 @@ def test_waitd_to_waitd_budget_scales_with_the_tick_count():
     assert pair.limit == 300 and pair.slack == 292
 
 
+def test_ld_and_st_cost_two_slots_each():
+    """SEMANTICS 6.11 (D-027): a data-memory access is its first slot plus a
+    completion slot, so the checker prices LD and ST at two slots."""
+    result = report(src(".thread 0", ".tick 100",
+                        "SETD 0", "LD r1, r2, 3", "ST r1, r2, 4", "NOP",
+                        "WAITD 1", "HALT"))
+    pair = result.pairs[0]
+    assert pair.slots == 6                  # LD 2, ST 2, NOP, WAITD
+    assert pair.clocks == 24
+
+
 def test_no_anchor_means_nothing_to_check():
     result = report(src(".thread 0", ".tick 100", "NOP", "NOP", "HALT"))
     assert result.pairs == []

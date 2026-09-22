@@ -45,6 +45,7 @@ timing_classes:
   one_slot: every execution costs exactly one slot
   wait: re-issues each slot until the condition holds (or the deadline, if T=1); each re-issue is one slot
   blocking: re-issues each slot while the FIFO cannot serve the request
+  two_slot: every execution costs exactly two slots of its own thread and no cycle of another's; the second slot completes the access (SEMANTICS 6.11, D-027)
 
 instructions:
   # ---------------------------------------------------------------- ALU
@@ -128,8 +129,8 @@ instructions:
   - {name: SIG,  fmt: "11001nnn--------", ops: [flag], sem: "SFLAGS[n] = 1", flags: [], timing: one_slot, class: sflag}
 
   # ------------------------------------------------ data memory (optional)
-  - {name: LD,   fmt: "11010dddaaaiiiii", ops: [rd, ra, imm5], sem: "rd = DMEM[ra + imm5]; NOP with BADOP if DMEM not built", flags: [], timing: one_slot, class: mem, optional: DMEM}
-  - {name: ST,   fmt: "11011dddaaaiiiii", ops: [rd, ra, imm5], sem: "DMEM[ra + imm5] = rd; NOP with BADOP if DMEM not built", flags: [], timing: one_slot, class: mem, optional: DMEM}
+  - {name: LD,   fmt: "11010dddaaaiiiii", ops: [rd, ra, imm5], sem: "rd = IMEM[(ra + imm5) mod IMEM_WORDS], the data memory being the instruction memory (SEMANTICS 6.11); two slots; NOP with BADOP if DMEM not built", flags: [], timing: two_slot, class: mem, optional: DMEM}
+  - {name: ST,   fmt: "11011dddaaaiiiii", ops: [rd, ra, imm5], sem: "IMEM[(ra + imm5) mod IMEM_WORDS] = rd (SEMANTICS 6.11); two slots; NOP with BADOP if DMEM not built", flags: [], timing: two_slot, class: mem, optional: DMEM}
 
 reserved:
   - {pattern: "0101ccc1rrrrrrrr", note: "branch with bit 8 set"}
