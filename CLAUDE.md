@@ -62,6 +62,12 @@ decision or configuring the flow; it is reference material.
   cell count. Commits that only touch docs or Python tools do not trigger a
   hardening (D-018). Before submission, run `gds` by hand on the exact commit
   being submitted.
+  **A push that touches `src/`, `info.yaml` or `macro/` cancels a hardening
+  in progress** (the workflow's concurrency group), and `git push` sends
+  every unpushed local commit, so while a run is going make sure
+  `git log origin/main..main -- src info.yaml macro` is empty before
+  pushing anything (2026-09-22: a local ISA-regeneration commit rode
+  along with a docs push and cancelled run 35773244433 at 54 minutes).
 - **Tiny Tapeout hygiene:** all outputs assigned; unused inputs listed in the
   `_unused` wire; `ena` ignored; pins documented in `info.yaml`; `source_files`
   and `test/Makefile` `PROJECT_SOURCES` kept in sync (the flow fails otherwise).

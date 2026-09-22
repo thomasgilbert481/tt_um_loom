@@ -285,7 +285,10 @@ result recorded, bounded or proved.
       Fable took it 2026-09-22). Done the same day: SEMANTICS 6.10,
       HOST_PROTOCOL, model, `loom_timer`, regression tests on both sides,
       formal TIMER-2 proved. Open: its hardening, which is the slow-corner
-      measurement and sets the baseline the slices are read against.
+      measurement and sets the baseline the slices are read against: run
+      35773244433 was cancelled at 54 minutes by a push that carried a local
+      commit touching `src/loom_isa.vh` (the trap is now in CLAUDE.md); run
+      35779039938 on e64f18a, the same netlist, started 20:15 UTC.
 - [ ] One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
       the pinned PDK) to the end of global routing and stop? Record the answer
       in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow

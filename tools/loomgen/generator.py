@@ -177,6 +177,10 @@ WAITB_BE_IDLE, WAITB_OUTQ_NF, WAITB_INQ_NE, WAITB_TICK = 0, 1, 2, 3
 
 #: ``BE_CFG`` fields that exist at M2 (SEMANTICS 6.9).
 BE_CFG_DIR, BE_CFG_INV, BE_CFG_CRC_EN = 1 << 1, 1 << 7, 1 << 9
+#: Slice A (SEMANTICS 6.9.1, feature ``BEENC``): ``ENC`` at bits 4:3,
+#: ``STUFF`` at 6:5, ``DIFF`` at bit 10. Value 3 of a field is reserved
+#: and stored as 0, so it is worth writing now and then.
+BE_CFG_ENC_SHIFT, BE_CFG_STUFF_SHIFT, BE_CFG_DIFF = 3, 5, 1 << 10
 
 #: Known ``avoid`` flags. Each switches off one construct on which the RTL
 #: and the model disagree where ``docs/SEMANTICS.md`` does not decide the
@@ -484,6 +488,7 @@ class _ThreadBuilder:
         self.avoid = avoid
         self.features = frozenset(features)
         self.fifo = "FIFO" in self.features
+        self.be_enc = "BEENC" in self.features
         self.be = "BE" in self.features
         self.setpd = "SETPD" in self.features
         self.fifo_depth = fifo_depth
@@ -636,6 +641,13 @@ class _ThreadBuilder:
             (BE_CFG_INV if rng.random() < 0.3 else 0)
         if crc if crc is not None else rng.random() < 0.4:
             value |= BE_CFG_CRC_EN
+        if self.be_enc:
+            # Slice A: an encoder, a stuffer and DIFF, each field with its
+            # reserved value 3 now and then (stored as 0, SEMANTICS 6.9.1).
+            value |= rng.choice((0, 0, 0, 0, 1, 1, 1, 2, 2, 3)) << BE_CFG_ENC_SHIFT
+            value |= rng.choice((0, 0, 0, 0, 1, 1, 1, 2, 2, 3)) << BE_CFG_STUFF_SHIFT
+            if rng.random() < 0.25:
+                value |= BE_CFG_DIFF
         return value
 
     def be_pins_value(self) -> int:

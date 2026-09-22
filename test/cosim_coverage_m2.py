@@ -62,8 +62,11 @@ WAITB_NAMES = {WAITB_BE_IDLE: "BE_IDLE", WAITB_OUTQ_NF: "OUTQ_NF",
 #: ``BE_CFG`` fields of M2 (SEMANTICS 6.9).
 BE_CFG_DIR, BE_CFG_INV, BE_CFG_CRC_EN = 1 << 1, 1 << 7, 1 << 9
 BE_CFG_M2_MASK = BE_CFG_DIR | BE_CFG_INV | BE_CFG_CRC_EN
+#: Slice A fields (SEMANTICS 6.9.1, feature ``BEENC``, CAPS[9]).
+BE_CFG_ENC_SHIFT, BE_CFG_STUFF_SHIFT, BE_CFG_DIFF = 3, 5, 1 << 10
 
-M2_GROUPS = ("m2_fifo", "m2_be", "m2_csr", "m2_setpd", "m2_irq", "m2_host")
+M2_GROUPS = ("m2_fifo", "m2_be", "m2_csr", "m2_setpd", "m2_irq", "m2_host",
+             "m3a_be")
 
 IRQ_CAUSES = ("SWIRQ", "SFLAGS", "INQ_NOT_FULL", "OUTQ_NOT_EMPTY", "HALTED")
 PIN_CLASSES = ("bidir", "bidir_od", "out", "readonly", "reserved")
@@ -132,6 +135,16 @@ class M2Coverage(Coverage):
                     name, "the bit engine is built, so no CSR of isa.yaml is unbuilt")
             else:
                 cosim_coverage.UNREACHABLE.pop(name, None)
+        # The slice-A bins exist only in a build with the encoders (CAPS[9]).
+        any_build_has_enc = any("BEENC" in f for f, _ in self.builds)
+        for group, bin_name in _m2_bins():
+            if group != "m3a_be":
+                continue
+            if any_build_has_enc:
+                cosim_coverage.UNREACHABLE.pop(bin_name, None)
+            else:
+                cosim_coverage.UNREACHABLE.setdefault(
+                    bin_name, "slice A (the encoders) is not built: CAPS[9] = 0")
 
     def _built(self, name: str, fields: Dict[str, int],
                features: Sequence[str]) -> bool:
@@ -185,6 +198,8 @@ class M2Coverage(Coverage):
     # ----------------------------------------------------------- bit engine
     def _note_shift(self, name, record, ctx: SlotContext) -> None:
         cfg = ctx.be_cfg
+        if "BEENC" in ctx.features:
+            self._note_enc(name, record, cfg)
         direction = 1 if cfg & BE_CFG_DIR else 0
         self.hit("m2_be", "%s:DIR%d" % (name, direction))
         self.hit("m2_be", "%s:INV%d" % (name, 1 if cfg & BE_CFG_INV else 0))
@@ -203,9 +218,25 @@ class M2Coverage(Coverage):
             index = (ctx.be_pins >> 5) & 0x1F
             self.hit("m2_be", "SHI:in_%s" % _in_class(index))
 
+    def _note_enc(self, name, record, cfg: int) -> None:
+        """Slice A (6.9.1): which encoder, stuffer and DIFF each shift ran with,
+        and a SHI that left T set (a violation, or one already there)."""
+        self.hit("m3a_be", "%s:ENC%d" % (name, (cfg >> BE_CFG_ENC_SHIFT) & 3))
+        self.hit("m3a_be", "%s:STUFF%d" % (name, (cfg >> BE_CFG_STUFF_SHIFT) & 3))
+        if name == "SHO":
+            self.hit("m3a_be", "SHO:DIFF%d" % (1 if cfg & BE_CFG_DIFF else 0))
+        elif record.t:
+            self.hit("m3a_be", "SHI:T1")
+
     def _note_be_csr(self, name, fields, ctx: SlotContext) -> None:
         csr = self.be_csr_numbers[fields["csr"]]
         self.hit("m2_csr", "%s:%s" % (name, csr))
+        if name == "CSRW" and csr == "BE_CFG" and ctx.regs \
+                and "BEENC" in ctx.features:
+            written = ctx.regs[fields["ra"]]
+            self.hit("m3a_be", "CSRW:BE_CFG:ENC%d" % ((written >> BE_CFG_ENC_SHIFT) & 3))
+            self.hit("m3a_be", "CSRW:BE_CFG:STUFF%d" % ((written >> BE_CFG_STUFF_SHIFT) & 3))
+            self.hit("m3a_be", "CSRW:BE_CFG:DIFF%d" % (1 if written & BE_CFG_DIFF else 0))
         if name == "CSRW" and csr == "BE_CFG" and ctx.regs \
                 and ctx.regs[fields["ra"]] & ~BE_CFG_M2_MASK & 0xFFFF:
             self.hit("m2_csr", "CSRW:BE_CFG:bits_M2_ignores")
@@ -313,6 +344,13 @@ def _m2_bins() -> List[Tuple[str, str]]:
     for op in ("CSRR", "CSRW"):
         add("m2_csr", *["%s:%s" % (op, n) for n in M2_CSR_NAMES])
     add("m2_csr", "CSRW:BE_CFG:bits_M2_ignores")
+    for name in ("SHO", "SHI"):
+        add("m3a_be", *["%s:ENC%d" % (name, v) for v in range(3)])
+        add("m3a_be", *["%s:STUFF%d" % (name, v) for v in range(3)])
+    add("m3a_be", "SHO:DIFF0", "SHO:DIFF1", "SHI:T1")
+    add("m3a_be", *["CSRW:BE_CFG:ENC%d" % v for v in range(4)])
+    add("m3a_be", *["CSRW:BE_CFG:STUFF%d" % v for v in range(4)])
+    add("m3a_be", "CSRW:BE_CFG:DIFF0", "CSRW:BE_CFG:DIFF1")
     add("m2_setpd", "staged:new", "staged:replaces", "fired:rule1", "fired:rule2",
         "fired:ordinary_write_wins")
     add("m2_setpd", *["staged:%s" % c for c in PIN_CLASSES])

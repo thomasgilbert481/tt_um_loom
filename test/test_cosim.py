@@ -410,6 +410,7 @@ class _Probe:
         self.be = {name: _optional(core, name) for name in (
             "be_sr_all", "be_cnt_all", "be_crc_all", "be_poly_all",
             "be_init_all", "be_reload_all", "be_cfg_all", "be_pins_all")}
+        self.be_enc_all = _optional(core, "be_enc_all")     # slice A (6.9.1)
         self.lat_valid_all = _optional(core, "lat_valid_all")
         self.lat_pin_all = _optional(core, "lat_pin_all")
         self.lat_val_all = _optional(core, "lat_val_all")
@@ -426,6 +427,14 @@ def _i(handle) -> int:
 
 def _field(word: int, index: int, width: int) -> int:
     return (word >> (index * width)) & ((1 << width) - 1)
+
+
+def _width(handle) -> int:
+    """The width in bits of a vector handle (cocotb 2.x)."""
+    try:
+        return len(handle)
+    except TypeError:
+        return len(handle.value)
 
 
 # --------------------------------------------------------------- records
@@ -560,6 +569,17 @@ def _m2_state_pairs(p: _Probe, machine: Machine, build: _Build):
     if "BE" in build.features:
         be = {name: _i(_needed(handle, "u_core." + name, "the bit engine"))
               for name, handle in p.be.items()}
+        # BE_CFG is stored packed: {CRC_EN, INV, DIR} at M2 (3 bits per
+        # thread) and {DIFF, STUFF[1:0], ENC[1:0], CRC_EN, INV, DIR} with
+        # slice A (8 bits, SEMANTICS 6.9.1).
+        cfg_width = _width(p.be["be_cfg_all"]) // THREADS
+        enc_all = 0
+        if "BEENC" in build.features:
+            enc_all = _i(_needed(p.be_enc_all, "u_core.be_enc_all",
+                                 "the slice-A encoders"))
+            assert cfg_width >= 8, (
+                "CAPS says slice A is built but be_cfg_all is %d bits per thread"
+                % cfg_width)
         for t in range(THREADS):
             th = machine.threads[t]
             add(("t%d.SR" % t, _field(be["be_sr_all"], t, 16), th.sr))
@@ -569,11 +589,16 @@ def _m2_state_pairs(p: _Probe, machine: Machine, build: _Build):
             add(("t%d.CRC_INIT" % t, _field(be["be_init_all"], t, 16), th.crc_init))
             add(("t%d.BE_RELOAD" % t, _field(be["be_reload_all"], t, 5), th.be_reload))
             add(("t%d.BE_PINS" % t, _field(be["be_pins_all"], t, 10), th.be_pins))
-            # The RTL keeps the three BE_CFG fields M2 builds, {CRC_EN, INV, DIR}.
-            cfg = _field(be["be_cfg_all"], t, 3)
+            cfg = _field(be["be_cfg_all"], t, cfg_width)
             add(("t%d.BE_CFG.DIR" % t, cfg & 1, (th.be_cfg >> 1) & 1))
             add(("t%d.BE_CFG.INV" % t, (cfg >> 1) & 1, (th.be_cfg >> 7) & 1))
             add(("t%d.BE_CFG.CRC_EN" % t, (cfg >> 2) & 1, (th.be_cfg >> 9) & 1))
+            if cfg_width >= 8:
+                add(("t%d.BE_CFG.ENC" % t, (cfg >> 3) & 3, (th.be_cfg >> 3) & 3))
+                add(("t%d.BE_CFG.STUFF" % t, (cfg >> 5) & 3, (th.be_cfg >> 5) & 3))
+                add(("t%d.BE_CFG.DIFF" % t, (cfg >> 7) & 1, (th.be_cfg >> 10) & 1))
+            if "BEENC" in build.features:
+                add(("t%d.ENC" % t, _field(enc_all, t, 8), th.enc))
     if "SETPD" in build.features:
         valid = _i(_needed(p.lat_valid_all, "u_core.lat_valid_all", "SETP D"))
         value = _i(_needed(p.lat_val_all, "u_core.lat_val_all", "SETP D"))
