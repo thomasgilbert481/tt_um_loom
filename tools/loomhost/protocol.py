@@ -318,6 +318,7 @@ def decode_caps(word: int) -> Dict[str, int]:
         "boot_rom": (word >> 6) & 1,
         "setp_deadline": (word >> 7) & 1,
         "bit_engine_auto": (word >> 8) & 1,
+        "bit_engine_enc": (word >> 9) & 1,     # slice A: encoders, stuffing, DIFF
         "imem_words_log2": imem_log2,
         "imem_words": 1 << imem_log2,
         "raw": word & WORD_MASK,
@@ -326,13 +327,15 @@ def decode_caps(word: int) -> Dict[str, int]:
 
 def encode_caps(imem_words: int, fifo_depth: int = 0, bit_engine: bool = False,
                 dmem: bool = False, boot_rom: bool = False,
-                setp_deadline: bool = False, bit_engine_auto: bool = False) -> int:
+                setp_deadline: bool = False, bit_engine_auto: bool = False,
+                bit_engine_enc: bool = False) -> int:
     """Inverse of :func:`decode_caps` (``fifo_depth`` 0 means no FIFOs)."""
     word = ((imem_words.bit_length() - 1) & 0xF) << 12
     if fifo_depth:
         word |= ((fifo_depth.bit_length() - 1) & 0x7) | (1 << 3)
     word |= (int(bit_engine) << 4) | (int(dmem) << 5) | (int(boot_rom) << 6)
     word |= (int(setp_deadline) << 7) | (int(bit_engine_auto) << 8)
+    word |= int(bit_engine_enc) << 9
     return word
 
 

@@ -151,7 +151,8 @@ def test_caps_layout_is_semantics_section_5():
     assert (caps["imem_words"], caps["fifos"], caps["fifo_depth"]) == (1024, 1, 4)
     assert P.encode_caps(1024, fifo_depth=4) == 0xA00A
     word = P.encode_caps(512, fifo_depth=8, bit_engine=True, dmem=True, boot_rom=True,
-                         setp_deadline=True, bit_engine_auto=True)
+                         setp_deadline=True, bit_engine_auto=True, bit_engine_enc=True)
+    assert word & 0x200 and P.decode_caps(word)["bit_engine_enc"] == 1   # CAPS[9], slice A
     back = P.decode_caps(word)
     assert (back["imem_words"], back["fifo_depth"], back["bit_engine"], back["dmem"],
             back["boot_rom"], back["setp_deadline"], back["bit_engine_auto"]) == (
