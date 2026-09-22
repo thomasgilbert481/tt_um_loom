@@ -64,6 +64,7 @@ module loom_sched_props #(
     input wire [63:0] be_sr_all,
     input wire [19:0] be_cnt_all,
     input wire [63:0] be_crc_all,
+    input wire [31:0] be_enc_all,     // slice A encoder state (6.9.1)
     input wire [3:0]  rf_we_oh,
 
     // Host port.
@@ -187,7 +188,8 @@ module loom_sched_props #(
 
   // ==================================================================
   // SCHED-2: thread t's architectural state (regs, PC, flags, TD, SR, CNT,
-  // CRC) changes only in its own W stage.
+  // CRC, and from slice A the encoder state of 6.9.1) changes only in its
+  // own W stage.
   //
   // SEMANTICS 2: "All effects of the slot are registered at edge k+4"; the
   // slot in W during a cycle belongs to one thread, so no other thread's
@@ -218,6 +220,7 @@ module loom_sched_props #(
       wire [15:0] s_sr  = be_sr_all[16*t +: 16];
       wire [4:0]  s_cnt = be_cnt_all[5*t +: 5];
       wire [15:0] s_crc = be_crc_all[16*t +: 16];
+      wire [7:0]  s_enc = be_enc_all[8*t +: 8];
 
       // Explicit delayed copies: the slang frontend only allows $past inside
       // a clocked block, and s_changed is wanted as a wire.
@@ -225,6 +228,7 @@ module loom_sched_props #(
       reg [2:0]  p_fl;
       reg [15:0] p_td, p_sr, p_crc;
       reg [4:0]  p_cnt;
+      reg [7:0]  p_enc;
       always @(posedge clk) begin
         p_pc  <= s_pc;
         p_fl  <= s_fl;
@@ -232,11 +236,13 @@ module loom_sched_props #(
         p_sr  <= s_sr;
         p_cnt <= s_cnt;
         p_crc <= s_crc;
+        p_enc <= s_enc;
       end
 
       wire s_changed = (s_pc  != p_pc)  | (s_fl  != p_fl)
                      | (s_td  != p_td)  | (s_sr  != p_sr)
-                     | (s_cnt != p_cnt) | (s_crc != p_crc);
+                     | (s_cnt != p_cnt) | (s_crc != p_crc)
+                     | (s_enc != p_enc);
 
       // Four consecutive cycles with neither RUN nor STEP_REQ.
       wire      quiet_now = ~run_r[t] & ~step_req_r[t];
@@ -303,6 +309,7 @@ bind loom_core loom_sched_props #(.FIFO_DEPTH(4), .FAW(2)) u_sched_props (
     .pc_all(pc_all), .z_all(z_all), .c_all(c_all), .t_all(t_all),
     .td_all(td_all_w),
     .be_sr_all(be_sr_all), .be_cnt_all(be_cnt_all), .be_crc_all(be_crc_all),
+    .be_enc_all(be_enc_all),
     .rf_we_oh(rf_we_oh),
     .h_reset(h_reset), .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
     .h_dbg_thread(h_dbg_thread),

@@ -74,7 +74,7 @@ except ISO-1 and WAIT-1.
 | FIFO-1B | the caller never pushes into a full FIFO or pops an empty one | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
 | — | 7 cover points | `fifo.sby:cover` | cover | smtbmc yices | 20 | 7/7 | 1 s |
 | SCHED-1 | exactly one thread in each pipeline stage, the four distinct, every commit ring one-hot on the W thread | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
-| SCHED-2 | thread `t`'s regs, PC, flags, TD, SR, CNT, CRC change only in its own W stage (or by a host write) | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
+| SCHED-2 | thread `t`'s regs, PC, flags, TD, SR, CNT, CRC and, from slice A (2026-09-22), its encoder state of 6.9.1 change only in its own W stage (or by a host write) | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** (21 s with the encoder state) | 26 s |
 | SCHED-3 | a thread the host has neither run nor stepped for four cycles changes nothing | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 26 s |
 | SCHED-1..3, FIFO-1B | bounded cross-check | `sched.sby:bmc` | bmc | btor btormc | 24 | pass | 39 s |
 | — | 5 cover points | `sched.sby:cover` | cover | smtbmc yices | 20 | 5/5 | 7 s |

@@ -135,8 +135,9 @@ reference model, check data and timing.
 
 - SCHED-1: at every cycle exactly one thread is in each pipeline stage and the
   four are distinct (induction).
-- SCHED-2: thread t's architectural state (regs, PC, flags, TD, SR, CNT, CRC)
-  changes only in its own W stage.
+- SCHED-2: thread t's architectural state (regs, PC, flags, TD, SR, CNT, CRC,
+  and from slice A the encoder state of SEMANTICS 6.9.1) changes only in its
+  own W stage.
 - SCHED-3: a thread with RUN=0 never changes architectural state except through
   host debug writes.
 - ISO-1: for any two traces that agree on thread t's inputs (its pins, its
