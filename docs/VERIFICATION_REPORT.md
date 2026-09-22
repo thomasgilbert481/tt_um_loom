@@ -82,7 +82,17 @@ miss". The state on 2026-09-22 is:]
 - L4 formal: 19 properties (`formal/README.md` has engine, depth and time per
   property); SCHED-1..3, FIFO-1B and SPI-1A..C proved unbounded by `abc pdr`,
   the rest by k-induction or exhaustively; every group has cover points
-  against vacuity; ISO-1 and WAIT-1 open.
+  against vacuity; SCHED-2 was extended to the slice A encoder state on
+  2026-09-22 and re-proved; ISO-1 (attempted from 2026-09-22 as a two-copy
+  miter, result to be recorded here) and WAIT-1 open.
+- M3 slice A (2026-09-22) as a worked example of the method: the golden
+  model and the RTL of the bit-engine encoders, stuffing and differential
+  output were written from one paragraph of SEMANTICS (6.9.1) by two agents
+  that never saw each other's code; each recorded its spec questions (eight
+  and nine) and the readings agree everywhere they overlap; the
+  co-simulation, with the generator driving the new configuration bits,
+  found no divergence in the default run or in a 40-seed sweep, with all 25
+  new coverage bins hit.
 - L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 71 of 71
   on the last full hardening (run 35524275302).
 - L7 mutation: 823 mutants, 99.7 per cent killed with 44 documented
