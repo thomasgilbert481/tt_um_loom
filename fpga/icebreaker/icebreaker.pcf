@@ -1,0 +1,40 @@
+# iCEBreaker v1.0e (iCE40UP5K-SG48) pins for loom_icebreaker.
+# Package pins from the board's reference constraints; the same map as
+# Thomas's earlier iCEBreaker project (clock 35, button 10, green LED 37).
+
+set_io CLK      35
+set_io BTN_N    10
+set_io LEDG_N   37
+set_io LEDR_N   11
+
+# PMOD1A -> ui_in[7:0]   (P1A1..P1A4, P1A7..P1A10)
+#   ui_in[4] CS_n, ui_in[5] SCK, ui_in[6] MOSI: the host SPI port
+set_io P1A[0]    4
+set_io P1A[1]    2
+set_io P1A[2]   47
+set_io P1A[3]   45
+set_io P1A[4]    3
+set_io P1A[5]   48
+set_io P1A[6]   46
+set_io P1A[7]   44
+
+# PMOD1B -> uo_out[7:0]  (P1B1..P1B4, P1B7..P1B10)
+#   uo_out[6] HOST_IRQ, uo_out[7] MISO
+set_io P1B[0]   43
+set_io P1B[1]   38
+set_io P1B[2]   34
+set_io P1B[3]   31
+set_io P1B[4]   42
+set_io P1B[5]   36
+set_io P1B[6]   32
+set_io P1B[7]   28
+
+# PMOD2 -> uio[7:0]      (P2_1..P2_4, P2_7..P2_10)
+set_io P2[0]    27
+set_io P2[1]    25
+set_io P2[2]    21
+set_io P2[3]    19
+set_io P2[4]    26
+set_io P2[5]    23
+set_io P2[6]    20
+set_io P2[7]    18

@@ -231,6 +231,15 @@ data moving through the SPI host port; FPGA prototype runs the same tests.
       defines and stops at "Module `RM_IHPSG13_1P_512x16_c2_bm_bist`
       referenced in module `loom_imem_macro`"), so the FPGA build is ours to
       write, with a top that sets `IMEM_IMPL`. Hardware time needs Thomas.
+      2026-09-21: **the full design does not fit the iCEBreaker.** Synthesis
+      for the iCE40UP5K needs 7,732 LUT4 against 5,280 (the instruction memory
+      does go to block RAM; the gap is logic, and no build knob closes it),
+      so `fpga/icebreaker/` stays as the measured attempt and the pin-map
+      template. The same RTL on an ECP5-25F uses 32 per cent of the LUTs and
+      closes at 47 MHz. Thomas's call: buy a 25F-class ECP5 board (ULX3S,
+      OrangeCrab or iCESugar-Pro, all supported by the OSS CAD Suite's
+      nextpnr-ecp5), or drop the FPGA half of the exit criterion and rely on
+      simulation, gate level and formal until the silicon.
 - [x] Memory decision taken early, 2026-09-18 (D-020): the 512x16 SRAM macro,
       with the latch array as fallback. Remaining conditions: Tiny Tapeout's
       view of the overlap waiver and power-script wrapper, and Jane Street's
