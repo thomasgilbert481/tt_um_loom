@@ -41,6 +41,7 @@ module loom_isa_core_props (
     input wire        tr_we,
     input wire [2:0]  tr_flags,
     input wire [9:0]  tr_next_pc,
+    input wire        w_mem_done,   // the slot in W completes an LD/ST (6.11)
     input wire [15:0] badop,
     input wire        h_badop_clr_we,
     input wire [15:0] h_badop_clr
@@ -115,7 +116,10 @@ module loom_isa_core_props (
   assign m[61 ] = (tr_ir & 16'hF800) == 16'hC800;   // SIG
   assign m[62 ] = (tr_ir & 16'hF800) == 16'hD000;   // LD
   assign m[63 ] = (tr_ir & 16'hF800) == 16'hD800;   // ST
-  wire f_reserved = (m == 64'd0);
+  // SEMANTICS 6.11: the completion slot of an LD/ST decodes nothing; the
+  // word it carries is data, so a reserved-looking one is not a reserved
+  // instruction. Before slice B every valid slot decoded its word.
+  wire f_reserved = (m == 64'd0) && !w_mem_done;
 
   wire [9:0] f_next = tr_pc + 10'd1;      // SEMANTICS 6: next = (PC + 1) mod 2^10
 
@@ -165,7 +169,8 @@ module loom_isa_core_props (
   // ---------------------------------------- cover (anti-vacuity)
   always @(posedge clk) if (f_past_valid && p_rst_n) begin
     cover (tr_valid && f_reserved);        // a reserved word retires
-    cover (tr_valid && !f_reserved);       // a real instruction retires
+    cover (tr_valid && !f_reserved && !w_mem_done);  // a real instruction retires
+    cover (tr_valid && w_mem_done && m == 64'd0);  // an LD/ST completes on a reserved-looking data word
     cover (badop[3:0] != 4'd0);            // BADOP can be set
     cover (p_badop != 4'd0 && badop[3:0] == 4'd0);  // and cleared
   end
@@ -177,6 +182,7 @@ bind loom_core loom_isa_core_props u_isa_core_props (
     .tr_valid(tr_valid), .tr_thread(tr_thread), .tr_pc(tr_pc),
     .tr_ir(tr_ir), .tr_done(tr_done), .tr_we(tr_we),
     .tr_flags(tr_flags), .tr_next_pc(tr_next_pc),
+    .w_mem_done(w_mem_done),
     .badop(badop),
     .h_badop_clr_we(h_badop_clr_we), .h_badop_clr(h_badop_clr)
 );

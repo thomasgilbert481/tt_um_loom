@@ -65,6 +65,7 @@ module loom_wait_props #(
     input wire [9:0]  pcx,
     input wire [15:0] irx,
     input wire        bad_op,
+    input wire        dec_ok,       // an instruction is really in X (6.11: not an LD/ST completion)
     input wire        is_waitd,
     input wire        wait_class,
     input wire        first_issue,
@@ -109,7 +110,10 @@ module loom_wait_props #(
     if (h_dbg_req && h_dbg_wr) assume (!thread_busy[h_dbg_thread]);
   end
 
-  wire x_wd = vx && is_waitd && !bad_op;
+  // `dec_ok`, not `!bad_op`: since slice B the completion slot of an LD/ST
+  // carries a data word that decodes to nothing (SEMANTICS 6.11), and
+  // `bad_op` is low there because it is qualified by `xins` itself.
+  wire x_wd = vx && is_waitd && dec_ok;
 
   // ==================================================================
   // WAIT-1A. SEMANTICS 6.4, the three sentences quoted in the header.
@@ -153,7 +157,7 @@ module loom_wait_props #(
         assume ((s_tint == 16'd1) && (s_tfrac == 8'd0));
 
       wire x_mine  = vx && (tx_th == t[1:0]);
-      wire x_wd_me = x_mine && is_waitd && !bad_op;
+      wire x_wd_me = x_mine && is_waitd && dec_ok;
       wire host_t  = h_reset[t]
                      | (h_dbg_req & h_dbg_wr & (h_dbg_thread == t[1:0]));
 
@@ -232,7 +236,7 @@ endmodule
 // The port expressions are elaborated in the scope of the loom_core instance.
 bind loom_core loom_wait_props u_wait_props (
     .clk(clk), .rst_n(rst_n),
-    .vx(vx), .tx_th(tx_th), .pcx(pcx), .irx(irx), .bad_op(bad_op),
+    .vx(vx), .tx_th(tx_th), .pcx(pcx), .irx(irx), .bad_op(bad_op), .dec_ok(dec_ok),
     .is_waitd(is_waitd), .wait_class(wait_class), .first_issue(first_issue),
     .x_now(x_now), .x_td(x_td), .td_new(td_new),
     .reach_td_new(reach_td_new), .x_done(x_done), .x_stall(x_stall),

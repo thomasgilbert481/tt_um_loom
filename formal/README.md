@@ -366,6 +366,23 @@ Neither is an RTL bug: WAIT-1A (`wait.sby:prove`) shows the completion rule
 is exactly SEMANTICS 6.4's, and TIMER-1C (proved) shows `NOW` never jumps.
 This is a wording correction to `docs/VERIFICATION.md`, like F-1.
 
+### F-6 the properties went stale when slice B added a slot that decodes nothing
+
+Not a design finding, and recorded because it is the failure mode to watch for
+whenever the pipeline gains a new kind of slot. ISA-2A/2C (generated) and
+WAIT-1A (hand-written) took `!bad_op` to mean "an instruction is in X".
+Slice B's LD/ST completion slot (SEMANTICS 6.11) carries the *data* word
+through D and X and decodes none of it; the RTL gates every decode effect
+with `dec_ok = xins & ~bad_op`, and `bad_op` is itself qualified by `xins`,
+so it reads 0 there. A data word that happened to look like a reserved word
+or a `WAITD` therefore satisfied each property's antecedent in a slot that
+executes no instruction, and the CI run on 54ebaa1 (35871222710) failed both
+at depth 4 and 5. ISA-2A/2C now exclude `w_mem_done` (the completion slot in
+W; `formal/gen_isa_props.py`) with a new cover showing the exclusion is
+reachable, and WAIT-1A uses `dec_ok`. The co-simulation had covered LD/ST all
+along and found no divergence: the design was right and the proofs were the
+thing that had not been told.
+
 ## ISO-1: what the miter assumes
 
 ISO-1 is the one L4 property that is a relation between two traces, so it is
