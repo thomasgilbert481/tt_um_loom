@@ -281,14 +281,17 @@ Exit: slices A and B hardened inside the D-025 budget; `ws2812`, `ps2_host`,
 their L3 tests on the golden model and on the RTL; ISO-1 attempted and its
 result recorded, bounded or proved.
 
-- [ ] D-028 (the host's TD write leaves rule 2; Thomas delegated the call,
+- [x] D-028 (the host's TD write leaves rule 2; Thomas delegated the call,
       Fable took it 2026-09-22). Done the same day: SEMANTICS 6.10,
       HOST_PROTOCOL, model, `loom_timer`, regression tests on both sides,
       formal TIMER-2 proved. Open: its hardening, which is the slow-corner
       measurement and sets the baseline the slices are read against: run
       35773244433 was cancelled at 54 minutes by a push that carried a local
       commit touching `src/loom_isa.vh` (the trap is now in CLAUDE.md); run
-      35779039938 on e64f18a, the same netlist, started 20:15 UTC.
+      35779039938 on e64f18a, the same netlist, started 20:15 UTC and passed
+      every job on 2026-09-23: routing 2 h 57 min, Metal3 overflow 1,248
+      (the lowest yet), typ +3.56 ns, slow -6.36 ns on a new worst path
+      (host debug thread select to `pin_oe_reg[6]`); D-031 proposed.
 - [ ] One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
       the pinned PDK) to the end of global routing and stop? Record the answer
       in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow
@@ -637,3 +640,16 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   going and a src push would cancel it. Firmware agent (ws2812, ps2_host,
   then jtag/swd) still running. Next: read run 35779039938 (AREA.md, D-028
   outcome), push, and its follow-on hardening is slice A's D-025 reading.
+- 2026-09-23 (small hours), Fable 5.1: the D-028 hardening passed and was
+  read (AREA.md); the slow corner did not close and the typical margin
+  dropped to +3.56 ns on a logic deletion, so D-031 (registered one-hot
+  host thread select) is proposed for after the slices. Six agents'
+  work integrated in one night: slice A (RTL + model, cosim 40 seeds
+  clean), slice B (RTL + model, per-thread held access, cosim 40 seeds
+  clean), four M3 firmware programs with models and tests plus the
+  `.bounded` declaration, ISO-1 proved unbounded, WAIT-1A proved, SCHED-2
+  extended and SCHED-4 added (BUGS 6). Pushed up to 8c487cc (slice A's
+  hardware only): run 35812463112 is slice A's D-025 reading. Slice B
+  (b32c152) and later docs stay local until that run finishes; then push
+  b32c152 for slice B's reading. Next: read 35812463112; push slice B;
+  then D-031; then the USB LS, CAN and I2C EEPROM firmware on the slices.

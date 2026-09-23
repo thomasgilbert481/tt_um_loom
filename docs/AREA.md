@@ -18,6 +18,8 @@ Reading of the M1 row: the design fits and is tape-out clean at the sign-off cor
 Reading of the macro row: the macro freed a third of the core (stdcell area 710,760 -> 419,165 um2) and the whole typical-corner margin came back (+1.45 -> +6.21 ns). The slow corner is down to two paths, both far more buffering than logic: 22 endpoints behind the deadline-latch fire logic, whose host thread decode went through `buf_1` fanout buffers with slews up to 1.85 ns ahead of a 16-bit subtract (D-022 moved the decode behind the subtract and was then reverted: it cost more in routing than it bought in slack, see the section below), and one `tx_th` path through a series chain of six `buf_1` (-0.26 ns). The flow's settings explain the weak buffering: `SYNTH_STRATEGY` "AREA 0", `MAX_FANOUT_CONSTRAINT` 10, `RUN_POST_GRT_RESIZER_TIMING` false, `PL_TIMING_DRIVEN` false; only the typical corner is sign-off (`TIMING_VIOLATION_CORNERS` `*typ*`). Knobs to try if slow-corner closure is wanted: a DELAY synthesis strategy, post-GRT resizer timing, timing-driven placement (each costs one 4-hour hardening to evaluate, and `src/config.json` changes need a DECISIONS entry).
 | 2026-09-20 | M2 + macro + D-023, everything green | main f081f4a (D-023 pads, D-022 reverted, TICK_SEEN fix), run 35524275302, 6x4 | 28,842 stdcells + 1 macro | 3,028 | 51.4% | typ +5.98 ns; fast +10.92 ns; slow -2.48 ns (23 endpoints, TNS -38.7 ns); hold +0.28 typ, 0 violations | **every job passed**: gds 4 h 45 min, precheck 1 h 47 min, gl_test 71/71 in 12.7 min (the widened list), viewer. DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10, the same four stripe crossings D-021 watches; stdcell area 418,678 um2; power 11.8 mW; detailed routing 3 h 37 min, Metal3 overflow 3,169; +17 cells against the run before it, which is D-023's pad gate |
 
+| 2026-09-23 | M2 + D-028 (the host's TD write out of the latch-fire cone) | main e64f18a (ccc03b0's netlist), run 35779039938, 6x4 | 28,803 stdcells + 1 macro | 3,028 | 51.4% | typ +3.56 ns; fast +9.38 ns; slow -6.36 ns (36 endpoints, TNS -137.6 ns); hold +0.28 typ / +0.61 slow / +0.09 fast, 0 violations | **every job passed**: gds 4 h 05 min, precheck 1 h 46 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic overlaps 10 (D-021's four crossings); stdcell area 418,872 um2; power 11.6 mW; detailed routing 2 h 57 min, Metal3 overflow 1,248 (total 1,277), the lowest yet; max-slew 116 slow / 23 typ, max-cap 31-32. The 22 latch-fire endpoints of the previous rows are gone, as D-028 intended, and the worst path at both corners is now host debug thread select -> a 4:1 select of per-thread state -> a long, weakly buffered chain (buf_1 fanout buffers with slews of 1.9 to 3.2 ns, two hold-fix delay cells at the end) -> `pin_oe_reg[6]`. Typical margin fell from +5.98 to +3.56 ns on a change that only deleted logic, which says the earlier margin was partly placement luck: judge the typical corner's margin with that variance in mind before adding logic |
+
 ### Routing time is the binding constraint, 2026-09-20
 
 | Run | Design | GRT overflow (Metal3 / total) | Detailed routing | gds job |
@@ -25,6 +27,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 35419160398 | macro core, d41fe34 | 1,768 / 1,804 | 3 h 03 min | 3 h 53 min, finished |
 | 35470401774 | the same plus D-022 (+2.2% cells) | 5,776 / 5,883 | 5 h 15 min for the first pass, 0 violations, antenna pass still to run | **cancelled at GitHub's 6 h limit** |
 | 35524275302 | D-022 reverted, plus D-023's 17 cells | 3,169 / 3,271 | 3 h 37 min | 4 h 45 min, finished |
+| 35779039938 | D-028 (host TD writes out of the latch-fire cone; 39 cells fewer) | 1,248 / 1,277 | 2 h 57 min | 4 h 05 min, finished |
 
 Detailed routing is the long pole of the whole flow and it is superlinear in
 congestion: two per cent more cells, concentrated in the timers, tripled the
@@ -57,3 +60,20 @@ smaller version of the change itself (D-022's outcome note).
 | + M3 slice A: encoders, stuffing, DIFF (D-026, 2026-09-22) | 19,850 (from 19,164 before it) | 3,089 (+61) | 62 | measured by the RTL agent with `synth -top tt_um_loom -flatten` on the macro's port stub read as a blackbox, which reproduces the flop count and the ltp of the rows above but not their cell count (19,164 for the same design the row above the D-022 one reports as 19,493: a different Yosys read of the macro stub), so the delta is the number: +686 cells (+3.6 per cent), of which 52 flops are narrow per-thread state in `loom_be` and the rest one shared encoder/stuffer/decoder cone in the X stage behind `xsel`. No new deep path. Its hardening, after run 35779039938, is the D-025 reading |
 | + M3 slice B: LD/ST on the instruction memory (D-027, 2026-09-22) | 20,512 (+662 at the chip level; +593 in `loom_core`) | 3,154 (+65 at the chip level, +136 in `loom_core`: 104 for the per-thread held access, 20 for the section-5 state, 12 in the W stage; the port-only macro stub prunes the write-data path at the top) | 60 | measured by the RTL agent with the recipe of the row above (its base reproduces slice A's 3,089 flops). Per-thread held address and store word after the D-027 amendment; `dec_ok` gates every decode-driven effect off in a completion slot. Its hardening, after slice A's, is the D-025 reading |
 
+
+### The slow corner after D-028, 2026-09-23
+
+D-028 removed the family it aimed at (the 22 endpoints behind the latch-fire
+subtractor), and the run also routed fastest of any so far. The corner did
+not close: the worst path (-6.36 ns slow, +3.56 ns typical, `pin_oe_reg[6]`)
+still starts at the host's debug thread select, `h_dbg_thread`, which the
+host side decodes with a 2-bit compare that fans out to every per-thread
+register's write enable and to the 4:1 selects of the debug read path,
+exactly the shape D-019 removed from the W stage. The cells on the path
+show what costs the time: `buf_1` fanout buffers driving 0.3 pF with slews
+of 1.9 to 3.2 ns, and two hold-fix delay cells (1.3 ns) inserted for the
+fast corner. The structural fix to try, as D-031 after slices A and B have
+their D-025 readings, is the host-side twin of D-019: a registered one-hot
+thread select for the debug port, loaded from the ADDR byte cycles before
+the write strobe, so no thread-number decode sits on a host write path.
+Four flops, less fanout, and the E+4 rule of HOST_PROTOCOL untouched.

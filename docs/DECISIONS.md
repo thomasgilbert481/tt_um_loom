@@ -575,6 +575,17 @@ and re-pins the loading-edge reading through rule 1; formal TIMER-2 proved
 (`timer.sby:prove`, k-induction, 1 s) with three new cover points. The
 hardening of this commit is the slow-corner measurement.
 
+Outcome 2026-09-23 (run 35779039938, `docs/AREA.md`): the change did what
+it promised for the latch-fire cone (its 22 slow-corner endpoints are gone)
+and routed fastest of any run so far (Metal3 overflow 1,248, detailed
+routing 2 h 57 min, gds 4 h 05 min), but the corner did not close: the
+worst path is now host debug thread select to `pin_oe_reg[6]` through a
+weakly buffered chain, -6.36 ns at the slow corner and +3.56 ns at the
+typical one (was +5.98 for a netlist that only lost logic, so the earlier
+margin was partly placement luck). The datasheet states both clocks, 50
+MHz at the typical corner and 38 MHz over every corner, and D-031 below is
+the structural follow-up.
+
 ## D-029 2026-09-22 Fable: stretch scope: USB low-speed stays, CAN is firmware, 10 Mbit Manchester is cut as a target
 
 Decision: USB low-speed device keeps its slot, in manual mode at 1.5 Mbit/s
@@ -621,3 +632,19 @@ Rejected: keeping 2026-12-01 and spending the difference on another protocol
 Consequences: PLAN M3 ends 2026-11-01 with the slice C decision, M4 is the
 freeze and the evidence, M5's demo material is listings, waveforms, the
 gate-level log and the mutation table, with no video.
+
+## D-031 2026-09-23 Fable, proposed: a registered one-hot thread select for the host debug port
+
+Proposal (after slices A and B have their D-025 readings; one hardening of
+its own): the host side stops decoding `h_dbg_thread` with a 2-bit compare
+on every per-thread write enable and every debug read select, and instead
+loads a one-hot `h_sel[3:0]` register from the ADDR byte cycles before the
+data word's write strobe, the host-side twin of D-019's W-stage rings.
+Why: after D-028 the worst path at both corners still starts at
+`h_dbg_thread` (`docs/AREA.md`, the slow corner after D-028), and the
+typical corner's margin is down to +3.56 ns with two slices of logic still
+to harden. Four flops and less fanout; the E+4 commit rule of
+HOST_PROTOCOL is unchanged because the thread field is known long before
+the strobe. Rejected for now: flow knobs (each a whole-design change in
+cell selection); doing it inside the slice A or B hardening (D-025 wants
+one change per reading).

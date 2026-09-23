@@ -134,9 +134,16 @@ clean, precheck clean, gate-level tests 71 of 71. Timing at 20 ns: +5.98 ns
 setup at the typical corner (the flow's sign-off corner), +10.92 ns fast,
 and -2.48 ns at the slow corner (1.08 V, 125 C) on 23 endpoints of one
 block, so the clock guaranteed over every corner is 44 MHz and the nominal
-clock is 50 MHz with 6 ns of margin. [D-028, hardened after 2026-09-22,
-targets those 23 endpoints by deleting the host's thread decode from the
-path; its result replaces this sentence.]
+clock is 50 MHz with 6 ns of margin. D-028 (hardened 2026-09-23, run
+35779039938) removed those 23 endpoints by deleting the host's thread
+decode from the latch-fire path and routed fastest of any run (Metal3
+overflow 1,248); the worst path is now the host debug thread select into a
+pin register through weakly buffered logic, -6.36 ns at the slow corner
+and +3.56 ns at the typical one, so the numbers the datasheet states are
+50 MHz at the typical corner and 38 MHz over every corner, with D-031 (a
+registered one-hot host thread select) proposed as the next structural
+step. That a netlist which only lost logic also lost 2.4 ns of typical
+margin is itself a finding about the flow's placement variance.
 
 Routing time, not area, bounds the design: a two per cent increase in cells
 in one corner of the floorplan tripled the global router's Metal3 overflow
