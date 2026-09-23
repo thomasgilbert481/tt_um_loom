@@ -331,12 +331,15 @@ result recorded, bounded or proved.
       `two_slot`, the deadline checker prices them at two slots (test added),
       generated files refreshed. Data placement uses the existing `.org` and
       `.word`; the host's existing IMEM commands load and dump an image.
-- [ ] Slice B: 2026-09-22, RTL and model written from 6.11 by two agents
+- [x] Slice B: 2026-09-22, RTL and model written from 6.11 by two agents
       (per-thread held access after the model author's question 1; 14
       cocotb and 47 model tests; the generator addresses a data window;
-      generic synthesis +593 cells, +136 flops in `loom_core`). Open: the
-      hardening and its D-025 reading: run 35871222851 on 54ebaa1, started
-      2026-09-23 14:02 UTC, after slice A's passed.
+      generic synthesis +593 cells, +136 flops in `loom_core`). Hardened
+      2026-09-23 (run 35871222851 on 54ebaa1): every job passed, routing
+      3 h 29 min, Metal3 overflow 2,252, typ +3.56 ns, slow -6.08 ns,
+      54.7 per cent; stays under D-025, and meets the bar below for slice C.
+      Two formal properties (ISA-2A/2C, WAIT-1A) had to learn that the
+      completion slot decodes nothing; the design was right.
 - [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
       in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a
       Python host model, enumeration to SET_ADDRESS and one HID report

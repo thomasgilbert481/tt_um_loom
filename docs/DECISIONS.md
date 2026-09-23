@@ -539,6 +539,19 @@ programs from the first seed. Generic synthesis +593 cells and +136 flops in
 `loom_core`, longest path unchanged (`docs/AREA.md`). Its hardening follows
 slice A's; slice B stays only if it routes inside four hours (D-025).
 
+Outcome 2026-09-23 (run 35871222851 on 54ebaa1, `docs/AREA.md`): every job
+passed; detailed routing 3 h 29 min, Metal3 overflow 2,252 (below slice A's
+2,924, which says as much about placement variance as about slice B), gds
+4 h 38 min, typ +3.56 ns, slow -6.08 ns on 93 endpoints, utilisation 54.7 per
+cent. Under D-025 slice B stays. It also meets the bar PLAN set for slice C
+(Metal3 overflow under 3,500 and routing under 3 h 45 min), so slice C is
+open to decide on 2026-11-01 on the merits and on Thomas's interest, not
+ruled out by the budget. The formal job on the same commit failed, and that
+was the properties, not the design: ISA-2A/2C and WAIT-1A still took
+`!bad_op` to mean "an instruction is in X", which slice B's completion slot
+(a data word that decodes to nothing) made false; fixed by qualifying them
+with `w_mem_done` and `dec_ok` (`formal/README.md`).
+
 ## D-028 2026-09-22 Fable: the host's TD write leaves rule 2 of the deadline latch
 
 Decision (proposed to Thomas at the M2 review; Thomas delegated the call the
