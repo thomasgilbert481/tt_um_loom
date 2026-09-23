@@ -300,15 +300,15 @@ result recorded, bounded or proved.
       `SHO` per bit, USB and CAN stuffing and destuffing with a uniform run
       rule, the T flag, the differential output bit, the encoder state at
       debug 0x27, `CAPS[9]`. ARCHITECTURE 8.1 kept in step.
-- [ ] Slice A: 2026-09-22, RTL and golden model written from that text by
+- [x] Slice A: 2026-09-22, RTL and golden model written from that text by
       two agents that never saw each other's code (spec questions and
       rulings in `docs/spec-questions/{rtl,loomsim}-m3a.md`); L1-BE-ENC and
       L1-BE-STUFF on both sides (8 cocotb, 67 model tests); the
       co-simulation generator drives `ENC`, `STUFF` and `DIFF` with 25 new
       coverage bins and finds no divergence; generic synthesis +686 cells,
-      +61 flops, longest path unchanged (`docs/AREA.md`). Open: the
-      hardening and its D-025 reading, after run 35779039938 (D-028)
-      finishes; a push before that would cancel it.
+      +61 flops, longest path unchanged (`docs/AREA.md`). Hardened
+      2026-09-23 (run 35812463112): every job passed, routing 3 h 27 min,
+      Metal3 overflow 2,924, typ +4.80 ns, slow -4.04 ns; stays under D-025.
 - [x] 2026-09-22: firmware with no RTL, by an agent in parallel with slice A:
       `ws2812` (`SETP ... D` pulses, every edge clock-exact), `ps2_host`,
       `jtag_master` (IDCODE read), `swd_master` (DPIDR read, bidirectional
@@ -335,7 +335,8 @@ result recorded, bounded or proved.
       (per-thread held access after the model author's question 1; 14
       cocotb and 47 model tests; the generator addresses a data window;
       generic synthesis +593 cells, +136 flops in `loom_core`). Open: the
-      hardening and its D-025 reading, after slice A's.
+      hardening and its D-025 reading: run 35871222851 on 54ebaa1, started
+      2026-09-23 14:02 UTC, after slice A's passed.
 - [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
       in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a
       Python host model, enumeration to SET_ADDRESS and one HID report

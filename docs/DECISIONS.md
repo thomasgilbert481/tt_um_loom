@@ -477,6 +477,12 @@ flops, longest path unchanged (`docs/AREA.md`); the hardening after run
 35779039938 is the D-025 reading, and slice A stays only if it routes
 inside four hours.
 
+Outcome 2026-09-23 (run 35812463112 on 8c487cc, `docs/AREA.md`): every
+job passed; detailed routing 3 h 27 min, Metal3 overflow 2,924, gds 4 h 36
+min, typ +4.80 ns, slow -4.04 ns, gate-level tests including the slice A
+ones. Under D-025 slice A stays, and its baseline (under 3,500 overflow and
+3 h 45 min of routing) lets slice B stack on it.
+
 ## D-027 2026-09-22 Fable: data memory is the instruction memory, reached by LD/ST through the thread's own fetch cycle
 
 Decision: `LD` and `ST` are built as two-slot instructions on the 512-word

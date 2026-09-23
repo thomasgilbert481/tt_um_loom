@@ -20,6 +20,8 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 
 | 2026-09-23 | M2 + D-028 (the host's TD write out of the latch-fire cone) | main e64f18a (ccc03b0's netlist), run 35779039938, 6x4 | 28,803 stdcells + 1 macro | 3,028 | 51.4% | typ +3.56 ns; fast +9.38 ns; slow -6.36 ns (36 endpoints, TNS -137.6 ns); hold +0.28 typ / +0.61 slow / +0.09 fast, 0 violations | **every job passed**: gds 4 h 05 min, precheck 1 h 46 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic overlaps 10 (D-021's four crossings); stdcell area 418,872 um2; power 11.6 mW; detailed routing 2 h 57 min, Metal3 overflow 1,248 (total 1,277), the lowest yet; max-slew 116 slow / 23 typ, max-cap 31-32. The 22 latch-fire endpoints of the previous rows are gone, as D-028 intended, and the worst path at both corners is now host debug thread select -> a 4:1 select of per-thread state -> a long, weakly buffered chain (buf_1 fanout buffers with slews of 1.9 to 3.2 ns, two hold-fix delay cells at the end) -> `pin_oe_reg[6]`. Typical margin fell from +5.98 to +3.56 ns on a change that only deleted logic, which says the earlier margin was partly placement luck: judge the typical corner's margin with that variance in mind before adding logic |
 
+| 2026-09-23 | M3 slice A: encoders, stuffing, DIFF (D-026) on D-028 | main 8c487cc, run 35812463112, 6x4 | 30,008 stdcells + 1 macro (+1,205) | 3,089 | 52.7% | typ +4.80 ns; fast +10.13 ns; slow -4.04 ns (50 endpoints); hold +0.31 typ / +0.65 slow / +0.12 fast, 0 violations | **every job passed**: gds 4 h 36 min, precheck 1 h 57 min, gl_test pass (the slice A tests at gate level too), viewer; DRC 0, LVS 0, antenna 0; Magic overlaps 10; stdcell area 430,316 um2; power 11.7 mW; detailed routing 3 h 27 min, Metal3 overflow 2,924 (total 3,004); max-slew 160 slow / 34 typ. D-025's reading: routing under 4 h and overflow under 4,000, so slice A stays; the baseline is also under 3,500 and 3 h 45 min, so slice B may stack on it. Typical margin +4.80 against +3.56 on the run before (a logic deletion) and +5.98 before that: three runs within 2.4 ns of each other are the flow's variance, not the design's trend |
+
 ### Routing time is the binding constraint, 2026-09-20
 
 | Run | Design | GRT overflow (Metal3 / total) | Detailed routing | gds job |
@@ -28,6 +30,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 35470401774 | the same plus D-022 (+2.2% cells) | 5,776 / 5,883 | 5 h 15 min for the first pass, 0 violations, antenna pass still to run | **cancelled at GitHub's 6 h limit** |
 | 35524275302 | D-022 reverted, plus D-023's 17 cells | 3,169 / 3,271 | 3 h 37 min | 4 h 45 min, finished |
 | 35779039938 | D-028 (host TD writes out of the latch-fire cone; 39 cells fewer) | 1,248 / 1,277 | 2 h 57 min | 4 h 05 min, finished |
+| 35812463112 | slice A on that (+1,205 cells, +61 flops) | 2,924 / 3,004 | 3 h 27 min | 4 h 36 min, finished |
 
 Detailed routing is the long pole of the whole flow and it is superlinear in
 congestion: two per cent more cells, concentrated in the timers, tripled the
