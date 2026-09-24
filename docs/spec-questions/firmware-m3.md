@@ -251,8 +251,9 @@ change of meaning.** Memory nothing wrote stays unspecified in SEMANTICS,
 as it must for silicon. The model backend of `tools/tests/fw_backend.py`
 should fail a scenario whose program fetches or `LD`s a word the image never
 loaded and nothing stored, the check `test/tb.v` makes on the RTL, so the
-model run finds it first and names the address. Open: tools work, before
-the firmware freeze (2026-12-01); `docs/PLAN.md` M4.
+model run finds it first and names the address. Built 2026-09-24 (b809321):
+`Machine.unloaded_reads` and `on_unloaded_read` in `tools/loomsim`, and the
+model backend raises `UnloadedReadError` at the read.
 
 ## 10. usb_ls_device: needs the whole memory, and one idiom per tight path
 
@@ -414,3 +415,8 @@ another thread's reset vector, so the reader of the listing sees it.
 as tools work before the firmware freeze (2026-12-01, `docs/PLAN.md` M4):
 the listing marks a section that crosses another thread's reset vector,
 and the thread summary names the threads that must then not be started.
+Built 2026-09-24, wider than asked: data at a reset vector blocks the thread
+too, even in its own section (`i2c_slave_eeprom`'s window starts at thread
+3's vector). `Program.unstartable` carries the set; the listings now say
+thread 2 for `can_loopback`, thread 3 for `i2c_slave_eeprom` and threads 1
+to 3 for `usb_ls_device`.

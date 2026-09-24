@@ -100,6 +100,12 @@ class Program:
     word_info: List[WordInfo] = dataclasses.field(default_factory=list)
     #: address -> the reason of the ``.bounded`` declaration on it
     bounded: Dict[int, str] = dataclasses.field(default_factory=dict)
+    #: thread -> the word at its reset vector, for each thread whose reset
+    #: vector holds a word of another thread's section, or data of any
+    #: section: that thread must not be started with this image, since it
+    #: would begin executing there (``docs/spec-questions/firmware-m3.md``
+    #: item 16). A note in the listing, not a diagnostic.
+    unstartable: Dict[int, WordInfo] = dataclasses.field(default_factory=dict)
 
     @property
     def errors(self) -> List[Diagnostic]:
@@ -764,6 +770,12 @@ class _Assembler:
                 program.threads[thread] = ThreadInfo(
                     thread=thread, entry=self.first_addr[thread],
                     size=self.count[thread])
+        at = {info.addr: info for info in self.word_info}
+        for thread in range(self.threads):
+            info = at.get(self.thread_origin(thread))
+            if info is not None and (info.thread != thread
+                                     or info.timing == "data"):
+                program.unstartable[thread] = info
         # A file that did not assemble has holes in its control-flow graph, so
         # its deadline numbers would be noise on top of the real errors.
         if run_deadline_check and not any(d.fatal for d in self.diagnostics):

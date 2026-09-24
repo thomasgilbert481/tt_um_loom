@@ -801,3 +801,30 @@ def test_disassembler_omits_a_clear_timeout_bit_and_names_enums():
     assert disassemble(ISA.encode("WAITB", cond=2, tmo=0), ISA) == "WAITB INQ_NE"
     assert disassemble(ISA.encode("CSRR", rd=3, csr=9), ISA) == "CSRR r3, NOW"
     assert disassemble(ISA.encode("RET"), ISA) == "RET"
+
+
+# ------------------------------------ reset vectors held by another section
+# docs/spec-questions/firmware-m3.md item 16: a note, never a diagnostic.
+
+def test_a_section_running_into_the_next_quarter_blocks_that_thread():
+    body = "\n".join(["        NOP"] * 70)            # 0x40 + 70 > 0x80
+    program = asm(".imem 256\n.thread 1\n" + body + "\n        HALT\n")
+    assert program.ok and not program.warnings
+    assert sorted(program.unstartable) == [2]
+    assert program.unstartable[2].thread == 1
+    text = program.listing_text()
+    assert "thread 2's reset vector: thread 2 must not be started" in text
+    assert "; thread 2 must not be started: its reset vector 0x080 holds code of thread 1's section" in text
+
+
+def test_data_at_a_reset_vector_blocks_that_thread_even_in_its_own_section():
+    program = asm(".imem 256\n.thread 0\n        HALT\n"
+                  ".thread 3\n        .org 0xC0\n        .word 0xFFFF\n")
+    assert sorted(program.unstartable) == [3]
+    assert "holds data of thread 3's section" in program.listing_text()
+
+
+def test_threads_that_keep_to_their_quarters_block_nothing():
+    program = asm(".imem 256\n.thread 0\n        HALT\n.thread 1\n        HALT\n")
+    assert program.unstartable == {}
+    assert "must not be started" not in program.listing_text()

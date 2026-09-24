@@ -55,11 +55,23 @@ def build_listing(program: "Program", stmts: "List[Stmt]", isa: Isa) -> List[str
             if info.bounded:
                 lines.append(_blank_row(
                     "", "| bounded by declaration: %s" % info.bounded))
+            for thread, held in sorted(program.unstartable.items()):
+                if held.addr == info.addr:
+                    lines.append(_blank_row(
+                        "", "| thread %d's reset vector: thread %d must not "
+                            "be started with this image" % (thread, thread)))
 
     lines.append("")
     if program.deadlines:
         lines.extend(all_summary_lines(
             program.deadlines[t] for t in sorted(program.deadlines)))
+    for thread, held in sorted(program.unstartable.items()):
+        lines.append(
+            "; thread %d must not be started: its reset vector 0x%03X holds "
+            "%s of thread %d's section (line %d)" % (
+                thread, held.addr,
+                "data" if held.timing == "data" else "code",
+                held.thread, held.line))
     errors = program.errors
     warnings = program.warnings
     lines.append("%d word%s, %d thread%s, %d error%s, %d warning%s" % (

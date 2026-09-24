@@ -398,11 +398,11 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
       remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
       the RTL, the two open timer mutants closed (one by D-028 if taken).
-      Two tools items from the M3 firmware rulings: the model backend fails
-      a scenario that fetches or `LD`s a word the image never loaded
-      (firmware-m3 item 9, the check `test/tb.v` makes on the RTL), and the
-      assembler's listing marks a section that crosses another thread's
-      reset vector (item 16).
+      Two tools items from the M3 firmware rulings, both done 2026-09-24:
+      the model backend fails a scenario that fetches or `LD`s a word the
+      image never loaded (firmware-m3 item 9, the check `test/tb.v` makes
+      on the RTL), and the assembler's listing marks a thread whose reset
+      vector holds another section's word or data (item 16).
 - [ ] Mutation re-run on the freeze commit. The 99.7 per cent in M2 was
       measured on the M2 RTL; slices A and B, D-028 and D-031 have changed
       `loom_core`, `loom_timer`, `loom_be` and `loom_host_ctl` since, and a

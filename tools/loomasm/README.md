@@ -261,7 +261,14 @@ unless `.org` moved it, and `size` is how many words the thread emitted.
 **Listing** (`--listing [FILE]`): address, word, thread, timing class from
 `isa.yaml` (`one_slot`, `wait`, `blocking`), source line number and source text,
 with the extra words of a multi-word statement shown disassembled underneath.
-Each thread's deadline analysis follows.
+Each thread's deadline analysis follows. When a thread's reset vector holds a
+word of another thread's section, or data of any section, starting that thread
+would run it: the listing marks the word (`| thread 2's reset vector: thread 2
+must not be started with this image`) and the last lines say which threads
+must not be started, for example `; thread 2 must not be started: its reset
+vector 0x100 holds code of thread 1's section (line 291)`. It is a note, not a
+diagnostic, so `--strict` is unaffected; `Program.unstartable` carries the same
+set for tools (`docs/spec-questions/firmware-m3.md` item 16).
 
 **Diagnostics** go to stderr as `file:line:col: severity: message`. Every error
 in the file is reported. Diagnostics carry a `kind`: `syntax`, `symbol`,
