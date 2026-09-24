@@ -112,7 +112,7 @@ module loom_host_ctl #(
     // ---------------------------------------------------------- debug port
     output reg               h_dbg_req,
     output reg               h_dbg_wr,
-    output reg  [1:0]        h_dbg_thread,
+    output reg  [3:0]        h_dbg_sel,    // one-hot debug thread (D-031)
     output reg  [7:0]        h_dbg_reg,
     output reg  [15:0]       h_dbg_wdata,
     input  wire              h_dbg_ack,
@@ -494,7 +494,7 @@ module loom_host_ctl #(
     if (!rst_n) begin
       h_dbg_req    <= 1'b0;
       h_dbg_wr     <= 1'b0;
-      h_dbg_thread <= 2'd0;
+      h_dbg_sel    <= 4'b0001;         // thread 0, as the binary field was
       h_dbg_reg    <= 8'd0;
       h_dbg_wdata  <= 16'd0;
     end else if (h_dbg_req && h_dbg_ack) begin
@@ -503,12 +503,12 @@ module loom_host_ctl #(
     end else if (fetch_go && (space == SP_DBG)) begin
       h_dbg_req    <= 1'b1;
       h_dbg_wr     <= 1'b0;
-      h_dbg_thread <= addr[9:8];
+      h_dbg_sel    <= 4'b0001 << addr[9:8];
       h_dbg_reg    <= addr[7:0];
     end else if (cs_active && byte_done && (st == S_WLO) && (space == SP_DBG)) begin
       h_dbg_req    <= 1'b1;
       h_dbg_wr     <= 1'b1;
-      h_dbg_thread <= addr[9:8];
+      h_dbg_sel    <= 4'b0001 << addr[9:8];
       h_dbg_reg    <= addr[7:0];
       h_dbg_wdata  <= wr_word;
     end

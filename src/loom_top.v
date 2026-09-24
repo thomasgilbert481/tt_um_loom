@@ -142,7 +142,7 @@ module loom_top #(
   wire [7:0]  h_sfset, h_sfclr;
   wire [15:0] h_badop_clr;
   wire        h_dbg_req, h_dbg_wr, h_dbg_ack;
-  wire [1:0]  h_dbg_thread;
+  wire [3:0]  h_dbg_sel;
   wire [7:0]  h_dbg_reg;
   wire [15:0] h_dbg_wdata, h_dbg_rdata;
   wire [3:0]  run, halted, swirq;
@@ -182,7 +182,7 @@ module loom_top #(
       .h_outq_pop(h_outq_pop), .h_badop_set14(h_badop_set14),
       .fifo_stat(fifo_stat), .outq_head(outq_head), .outq_next(outq_next),
       .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
-      .h_dbg_thread(h_dbg_thread), .h_dbg_reg(h_dbg_reg),
+      .h_dbg_sel(h_dbg_sel), .h_dbg_reg(h_dbg_reg),
       .h_dbg_wdata(h_dbg_wdata), .h_dbg_ack(h_dbg_ack),
       .h_dbg_rdata(h_dbg_rdata),
       .run(run), .halted(halted), .badop(badop), .sflags(sflags),
@@ -214,7 +214,7 @@ module loom_top #(
       .h_outq_pop(h_outq_pop), .h_badop_set14(h_badop_set14),
       .fifo_stat(fifo_stat), .outq_head(outq_head), .outq_next(outq_next),
       .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
-      .h_dbg_thread(h_dbg_thread), .h_dbg_reg(h_dbg_reg),
+      .h_dbg_sel(h_dbg_sel), .h_dbg_reg(h_dbg_reg),
       .h_dbg_wdata(h_dbg_wdata), .h_dbg_ack(h_dbg_ack),
       .h_dbg_rdata(h_dbg_rdata),
       .h_pout_we(h_pout_we), .h_pout(h_pout),

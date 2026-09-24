@@ -91,7 +91,8 @@ module loom_wait_props #(
     input wire [3:0]  h_reset,
     input wire        h_dbg_req,
     input wire        h_dbg_wr,
-    input wire [1:0]  h_dbg_thread
+    input wire [1:0]  h_dbg_thread,
+    input wire [3:0]  h_dbg_sel
 );
 
   reg f_past_valid = 1'b0;
@@ -108,6 +109,10 @@ module loom_wait_props #(
   always @(*) if (f_past_valid && rst_n) begin
     assume ((h_reset & ~thread_busy) == h_reset);
     if (h_dbg_req && h_dbg_wr) assume (!thread_busy[h_dbg_thread]);
+    // D-031: the debug thread select is one-hot, as loom_host_ctl makes it
+    // (reset 0001, every load 0001 << addr[9:8]). ($onehot written out:
+    // the slang frontend does not have it.)
+    assume (h_dbg_sel != 4'd0 && (h_dbg_sel & (h_dbg_sel - 4'd1)) == 4'd0);
   end
 
   // `dec_ok`, not `!bad_op`: since slice B the completion slot of an LD/ST
@@ -245,7 +250,7 @@ bind loom_core loom_wait_props u_wait_props (
     .tick_int_all(tick_int_all), .tick_frac_all(tick_frac_all),
     .run_r(run_r), .step_req_r(step_req_r), .thread_busy(thread_busy),
     .h_reset(h_reset), .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
-    .h_dbg_thread(h_dbg_thread)
+    .h_dbg_thread(h_dbg_thread), .h_dbg_sel(h_dbg_sel)
 );
 
 `default_nettype wire

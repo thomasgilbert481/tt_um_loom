@@ -68,7 +68,7 @@ module loom_timer (
     // Host port: debug writes and CTRL.RESET (TD <= NOW) while halted.
     input  wire [3:0]  h_reset,       // bit t: reset thread t, TD := NOW
     input  wire        h_we,
-    input  wire [1:0]  h_thread,
+    input  wire [3:0]  h_sel,         // one-hot host debug thread (D-031)
     input  wire        h_td_we,
     input  wire        h_dt_we,
     input  wire        h_tint_we,
@@ -97,7 +97,7 @@ module loom_timer (
       reg [7:0]  tick_frac;
 
       wire        mine     = cm_sel[t];
-      wire        h_mine   = h_we && (h_thread == t[1:0]);
+      wire        h_mine   = h_we && h_sel[t];
 
       wire [15:0] tint_eff = (tick_int == 16'd0) ? 16'd1 : tick_int;
       wire [23:0] period   = {tint_eff, tick_frac};

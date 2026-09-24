@@ -140,7 +140,7 @@ of r0..r7 may wait up to three more edges for the register-file write port.
 | `fifo_stat[47:0]` | in | per thread, 12 bits each: `{OUTQ_COUNT[3:0], INQ_COUNT[3:0], OUTQ_EMPTY, OUTQ_FULL, INQ_EMPTY, INQ_FULL}` |
 | `outq_head[63:0]`, `outq_next[63:0]` | in | per thread: the OUTQ head entry and the entry after it (for a word loaded at the edge where the previous word is popped) |
 | `h_dbg_req`, `h_dbg_wr` | out | level: debug request, held until `h_dbg_ack` |
-| `h_dbg_thread[1:0]`, `h_dbg_reg[7:0]`, `h_dbg_wdata[15:0]` | out | valid while `h_dbg_req` |
+| `h_dbg_sel[3:0]`, `h_dbg_reg[7:0]`, `h_dbg_wdata[15:0]` | out | valid while `h_dbg_req`. `h_dbg_sel` is the addressed thread one-hot, a register: reset `0001`, loaded `0001 << A[9:8]` with the rest of the request (D-031) |
 | `h_dbg_ack` | in | one-clock pulse; on a read `h_dbg_rdata` is valid in the same cycle |
 | `h_pout_we`/`h_pout[15:0]`, `h_poe_we`/`h_poe[7:0]`, `h_od_we`/`h_od[7:0]` | out | pulse: host writes to PIN_OUT, PIN_OE, OD_MASK |
 | `run`, `halted`, `badop`, `sflags`, `swirq`, `resetpc_all` | in | status, read back through CTRL |
@@ -259,7 +259,7 @@ The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`, `FIFO_DEPTH`.
 | `cw_out_mask[13:0]`, `cw_out_data[13:0]` | out | bit-masked write to PIN_OUT (bits 7:0 BIDIR, 13:8 OUT0..5), open-drain rule already applied. Valid during W |
 | `cw_oe_mask[7:0]`, `cw_oe_data[7:0]` | out | bit-masked write to PIN_OE, valid during W |
 | `cw_od_we`, `cw_od[7:0]` | out | write to OD_MASK, valid during W |
-| `h_*` (run control, debug) | in | see loom_host_ctl; every pulse takes effect at the next edge |
+| `h_*` (run control, debug) | in | see loom_host_ctl; every pulse takes effect at the next edge. The debug thread arrives one-hot (`h_dbg_sel`, D-031); the write side uses it as is, the read side encodes it to a thread number |
 | `h_inq_push[3:0]`, `h_fifo_wdata[15:0]`, `h_outq_pop[3:0]`, `h_badop_set14` | in | the host FIFO port of loom_host_ctl; each pulse takes effect at the next edge. A push into a full INQ is dropped and sets BADOP[14] |
 | `fifo_stat[47:0]`, `outq_head[63:0]`, `outq_next[63:0]` | out | FIFO status words and OUTQ entries for the host, register values valid every cycle |
 | `h_dbg_ack` | out | one-clock pulse; `h_dbg_rdata` is valid in the same cycle. A read or write of r0..r7 waits for a bubble slot, which arrives within 4 cycles |
@@ -363,7 +363,7 @@ flattened: thread `t` occupies `[16t+15:16t]` of the 16-bit vectors and
 | `cm_td_we`/`cm_td`, `cm_dt_we`/`cm_dt` | in | TD and DT writes from the W stage |
 | `cm_tint_we`/`cm_tint`, `cm_tfrac_we`/`cm_tfrac` | in | TICK_INT and TICK_FRAC writes; either also clears ACC and suppresses the tick at that edge |
 | `h_reset[3:0]` | in | CTRL RESET: `TD <= NOW` for that thread |
-| `h_we`, `h_thread[1:0]`, `h_td_we`, `h_dt_we`, `h_tint_we`, `h_tfrac_we`, `h_tseen_we`, `h_wdata[15:0]` | in | host debug writes; a TICK_INT/TICK_FRAC write clears ACC exactly as CSRW does; `h_tseen_we` writes TICK_SEEN (debug 0x24) |
+| `h_we`, `h_sel[3:0]`, `h_td_we`, `h_dt_we`, `h_tint_we`, `h_tfrac_we`, `h_tseen_we`, `h_wdata[15:0]` | in | host debug writes, `h_sel` the host's one-hot debug thread select (D-031); a TICK_INT/TICK_FRAC write clears ACC exactly as CSRW does; `h_tseen_we` writes TICK_SEEN (debug 0x24) |
 | `now_all[63:0]`, `td_all[63:0]`, `dt_all[63:0]` | out | NOW, TD, DT per thread |
 | `tick_int_all[63:0]`, `tick_frac_all[31:0]` | out | the period CSRs as written (0 is stored, and treated as 1 by the divider) |
 | `tick_seen_all[3:0]` | out | sticky tick flag, cleared at each valid slot commit. Only WAITB (M2) reads it |

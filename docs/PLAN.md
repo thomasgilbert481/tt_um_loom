@@ -340,6 +340,13 @@ result recorded, bounded or proved.
       54.7 per cent; stays under D-025, and meets the bar below for slice C.
       Two formal properties (ISA-2A/2C, WAIT-1A) had to learn that the
       completion slot decodes nothing; the design was right.
+- [ ] D-031 (Fable's proposal after D-028's reading): the host's debug
+      thread select becomes a one-hot register in `loom_host_ctl`, so the
+      timers' host write enables are ANDs with a flop instead of a 2-bit
+      compare in the slow-corner cone. Built 2026-09-23 (generic synthesis
+      -156 cells, +2 flops; check_all and the whole formal suite green);
+      its own hardening is the reading, against D-025 and against slice B's
+      slow corner (-6.08 ns).
 - [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
       in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a
       Python host model, enumeration to SET_ADDRESS and one HID report

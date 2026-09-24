@@ -77,6 +77,7 @@ module loom_sched_props #(
     input wire        h_dbg_req,
     input wire        h_dbg_wr,
     input wire [1:0]  h_dbg_thread,
+    input wire [3:0]  h_dbg_sel,
 
     // FIFO ports, for FIFO-1B.
     input wire [4*(FAW+1)-1:0] inq_cnt_all,
@@ -143,6 +144,10 @@ module loom_sched_props #(
   always @(*) if (f_past_valid && rst_n) begin
     assume ((h_reset & ~f_halted) == 4'd0);
     if (h_dbg_req && h_dbg_wr) assume (f_halted[h_dbg_thread]);
+    // D-031: the debug thread select is one-hot, as loom_host_ctl makes it
+    // (reset 0001, every load 0001 << addr[9:8]). ($onehot written out:
+    // the slang frontend does not have it.)
+    assume (h_dbg_sel != 4'd0 && (h_dbg_sel & (h_dbg_sel - 4'd1)) == 4'd0);
   end
 
   // ==================================================================
@@ -331,7 +336,7 @@ bind loom_core loom_sched_props #(.FIFO_DEPTH(4), .FAW(2)) u_sched_props (
     .valid_f(valid_f), .h_step_we(h_step_we), .h_step(h_step),
     .rf_we_oh(rf_we_oh),
     .h_reset(h_reset), .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
-    .h_dbg_thread(h_dbg_thread),
+    .h_dbg_thread(h_dbg_thread), .h_dbg_sel(h_dbg_sel),
     .inq_cnt_all(inq_cnt_all), .outq_cnt_all(outq_cnt_all),
     .cw_fifo(cw_fifo), .w_push(w_push), .w_pop(w_pop),
     .h_push_ok(h_push_ok), .h_outq_pop(h_outq_pop)

@@ -33,7 +33,7 @@ module loom_timer_props (
     input wire [3:0]  cm_sel,
     input wire        cm_td_we,
     input wire        h_we,
-    input wire [1:0]  h_thread,
+    input wire [3:0]  h_sel,
     input wire        h_td_we
 );
 
@@ -99,7 +99,7 @@ module loom_timer_props (
   always @(posedge clk) begin
     pc_now   <= c_now;
     pc_fire  <= lat_fire[0];
-    pc_h_td  <= h_we && h_td_we && (h_thread == 2'd0);
+    pc_h_td  <= h_we && h_td_we && h_sel[0];
     pc_cm_td <= cm_sel[0] && cm_td_we;
   end
   always @(posedge clk) if (f_past_valid && $past(rst_n)) begin
@@ -117,7 +117,7 @@ endmodule
 bind loom_timer loom_timer_props u_timer_props (
     .clk(clk), .rst_n(rst_n), .now_all(now_all), .td_all(td_all),
     .lat_fire(lat_fire), .cm_sel(cm_sel), .cm_td_we(cm_td_we),
-    .h_we(h_we), .h_thread(h_thread), .h_td_we(h_td_we)
+    .h_we(h_we), .h_sel(h_sel), .h_td_we(h_td_we)
 );
 
 `default_nettype wire

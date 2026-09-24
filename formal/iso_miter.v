@@ -191,6 +191,9 @@ module loom_iso_miter #(
   // transaction is suppressed whenever it would address T; the other
   // threads' traffic is independent. In mode 2 the whole port is copy A's,
   // so the host's debug traffic is the same in the two traces.
+  // The thread stays a binary field here, as in the host's address; each
+  // copy gets the one-hot select loom_host_ctl would make of it, 0001 <<
+  // thread (D-031).
   wire        dbg_all        = (DBG == 2);
   wire        dbg_t_a        = h_dbg_req_a & (h_dbg_thread_a == TT);
   wire        h_dbg_req_b1   = dbg_t_a ? 1'b1
@@ -258,7 +261,7 @@ module loom_iso_miter #(
       .h_outq_pop(h_outq_pop_a), .h_badop_set14(h_badop_set14_a),
       .fifo_stat(fstat_a), .outq_head(oqh_a), .outq_next(oqn_a),
       .h_dbg_req(dreq_a), .h_dbg_wr(h_dbg_wr_a),
-      .h_dbg_thread(h_dbg_thread_a), .h_dbg_reg(h_dbg_reg_a),
+      .h_dbg_sel(4'b0001 << h_dbg_thread_a), .h_dbg_reg(h_dbg_reg_a),
       .h_dbg_wdata(h_dbg_wdata_a), .h_dbg_ack(dack_a), .h_dbg_rdata(drd_a),
       .run(run_a), .halted(halted_a), .badop(badop_a), .sflags(sflags_a),
       .swirq(swirq_a), .resetpc_all(rpc_a), .core_busy(busy_a),
@@ -333,7 +336,7 @@ module loom_iso_miter #(
       .h_outq_pop(h_outq_pop_b), .h_badop_set14(h_badop_set14_b),
       .fifo_stat(fstat_b), .outq_head(oqh_b), .outq_next(oqn_b),
       .h_dbg_req(dreq_b), .h_dbg_wr(h_dbg_wr_b),
-      .h_dbg_thread(h_dbg_thread_b), .h_dbg_reg(h_dbg_reg_b),
+      .h_dbg_sel(4'b0001 << h_dbg_thread_b), .h_dbg_reg(h_dbg_reg_b),
       .h_dbg_wdata(h_dbg_wdata_b), .h_dbg_ack(dack_b), .h_dbg_rdata(drd_b),
       .run(run_b), .halted(halted_b), .badop(badop_b), .sflags(sflags_b),
       .swirq(swirq_b), .resetpc_all(rpc_b), .core_busy(busy_b),

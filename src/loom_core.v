@@ -184,7 +184,7 @@ module loom_core #(
 
     input  wire              h_dbg_req,
     input  wire              h_dbg_wr,
-    input  wire [1:0]        h_dbg_thread,
+    input  wire [3:0]        h_dbg_sel,      // one-hot debug thread (D-031)
     input  wire [7:0]        h_dbg_reg,
     input  wire [15:0]       h_dbg_wdata,
     output reg               h_dbg_ack,
@@ -427,8 +427,15 @@ module loom_core #(
   end
   wire [3:0] thread_busy = run_r | step_req_r | busy_f | infl;
 
+  // D-031: the host's debug thread arrives one-hot from a register in
+  // loom_host_ctl, loaded at the same edge as the rest of the request, so
+  // every write-side use below is an AND with a flop instead of a 2-bit
+  // compare fanned out to four threads (the worst path at both corners
+  // after D-028, docs/AREA.md). The read side, which is not timing-
+  // critical, still selects with the binary field, encoded here.
+  wire [1:0]  h_dbg_thread = {h_dbg_sel[3] | h_dbg_sel[2], h_dbg_sel[3] | h_dbg_sel[1]};
   wire        dbg_is_reg   = (h_dbg_reg[7:3] == 5'd0);
-  wire        dbg_running  = thread_busy[h_dbg_thread];
+  wire        dbg_running  = |(thread_busy & h_dbg_sel);
   wire        dbg_rf_wr_go = h_dbg_req &  h_dbg_wr & dbg_is_reg & ~dbg_running
                              & ~(w_valid & w_reg_we) & ~h_dbg_ack;
 
@@ -445,7 +452,7 @@ module loom_core #(
   // thread select is the one-hot ring, never a decoded thread number.
   wire       w_rf_write = w_valid & w_reg_we;
   wire [3:0] rf_we_oh   = ({4{w_rf_write}} & woh_rf)
-                          | ({4{dbg_rf_wr_go}} & (4'd1 << h_dbg_thread));
+                          | ({4{dbg_rf_wr_go}} & h_dbg_sel);
 
   loom_regfile u_rf (
       .clk(clk), .rst_n(rst_n),
@@ -560,7 +567,7 @@ module loom_core #(
       .cm_tint_we(w_tint_we), .cm_tint(w_csr_val),
       .cm_tfrac_we(w_tfrac_we), .cm_tfrac(w_csr_val[7:0]),
       .h_reset(h_reset),
-      .h_we(tmr_h_we), .h_thread(h_dbg_thread),
+      .h_we(tmr_h_we), .h_sel(h_dbg_sel),
       .h_td_we(tmr_h_td_we), .h_dt_we(tmr_h_dt_we),
       .h_tint_we(tmr_h_tint_we), .h_tfrac_we(tmr_h_tfrac_we),
       .h_tseen_we(tmr_h_tseen_we),
@@ -1296,7 +1303,7 @@ module loom_core #(
 
   // Host-side selects (slow paths): which thread a debug write or a
   // RESET_PC write addresses, and which debug register it is.
-  wire [3:0] dbg_we   = {4{dbg_wr_go}} & (4'd1 << h_dbg_thread);
+  wire [3:0] dbg_we   = {4{dbg_wr_go}} & h_dbg_sel;
   wire [3:0] rpc_we   = {4{h_rpc_we}} & (4'd1 << h_rpc_sel);
   wire       dw_pc    = (h_dbg_reg == 8'h08);
   wire       dw_flags = (h_dbg_reg == 8'h09) | (h_dbg_reg == 8'h1B);

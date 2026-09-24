@@ -652,7 +652,7 @@ Consequences: PLAN M3 ends 2026-11-01 with the slice C decision, M4 is the
 freeze and the evidence, M5's demo material is listings, waveforms, the
 gate-level log and the mutation table, with no video.
 
-## D-031 2026-09-23 Fable, proposed: a registered one-hot thread select for the host debug port
+## D-031 2026-09-23 Fable, proposed; built 2026-09-23 by Opus 5.5: a registered one-hot thread select for the host debug port
 
 Proposal (after slices A and B have their D-025 readings; one hardening of
 its own): the host side stops decoding `h_dbg_thread` with a 2-bit compare
@@ -667,3 +667,25 @@ HOST_PROTOCOL is unchanged because the thread field is known long before
 the strobe. Rejected for now: flow knobs (each a whole-design change in
 cell selection); doing it inside the slice A or B hardening (D-025 wants
 one change per reading).
+
+Built 2026-09-23 after slices A and B had their D-025 readings, under
+Thomas's standing "proceed on your best judgement". `loom_host_ctl` now
+drives `h_dbg_sel[3:0]` instead of `h_dbg_thread[1:0]`: reset `0001`, loaded
+`0001 << addr[9:8]` at exactly the two edges that loaded the binary field, so
+every host request keeps its edges and the E+4 rule is untouched by
+construction. `loom_core` takes only the one-hot input and derives the binary
+field internally (two OR gates) for the read side, which is not timing
+critical: the per-thread read muxes, the register-file read port, and debug
+0x1C. The write side uses the one-hot select directly: `dbg_running` is
+`|(thread_busy & h_dbg_sel)`, the debug write enables and the register-file
+write select are ANDs with it, and each timer's `h_mine` is `h_we && h_sel[t]`
+instead of a 2-bit compare, which takes the compare and its fanout out of the
+`acc_clr -> tick -> NOW / lat_fire -> pin` cone that the slow-corner paths
+ran through. Generic synthesis 20,547 -> 20,391 cells, 3,225 -> 3,227 flops.
+The formal harnesses at `loom_core` level (sched, wait, iso) assume the
+select is one-hot, which is what `loom_host_ctl` makes; without it their
+host-legality assumptions, phrased on the binary field, would stop covering
+the threads a non-one-hot select writes. (Written out as `s != 0 && (s &
+(s - 1)) == 0`: the slang frontend has no `$onehot`.) The ISO-1 miter keeps
+the host's binary thread field and hands each copy `0001 << thread`, and the
+timer harness binds `h_sel`.

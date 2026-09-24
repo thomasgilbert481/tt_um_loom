@@ -78,6 +78,7 @@ module loom_iso_view #(
     input wire        h_dbg_req,
     input wire        h_dbg_wr,
     input wire [1:0]  h_dbg_thread,
+    input wire [3:0]  h_dbg_sel,
     input wire [7:0]  h_dbg_reg,
 
     // ------------------------------------- per-thread state (SEMANTICS 5)
@@ -359,6 +360,10 @@ module loom_iso_view #(
   always @(*) if (f_past_valid && rst_n) begin
     assume ((h_reset & thread_busy) == 4'd0);
     if (h_dbg_req && h_dbg_wr) assume (!thread_busy[h_dbg_thread]);
+    // D-031: the debug thread select is one-hot, as loom_host_ctl makes it
+    // (reset 0001, every load 0001 << addr[9:8]). ($onehot written out:
+    // the slang frontend does not have it.)
+    assume (h_dbg_sel != 4'd0 && (h_dbg_sel & (h_dbg_sel - 4'd1)) == 4'd0);
   end
 
   // ==================================================================
@@ -393,7 +398,7 @@ bind loom_core loom_iso_view #(.T(`ISO_T), .FAW(2)) u_view (
     .csr_pin_oe(csr_pin_oe), .csr_od_mask(csr_od_mask),
     .csr_host_irq(csr_host_irq), .cond_hit(cond_hit), .x_stall(x_stall),
     .h_reset(h_reset), .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
-    .h_dbg_thread(h_dbg_thread), .h_dbg_reg(h_dbg_reg),
+    .h_dbg_thread(h_dbg_thread), .h_dbg_sel(h_dbg_sel), .h_dbg_reg(h_dbg_reg),
     .pc_all(pc_all), .z_all(z_all), .c_all(c_all), .t_all(t_all),
     .wa_all(wa_all), .rs0_all(rs0_all), .rs1_all(rs1_all),
     .depth_all(depth_all), .pp_all(pp_all),
