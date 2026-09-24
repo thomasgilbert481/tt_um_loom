@@ -117,7 +117,7 @@ instructions:
   - {name: SHI,   fmt: "101001001-------", ops: [], sem: "s = pin_in(BE_PINS.in)^INV shifted into SR (per DIR); CNT = max(CNT-1, 0); Z = (CNT == 0); CRC update with s if CRC_EN (SEMANTICS 6.9). T = stuffing violation at M3", flags: [Z, T], timing: one_slot, class: be}
   - {name: LDSR,  fmt: "101010000aaa----", ops: [ra], sem: "SR = ra", flags: [], timing: one_slot, class: be}
   - {name: STSR,  fmt: "101010001ddd----", ops: [rd], sem: "rd = SR", flags: [], timing: one_slot, class: be}
-  - {name: CRCI,  fmt: "101011000-------", ops: [], sem: "CRC = CRC_INIT; stuffing state reset", flags: [], timing: one_slot, class: be}
+  - {name: CRCI,  fmt: "101011000-------", ops: [], sem: "CRC = CRC_INIT; the encoder and stuffing state are left alone (6.9.1)", flags: [], timing: one_slot, class: be}
   - {name: STCRC, fmt: "101011001ddd----", ops: [rd], sem: "rd = CRC", flags: [], timing: one_slot, class: be}
 
   # ---------------------------------------------------------------- CSR
@@ -193,8 +193,9 @@ crc_presets:
   can15:  {poly: 0x4599, init: 0x0000, width: 15, doc: "CAN CRC15, x^15+x^14+x^10+x^8+x^7+x^4+x^3+1"}
   smbus8: {poly: 0x07,   init: 0x00,   width: 8,  doc: "CRC-8 (SMBus PEC), x^8+x^2+x+1"}
   # Canonical n-bit form. The CRC unit works on a left-aligned 16-bit register
-  # (SEMANTICS 6.9), so the assembler's .crc directive loads poly << (16 - width)
-  # and init << (16 - width); L1-BE-CRC checks the result against a Python reference.
+  # (SEMANTICS 6.9), so a program loads poly << (16 - width) and
+  # init << (16 - width) itself (there is no .crc directive); L1-BE-CRC checks
+  # the result against a Python reference.
 
 # Symbolic operand values. The assembler takes these spellings from here.
 enums:

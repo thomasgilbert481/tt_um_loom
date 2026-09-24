@@ -1,0 +1,621 @@
+; usb_ls_device.loom
+; USB low-speed (1.5 Mbit/s) device in manual mode, a HID boot mouse. M3
+; firmware on slices A and B: the bit engine does NRZI, bit stuffing, the
+; CRCs and D+/D- together (SEMANTICS 6.9.1), LD/ST read the descriptors and
+; keep the state (6.11); the firmware does SYNC, PID, EOP, the handshakes,
+; the data toggles and the control transfers. firmware/README.md has the
+; summary; tools/tests/test_fw_usb.py the tests, on the model and the RTL.
+;
+; Pins: D+ = BIDIR0, D- = BIDIR1 (push-pull while transmitting, released
+; otherwise). The board needs the 1.5 kOhm pull-up on D- that marks a
+; low-speed device; the host's pull-downs make an undriven bus J.
+;
+; Rate: fixed by the specification, so the program sets its own divider and
+; the host must not: TICK_INT = 33, TICK_FRAC = 85 is 33.33 clocks per tick
+; at 50 MHz, one tick per bit.
+;
+; Host command (INQ, thread 0): one boot mouse report as two words, buttons
+; | X << 8, then Y. It goes out on the next IN to endpoint 1 once both words
+; are in. Nothing is ever pushed to OUTQ.
+;
+; Memory: the whole 512 words (511 used), so thread 0 only: code, the state
+; in words 1..16, the descriptors packed two bytes per word at the end.
+;
+; Registers: r2 always holds the endpoint 0 token field for our address
+; (see newaddr); nothing else touches it. In the receiver: r0 the last word,
+; r1 the PID byte (15:8), r3 the CRC, r4 scratch, r6 the words to receive
+; plus one, r7 16 (the CNT reload). CRC_POLY and CRC_INIT hold CRC16
+; except inside newaddr.
+
+        .imem   512
+        .thread 0
+        .pins   DP = BIDIR0, DM = BIDIR1
+        .equ    CFG = (1 << 3) | (1 << 5) | (1 << 9) | (1 << 10)  ; NRZI, USB stuffing, CRC_EN, DIFF
+        .equ    GRP2 = 2 << 5           ; OUTGRP / INGRP: D+ and D-, base 0
+        .equ    LINE_J = 2              ; OUT value: D+ low, D- high
+        .equ    CRC5_POLY = 0x05 << 11  ; left-aligned (SEMANTICS 6.9)
+        .equ    CRC5_INIT = 0x1F << 11
+        .equ    CRC5_RES = 0b01100 << 11  ; residual of a good token (8.3.5.1)
+        .equ    CRC16_POLY = 0x8005
+        .equ    CRC16_INIT = 0xFFFF
+        .equ    CRC16_RES = 0x800D      ; residual of a good data packet (8.3.5.2)
+        .equ    TMO = 16                ; ticks a reply may take: from entry,
+                                        ; ~17 bits after an EOP (16..18, 7.1.19.1)
+        .equ    RESP = 6                ; ticks from the EOP seen to our SYNC
+        .equ    SYNC = 0x80             ; seven 0s and a 1, LSB first
+        .equ    ACKW = (0xD2 << 8) | SYNC       ; SYNC and PID, one SR load
+        .equ    NAKW = (0x5A << 8) | SYNC
+        .equ    STALLW = (0x1E << 8) | SYNC
+        .equ    DATA0W = (0xC3 << 8) | SYNC
+        .equ    DATA1W = (0x4B << 8) | SYNC
+        .equ    TOGGLE = 0x8800         ; DATA0W xor DATA1W
+        .equ    DEVLEN = 18             ; descriptor lengths (see the end)
+        .equ    CFGLEN = 34
+        .equ    REPLEN = 50
+
+        JMP     start                   ; the data words below are not code
+
+; ------------------------------------------------------------------ data
+; Every address is below 32, so `LD/ST rd, rZ, NAME` with rZ = 0 reaches it.
+EP1F:   .word   0                       ; the endpoint 1 token field (newaddr)
+BUF:    .word   0, 0, 0, 0, 0, 0        ; received words at BUF + n, n = 5 .. 1
+; The next reply to an IN on endpoint 0, kept ready so that the reply only
+; has to load it: SYNC and PID, the data (a word address, two bytes per
+; word), the bytes left in the data stage and the bytes of the next packet
+; (0 a ZLP, 9 or more no data: INW is then a NAK or a STALL).
+INW:    .word   NAKW
+INP:    .word   0
+INN:    .word   0
+INC:    .word   0xFF
+NEWA:   .word   0xFFFF                  ; SET_ADDRESS value, taken after its status stage
+; Endpoint 1: the report being assembled from INQ (two words: buttons | X
+; << 8, then Y), how many of its words are here, the next data PID.
+RPT:    .word   0, 0
+RPTN:   .word   0
+EP1W:   .word   DATA0W
+
+start:  .csr    TICK_INT, 33            ; 33 + 85/256 clocks: one bit
+        .csr    TICK_FRAC, 85
+        .csr    OUTGRP, GRP2            ; OUT drives D+ (bit 0) and D- (bit 1)
+        .csr    INGRP, GRP2             ; IN reads them the same way
+        .csr    BE_CFG, CFG             ; only a transmitter rewrites it
+        LDI     r7, LINE_J
+        OUT     r7                      ; J on the pads before any OE is set
+        LDI     r0, 0
+        CALL    newaddr                 ; address 0 until SET_ADDRESS
+
+; ------------------------------------------------------------ token loop
+; Tokens are matched whole: the PID byte (which covers its check nibble)
+; and the 16-bit field, whose CRC5 is a function of the address and the
+; endpoint, so a field equal to one of ours is a good token for us and no
+; CRC5 has to be computed while the host waits for an answer.
+idle:   CALL    rxtok
+        BNZ     idle                    ; no EOP where a token ends
+        SHRI    r1, 8                   ; the PID byte
+        LDI     r4, 0x69                ; IN
+        CMP     r1, r4
+        BZ      tin
+        LDI     r4, 0x2D                ; SETUP
+        CMP     r1, r4
+        BZ      tsetup
+        LDI     r4, 0xE1                ; OUT
+        CMP     r1, r4
+        BZ      tout
+        JMP     idle
+tin:    CMP     r0, r2                  ; IN to our endpoint 0?
+        BZ      in0
+        LDI     r7, 0
+        LD      r4, r7, EP1F            ; ... or to endpoint 1?
+        CMP     r0, r4
+        BZ      in1
+        JMP     idle
+; IN on endpoint 1: a whole report (both of its words taken from INQ) goes
+; out with the endpoint's data PID, else a NAK. The report is dropped and the
+; PID toggled only when the host ACKs, so a lost ACK repeats the same data
+; with the same PID (8.6.4).
+in1:    LD      r3, r7, RPTN
+        MOV16   r0, NAKW
+        CMPI    r3, 2
+        BNZ     in0h                    ; not a whole report: NAK
+        LD      r0, r7, EP1W
+        LDI     r1, RPT
+        LDI     r6, 3                   ; buttons, X, Y
+        CALL    txdat
+        LDI     r6, 1                   ; the handshake
+        CALL    rxpkt
+        BNZ     idle
+        SHRI    r1, 8
+        LDI     r4, 0xD2                ; ACK
+        CMP     r1, r4
+        BNZ     idle
+        LDI     r7, 0
+        ST      r7, r7, RPTN            ; the report is delivered
+        LD      r0, r7, EP1W
+        MOV16   r4, TOGGLE
+        XOR     r0, r0, r4
+        ST      r0, r7, EP1W
+        JMP     idle
+
+; IN on endpoint 0: the reply kept ready in INW/INP/INC, then the host's
+; handshake. An ACK moves the stage on: pointer and count forward, the data
+; PID toggled; a ZLP acknowledged ends the stage (and a SET_ADDRESS takes
+; effect: 9.4.6, after its status stage). No ACK: the same packet again
+; next time, as the host will retry it.
+in0:    LDI     r7, 0
+        LD      r0, r7, INW
+        LD      r6, r7, INC
+        LD      r1, r7, INP
+        CMPI    r6, 9
+        BC      in0h                    ; no data: a NAK or a STALL
+        TEST    r6, r6
+        BZ      in0z
+        CALL    txdat
+        JMP     in0a
+in0z:   CALL    txzlp
+in0a:   LDI     r6, 1                   ; the handshake: a PID alone
+        CALL    rxpkt
+        BNZ     idle
+        SHRI    r1, 8
+        LDI     r4, 0xD2                ; ACK
+        CMP     r1, r4
+        BNZ     idle
+        LDI     r7, 0
+        LD      r3, r7, INC
+        TEST    r3, r3
+        BZ      in0end
+        LD      r4, r7, INP
+        MOV     r5, r3
+        SHRI    r5, 1                   ; words sent (odd only in a last packet)
+        ADD     r4, r4, r5
+        ST      r4, r7, INP
+        LD      r5, r7, INN
+        SUB     r5, r5, r3
+        ST      r5, r7, INN
+        LD      r0, r7, INW
+        MOV16   r4, TOGGLE
+        XOR     r0, r0, r4
+        ST      r0, r7, INW
+        CMPI    r5, 8
+        BNC     in0c                    ; fewer than 8 left: all of them
+        LDI     r5, 8
+in0c:   ST      r5, r7, INC
+        JMP     idle
+in0end: LD      r0, r7, NEWA
+        NOT     r4, r0
+        BZ      in0n                    ; 0xFFFF: no new address
+        CALL    newaddr
+        LDI     r7, 0
+        MOV16   r4, 0xFFFF
+        ST      r4, r7, NEWA
+in0n:   MOV16   r0, NAKW
+        LDI     r6, 0xFF
+        JMP     ep0set
+in0h:   CALL    txhs
+        JMP     idle
+
+; OUT on endpoint 0: the status stage of a read (a ZLP), ACKed, or STALLed
+; when the request was. Data stages of writes are not supported: a data
+; packet longer than a ZLP gets no handshake.
+tout:   CMP     r0, r2
+        BNZ     idle
+        LDI     r6, 2                   ; a ZLP: the PID and the CRC word
+        CALL    rxpkt
+        BNZ     idle
+        MOV16   r4, CRC16_RES
+        CMP     r3, r4
+        BNZ     idle
+        LDI     r7, 0
+        LD      r0, r7, INW
+        MOV16   r4, STALLW
+        CMP     r0, r4
+        BZ      in0h                    ; a stalled request: STALL again
+        MOV16   r0, ACKW
+        CALL    txhs
+        MOV16   r0, NAKW                ; the transfer is over
+        LDI     r6, 0xFF
+; ep0set: r0 = the next IN reply's SYNC and PID, r6 = its byte count.
+ep0set: LDI     r7, 0
+        ST      r0, r7, INW
+        ST      r6, r7, INC
+        JMP     idle
+
+; SETUP: DATA0 with the 8-byte request follows; a good one is ACKed (a
+; device may not refuse a SETUP) and decoded afterwards.
+tsetup: CMP     r0, r2
+tsno:   BNZ     idle                    ; (also the way out, with Z = 0, of
+        LDI     r6, 6                   ;  the tests below, out of reach)
+        CALL    rxpkt                   ; DATA0: the PID and five words
+        BNZ     idle                    ; no EOP after 8 bytes and the CRC
+        MOV16   r4, CRC16_RES
+        CMP     r3, r4
+        BNZ     tsno                    ; bad CRC: no handshake, the host retries
+        SHRI    r1, 8
+        LDI     r4, 0xC3                ; DATA0
+        CMP     r1, r4
+        BNZ     tsno
+        MOV16   r0, ACKW
+        CALL    txhs
+; The request (9.3), decoded after the ACK is out. GET_DESCRIPTOR of the
+; device, configuration and HID report descriptors starts a read of
+; min(length, wLength) bytes with DATA1; SET_ADDRESS and every other request
+; without a data stage get a ZLP DATA1 status stage; a device-to-host
+; request not known here gets a STALL.
+        LDI     r7, 0
+        MOV16   r4, 0xFFFF
+        ST      r4, r7, NEWA            ; a new SETUP cancels a pending address
+        LD      r0, r7, BUF + 5         ; bmRequestType, bRequest
+        LD      r1, r7, BUF + 4         ; wValue
+        LD      r3, r7, BUF + 2         ; wLength
+        MOV16   r4, 0x0680              ; GET_DESCRIPTOR, standard, device
+        CMP     r0, r4
+        BZ      sgd
+        MOV16   r4, 0x0681              ; the same to an interface (HID report)
+        CMP     r0, r4
+        BZ      sgd
+        MOV16   r4, 0x0500              ; SET_ADDRESS
+        CMP     r0, r4
+        BNZ     snod
+        SHLI    r1, 9
+        SHRI    r1, 9                   ; the address, 7 bits
+        ST      r1, r7, NEWA
+snod:   MOV16   r4, 0x0900              ; SET_CONFIGURATION
+        CMP     r0, r4
+        BNZ     snod2
+        MOV16   r4, DATA0W
+        ST      r4, r7, EP1W            ; the toggle restarts at DATA0 (9.1.1.5)
+snod2:  SHLI    r0, 9                   ; C = bmRequestType bit 7
+        BC      sstall                  ; device-to-host, unknown: STALL
+        MOV16   r0, DATA1W              ; no data stage: a ZLP DATA1 status
+        LDI     r6, 0
+        JMP     ep0set
+sgd:    SWAP    r1, r1                  ; descriptor type in 7:0, index in 15:8
+        CMPI    r1, 1
+        BZ      sdev
+        CMPI    r1, 2
+        BZ      scfg
+        CMPI    r1, 0x22
+        BZ      srep
+sstall: MOV16   r0, STALLW
+        LDI     r6, 0xFF
+        JMP     ep0set
+sdev:   MOV16   r1, DEVD
+        LDI     r5, DEVLEN
+        JMP     slen
+scfg:   MOV16   r1, CFGD
+        LDI     r5, CFGLEN
+        JMP     slen
+srep:   MOV16   r1, REPD
+        LDI     r5, REPLEN
+slen:   CMP     r5, r3                  ; C: the descriptor is at least wLength
+        BNC     slen1
+        MOV     r5, r3
+slen1:  ST      r1, r7, INP
+        ST      r5, r7, INN
+        MOV     r6, r5
+        CMPI    r6, 8
+        BNC     slen2
+        LDI     r6, 8
+slen2:  MOV16   r0, DATA1W
+        JMP     ep0set
+
+; newaddr: r0 = the address. r2 = the endpoint 0 token field as the host
+; sends it (address, endpoint, CRC5), EP1F = the endpoint 1 field. The CRC5
+; is clocked through the bit engine with SHO while BE_PINS.out points at
+; pin 22, which is not a pad, so nothing moves on the bus.
+newaddr: .csr   CRC_POLY, CRC5_POLY, r4
+        .csr    CRC_INIT, CRC5_INIT, r4
+        .csr    BE_PINS, 22, r4         ; (BE_CFG is CFG: CRC_EN is on)
+        LDI     r6, 2                   ; two fields: endpoint 1, then 0
+        LDI     r5, 128
+        OR      r0, r0, r5
+nafld:  CRCI
+        LDSR    r0
+        LDI     r5, 11
+        CSRW    CNT, r5
+nabit:  SHO                             ; (a stuff bit costs an SHO, not a CNT)
+        BNZ     nabit
+        STCRC   r5                      ; the remainder in 15:11
+        NOT     r5, r5                  ; sent inverted ...
+        REV     r5, r5                  ; ... most significant bit first
+        SHLI    r5, 11
+        OR      r2, r0, r5
+        DJNZ    r6, na0
+        .csr    CRC_POLY, CRC16_POLY, r4
+        .csr    CRC_INIT, CRC16_INIT, r4
+        SETD    0                       ; (for the deadline checker: the loop
+        RET                             ; above has no anchor of its own)
+na0:    LDI     r5, 0
+        ST      r2, r5, EP1F
+        LDI     r5, 128
+        XOR     r0, r0, r5              ; endpoint 0
+        JMP     nafld
+
+; ------------------------------------------------------------ receiver
+; rxtok: wait as long as it takes for a token (the PID and one word).
+; rxpkt: wait at most TMO bit times for a packet of r6 - 1 words after the
+; PID (r6 = 1: a handshake). Both return with Z = 1 when the EOP came where
+; that length ends it (one bit later if a stuff bit came first) and Z = 0
+; otherwise or on a timeout; TD is then the tick at which the SE0 was seen,
+; r1 holds the PID byte in 15:8, r0 the last word, r3 the CRC after it, and
+; BUF + n the words (the first at BUF + r6 - 1).
+;
+; D+ rises only at J -> K, so the first rising edge of D+ is a K of the
+; SYNC. The tick is re-phased on it (a write to TICK_INT clears ACC,
+; SEMANTICS 4): every later WAITD 1 then completes a fixed few clocks after
+; a bit boundary, and the SHI two slots later samples near mid-bit.
+; The encoder state needs no reset here: whatever LVL, the run and PEND
+; were, the SYNC (seven 0s and a 1) leaves LVL = K, a run of one 1 and no
+; stuff bit due at the PID, exactly as a fresh state would.
+;
+; While it waits for a token, rxtok also moves the endpoint 1 report from
+; INQ into RPT, one word per look, and looks again every 250 idle bit
+; times. Each POP follows a WAITB INQ_NE, T that completed with T = 0, and
+; that WAITB is only a test: TD has always passed when rxtok runs (the last
+; deadline of the packet before, or the 250-tick look-out, re-anchored each
+; time, so it never goes stale).
+rxtok:  LDI     r6, 2                   ; the PID and one word
+rxtp:   LDI     r7, 0
+        LD      r3, r7, RPTN
+        CMPI    r3, 2
+        BZ      rxtw                    ; a whole report is waiting already
+        WAITB   INQ_NE, T
+        BT      rxtw
+        POP     r0
+        ST      r0, r3, RPT             ; at RPT + RPTN
+        INC     r3
+        ST      r3, r7, RPTN
+        JMP     rxtp
+rxtw:   LDI     r4, 33
+        SETD    250
+        WAITE   DP, RISE, T             ; J -> K: a packet starts
+        CSRW    TICK_INT, r4            ; ACC <= 0 at this edge: re-phase
+        BT      rxtp                    ; (after a look-out, harmless)
+        SETD    0
+        JMP     sync0
+rxpkt:  LDI     r4, 33
+        SETD    TMO
+        WAITE   DP, RISE, T
+        CSRW    TICK_INT, r4            ; (harmless after a timeout)
+        BT      rxtmo
+        SETD    0
+sync0:  SHI                             ; the K just seen, near its middle
+khave:  WAITD   1
+        NOP
+        SHI                             ; the bit after a K
+        JP      DP, 1, synced           ; K again: the KK that ends SYNC
+        WAITD   1                       ; it was J; a K follows
+        NOP
+        SHI
+        JMP     khave
+synced: LDI     r0, 8
+        CSRW    CNT, r0
+        LDI     r7, 16
+pidl:   WAITD   1
+        NOP
+        SHI
+        BNZ     pidl
+        STSR    r1                      ; the PID byte is in r1[15:8]
+        CRCI                            ; the CRC covers what follows the PID
+        CSRW    CNT, r7
+        DJNZ    r6, wbl                 ; words to come?
+        WAITD   1                       ; no (a handshake): SE0 now?
+        IN      r4
+        TEST    r4, r4
+        BZ      rxeop
+        JMP     rxend2
+; A word: sixteen bits, then stored at BUF + r6. The first bit of the next
+; word is taken outside the loop, which leaves room for the store while
+; every SHI stays two slots after its WAITD.
+wbl:    WAITD   1
+        NOP
+        SHI
+        BNZ     wbl
+        STSR    r0
+        ST      r0, r6, BUF
+        DJNZ    r6, wnext
+rxend:  WAITD   1                       ; the bit after the packet: SE0?
+        IN      r4
+        TEST    r4, r4
+        BZ      rxeop
+rxend2: WAITD   1                       ; not yet: a stuff bit, then SE0
+        IN      r4
+        TEST    r4, r4
+        BNZ     rxret                   ; no EOP: Z = 0
+rxeop:  STCRC   r3                      ; (Z is still 1 from the SE0 test)
+rxret:  RET
+rxtmo:  TEST    r4, r4                  ; r4 = 33: Z = 0
+        RET
+wnext:  WAITD   1
+        CSRW    CNT, r7
+        SHI                             ; CNT is now 15 (16 after a stuff bit)
+        JMP     wbl
+
+; ------------------------------------------------------------ transmit
+; Entered with TD on the tick at which the SE0 of the packet being answered
+; was seen. The host's EOP is two bits of SE0 and one of J, then it lets go:
+; the output enables go on at TD + RESP - 1, the SYNC's first bit at
+; TD + RESP. Every bit goes out two slots after its WAITD, like the
+; receiver's samples. r2 is left alone.
+;
+; txhs: r0 = SYNC and PID. txzlp: the same, then a zero-length data field
+; (the CRC16 of nothing is 0000: sixteen 0s). txdat: r0 as above, then r6
+; bytes (1 .. 8) packed two per word, low byte first, from the word at r1,
+; the CRC16 and, when the last six bits were 1s, the stuff bit that is due
+; even before an EOP (7.1.9).
+txzlp:  LDI     r6, 1                   ; a second word, all zero
+        JMP     txw
+txhs:   LDI     r6, 0
+txw:    .csr    BE_CFG, CFG, r4         ; LVL = J, the run cleared
+        .csr    BE_PINS, 0, r4
+        LDSR    r0
+        LDI     r7, 16
+        CSRW    CNT, r7
+        LDI     r3, 0
+        WAITD   RESP - 1
+        OEP     DP, 1
+        OEP     DM, 1                   ; drive J: PIN_OUT holds J
+        WAITD   1
+        JMP     wl1
+wl:     WAITD   1
+        NOP
+wl1:    SHO
+        BNZ     wl
+        TEST    r6, r6
+        BZ      txeop                   ; every word sent
+        LDSR    r3                      ; the ZLP's CRC field
+        CSRW    CNT, r7
+        WAITD   1
+        LDI     r6, 0
+        SHO
+        JMP     wl
+
+txdat:  .csr    BE_CFG, CFG, r4
+        .csr    BE_PINS, 0, r4
+        LDSR    r0
+        LDI     r7, 16
+        CSRW    CNT, r7
+        LDI     r5, 8
+        LD      r3, r1, 0               ; the first data byte
+        INC     r1
+        WAITD   RESP - 1
+        OEP     DP, 1
+        OEP     DM, 1
+        WAITD   1
+        JMP     pw1
+pwl:    WAITD   1
+        NOP
+pw1:    SHO                             ; SYNC and PID
+        BNZ     pwl
+        CRCI                            ; the CRC covers the data only
+        JMP     lob
+; Two bytes per word, low byte first: a low byte is the word loaded into SR
+; with CNT 8; after its eight shifts SR holds the high byte, so a high byte
+; needs only CNT 8 again. Each byte's first bit goes out of its loop, which
+; leaves room to fetch the next word while every SHO keeps its offset.
+dh:     WAITD   1                       ; a high byte, more to come
+        NOP
+        SHO
+        BNZ     dh
+lob:    LDSR    r3                      ; a low byte: the next word
+        CSRW    CNT, r5
+        WAITD   1
+        NOP
+        SHO                             ; its first bit (or a stuff bit)
+        LD      r3, r1, 0               ; the word after it
+        INC     r1
+        DJNZ    r6, dlo
+        JMP     ll
+dlo:    WAITD   1                       ; a low byte, more to come
+        NOP
+        SHO
+        BNZ     dlo
+        CSRW    CNT, r5                 ; the high byte is in SR already
+        WAITD   1
+        NOP
+        SHO
+        DJNZ    r6, dh
+ll:     WAITD   1                       ; the last byte
+        NOP
+        SHO
+        BNZ     ll
+        STCRC   r4
+        NOT     r4, r4                  ; sent inverted ...
+        REV     r4, r4                  ; ... most significant bit first
+        LDSR    r4
+        WAITD   1
+        CSRW    CNT, r7
+        SHO                             ; the CRC's first bit
+        LDI     r3, 0                   ; SE0
+        LDI     r5, 22                  ; a pin index that is not a pad
+        LDI     r1, 1
+cl:     WAITD   1
+        IN      r0                      ; the line before this bit
+        SHO
+        BNZ     cl
+; The firmware cannot read PEND, so it asks the engine: one more SHO with
+; the output on pin 22 and CNT = 1 sends a pending stuff bit (CNT stays 1,
+; Z = 0) or a data bit (CNT 0, Z = 1), either way to no pad. A stuff bit
+; due after 1s leaves the line where r0 read it, so it is its complement.
+        CSRW    BE_PINS, r5
+        CSRW    CNT, r1
+        NOT     r0, r0                  ; (before the SHO: NOT sets Z too)
+        SHO
+        WAITD   1
+        BZ      se0                     ; no stuff bit due
+        OUT     r0                      ; the stuff bit, by hand
+txeop:  WAITD   1
+        NOP
+se0:    OUT     r3                      ; SE0 ...
+        LDI     r4, LINE_J
+        WAITD   2
+        NOP
+        OUT     r4                      ; ... for two bits, then J ...
+        WAITD   1
+        NOP
+        OEP     DP, 0                   ; ... for one; then let go
+        OEP     DM, 0
+        RET
+
+; ------------------------------------------------------------ descriptors
+; Two bytes per word, low byte first, as txdat sends them. A low-speed HID
+; boot mouse: USB 1.1, bMaxPacketSize0 8 (the only size allowed at low
+; speed), VID 0x1209 / PID 0x0001 (pid.codes' test PID: fine for a bench,
+; not for a product), one configuration, one interface (HID, boot, mouse)
+; with an interrupt IN endpoint 1 of 3 bytes every 10 ms.
+DEVD:   .word   0x12 | 0x01 << 8        ; bLength, DEVICE
+        .word   0x10 | 0x01 << 8        ; bcdUSB 1.10
+        .word   0x00 | 0x00 << 8        ; class, subclass (per interface)
+        .word   0x00 | 0x08 << 8        ; protocol, bMaxPacketSize0 8
+        .word   0x09 | 0x12 << 8        ; idVendor 0x1209
+        .word   0x01 | 0x00 << 8        ; idProduct 0x0001
+        .word   0x00 | 0x01 << 8        ; bcdDevice 1.00
+        .word   0x00 | 0x00 << 8        ; no strings
+        .word   0x00 | 0x01 << 8        ; no serial string, 1 configuration
+CFGD:   .word   0x09 | 0x02 << 8        ; bLength, CONFIGURATION
+        .word   0x22 | 0x00 << 8        ; wTotalLength 34
+        .word   0x01 | 0x01 << 8        ; 1 interface, bConfigurationValue 1
+        .word   0x00 | 0x80 << 8        ; no string, bus powered
+        .word   0x32 | 0x09 << 8        ; 100 mA; INTERFACE: bLength
+        .word   0x04 | 0x00 << 8        ; INTERFACE, bInterfaceNumber 0
+        .word   0x00 | 0x01 << 8        ; alternate 0, 1 endpoint
+        .word   0x03 | 0x01 << 8        ; HID, boot subclass
+        .word   0x02 | 0x00 << 8        ; mouse, no string
+        .word   0x09 | 0x21 << 8        ; HID: bLength, HID
+        .word   0x11 | 0x01 << 8        ; bcdHID 1.11
+        .word   0x00 | 0x01 << 8        ; no country, 1 class descriptor
+        .word   0x22 | REPLEN << 8      ; REPORT, wDescriptorLength ...
+        .word   0x00 | 0x07 << 8        ; ... 50; ENDPOINT: bLength
+        .word   0x05 | 0x81 << 8        ; ENDPOINT, IN 1
+        .word   0x03 | 0x03 << 8        ; interrupt, wMaxPacketSize 3 ...
+        .word   0x00 | 0x0A << 8        ; ... ; bInterval 10 ms
+; The boot mouse report of the HID specification (Appendix B.2): three
+; buttons, then X and Y, relative, -127 .. 127: three bytes.
+REPD:   .word   0x05 | 0x01 << 8        ; Usage Page (Generic Desktop)
+        .word   0x09 | 0x02 << 8        ; Usage (Mouse)
+        .word   0xA1 | 0x01 << 8        ; Collection (Application)
+        .word   0x09 | 0x01 << 8        ;   Usage (Pointer)
+        .word   0xA1 | 0x00 << 8        ;   Collection (Physical)
+        .word   0x05 | 0x09 << 8        ;     Usage Page (Buttons)
+        .word   0x19 | 0x01 << 8        ;     Usage Minimum (1)
+        .word   0x29 | 0x03 << 8        ;     Usage Maximum (3)
+        .word   0x15 | 0x00 << 8        ;     Logical Minimum (0)
+        .word   0x25 | 0x01 << 8        ;     Logical Maximum (1)
+        .word   0x95 | 0x03 << 8        ;     Report Count (3)
+        .word   0x75 | 0x01 << 8        ;     Report Size (1)
+        .word   0x81 | 0x02 << 8        ;     Input (Data, Variable, Absolute)
+        .word   0x95 | 0x01 << 8        ;     Report Count (1)
+        .word   0x75 | 0x05 << 8        ;     Report Size (5)
+        .word   0x81 | 0x01 << 8        ;     Input (Constant): padding
+        .word   0x05 | 0x01 << 8        ;     Usage Page (Generic Desktop)
+        .word   0x09 | 0x30 << 8        ;     Usage (X)
+        .word   0x09 | 0x31 << 8        ;     Usage (Y)
+        .word   0x15 | 0x81 << 8        ;     Logical Minimum (-127)
+        .word   0x25 | 0x7F << 8        ;     Logical Maximum (127)
+        .word   0x75 | 0x08 << 8        ;     Report Size (8)
+        .word   0x95 | 0x02 << 8        ;     Report Count (2)
+        .word   0x81 | 0x06 << 8        ;     Input (Data, Variable, Relative)
+        .word   0xC0 | 0xC0 << 8        ;   End Collection; End Collection
+; txdat fetches the word after the last one it sends (it cannot know in time
+; that it is the last), so a descriptor at the end of the image needs one
+; word of padding: an IMEM word that was never loaded is X in simulation.
+        .word   0

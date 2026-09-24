@@ -47,10 +47,13 @@ from tools.tests import test_fw_i2c, test_fw_spi                  # noqa: E402
 from tools.tests import test_fw_spi_slave, test_fw_uart           # noqa: E402
 from tools.tests import test_fw_ps2, test_fw_ws2812               # noqa: E402
 from tools.tests import test_fw_jtag, test_fw_swd                 # noqa: E402
+from tools.tests import test_fw_usb                               # noqa: E402
+from tools.tests import test_fw_i2c_slave, test_fw_can            # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
-           test_fw_ws2812, test_fw_ps2, test_fw_jtag, test_fw_swd)
+           test_fw_ws2812, test_fw_ps2, test_fw_jtag, test_fw_swd,
+           test_fw_usb, test_fw_i2c_slave, test_fw_can)
 
 
 def _make(scenario):

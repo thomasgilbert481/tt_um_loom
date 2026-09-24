@@ -66,7 +66,7 @@ behaviour is defined in `docs/SEMANTICS.md`.
 | `SHI` | - | `1010 0100 1--- ----` | `FF80` / `A480` | Z T | one_slot | s = pin_in(BE_PINS.in)^INV shifted into SR (per DIR); CNT = max(CNT-1, 0); Z = (CNT == 0); CRC update with s if CRC_EN (SEMANTICS 6.9). T = stuffing violation at M3 |
 | `LDSR` | ra | `1010 1000 0aaa ----` | `FF80` / `A800` | - | one_slot | SR = ra |
 | `STSR` | rd | `1010 1000 1ddd ----` | `FF80` / `A880` | - | one_slot | rd = SR |
-| `CRCI` | - | `1010 1100 0--- ----` | `FF80` / `AC00` | - | one_slot | CRC = CRC_INIT; stuffing state reset |
+| `CRCI` | - | `1010 1100 0--- ----` | `FF80` / `AC00` | - | one_slot | CRC = CRC_INIT; the encoder and stuffing state are left alone (6.9.1) |
 | `STCRC` | rd | `1010 1100 1ddd ----` | `FF80` / `AC80` | - | one_slot | rd = CRC |
 | `CSRR` | rd, csr | `1011 0CCC CCdd d---` | `F800` / `B000` | - | one_slot | rd = CSR[csr] |
 | `CSRW` | csr, ra | `1011 1CCC CCaa a---` | `F800` / `B800` | - | one_slot | CSR[csr] = ra (read-only CSRs ignore the write) |

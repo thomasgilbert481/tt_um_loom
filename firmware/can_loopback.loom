@@ -1,0 +1,304 @@
+; can_loopback.loom
+; A CAN 2.0A node for standard data and remote frames, built on slice A of
+; the bit engine (SEMANTICS 6.9, 6.9.1): the engine stuffs and destuffs
+; (STUFF = 2, CAN), flags a stuffing violation in T, and runs the CRC15
+; (isa.yaml crc_presets.can15, x^15+x^14+x^10+x^8+x^7+x^4+x^3+1, init 0).
+; Nothing else beyond the M2 core (FIFOs, SETP ... D).
+;
+; Pins: TX = OUT0 (to a transceiver's TXD, push-pull, 1 = recessive),
+; RX = IN0 (from its RXD, the bus level). The bus is the wired AND of every
+; node's TX, dominant 0.
+;
+; Threads. Thread 0 transmits the frames the host pushes to INQ[0]. Thread 1
+; receives every frame on the bus, the chip's own included (that is the
+; loopback: a transmitter's frame comes back through RX), ACKs the frames
+; of other nodes whose CRC is right, and pushes each frame to OUTQ[1] with
+; a status word. The two threads share only SFLAGS[0], "thread 0 is
+; sending", which stops thread 1 from ACKing the chip's own frame.
+;
+; Host words.
+;   INQ[0]:  {ID[10:0], RTR, DLC[3:0]}, then ceil(len/2) data words, first
+;            byte in 15:8 (an odd last byte in 15:8, 7:0 ignored), where
+;            len = 0 for a remote frame (RTR = 1) and min(DLC, 8) otherwise.
+;            DLC 9..15 is sent as given with 8 data bytes (ISO 11898-1).
+;   OUTQ[1]: a status word, then the n words it announces: the header in
+;            the INQ format and the data words in the INQ format (an odd
+;            last byte in 15:8, 7:0 = 0).
+;   Status:  bit 0 CRC error, bit 1 stuff error, bit 2 form error (a
+;            dominant CRC delimiter, ACK delimiter or EOF bit 1..6; the 7th
+;            EOF bit is not checked, as a receiver does not), bit 3 no ACK
+;            (the ACK slot was recessive), bit 4 own frame (thread 0 sent
+;            it), bit 5 extended frame (IDE = 1, not decoded), bits 10:8 n.
+;            A stuff error and an extended frame end the frame at once with
+;            n = 0; a form error ends it with the header and data it had.
+;            After either, thread 1 waits for 11 recessive bits (bus idle)
+;            before it looks for the next start of frame.
+;
+; Start threads 0 and 1 only: thread 1's code runs past 0x0FF, so thread 2's
+; reset vector 0x100 is in the middle of it.
+;
+; Rate: the host writes the tick CSRs of both threads before RUN (the M2
+; convention). Thread 0 ticks once a bit, thread 1 eight times a bit:
+;   500 kbit/s: thread 0 TICK_INT 100; thread 1 TICK_INT 12, TICK_FRAC 128
+;   125 kbit/s: thread 0 TICK_INT 400; thread 1 TICK_INT 50, TICK_FRAC 0
+; The .tick lines prove every deadline pair at 500 kbit/s (12.5 rounded down
+; to 12); a slower rate only adds slack.
+;
+; Transmit. The frame goes out in segments through the subroutine txbits
+; (WAITD 1; SHO; BNZ), so every bit edge lies the same number of slots after
+; its tick: {SOF, ID, RTR} (13 bits), {IDE = 0, r0 = 0, DLC} (6), the data
+; words (16 bits, or 8 for an odd last byte), then CRC | 1 as 16 bits: the
+; 15 CRC bits and the CRC delimiter. Stuffing covers SOF to the end of the
+; CRC sequence (ISO 11898-1), so a stuff bit due after the last CRC bit must
+; still go out; sending the delimiter as a 16th data bit lets the engine put
+; it there by itself. After the delimiter TX stays recessive (ACK slot, ACK
+; delimiter, EOF). Before SOF thread 0 waits for at least 10 bit times of
+; recessive bus. It does not arbitrate or read its bits back, sends no error
+; frames and does not retransmit: thread 1's status is the report.
+;
+; Receive. Hard synchronisation only: thread 1 waits for a falling edge,
+; restarts its tick generator there by rewriting TICK_INT (SEMANTICS 4: the
+; write clears ACC), and samples every bit 5 of its 8 ticks after the bit
+; start, plus 10 to 16 clocks of detection latency: 72-79 % of the bit at
+; 500 kbit/s, about 66 % at 125 kbit/s (the SOF itself 8 clocks later
+; still). There is no resynchronisation, so the node tolerates a bit-rate
+; mismatch of about 0.2 % over a 130-bit frame, not the 1.58 % of the
+; standard. The SOF sample is checked (a recessive level there is a glitch).
+; Destuffing and the CRC run in the engine; after the 15 CRC bits and the
+; delimiter (read as a 16th data bit, as thread 0 sends it) the CRC register
+; is POLY when the CRC was right and the delimiter recessive, and no other
+; value is (CRC[0] is always 0). The ACK is a SETP ... D staged before the
+; WAITD that ends at the ACK slot's first tick, so it lands on that edge, and
+; a second one releases it on the edge that ends the slot.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   TX = OUT0, RX = IN0
+        .equ    CFG = (1 << 1) | (2 << 5) | (1 << 9)    ; DIR MSB first, STUFF CAN, CRC_EN
+        .equ    POLY = 0x4599 << 1      ; can15, left-aligned (SEMANTICS 6.9)
+        .equ    SAMPLE = 5              ; receive sample point, ticks into the bit
+
+; ---------------------------------------------------------------- transmit
+        .thread 0
+        .tick   100                     ; 500 kbit/s, one tick per bit
+        SETP    TX, 1                   ; recessive
+        .csr    BE_PINS, 16             ; out = OUT0
+        .csr    CRC_POLY, POLY          ; CRC_INIT stays at its reset value 0
+
+next:   POP     r0                      ; {ID, RTR, DLC}
+        MOV     r5, r0
+        ANDI    r5, 15                  ; DLC
+        MOV     r7, r0
+        ANDI    r7, 16                  ; RTR
+        BZ      dlen
+        LDI     r5, 0                   ; a remote frame has no data field
+dlen:   CMPI    r5, 9                   ; C = (DLC >= 9)
+        BNC     dpop
+        LDI     r5, 8
+dpop:   MOV     r6, r5                  ; r5 = len, bytes
+        ADDI    r6, 1
+        SHRI    r6, 1                   ; words to pop, 0..4
+        BZ      idle
+        POP     r1
+        CMPI    r6, 2
+        BNC     idle
+        POP     r2
+        CMPI    r6, 3
+        BNC     idle
+        POP     r3
+        CMPI    r6, 4
+        BNC     idle
+        POP     r4
+
+idle:   SETD    11                      ; 10 to 11 bit times ...
+        WAITP   RX, 0, T                ; ... with no dominant bit on the bus
+        BNT     idle                    ; one came: the bus is busy, start again
+        SIG     0                       ; thread 0 is sending
+        .csr    BE_CFG, CFG             ; also clears the stuffing state (6.9.1)
+        CRCI
+        MOV     r7, r0
+        SHRI    r7, 1                   ; {SOF = 0, ID, RTR, ...}
+        LDSR    r7
+        LDI     r7, 13
+        CSRW    CNT, r7
+        SETD    0
+        CALL    txbits                  ; SOF, ID[10:0], RTR
+        MOV     r7, r0
+        SHLI    r7, 12
+        SHRI    r7, 2                   ; {IDE = 0, r0 = 0, DLC, 0 ...}
+        LDSR    r7
+        LDI     r7, 6
+        CSRW    CNT, r7
+        CALL    txbits                  ; IDE, r0, DLC[3:0]
+
+dloop:  CMPI    r5, 0                   ; bytes still to send
+        BZ      crc
+        LDSR    r1
+        LDI     r7, 16
+        CMPI    r5, 2
+        BC      dword
+        LDI     r7, 8                   ; the odd last byte, in 15:8
+dword:  CSRW    CNT, r7
+        CALL    txbits
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r4
+        SUBI    r5, 2                   ; C = (at least two were left)
+        BC      dloop
+
+crc:    STCRC   r7                      ; CRC[15:1]; CRC[0] is 0
+        ORI     r7, 1                   ; the CRC delimiter as the 16th bit
+        LDSR    r7
+        LDI     r7, 16
+        CSRW    CNT, r7
+        CALL    txbits                  ; CRC, a stuff bit if due, delimiter
+        WAITD   10                      ; ACK slot, ACK delimiter, EOF: recessive
+        CLR     0
+        JMP     next
+
+txbits: WAITD   1
+        SHO
+        BNZ     txbits
+        RET
+
+; ----------------------------------------------------------------- receive
+        .thread 1
+        .tick   12                      ; 500 kbit/s: 8 ticks of 12.5 clocks a bit
+        .csr    BE_PINS, 8 << 5         ; in = IN0
+        .csr    CRC_POLY, POLY
+
+integ:  SETD    88                      ; bus idle: 11 bits (88 ticks) ...
+        WAITP   RX, 0, T                ; ... with no dominant bit
+        BNT     integ
+
+sof:    CSRR    r7, TICK_INT            ; the host's divider, to restart it
+        WAITE   RX, FALL
+        CSRW    TICK_INT, r7            ; ACC <= 0: ticks now count from the edge
+        SETD    SAMPLE                  ; before the first tick (12.5 clocks away)
+        .csr    BE_CFG, CFG             ; also clears the destuffing state
+        CRCI
+        LDI     r5, 0
+        CSRW    FLAGS, r5               ; T = 0 (WAITP above may have set it)
+        LDI     r7, 13
+        CSRW    CNT, r7
+        WAITD   0                       ; the SOF's sample point
+        JP      RX, 1, sof              ; recessive there: a glitch, not a SOF
+        CALL    rxnow                   ; SOF, ID[10:0], RTR
+        STSR    r0                      ; 12:0 = {SOF, ID, RTR}
+        MOV     r1, r0
+        ANDI    r1, 1
+        SUBI    r1, 1                   ; r1 = 0 for a remote frame, else 0xFFFF
+        SHLI    r0, 4                   ; {ID, RTR, 0000}
+        LDI     r7, 2
+        CSRW    CNT, r7
+        CALL    rxbits                  ; IDE, r0
+        STSR    r7
+        ANDI    r7, 2                   ; IDE
+        BNZ     ext
+        LDI     r7, 4
+        CSRW    CNT, r7
+        CALL    rxbits                  ; DLC[3:0]
+        STSR    r6
+        ANDI    r6, 15
+        OR      r0, r0, r6              ; the header word
+        AND     r6, r6, r1              ; 0 for a remote frame
+        CMPI    r6, 9
+        BNC     rlen
+        LDI     r6, 8                   ; r6 = len, bytes
+rlen:   CMPI    r6, 0
+        BZ      crcprep
+        MOV     r5, r6                  ; bytes still to come
+
+rloop:  LDI     r7, 16
+        CMPI    r5, 2
+        BC      rword
+        LDI     r7, 8                   ; the odd last byte, lands in 7:0
+rword:  CSRW    CNT, r7
+        CALL    rxbits
+        MOV     r1, r2                  ; the words move down: the newest is r4,
+        MOV     r2, r3                  ; so w words end in r(5-w) .. r4
+        MOV     r3, r4
+        STSR    r4
+        SUBI    r5, 2                   ; C = (at least two were left)
+        BZ      crcprep
+        BC      rloop
+
+crcprep: MOV16  r5, POLY                ; what the CRC register must end as
+        CSRR    r7, SFLAGS
+        ANDI    r7, 1
+        BZ      rcrc
+        LDI     r5, 1                   ; our own frame: never matches, no ACK
+rcrc:   LDI     r7, 16
+        CSRW    CNT, r7
+crcl:   WAITD   8                       ; CRC[14:0], a stuff bit if due, delimiter
+        SHI
+        BT      stufferr
+        BNZ     crcl
+        STCRC   r7
+        CMP     r7, r5
+        BNZ     noack
+        SETP    TX, 0, D                ; ACK, on the edge that starts the slot
+noack:  WAITD   3                       ; the ACK slot starts
+        STSR    r5
+        ANDI    r5, 1                   ; the CRC delimiter
+        BZ      formerr
+        MOV16   r5, POLY
+        CMP     r7, r5
+        LDI     r5, 0                   ; the status word
+        BZ      crcok
+        LDI     r5, 1                   ; CRC error
+crcok:  CSRR    r7, SFLAGS
+        ANDI    r7, 1
+        BZ      other
+        ORI     r5, 16                  ; own frame
+other:  WAITD   5                       ; the ACK slot's sample point
+        JP      RX, 0, acked
+        ORI     r5, 8                   ; no ACK
+acked:  SETP    TX, 1, D                ; releases a staged ACK at the slot's end
+        WAITD   3
+        WAITD   5                       ; ACK delimiter
+        JP      RX, 0, formerr
+        LDI     r7, 6
+eof:    WAITD   8                       ; EOF bits 1 to 6
+        JP      RX, 0, formerr
+        DJNZ    r7, eof
+        BRA     push
+formerr: ORI    r5, 4
+
+push:   MOV     r7, r6                  ; r6 = len; w = (len + 1) / 2 words
+        ANDI    r7, 1                   ; are in r(5-w) .. r4
+        BZ      even
+        SHLI    r4, 8                   ; the odd last byte to 15:8
+even:   ADDI    r6, 1
+        SHRI    r6, 1                   ; w
+        MOV     r7, r6
+        ADDI    r7, 1                   ; n = w + 1, the header too
+        SHLI    r7, 8
+        OR      r5, r5, r7
+        PUSH    r5
+        PUSH    r0
+        CMPI    r6, 3                   ; C = (w >= 3), Z = (w == 3)
+        BZ      p2
+        BC      p1
+        CMPI    r6, 1
+        BZ      p4
+        BNC     pdone
+        BRA     p3
+p1:     PUSH    r1
+p2:     PUSH    r2
+p3:     PUSH    r3
+p4:     PUSH    r4
+pdone:  ANDI    r5, 4                   ; after a form error, wait for bus idle
+        BNZ     integ
+        BRA     sof
+
+ext:    LDI     r5, 32                  ; extended frame, not decoded
+        BRA     perr
+stufferr: LDI   r5, 2
+perr:   PUSH    r5
+        BRA     integ
+
+rxbits: WAITD   8
+rxnow:  SHI
+        BT      stufferr
+        BNZ     rxbits
+        RET

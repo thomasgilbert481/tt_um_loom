@@ -107,7 +107,9 @@ at every edge:
 - The tick generator runs whether or not the thread is running.
 - Any write to `TICK_INT` or `TICK_FRAC`, by a committed `CSRW` or by a host
   debug-space write, also sets `ACC <= 0` at the same edge (the clear wins over
-  the accumulate; `NOW` does not tick at that edge).
+  the accumulate; `NOW` does not tick at that edge). Firmware relies on it:
+  writing back the value already there restarts the thread's tick grid at
+  that edge, which is how a receiver hard-synchronises to a start bit.
 - `TICK_INT = 0` is stored and read back as 0; the divider treats it as 1.
 - `reached(a, b)` is `((a - b) mod 2^16) < 2^15`. It is a half-window
   comparison, so it is not monotone in `NOW`: with `TD` unchanged it goes true
@@ -357,8 +359,9 @@ detect what the engine supports; slice A (6.9.1) adds `ENC`, `STUFF` and
 - CRC update with bit `x`, serial and MSB-first on a left-aligned register:
   `fb = CRC[15] ^ x; CRC <= {CRC[14:0], 1'b0} ^ (fb ? CRC_POLY : 16'h0000)`. An
   `n`-bit CRC lives in `CRC[15:16-n]` with its polynomial and initial value
-  left-aligned the same way (`poly << (16 - n)`); the assembler's `.crc`
-  presets do that alignment. The bits enter the register in transmission order.
+  left-aligned the same way (`poly << (16 - n)`); the program does that
+  alignment, from the canonical values `isa.yaml`'s `crc_presets` give. The
+  bits enter the register in transmission order.
 - `LDSR ra`: `SR <= ra`. `STSR rd`: `rd <= SR`. `CRCI`: `CRC <= CRC_INIT`.
   `STCRC rd`: `rd <= CRC`. None changes flags. `CSRR`/`CSRW` reach `SR`,
   `CNT`, `CRC` and the configuration CSRs as well.
@@ -385,7 +388,8 @@ slice A on; a build without slice A is the M2 engine of 6.9 exactly (the
 golden model builds it as the feature `BEENC` on top of `BE`).
 
 Per-thread encoder state, all reset to 0 and cleared by every write to
-`BE_CFG` (by `CSRW` or by the host) and by `CTRL.RESET`: `LVL` (1, the NRZI
+`BE_CFG` (by `CSRW` or by the host) and by `CTRL.RESET`, and by nothing
+else (a write of `BE_PINS`, `SR` or `CNT` leaves it): `LVL` (1, the NRZI
 line level), `RUN` (3) and `RVAL` (1, the length and the value of the current
 run of equal bits), `PEND` (1, a stuff bit is due), `HALF` (1, the Manchester
 half-bit phase) and `FIRST` (1, the bit kept between the two halves). The
@@ -437,13 +441,20 @@ stuff value is 0 for USB and `~RVAL` for CAN. A stuff bit starts the next run
 4. Run accounting on `s`.
 
 `T` is set by a violation and never cleared by `SHI`; firmware clears it with
-`CSRW FLAGS` or lets a timed wait clear it. The loops that result: USB
+`CSRW FLAGS` or lets a timed wait clear it. The timed waits of 6.4 set `T`
+on a timeout too, so a receiver clears `T` before a frame and tests it after
+the `SHI`s, not after a wait. The loops that result: USB
 low-speed transmit and receive are `SHO; WAITD 1; BNZ` and `SHI; WAITD 1;
 BNZ` at a tick of 33.33 clocks (`TICK_INT = 33, TICK_FRAC = 85`), three of
 the eight slots per bit, with NRZI, stuffing, CRC5/CRC16 and D+/D- done by
 the engine and SYNC, PID, EOP (an `SE0` written with two `SETP`) and the
 handshake done by firmware; Manchester is `SHO; WAITD 1; SHO; WAITD 1; BNZ`
-at a half-bit tick.
+at a half-bit tick. The thread cannot read `PEND`, so a frame whose
+stuffing runs up to a fixed-form field sends that field's first bit through
+the engine as a data bit, and a due stuff bit goes out before it: CAN's CRC
+delimiter is sent as a sixteenth bit of the CRC field (`SR = CRC | 1`).
+Where the next field is not a data bit (USB's EOP), the program probes for a
+due stuff bit instead (`firmware/README.md`, `usb_ls_device`).
 
 ### 6.10 Deadline-latched pin write **[M2]** (D-016)
 

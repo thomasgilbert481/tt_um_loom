@@ -295,7 +295,13 @@ result recorded, bounded or proved.
 - [ ] One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
       the pinned PDK) to the end of global routing and stop? Record the answer
       in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow
-      there before it goes to CI.
+      there before it goes to CI. Deferred 2026-09-24 until the slice C
+      decision: no other slice is planned, so its only use would be slice C
+      or a post-freeze fix. What it takes, from `tt-gds-action@ihp-cmos5l`:
+      `pip install librelane==3.1.0.dev3`, tt-support-tools branch
+      `ihp-sg13cmos5l`, the PDK from the action's `install_sg13cmos5l.sh`,
+      and Docker reachable from WSL for LibreLane's container; then
+      LibreLane's `--to` on the config `tt_tool.py --harden --ihp` writes.
 - [x] 2026-09-22: SEMANTICS 6.9.1 (D-026 slice A): NRZI, Manchester as two
       `SHO` per bit, USB and CAN stuffing and destuffing with a uniform run
       rule, the T flag, the differential output bit, the encoder state at
@@ -351,15 +357,30 @@ result recorded, bounded or proved.
       Hardened 2026-09-24 (run 35940928210): every job passed, routing
       3 h 54 min, Metal3 overflow 1,945, typ +5.38 ns, slow -3.53 ns (from
       -6.08); stays. The gds job took 5 h 02 min, the longest yet.
-- [ ] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
+- [x] Firmware on slice A and B: `i2c_slave_eeprom` (24C02-style, 256 bytes
       in an unused quarter, L3-I2C-S), `usb_ls_device` in manual mode with a
       Python host model, enumeration to SET_ADDRESS and one HID report
-      (L3-USB-LS), `can_loopback` with stuffing and CRC15 (L3-CAN).
+      (L3-USB-LS), `can_loopback` with stuffing and CRC15 (L3-CAN). Done
+      2026-09-23 by two agents, on both backends with no divergence.
+      `usb_ls_device` enumerates as a HID boot mouse (device, configuration
+      and report descriptors, SET_ADDRESS after its status stage,
+      SET_CONFIGURATION, interrupt IN with host-pushed reports, STALL for
+      the rest) and meets every USB 2.0 limit it is checked against
+      (response 4.56 to 4.74 bit times of 2 to 6.5), in 511 of the 512
+      words, so it runs alone in thread 0. `i2c_slave_eeprom` (239 words
+      with its data) at 100 and 400 kHz with no clock stretching;
+      `can_loopback` (TX thread 0, RX thread 1 that ACKs and reports CRC,
+      stuff, form and no-ACK errors) at 125 and 500 kbit/s. Spec questions
+      8 to 16 of `docs/spec-questions/firmware-m3.md` ruled; the text fixes
+      (SEMANTICS 4, 6.9, 6.9.1, `CRCI` in `isa.yaml`) came with them.
 - [ ] 2026-11-01, slice C decided by the numbers: auto mode in the
       slot-injected shape (D-026) only if slice B's hardening shows Metal3
       overflow under 3,500 and detailed routing under 3 h 45 min, and Thomas
       wants it. If built: SEMANTICS text, model, RTL, co-simulation,
-      hardening, all before 2026-11-08.
+      hardening, all before 2026-11-08. Input from the firmware: slice B's
+      numbers meet the bar, and USB low speed, the stretch protocol D-029
+      kept, meets its timing in manual mode (firmware-m3 item 10), so no
+      program on the plan needs auto mode.
 - [ ] Fable review, M3: the slices' numbers, ISO-1's state, the freeze commit.
 
 ### M4: RTL freeze and the evidence (freeze 2026-11-08; by 2026-12-01)
@@ -377,6 +398,11 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
       remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
       the RTL, the two open timer mutants closed (one by D-028 if taken).
+      Two tools items from the M3 firmware rulings: the model backend fails
+      a scenario that fetches or `LD`s a word the image never loaded
+      (firmware-m3 item 9, the check `test/tb.v` makes on the RTL), and the
+      assembler's listing marks a section that crosses another thread's
+      reset vector (item 16).
 - [ ] Mutation re-run on the freeze commit. The 99.7 per cent in M2 was
       measured on the M2 RTL; slices A and B, D-028 and D-031 have changed
       `loom_core`, `loom_timer`, `loom_be` and `loom_host_ctl` since, and a
@@ -391,9 +417,11 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       Started 2026-09-22: sections 1 to 3 and 5 to 7 describe `main` after
       the M2 review; sections 4 (evidence by layer) and 8 (what the AI did)
       are outlines to fill at the freeze; updated with each slice.
-- [ ] If the `gds` artefact includes SDF (unverified; check first): one
-      timing-annotated gate-level run of the L3 suite at the typical corner,
-      recorded as PHY-GL-SDF.
+- [ ] If the `gds` artefact includes SDF (checked 2026-09-24: it does, the
+      `GDS_logs` artifact carries `runs/wokwi/final/sdf/` for all three
+      corners, run 35940928210): one timing-annotated gate-level run of the
+      L3 suite at the typical corner, recorded as PHY-GL-SDF. Open: whether
+      Icarus annotates the IHP cell models' `specify` blocks.
 - [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
       measured slow-corner clock, both with their slack.
 - [ ] Firmware freeze 2026-12-01.

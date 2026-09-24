@@ -1,0 +1,238 @@
+; i2c_slave_eeprom.loom
+; A 24C02-style I2C EEPROM: 256 bytes, 8-byte pages, device address 0x50.
+; M3 firmware on slice B: the data lives in the instruction memory and is
+; reached with LD and ST (SEMANTICS 6.11); nothing else beyond the M1 core.
+;
+; Pins: SCL = BIDIR0, SDA = BIDIR1, both open drain (OD_MASK bits 0 and 1,
+; set with a read-modify-write). The device only ever pulls SDA low or lets
+; it go; it never touches SCL (no clock stretching, see "Budget" below). The
+; board supplies the pull-ups.
+;
+; Data window: the 256 bytes are the 128 words 0x180..0x1FF, thread 3's
+; quarter of the 512-word memory (D-020), which no thread runs from. Byte
+; address A is word 0x180 + A/2: an even byte in bits 15:8, an odd byte in
+; bits 7:0, so a word read as hex shows its two bytes in address order. The
+; image below fills the window with 0xFFFF (an erased part); the host loads
+; another image into it, or reads the contents back, with its IMEM commands
+; while the thread is halted (SEMANTICS 6.11: no new host feature).
+;
+; Transactions (the 24C02 command set):
+;     byte write     S A0 a d P            page write   S A0 a d0 .. dn P
+;     current read   S A1 d.. P            random read  S A0 a Sr A1 d.. P
+;     sequential read: the master ACKs each byte it wants another after.
+; The address counter is the 24C02's: the word address byte sets it, every
+; byte written or read moves it on by one; it is 0 when the program starts. A write wraps inside its 8-byte
+; page (byte 7 of a page is followed by byte 0 of the same page), a read
+; wraps at the end of the array (0xFF is followed by 0x00). After a read the
+; counter points after the last byte the master acknowledged or NACKed, so
+; a current-address read continues where the last one stopped.
+; Each data byte is written to the array during its own ACK clock, not
+; collected and committed at the STOP as a real part does: a write cut
+; short by a repeated START keeps the bytes already acknowledged, and there
+; is no internal write cycle (the next transaction may start at once and is
+; acknowledged).
+; A byte whose first seven bits are not 0x50 is not acknowledged: SDA stays
+; released and the device waits for the next START, ignoring the rest of
+; that transaction. When the master NACKs a byte it read, the device lets go
+; of SDA and waits for the STOP or the repeated START that follows.
+; Host command and result: none. The program never touches the FIFOs.
+;
+; Rate: the master owns SCL, so the program has no tick and no deadline
+; (no .tick, no WAITD; the checker has no pair to prove). What it must
+; meet is the I2C specification (UM10204, table 10) for a slave:
+;     SDA valid within tVD;DAT / tVD;ACK after SCL falls: 3.45 us at
+;     100 kHz, 0.9 us = 45 clocks at 400 kHz, 50 MHz;
+;     a START or STOP recognised while SCL is high (tHIGH >= 0.6 us).
+; Every SCL fall is seen by a JP in a two-slot poll or by a WAITP, so
+; within 8 clocks plus the synchroniser (pin_in is the pad at edge x - 1,
+; SEMANTICS 3); the longest path from that JP to the pin write that
+; answers it is the ACK of a received byte: DJNZ RET SETP, three slots.
+; The worst response, fall to the SDA pad, is about 30 clocks.
+;
+; Budget: the store of a received byte (the LD, the merge of the byte into
+; its word, the ST, the page-wrapping counter step) is 19 slots and runs
+; between the ACK going low at the 8th SCL fall and the 9th SCL fall, at
+; least one SCL period (125 clocks at 400 kHz) later. The prefetch of the
+; next byte to send is 8 slots and runs between the 8th SCL fall and the
+; 9th SCL rise (tLOW >= 65 clocks at 400 kHz). Both fit without holding
+; SCL, so the device never stretches the clock.
+;
+; START and STOP. While SCL is high inside a received byte the program
+; polls SCL and SDA alternately (two slots a poll). SDA changing while SCL
+; is still high is a START (it fell) or a STOP (it rose); because the two
+; JPs read the pads 4 clocks apart, a change seen on SDA is confirmed by
+; one more look at SCL, which is still high for a START or STOP (tHD;STA,
+; tSU;STO >= 0.6 us) and already low for data the master changed right
+; after SCL fell (tHD;DAT may be 0). Waiting for a START with the bus idle
+; uses IN, which reads both lines from the same synchroniser edge.
+;
+; Registers: r0 the byte shifter, r1 bit count, r2 0x50, r3 the address
+; counter (0..255), r5 r6 r7 scratch (r7 is also the .csr scratch).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   SCL = BIDIR0, SDA = BIDIR1
+        .equ    DEVICE = 0x50           ; 7-bit address (A2..A0 tied low)
+        .equ    WINDOW_HI = 0x03        ; (0x300 | A) >> 1 = 0x180 + A/2
+
+start:  CSRR    r5, OD_MASK
+        ORI     r5, 3                   ; SCL and SDA open drain
+        CSRW    OD_MASK, r5
+        SETP    SCL, 1                  ; never pulled by this program
+        SETP    SDA, 1
+        .csr    INGRP, (2 << 5) | 0     ; IN reads {SDA, SCL} in bits 1:0
+        LDI     r2, DEVICE
+        LDI     r3, 0                   ; the address counter
+
+; Idle: wait for a START, SDA falling while SCL is high. IN reads both
+; lines at once, so the order of two changes inside one poll is never
+; guessed: both high, then SCL high with SDA low, is a START.
+idle:   SETP    SDA, 1                  ; let go of SDA
+i_both: IN      r5
+        CMPI    r5, 3
+        BNZ     i_both                  ; wait until both lines are high
+i_high: IN      r5
+        CMPI    r5, 3
+        BZ      i_high
+        CMPI    r5, 1                   ; SCL high, SDA low: a START
+        BNZ     i_both                  ; SCL fell first: data, not a START
+
+; A START (or a repeated START from rbits). The address byte follows once
+; the master has taken SCL low.
+got_start:
+        WAITP   SCL, 0
+        LDI     r0, 0
+        LDI     r1, 7
+        CALL    rbits                   ; the 7-bit device address
+        CMP     r0, r2
+        BNZ     idle                    ; not us: no ACK, wait for a START
+        LDI     r1, 1
+        CALL    rbits                   ; R/W; returns at the 8th SCL fall
+        SETP    SDA, 0                  ; ACK
+        SHRI    r0, 1                   ; C = R/W
+        BC      read
+
+; Write: the word address, then data bytes until a STOP or a START.
+        CALL    ackclk
+        LDI     r0, 0
+        LDI     r1, 8
+        CALL    rbits                   ; the word address
+        SETP    SDA, 0                  ; ACK
+        MOV     r3, r0                  ; the address counter
+        CALL    ackclk
+w_data: LDI     r0, 0
+        LDI     r1, 8
+        CALL    rbits                   ; a data byte (or a STOP / START)
+        SETP    SDA, 0                  ; ACK
+        CALL    store                   ; into the array, counter moved on
+        CALL    ackclk
+        JMP     w_data
+
+; Read: the ACK of the address byte is on SDA. The first byte is fetched
+; during that ACK clock; it is always sent, so the counter moves at once.
+read:   CALL    fetch
+        ADDI    r3, 1
+        LDIH    r3, 0                   ; wrap at 256
+        WAITP   SCL, 1                  ; the 9th clock ...
+        WAITP   SCL, 0                  ; ... ends: the first bit goes out
+tx:     LDI     r1, 8
+tx_bit: SHLI    r0, 1                   ; C = the next bit, MSB first
+        BC      tx_one
+        SETP    SDA, 0
+        JMP     tx_clk
+tx_one: SETP    SDA, 1
+tx_clk: WAITP   SCL, 1                  ; the master samples on this high
+        WAITP   SCL, 0
+        DJNZ    r1, tx_bit
+        SETP    SDA, 1                  ; release SDA for the master's ACK
+        CALL    fetch                   ; the next byte, counter not moved yet
+        WAITP   SCL, 1                  ; 9th clock high: ACK or NACK
+        JP      SDA, 0, tx_ack
+        JMP     idle                    ; NACK: the master is done
+tx_ack: ADDI    r3, 1                   ; ACK: that byte will be sent
+        LDIH    r3, 0
+        WAITP   SCL, 0
+        JMP     tx
+
+; ---------------------------------------------------------------------------
+; rbits: receive r1 bits MSB first, shifted into r0 from the right. Entered
+; with SCL low; returns at the fall of SCL after the last bit. A START or a
+; STOP inside the byte leaves the subroutine for got_start or idle (the
+; return address left on the two-entry stack is simply overwritten later).
+; ---------------------------------------------------------------------------
+rbits:  WAITP   SCL, 1                  ; the rise: SDA is valid now
+        SHLI    r0, 1
+        JP      SDA, 1, rb_one
+rb_z:   JP      SCL, 0, rb_next         ; SCL fell: the bit is done
+        JP      SDA, 0, rb_z            ; SDA still low
+        JP      SCL, 0, rb_next         ; SDA rose: after SCL fell, data
+        JMP     idle                    ; SDA rose while SCL high: STOP
+rb_one: ORI     r0, 1
+rb_o:   JP      SCL, 0, rb_next
+        JP      SDA, 1, rb_o
+        JP      SCL, 0, rb_next
+        JMP     got_start               ; SDA fell while SCL high: START
+rb_next: DJNZ   r1, rbits
+        RET
+
+; ackclk: the 9th clock of a received byte, whose ACK is on SDA: let go of
+; SDA when it ends.
+ackclk: WAITP   SCL, 1
+        WAITP   SCL, 0
+        SETP    SDA, 1
+        RET
+
+; fetch: r0 = the byte at the counter, in bits 15:8 (bits 7:0 are junk the
+; eight shifts of a byte never reach). The counter is not moved.
+fetch:  MOV     r5, r3
+        LDIH    r5, WINDOW_HI
+        SHRI    r5, 1                   ; the word; C = the byte is odd
+        LD      r0, r5, 0
+        BNC     f_even
+        SHLI    r0, 8                   ; odd byte: from bits 7:0
+f_even: RET
+
+; store: write r0 (bits 7:0, bits 15:8 zero) at the counter and step the
+; counter inside its 8-byte page.
+store:  MOV     r5, r3
+        LDIH    r5, WINDOW_HI
+        SHRI    r5, 1                   ; the word; C = the byte is odd
+        LD      r6, r5, 0
+        BC      s_odd
+        SHLI    r6, 8                   ; even: keep the odd byte ...
+        SHRI    r6, 8
+        SWAP    r7, r0                  ; ... and put the new one on top
+        JMP     s_put
+s_odd:  SHRI    r6, 8                   ; odd: keep the even byte ...
+        SHLI    r6, 8
+        MOV     r7, r0                  ; ... and put the new one below
+s_put:  OR      r6, r6, r7
+        ST      r6, r5, 0
+        MOV     r7, r3                  ; counter = (counter & ~7) | ((counter + 1) & 7)
+        ADDI    r7, 1
+        XOR     r7, r7, r3
+        ANDI    r7, 7
+        XOR     r3, r3, r7
+        RET
+
+; ---------------------------------------------------------------------------
+; The array: 256 bytes erased to 0xFF, in thread 3's quarter.
+; ---------------------------------------------------------------------------
+        .thread 3
+        .org    0x180
+eeprom: .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
