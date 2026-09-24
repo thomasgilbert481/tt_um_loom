@@ -34,7 +34,8 @@
 
 module loom_iso_view #(
     parameter integer T   = `ISO_T,
-    parameter integer FAW = 2
+    parameter integer FAW = 2,
+    parameter integer AW  = 9      // IMEM_AW
 ) (
     input wire        clk,
     input wire        rst_n,
@@ -104,6 +105,18 @@ module loom_iso_view #(
     input wire [3:0]  lat_valid_all,
     input wire [3:0]  lat_val_all,
     input wire [19:0] lat_pin_all,
+
+    // ------------------------------------- data memory (6.11, slice B)
+    input wire [3:0]  mem_pend_all,
+    input wire [3:0]  mem_ld_all,
+    input wire [3:0]  mem_we_all,
+    input wire [11:0] mem_rd_all,
+    input wire [4*AW-1:0] mem_addr_all,
+    input wire [63:0] mem_data_all,
+    input wire        imem_en,
+    input wire        imem_we,
+    input wire [AW-1:0] imem_addr,
+    input wire [15:0] imem_wdata,
 
     // ------------------------------------------------------------- timer
     input wire [63:0] now_all,
@@ -222,6 +235,27 @@ module loom_iso_view #(
   wire        s_latv    = lat_valid_all[T];
   wire        s_latval  = lat_val_all[T];
   wire [4:0]  s_latpin  = lat_pin_all[5*T +: 5];
+
+  // Data memory (6.11, slice B): MEM = {MEM_PEND, MEM_LD, MEM_RD} of
+  // SEMANTICS 5, and the held access (address, store word, write bit),
+  // which is thread T's state although the host cannot read it. All reset.
+  wire          s_mpend = mem_pend_all[T];
+  wire          s_mld   = mem_ld_all[T];
+  wire [2:0]    s_mrd   = mem_rd_all[3*T +: 3];
+  wire          s_mwe   = mem_we_all[T];
+  wire [AW-1:0] s_maddr = mem_addr_all[AW*T +: AW];
+  wire [15:0]   s_mdata = mem_data_all[16*T +: 16];
+  // Thread T's use of the memory port, in its own F cycle (SEMANTICS 2: a
+  // slot of thread t is in F in cycle t mod 4). Since slice B the port
+  // writes: an ST's completion slot stores into memory every thread reads,
+  // so T's stores are T's output to shared state, compared like its pin
+  // writes. (The other threads' stores need no assumption here: in the
+  // miter the memory is an input, see iso_miter.v.)
+  wire          s_f_is_t   = (ph == TT);
+  wire          s_mp_en    = s_f_is_t & imem_en;
+  wire          s_mp_we    = s_f_is_t & imem_we;
+  wire [AW-1:0] s_mp_addr  = {AW{s_mp_en}} & imem_addr;
+  wire [15:0]   s_mp_wdata = {16{s_mp_we}} & imem_wdata;
 
   wire [FAW:0] s_icnt   = inq_cnt_all[(FAW+1)*T +: FAW+1];
   wire [FAW:0] s_ocnt   = outq_cnt_all[(FAW+1)*T +: FAW+1];
@@ -380,6 +414,8 @@ module loom_iso_view #(
                       && (|cw_out_mask || |cw_oe_mask || cw_od_we);
   wire c_t_latw     = |lw_out_mask;
   wire c_pipe_full  = vd && vx && w_valid;
+  wire c_t_store    = s_mp_we;                         // T's ST stores
+  wire c_t_load     = s_mp_en && s_mpend && !s_mwe;    // T's LD reads
 
 endmodule
 
@@ -387,7 +423,7 @@ endmodule
 // so the property module reads internal registers with no port added to the
 // RTL. Yosys's own Verilog frontend silently drops `bind`; every .sby here
 // reads the design through `plugin -i slang; read_slang` (formal/README.md).
-bind loom_core loom_iso_view #(.T(`ISO_T), .FAW(2)) u_view (
+bind loom_core loom_iso_view #(.T(`ISO_T), .FAW(2), .AW(IMEM_AW)) u_view (
     .clk(clk), .rst_n(rst_n),
     .ph(ph), .vd(vd), .td_th(td_th), .pcd(pcd), .ird(ird),
     .vx(vx), .tx_th(tx_th), .pcx(pcx), .irx(irx), .op_a(op_a), .op_b(op_b),
@@ -407,6 +443,11 @@ bind loom_core loom_iso_view #(.T(`ISO_T), .FAW(2)) u_view (
     .step_req_r(step_req_r), .badop_r(badop_r), .sflags_r(sflags_r),
     .swirq_r(swirq_r), .lat_valid_all(lat_valid_all),
     .lat_val_all(lat_val_all), .lat_pin_all(lat_pin_all),
+    .mem_pend_all(mem_pend_all), .mem_ld_all(mem_ld_all),
+    .mem_we_all(mem_we_all), .mem_rd_all(mem_rd_all),
+    .mem_addr_all(mem_addr_all), .mem_data_all(mem_data_all),
+    .imem_en(imem_en), .imem_we(imem_we), .imem_addr(imem_addr),
+    .imem_wdata(imem_wdata),
     .now_all(now_all), .td_all(td_all_w), .dt_all(dt_all_w),
     .tick_int_all(tick_int_all), .tick_frac_all(tick_frac_all),
     .tick_seen_all(tick_seen_all),

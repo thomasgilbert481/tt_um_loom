@@ -86,7 +86,9 @@ miss". The state on 2026-09-22 is:]
   2026-09-22 and re-proved; ISO-1, thread isolation, proved unbounded the
   same day by `abc pdr` on a two-copy miter with the host debug port quiet
   (thread 0's whole state compared every cycle, whatever the other three
-  threads run; 35 minutes; a depth-24 BMC cross-check); WAIT-1's completion
+  threads run; a depth-24 BMC cross-check), extended on 2026-09-23 to slice
+  B's data-memory state and the thread's own stores (F-7) and proved for all
+  four threads; WAIT-1's completion
   rule proved and its bound checked to depth 40. The L4 list has nothing
   unattempted. Two more findings, F-4 and F-5, are wording corrections.
 - M3 slice A (2026-09-22) as a worked example of the method: the golden
@@ -155,9 +157,11 @@ hours and every hardware change since is judged by that rule (D-025).
 ## 7. Known limitations and open items
 
 - No hardware before silicon (section 2). L6 open.
-- ISO-1 is proved for thread 0 with the host debug port quiet; the other
-  three threads are re-runs of the same miter (35 minutes each, not yet
-  done), and with the debug port in use the property is false by design
+- ISO-1 is proved for each of the four threads with the host debug port
+  quiet. Since slice B it also takes as given that no other thread stores
+  into memory the thread reads: the hardware lets any thread store
+  anywhere (SEMANTICS 6.11), and keeping to one quarter per thread is the
+  programs' job. With the debug port in use the property is false by design
   (F-4: the port, the register-file write port and the staged-write port
   are shared, as HOST_PROTOCOL already states). WAIT-1's bound is bounded
   at depth 40, not proved unbounded.

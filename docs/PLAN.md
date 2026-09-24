@@ -324,6 +324,9 @@ result recorded, bounded or proved.
       rule) proved, WAIT-1's bound checked to depth 40. Findings F-4 and F-5
       are wording corrections (`formal/README.md`); BUGS 6 is an
       observation from the same work. One formal agent, one run.
+      2026-09-23, F-7: the miter predated slice B and compared none of its
+      state or a thread's stores; extended (99 assertions, 11 covers) and
+      proved for all four threads, thread 0 in 33 min.
 - [x] 2026-09-22: SEMANTICS 6.11 and `isa.yaml` for D-027: `LD`/`ST` as
       two-slot instructions on the instruction memory through the thread's
       own fetch cycle (text in 6.11, state in section 5, debug 0x28, the
@@ -373,6 +376,14 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
       remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
       the RTL, the two open timer mutants closed (one by D-028 if taken).
+- [ ] Mutation re-run on the freeze commit. The 99.7 per cent in M2 was
+      measured on the M2 RTL; slices A and B, D-028 and D-031 have changed
+      `loom_core`, `loom_timer`, `loom_be` and `loom_host_ctl` since, and a
+      mutant's id carries its line number (`tools/mutate/operators.py`), so
+      every recorded equivalent below a changed line in `loom_core` is
+      already keyed to the wrong line. Re-run the campaign on the frozen RTL,
+      re-key `equivalents.json` (each reason re-checked, not copied), and
+      quote that score in the report.
 - [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
       the mutation table, the formal findings, the routing budget, D-024's
       statement that nothing ran on hardware and what stands in for it.

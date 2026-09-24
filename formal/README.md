@@ -50,14 +50,18 @@ bound: `abc pdr` (property-directed reachability) or k-induction in
 
 ## Results
 
-Recorded 2026-09-19 (TIMER-2 added 2026-09-22 with D-028, ISO-1 the same day),
+Recorded 2026-09-19 (TIMER-2 added 2026-09-22 with D-028, ISO-1 the same day;
+ISO-1 extended to slice B's state and run for all four threads 2026-09-23,
+F-7),
 OSS CAD Suite: SBY 0.63, Yosys 0.63+161, yices 2.6, btormc (boolector), abc
 pdr. Times are wall clock on the laptop. `scripts/formal.sh quick` is 21 sby
 tasks in about 5 minutes, the slowest single task being `iso:cover` at about 30 s —
 inside the `formal-quick` budget of the CI matrix in `docs/VERIFICATION.md`.
 The runs `quick` leaves out are the `formal-full` nightly's work and take
-about 55 minutes between them, nearly all of it `iso:prove` (35) and
-`iso:bmc` (14).
+one to two hours between them, nearly all of it `iso:prove` (about
+33 minutes for thread 0 since F-7, 35 before) and `iso:bmc` (14 to
+37). The F-7 times were taken with the laptop running other proofs
+beside them, so they are upper bounds.
 
 | ID | Property | File / task | Mode | Engine | Depth | Result | Time |
 |---|---|---|---|---|---|---|---|
@@ -96,11 +100,12 @@ about 55 minutes between them, nearly all of it `iso:prove` (35) and
 | SPI-1 | bounded cross-check (one full byte plus margin) | `spi.sby:bmc` | bmc | smtbmc yices | 70 | pass | 19 s |
 | SPI-1 | same, without "the chip is not reset mid-transaction" | `spi.sby:xfail` | bmc | smtbmc yices | 80 | **FAILS, steps 63-76** — finding F-3 | 16 s |
 | — | 5 cover points, including two bytes in one transaction | `spi.sby:cover` | cover | smtbmc yices | 140 | 5/5 | 65 s |
-| **ISO-1** | two traces that agree on thread 0's inputs keep thread 0's whole architectural state identical, whatever the other three threads run (two-copy miter, no host debug traffic) | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 2 118 s |
-| ISO-1 | same, bounded cross-check | `iso.sby:bmc` | bmc | btor btormc | 24 | pass | 819 s |
+| **ISO-1** | two traces that agree on thread 0's inputs keep thread 0's whole architectural state identical, whatever the other three threads run (two-copy miter, no host debug traffic); since F-7 the state includes `MEM` and the held access, and thread 0's stores are compared | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 1 953 s |
+| ISO-1 | the same for threads 1, 2 and 3 (`-DISO_T=<n>` on the `read_slang` lines) | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 2 125 / 2 117 / 3 456 s |
+| ISO-1 | same, bounded cross-check | `iso.sby:bmc` | bmc | btor btormc | 24 | pass | 2 201 s |
 | ISO-1 | same, with the host's whole debug traffic identical in the two traces | `iso.sby:dbg` | bmc | btor btormc | 16 | **FAILS, step 5** — finding F-4 | 23 s |
 | ISO-1 | same, with only the debug transactions addressed to thread 0 identical (the L4 wording taken literally) | `iso.sby:xfail` | bmc | btor btormc | 16 | **FAILS, step 5** — finding F-4 | 20 s |
-| — | 9 cover points: the other thread's PCs parted, it decodes a different word in the two copies, thread 0 advances / stalls / blocks on SFLAGS / fires a WAITS / commits a pin write / applies a deadline-latched write with the other thread diverged, both pipes full | `iso.sby:cover` | cover | smtbmc yices | 20 | 9/9 | 29 s |
+| — | 11 cover points: the other thread's PCs parted, it decodes a different word in the two copies, thread 0 advances / stalls / blocks on SFLAGS / fires a WAITS / commits a pin write / applies a deadline-latched write with the other thread diverged, both pipes full, and (F-7) thread 0 stores and loads with the other thread diverged; the same 11 for threads 1 to 3 | `iso.sby:cover` | cover | smtbmc yices | 20 | 11/11 | 73 s |
 | WAIT-1A | a `WAITD` is `done` exactly when `reached(NOW, TD')`; a re-issue leaves `TD` where the first issue put it; a wait-class slot that stalls leaves `PC` alone | `wait.sby:prove` | prove | abc pdr (k-induction at 12 also closes it) | unbounded | **proved** | 11 s |
 | **WAIT-1** | a timed wait retires within `TD - NOW + 2` of the thread's slots, all four threads, at the reset tick period (`TICK_INT = 1`, `TICK_FRAC = 0`), for deadlines up to 8 ticks away | `wait.sby:bmc` | bmc | btor btormc | 40 | pass | 163 s |
 | WAIT-1 | the same bound with the tick period free | `wait.sby:xfail` | bmc | btor btormc | 40 | **FAILS, step 17, thread 1** — finding F-5 | 23 s |
@@ -110,8 +115,11 @@ about 55 minutes between them, nearly all of it `iso:prove` (35) and
 it (the byte counter needs a deeper invariant than 20 cycles), which is why the
 group lists two engines and takes the first conclusive answer.
 
-**ISO-1 is proved, unbounded**, by `abc pdr` in 35 minutes: 89 assertions
-over a design of two `loom_core`s and two `loom_pins`. k-induction at depth
+**ISO-1 is proved, unbounded**, by `abc pdr`, for each of the four threads:
+99 assertions since F-7 (89 before, 35 minutes for thread 0) over a design
+of two `loom_core`s and two `loom_pins`, thread 0 in 33 min. The two
+assertions `pdr` closes last are the OUTQ head and next-entry comparisons,
+which F-7 did not touch; the ten it added close well before them. k-induction at depth
 12 does not close it (`smtbmc boolector` passes the base case and fails the
 induction step on six assertions, the register-file write port among them),
 which is why the group lists two engines and takes the first conclusive
@@ -383,6 +391,31 @@ reachable, and WAIT-1A uses `dec_ok`. The co-simulation had covered LD/ST all
 along and found no divergence: the design was right and the proofs were the
 thing that had not been told.
 
+### F-7 ISO-1 did not compare slice B's state or a thread's stores
+
+Found on 2026-09-23 while connecting the miter to D-031's new port, not by a
+failing run, and recorded for the reason F-6 is: the pipeline gained state
+and one harness was not told. The miter and its view were written on
+2026-09-22 (8c487cc), before slice B's RTL (b32c152), and were not revisited
+when it landed. The view named no `MEM_PEND`, `MEM_LD` or `MEM_RD` (SEMANTICS
+5 since 6.11) and none of the held access (address, store word, write bit),
+and the miter left the core's new store port (`imem_we`, `imem_wdata`)
+unconnected, which slang reported in four warnings on every run. ISO-1
+stayed green on the slice B RTL but no longer covered thread `t`'s whole
+state: a bug that let another thread disturb `t`'s held store address or
+store word would have passed, because the store lands in a memory the miter
+models as an input and nothing compared it.
+
+The view now compares `MEM` and the held access (all reset, so unguarded)
+and thread `t`'s use of the memory port in its own F cycle: enable, write,
+address and store word, masked outside that cycle. The cover task gains
+two points, `t` storing and `t` loading while another thread has diverged,
+and the warnings are gone. Result: 99 assertions (89 before), proved
+unbounded by `abc pdr` for each of the four threads, thread 0 in 33 min;
+the depth-24 cross-check and all 11 cover points pass. `iso.sby:prove`'s
+timeout is now 3 hours (it was 1). What slice B changes about the claim
+itself is under "What is outside the miter" below.
+
 ## ISO-1: what the miter assumes
 
 ISO-1 is the one L4 property that is a relation between two traces, so it is
@@ -492,6 +525,16 @@ under that guard, and the unguarded version fails:
   assertion proved here holds for the real, narrower environment. A `cover`
   trace need not correspond to one constant memory or to a reachable SPI
   command sequence.
+- **Shared memory, since slice B.** The words thread `t` reads in its own
+  slots now include its `LD` data, and every thread can `ST` to any
+  address (SEMANTICS 6.11 takes the address modulo `IMEM_WORDS`). The
+  hypothesis that `t` reads the same words in the two traces therefore
+  holds on the chip only if no other thread stores into a word `t` reads.
+  That is a placement rule for programs (one quarter of the memory per
+  thread, `.org`), not something the hardware enforces: a store by another
+  thread into `t`'s words is a write to shared state, outside the claim
+  exactly as a `CSRW PIN_OUT` is. Thread `t`'s own stores are compared
+  (F-7).
 - **Over-constraints** (they make the result weaker, and are the honest
   limits of this run): the `RESET_PC` write port is shared, so the other
   three threads' `RESET_PC` is also the same in the two traces — only thread

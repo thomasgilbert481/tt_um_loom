@@ -23,7 +23,10 @@ dbg:   timeout 3600
 dbg:   expect fail
 prove: mode prove
 prove: depth 12
-prove: timeout 3600
+# Thread 0 takes about 33 min on a quiet laptop with F-7's assertions (35
+# before F-7); runs beside other proofs have taken up to an hour, which is
+# where 1 h timed out, so the limit leaves room.
+prove: timeout 10800
 cover: mode cover
 cover: depth 20
 cover: timeout 3600

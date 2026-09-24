@@ -40,7 +40,8 @@ GROUPS_ALL="isa fifo timer pins spi isacore sched wait iso"
 # What `quick` leaves out: bounded runs that an unbounded proof in the same
 # group already subsumes, plus the long ISO-1 and WAIT-1 runs, which belong
 # to the `formal-full` nightly of docs/VERIFICATION.md and not to
-# `formal-quick` (iso:prove is 35 minutes, iso:bmc 14, wait:bmc 3).
+# `formal-quick` (iso:prove is about 33 minutes since F-7, iso:bmc 14 to
+# 37, wait:bmc 3).
 QUICK_SKIP="sched:bmc isacore:bmc spi:bmc iso:bmc iso:prove wait:bmc wait:cover"
 
 mode="full"

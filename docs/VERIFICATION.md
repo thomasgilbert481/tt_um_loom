@@ -147,8 +147,13 @@ reference model, check data and timing.
   FIFOs, SFLAGS it waits on) thread t's state sequence is identical regardless
   of what other threads do, given that no other thread writes shared state
   (ARCHITECTURE 1's "except through explicit shared state"). Checked as a
-  two-copy miter on `loom_core` + `loom_pins`, thread 0: **proved unbounded**
-  by `abc pdr` in 35 minutes, with a depth-24 BMC cross-check. The host's
+  two-copy miter on `loom_core` + `loom_pins`: **proved unbounded** by
+  `abc pdr` for each of the four threads, with a depth-24 BMC cross-check
+  for thread 0. Since slice B the compared state includes the data-memory
+  state and the thread's own stores (formal finding F-7), and the claim
+  needs one more precondition: no other thread stores into a word thread t
+  reads (SEMANTICS 6.11 lets any thread store anywhere; programs keep to
+  their own quarter). The host's
   debug traffic has to be counted among
   thread t's inputs, and even then the claim is false while the host uses the
   debug port, because that port, the register-file write port and the deadline
@@ -261,7 +266,7 @@ run it.
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, and from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 75 scenarios on the model, 52 on the RTL (the rest marked `model_only` with the reason), no divergence between the sides |
-| L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` (35 min) with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit) |
+| L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` for all four threads with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit); two harness findings came with slice B, F-6 (properties that took the LD/ST completion slot for an instruction) and F-7 (ISO-1 not comparing slice B's state or a thread's stores) |
 | L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; two open survivors; the results section below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
 

@@ -233,7 +233,8 @@ module loom_iso_miter #(
   wire [15:0] trir_a, trval_a;
   wire [2:0]  trrd_a, trfl_a;
   wire [IMEM_AW-1:0] iaddr_a;
-  wire        ien_a;
+  wire        ien_a, iwe_a;
+  wire [15:0] iwd_a;
   wire [7:0]  uio_out_a, uio_oe_a;
   wire [5:0]  out_pins_a;
 
@@ -241,6 +242,7 @@ module loom_iso_miter #(
               .FIFO_DEPTH(FIFO_DEPTH)) u_a (
       .clk(clk), .rst_n(rst_n),
       .imem_addr(iaddr_a), .imem_en(ien_a), .imem_rdata(imem_rdata_a),
+      .imem_we(iwe_a), .imem_wdata(iwd_a),
       .pin_in_vec(pin_in_vec_a), .pin_in_reg(pin_in_reg_a),
       .pin_out_reg(pin_out_reg_a), .pin_oe_reg(pin_oe_reg_a),
       .od_mask_reg(od_mask_reg_a),
@@ -308,7 +310,8 @@ module loom_iso_miter #(
   wire [15:0] trir_b, trval_b;
   wire [2:0]  trrd_b, trfl_b;
   wire [IMEM_AW-1:0] iaddr_b;
-  wire        ien_b;
+  wire        ien_b, iwe_b;
+  wire [15:0] iwd_b;
   wire [7:0]  uio_out_b, uio_oe_b;
   wire [5:0]  out_pins_b;
 
@@ -316,6 +319,7 @@ module loom_iso_miter #(
               .FIFO_DEPTH(FIFO_DEPTH)) u_b (
       .clk(clk), .rst_n(rst_n),
       .imem_addr(iaddr_b), .imem_en(ien_b), .imem_rdata(imem_rdata_b),
+      .imem_we(iwe_b), .imem_wdata(iwd_b),
       .pin_in_vec(pin_in_vec_b), .pin_in_reg(pin_in_reg_b),
       .pin_out_reg(pin_out_reg_b), .pin_oe_reg(pin_oe_reg_b),
       .od_mask_reg(od_mask_reg_b),
@@ -449,6 +453,20 @@ module loom_iso_miter #(
     assert (u_a.u_view.s_latval == u_b.u_view.s_latval);
     assert (u_a.u_view.s_latpin == u_b.u_view.s_latpin);
 
+    // ---- data memory (6.11, slice B): MEM and the held access, and
+    // thread T's own use of the memory port in its F cycle, stores
+    // included (formal/README.md, F-7)
+    assert (u_a.u_view.s_mpend == u_b.u_view.s_mpend);
+    assert (u_a.u_view.s_mld   == u_b.u_view.s_mld);
+    assert (u_a.u_view.s_mrd   == u_b.u_view.s_mrd);
+    assert (u_a.u_view.s_mwe   == u_b.u_view.s_mwe);
+    assert (u_a.u_view.s_maddr == u_b.u_view.s_maddr);
+    assert (u_a.u_view.s_mdata == u_b.u_view.s_mdata);
+    assert (u_a.u_view.s_mp_en    == u_b.u_view.s_mp_en);
+    assert (u_a.u_view.s_mp_we    == u_b.u_view.s_mp_we);
+    assert (u_a.u_view.s_mp_addr  == u_b.u_view.s_mp_addr);
+    assert (u_a.u_view.s_mp_wdata == u_b.u_view.s_mp_wdata);
+
     // ---- the FIFOs (6.7). Entry words are not reset, so the head and the
     // word after it are compared only while they hold something pushed.
     assert (u_a.u_view.s_icnt == u_b.u_view.s_icnt);
@@ -565,11 +583,15 @@ module loom_iso_miter #(
     cover (f_diverged && u_a.u_view.c_pipe_full && u_b.u_view.c_pipe_full);
     // 9. thread T stalls on a wait while the other thread has diverged
     cover (f_diverged && u_a.u_view.c_t_stall);
+    // 10. thread T's ST stores while the other thread has diverged
+    cover (f_diverged && u_a.u_view.c_t_store);
+    // 11. thread T's LD reads while the other thread has diverged
+    cover (f_diverged && u_a.u_view.c_t_load);
   end
 
-  // Lint sink: outputs the miter does not compare (the host-side views and
-  // the instruction fetch address, which belong to loom_host_ctl and
-  // loom_imem and are outside the miter).
+  // Lint sink: outputs the miter does not compare at this level (the
+  // host-side views, which belong to loom_host_ctl; the memory port, which
+  // the views compare in thread T's F cycle only).
   wire _unused = &{1'b0, fstat_a, fstat_b, oqh_a, oqh_b, oqn_a, oqn_b,
                    dack_a, dack_b, drd_a, drd_b, run_a, run_b,
                    halted_a, halted_b, badop_a, badop_b, sflags_a, sflags_b,
@@ -577,7 +599,7 @@ module loom_iso_miter #(
                    trv_a, trv_b, trt_a, trt_b, trpc_a, trpc_b, trir_a, trir_b,
                    trd_a, trd_b, trw_a, trw_b, trrd_a, trrd_b,
                    trval_a, trval_b, trfl_a, trfl_b, trnpc_a, trnpc_b,
-                   iaddr_a, iaddr_b, ien_a, ien_b,
+                   iaddr_a, iaddr_b, ien_a, ien_b, iwe_a, iwe_b, iwd_a, iwd_b,
                    pin_in_vec_a, pin_in_vec_b, pin_in_reg_a, pin_in_reg_b,
                    pin_out_reg_a, pin_out_reg_b, pin_oe_reg_a, pin_oe_reg_b,
                    od_mask_reg_a, od_mask_reg_b};
