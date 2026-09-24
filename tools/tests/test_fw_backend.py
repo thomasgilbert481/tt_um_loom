@@ -62,3 +62,15 @@ def test_the_model_backend_builds_a_bench_and_a_host():
     loom = MODEL.loom(bench)
     assert loom.transport.bench is bench
     assert loom.id() == 0x4C4D and bench.cycle > 0
+
+
+def test_the_model_backend_stops_at_a_read_of_memory_never_loaded():
+    """docs/spec-questions/firmware-m3.md item 9: what test/tb.v's X check
+    does on the RTL. Thread 0 runs one NOP and fetches word 1, which no image
+    loaded."""
+    from tools.loomisa import load
+    from tools.tests.fw_backend import UnloadedReadError
+    bench = MODEL.bench(image={0: load().encode("NOP")})
+    bench.machine.host_set_run(0b0001)
+    with pytest.raises(UnloadedReadError, match="0x001"):
+        bench.step(20)

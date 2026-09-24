@@ -240,6 +240,16 @@ class Machine:
                 version = H.DEFAULT_VERSION
         self.version = version & WORD_MASK
         self.imem: Dict[int, int] = {}
+        #: Reads by a valid slot's D stage (an instruction fetch, or an
+        #: ``LD``'s data word, SEMANTICS 6.11) of a word no image loaded and
+        #: nothing stored, as ``(cycle, thread, address)``. Such a word is
+        #: unspecified on the chip and reads 0 here; the record changes
+        #: nothing the model does. ``on_unloaded_read``, if set, is called
+        #: with the same three values at the read: the L3 model backend fails
+        #: the scenario there, as ``test/tb.v`` does on the RTL
+        #: (``docs/spec-questions/firmware-m3.md`` item 9).
+        self.unloaded_reads: List[Tuple[int, int, int]] = []
+        self.on_unloaded_read: Optional[Callable[[int, int, int], None]] = None
         if image:
             self.load_image(image)
         self.reset()
@@ -432,7 +442,12 @@ class Machine:
         d_slot = self._stage_d
         if d_slot is not None and d_slot.valid:
             addr = d_slot.mem_addr if d_slot.mem_access else d_slot.pc
-            d_slot.ir = self.imem.get(addr & self.imem_mask, 0)
+            addr &= self.imem_mask
+            if addr not in self.imem:
+                self.unloaded_reads.append((c, d_slot.thread, addr))
+                if self.on_unloaded_read is not None:
+                    self.on_unloaded_read(c, d_slot.thread, addr)
+            d_slot.ir = self.imem.get(addr, 0)
 
         # --- F: a new slot starts for the thread that owns this phase.
         t = c % SLOT_CLOCKS

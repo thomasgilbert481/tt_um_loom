@@ -18,6 +18,11 @@ so the same body runs
   pads. ``test/test_fw.py`` collects the bodies with :func:`scenarios` and
   runs each as a cocotb test.
 
+On the model, a valid slot that fetches or ``LD``s a word the image never
+loaded and nothing stored fails the scenario at that read
+(:class:`UnloadedReadError`), the check ``test/tb.v`` makes on the RTL, where
+such a word is X (``docs/spec-questions/firmware-m3.md`` item 9).
+
 A body the RTL run must skip carries :func:`model_only` with the reason: the
 slow 115200-baud UART cases (434 clocks a bit) and the middle of the SPI
 master's mode sweep. A simulated clock costs a fraction of a millisecond in
@@ -35,13 +40,26 @@ from tools.loomhost import Loom, ModelTransport
 from tools.protomodels.bench import Bench
 
 
+class UnloadedReadError(AssertionError):
+    """A valid slot read a memory word no image loaded and nothing stored."""
+
+
+def _fail_unloaded_read(cycle: int, thread: int, addr: int) -> None:
+    raise UnloadedReadError(
+        "cycle %d: thread %d's slot reads IMEM word 0x%03X, which no image "
+        "loaded and nothing stored (the RTL testbench stops on the X there)"
+        % (cycle, thread, addr))
+
+
 class ModelBackend:
     """Benches and transports that run against ``tools.loomsim``."""
 
     name = "model"
 
     def bench(self, **kwargs) -> Bench:
-        return Bench(**kwargs)
+        bench = Bench(**kwargs)
+        bench.machine.on_unloaded_read = _fail_unloaded_read
+        return bench
 
     def transport(self, bench: Bench) -> ModelTransport:
         return ModelTransport(bench)

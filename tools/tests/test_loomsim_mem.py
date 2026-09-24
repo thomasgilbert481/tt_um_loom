@@ -650,3 +650,44 @@ def test_slice_b_beside_the_rest_of_the_chip():
     assert machine.host_read_ctrl("CAPS") == 0x9000 | (1 << 9) | (1 << 7) \
         | (1 << 5) | (1 << 4) | (1 << 3) | 2
     assert machine.badop == 0
+
+
+# ------------------------------------------ reads of memory never loaded
+# docs/spec-questions/firmware-m3.md item 9: the model records a valid slot's
+# read of a word no image loaded and nothing stored, and changes nothing
+# else; the L3 model backend fails a scenario on it, as test/tb.v does on the
+# RTL, where such a word is X.
+
+def test_an_ld_of_a_word_never_loaded_is_recorded_and_reads_0():
+    machine = build([("LD", dict(rd=1, ra=2, imm=0)), ("HALT", {})])
+    run(machine, regs={1: 0x1234, 2: 0x40})
+    assert machine.threads[0].regs[1] == 0
+    assert [(t, a) for _, t, a in machine.unloaded_reads] == [(0, 0x40)]
+
+
+def test_a_stored_word_counts_as_loaded():
+    """The store lands before the completion slot's D cycle (6.11)."""
+    machine = build([("ST", dict(rd=3, ra=2, imm=1)),
+                     ("LD", dict(rd=4, ra=2, imm=1)),
+                     ("HALT", {})])
+    run(machine, regs={2: 0x40, 3: 0xA55A})
+    assert machine.threads[0].regs[4] == 0xA55A
+    assert machine.unloaded_reads == []
+
+
+def test_a_fetch_past_the_image_is_recorded():
+    machine = build([("NOP", {})])          # no HALT: the next fetch is at 1
+    machine.step_cycle()
+    machine.host_set_run(0b0001)
+    for _ in range(12):
+        machine.step_cycle()
+    assert machine.unloaded_reads[0][1:] == (0, 1)
+
+
+def test_the_hook_sees_the_read_as_it_happens():
+    calls = []
+    machine = build([("LD", dict(rd=1, ra=2, imm=0)), ("HALT", {})])
+    machine.on_unloaded_read = lambda cycle, thread, addr: calls.append(
+        (cycle, thread, addr))
+    run(machine, regs={2: 0x40})
+    assert calls == machine.unloaded_reads and len(calls) == 1
