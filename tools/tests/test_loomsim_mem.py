@@ -691,3 +691,18 @@ def test_the_hook_sees_the_read_as_it_happens():
         (cycle, thread, addr))
     run(machine, regs={2: 0x40})
     assert calls == machine.unloaded_reads and len(calls) == 1
+
+
+def test_a_loaded_setd_word_never_moves_td():
+    """6.11: the completion slot decodes nothing; the RTL twin of this is
+    test/test_mem.py's, which kills mutant loom_timer_L0146C023_stuck_79d2."""
+    setd = ISA.encode("SETD", imm=200)
+    csr_td = 0x0A
+    machine = build([("CSRR", dict(rd=3, csr=csr_td)),
+                     ("LD", dict(rd=1, ra=2, imm=0)),
+                     ("CSRR", dict(rd=4, csr=csr_td)),
+                     ("HALT", {})], data={0x40: setd})
+    run(machine, regs={2: 0x40})
+    regs = machine.threads[0].regs
+    assert regs[1] == setd
+    assert regs[4] == regs[3]

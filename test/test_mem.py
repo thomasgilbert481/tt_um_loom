@@ -41,7 +41,7 @@ from cocotb.triggers import ClockCycles
 
 from spi_host import (
     LoomHost, PadMonitor, asm, run_snippet, SP_CTRL, SP_IMEM,
-    CTRL_CAPS, CTRL_VERSION, CTRL_PIN_OUT, CAPS_DMEM, CSR_FLAGS,
+    CTRL_CAPS, CTRL_VERSION, CTRL_PIN_OUT, CAPS_DMEM, CSR_FLAGS, CSR_TD,
     DBG_PC, DBG_STEPS, DBG_WAIT_ACTIVE, DBG_FLAGS, DBG_MEM,
 )
 
@@ -129,6 +129,28 @@ async def test_ld_reads_what_the_host_wrote(dut):
             f"LD r1, r2, {off} gave {got:#06x}, IMEM[{DATA + off:#04x}] " \
             f"is {words[off]:#06x}"
     assert await host.badop() == 0, "LD is built: no BADOP (SEMANTICS 9)"
+
+
+@cocotb.test()
+async def test_a_loaded_setd_word_never_moves_td(dut):
+    """6.11: the completion slot decodes nothing, so a loaded word that
+    happens to encode `SETD` leaves TD where it was. The X stage still works
+    out a `SETD` target from that word; only the decode gate on the TD write
+    keeps it out. The mutant that writes TD on every commit
+    (loom_timer_L0146C023_stuck_79d2) passed every other check."""
+    host = await fresh(dut)
+    await seed_data(host)
+    setd = asm("SETD", imm=200)
+    await host.write(SP_IMEM, DATA, [setd])
+    await run_snippet(host, [asm("CSRR", rd=3, csr=CSR_TD),
+                             asm("LD", rd=1, ra=2, imm=0),
+                             asm("CSRR", rd=4, csr=CSR_TD)],
+                      regs={1: 0, 2: DATA, 3: 0, 4: 0})
+    got = await host.read_reg(0, 1)
+    assert got == setd, f"LD gave {got:#06x}, the word is {setd:#06x}"
+    before = await host.read_reg(0, 3)
+    after = await host.read_reg(0, 4)
+    assert after == before,         f"TD {before:#06x} before the LD and {after:#06x} after it: the "         f"completion slot decoded the SETD it loaded"
 
 
 @cocotb.test()

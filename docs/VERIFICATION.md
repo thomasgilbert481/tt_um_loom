@@ -265,9 +265,9 @@ run it.
 | L2-RAND, L2-TRACE, L2-SLOT | `tools/loomgen` + `test/test_cosim.py` | lockstep on every cycle: retire record, pads, `HOST_IRQ`, guard registers, periodic full state. Both sides built from `CTRL.CAPS`, so the M2 features (FIFOs, bit engine, `SETP ... D`) are exercised, and two seeds drive the host port throughout the run. Slice A (2026-09-22): the generator drives `ENC`, `STUFF` and `DIFF` in a build with `CAPS[9]`; the default run and a 36 + 4 seed sweep at seed base 1000 (`LOOM_COSIM_SEEDS=36 LOOM_COSIM_SEED_BASE=1000 LOOM_COSIM_SPI_SEEDS=4`) both end with zero divergences between the two independently written implementations of 6.9.1, with every one of the 25 slice A bins hit. Slice B (the same day): the generator emits `LD`/`ST` into a per-thread data window in a build with `CAPS[5]`; the default run and a 36 + 4 seed sweep at seed base 2000 end with zero divergences between the two implementations of 6.11, all five `LD`/`ST` bins hit |
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
-| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, and from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 75 scenarios on the model, 52 on the RTL (the rest marked `model_only` with the reason), no divergence between the sides |
+| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD, and from 2026-09-23 L3-USB-LS, L3-I2C-S, L3-CAN | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 94 scenarios on the model, 80 on the RTL (the rest marked `model_only` with the reason), no divergence between the sides |
 | L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` for all four threads with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit); two harness findings came with slice B, F-6 (properties that took the LD/ST completion slot for an instruction) and F-7 (ISO-1 not comparing slice B's state or a thread's stores) |
-| L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; two open survivors; the results section below |
+| L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; no open survivor since 2026-09-24 (the last one killed by a new `test_mem` check); the results section below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
 
 ## Mutation testing results (L7), 2026-09-21
@@ -321,18 +321,27 @@ five came out of the full pass and account for the "new tests" column:
 | `test_timing.test_tick_int_zero_is_one`, `test_long_tick_period` | `TICK_INT = 0` means 1; ticks of 32,768 clocks and more (the accumulator's top bit) | 4 |
 | `test_host.test_reset_sets_td_to_now` | CTRL.RESET sets TD := NOW | 1 |
 
-**Still open, one timer mutant** (two until 2026-09-22), each needing a
-coincidence no directed test arranges. The first, at the old
-`loom_timer.v:112`, let a host debug write to *another* thread's TD (or any
-host write to this thread) feed this thread's deadline-latch compare, so a
-staged `SETP ... D` could fire early if that value happened to equal
-`NOW + 1` at a tick. D-028 removed the host terms from that compare, so the
-line and its mutant no longer exist, and TIMER-2 proves what the mutant
-exposed: a thread's latch fire depends only on the tick and its own TD
-writes. The second, the `td` register's commit branch written even by a
-commit that does not write TD, differs only if CTRL.RESET of a *running*
-thread lands on the edge one of its slots commits, and needs the protocol to
-say whether RESET of a running thread is legal at all.
+**No survivor is open** (two until 2026-09-22, one until 2026-09-24). The
+first, at the old `loom_timer.v:112`, let a host debug write to *another*
+thread's TD (or any host write to this thread) feed this thread's
+deadline-latch compare, so a staged `SETP ... D` could fire early if that
+value happened to equal `NOW + 1` at a tick. D-028 removed the host terms
+from that compare, so the line and its mutant no longer exist, and TIMER-2
+proves what the mutant exposed: a thread's latch fire depends only on the
+tick and its own TD writes. The second (`loom_timer_L0146C023_stuck_79d2`,
+the `td` register's commit branch taken by every commit, not only a TD
+write) was thought to differ only when CTRL.RESET hits a *running* thread,
+which SEMANTICS 7 leaves undefined, and so to be an equivalent. Slice B made
+that stale: an `LD`/`ST` completion slot runs its data word through the X
+stage's decode, the word can encode `SETD`, and the TD value W carries is
+then `NOW + imm8`; only the decode gate on the TD write enable keeps it out
+of TD, which is the gate the mutant removes. So a legal program kills it,
+and `test_mem.test_a_loaded_setd_word_never_moves_td` (with its model twin)
+does. It had survived the re-check on 2026-09-24 only because the mutation
+ladder's module list predated slice B and never ran `test_mem`; it does now
+(`tools/mutate/runner.py`). Two lessons for the freeze re-run: an
+equivalent's reason can be broken by a later feature, so every reason is
+re-checked, not copied, and the ladder must list every L1 module.
 
 Cost for the next pass: a run that skips the 44 recorded equivalents saves
 about 33 CPU-hours of the 68, because an equivalent is a survivor and pays for

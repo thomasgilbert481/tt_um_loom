@@ -108,7 +108,8 @@ miss". The state on 2026-09-22 is:]
   on the last full hardening (run 35524275302).
 - L7 mutation: 823 mutants, 99.7 per cent killed with 44 documented
   equivalents set aside (`tools/mutate/equivalents.json` gives each its
-  reason), every module at 98.8 per cent or better; one open survivor.
+  reason), every module at 98.8 per cent or better; no open survivor since
+  2026-09-24 (section 5).
 
 ## 5. What verification found
 
@@ -127,10 +128,14 @@ found eight holes in the test suite. Per layer:
 | L4 formal, SPI-1 | a reset while SCK is high inserts a phantom edge; the host protocol now says to release CS_n around a reset | F-3, HOST_PROTOCOL |
 | L7 mutation | eight promises no test compared (debug-register cross-talk, `CSRR TICK_FRAC`, `BE_CFG` readback, MISO idle level, CS_n rising mid-byte, `PIN_IN[15:13]`, `TICK_INT = 0` and long periods, `CTRL.RESET` setting TD) | VERIFICATION.md L7 table |
 
-The one surviving non-equivalent mutant is in `loom_timer` and needs a
-CTRL.RESET of a running thread, which the host protocol calls undefined; the
-second survivor of the first pass was removed by D-028, which deleted the
-logic it lived in, and TIMER-2 now proves the property it exposed.
+No mutant survives without a documented reason. The last one, in
+`loom_timer`, had been read as reachable only through a CTRL.RESET of a
+running thread, which the host protocol calls undefined; slice B made it
+reachable by a legal program (an `LD` of a word that encodes `SETD`), and a
+new `test_mem` check kills it. It had gone unnoticed because the mutation
+ladder's module list predated slice B and never ran `test_mem`. The other
+survivor of the first pass was removed by D-028, which deleted the logic it
+lived in, and TIMER-2 now proves the property it exposed.
 
 ## 6. Physical results
 
@@ -170,7 +175,8 @@ hours and every hardware change since is judged by that rule (D-025).
   (F-4: the port, the register-file write port and the staged-write port
   are shared, as HOST_PROTOCOL already states). WAIT-1's bound is bounded
   at depth 40, not proved unbounded.
-- One mutation survivor open (section 5).
+- The mutation score is from the M2 RTL; it is re-measured on the freeze
+  commit, with every equivalent's reason re-checked (section 5).
 - The slow corner does not close at 20 ns (section 6); the datasheet states
   both clocks.
 - Not attempted: 10 Mbit Ethernet, 10 Mbit Manchester (D-029).

@@ -54,7 +54,9 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 
 # The L1 unit modules of VERIFICATION.md, cheapest first (measured on the
 # unmutated design, Icarus, 2026-09-19). test_fw (L3) and test_flops (the
-# FLOPS memory variant) are deliberately not here.
+# FLOPS memory variant) are deliberately not here. test_mem (slice B's LD/ST,
+# 2026-09-22) was missing until 2026-09-24, so a fault only LD/ST reach went
+# untested by every campaign before then; it sits last, unmeasured.
 L1_MODULES: Tuple[str, ...] = (
     "test_irq",
     "test_timing",
@@ -66,6 +68,7 @@ L1_MODULES: Tuple[str, ...] = (
     "test_be",
     "test_fifo",
     "test_alu",
+    "test_mem",
 )
 
 # Which L1 modules test a given source file most directly. They are promoted
@@ -76,7 +79,7 @@ AFFINITY: Dict[str, Tuple[str, ...]] = {
     "loom_pins": ("test_pins", "test_timing"),
     "loom_timer": ("test_timing", "test_setpd"),
     "loom_spi_host": ("test_host",),
-    "loom_core": ("test_irq", "test_ctrl"),
+    "loom_core": ("test_irq", "test_ctrl", "test_mem"),
     "loom_alu": ("test_alu",),
     "loom_host_ctl": ("test_host",),
     "loom_regfile": ("test_alu",),
