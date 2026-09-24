@@ -22,6 +22,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 
 | 2026-09-23 | M3 slice A: encoders, stuffing, DIFF (D-026) on D-028 | main 8c487cc, run 35812463112, 6x4 | 30,008 stdcells + 1 macro (+1,205) | 3,089 | 52.7% | typ +4.80 ns; fast +10.13 ns; slow -4.04 ns (50 endpoints); hold +0.31 typ / +0.65 slow / +0.12 fast, 0 violations | **every job passed**: gds 4 h 36 min, precheck 1 h 57 min, gl_test pass (the slice A tests at gate level too), viewer; DRC 0, LVS 0, antenna 0; Magic overlaps 10; stdcell area 430,316 um2; power 11.7 mW; detailed routing 3 h 27 min, Metal3 overflow 2,924 (total 3,004); max-slew 160 slow / 34 typ. D-025's reading: routing under 4 h and overflow under 4,000, so slice A stays; the baseline is also under 3,500 and 3 h 45 min, so slice B may stack on it. Typical margin +4.80 against +3.56 on the run before (a logic deletion) and +5.98 before that: three runs within 2.4 ns of each other are the flow's variance, not the design's trend |
 | 2026-09-23 | M3 slice B: LD/ST on the instruction memory (D-027) on slice A | main 54ebaa1, run 35871222851, 6x4 | 30,869 stdcells + 1 macro (+861) | 3,225 | 54.7% | typ +3.56 ns; fast +9.37 ns; slow -6.08 ns (93 endpoints, TNS -293.8 ns); hold +0.30 typ / +0.64 slow / +0.10 fast, 0 violations | **every job passed**: gds 4 h 38 min, precheck 1 h 52 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10 (the stripe crossings D-021 watches); stdcell area 448,160 um2; power 12.7 mW; detailed routing 3 h 29 min, Metal3 overflow 2,252: under D-025's four hours, so slice B stays |
+| 2026-09-24 | D-031: one-hot host debug thread select, on slice B | main d1ea0ac, run 35940928210, 6x4 | 31,393 stdcells + 1 macro (+524 placed; generic synthesis -156) | 3,227 | 54.7% | typ +5.38 ns; fast +10.60 ns; slow -3.53 ns (96 endpoints, TNS -135.6 ns); hold +0.29 typ / +0.63 slow / +0.09 fast, 0 violations | **every job passed**: gds 5 h 02 min, precheck 1 h 59 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10; stdcell area 447,957 um2; power 12.5 mW; detailed routing 3 h 54 min, Metal3 overflow 1,945 (total 2,019): under D-025's four hours, by six minutes, on less congestion than slice B's run, so D-031 stays; max-slew 215 slow / 65 typ, max-cap 30-31. The debug-thread family is gone from the worst paths: slow -6.08 -> -3.53 ns (about 38 -> 42.5 MHz at that corner), typical +3.56 -> +5.38 ns. The gds job's 5 h 02 min is the longest yet, 58 minutes inside GitHub's six hours |
 
 ### Routing time is the binding constraint, 2026-09-20
 
@@ -33,6 +34,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 35779039938 | D-028 (host TD writes out of the latch-fire cone; 39 cells fewer) | 1,248 / 1,277 | 2 h 57 min | 4 h 05 min, finished |
 | 35812463112 | slice A on that (+1,205 cells, +61 flops) | 2,924 / 3,004 | 3 h 27 min | 4 h 36 min, finished |
 | 35871222851 | slice B on that (+861 cells, +136 flops) | 2,252 / 2,289 | 3 h 29 min | 4 h 38 min, finished |
+| 35940928210 | D-031 on that (generic synthesis -156 cells, +2 flops) | 1,945 / 2,019 | 3 h 54 min | 5 h 02 min, finished |
 
 Detailed routing is the long pole of the whole flow and it is superlinear in
 congestion: two per cent more cells, concentrated in the timers, tripled the
@@ -82,3 +84,31 @@ their D-025 readings, is the host-side twin of D-019: a registered one-hot
 thread select for the debug port, loaded from the ADDR byte cycles before
 the write strobe, so no thread-number decode sits on a host write path.
 Four flops, less fanout, and the E+4 rule of HOST_PROTOCOL untouched.
+
+### The slow corner after D-031, 2026-09-24
+
+D-031 (run 35940928210) took its family off the list: no path in the slow
+corner's report starts at the debug thread select any more, the worst slack
+went from -6.08 to -3.53 ns and the negative slack from -293.8 to -135.6 ns,
+and the typical margin from +3.56 to +5.38 ns. The 96 violating endpoints
+that remain are two families, both the same shape as the one D-031 removed,
+a registered select fanned out through `buf_1` chains:
+
+- 63 start at the X stage's thread number `tx_th[1]` and end at the W
+  stage's result and flag registers (`tr_val`, `tr_flags`), worst -3.53 ns:
+  the 4:1 selects of per-thread state in X, a `nor2_1` driving the select
+  (3.9 ns) and a ripple chain after it. The fix of the same kind would be an
+  X-stage one-hot ring, the X-stage twin of D-019.
+- 33 start at the host's debug register address `h_dbg_reg[5]` and end at
+  thread 3's `NOW` counter and `pin_out_reg[7]`, worst -2.53 ns: the 8-bit
+  compare that makes a host `TICK_INT` or `TICK_FRAC` write still sits in the
+  `acc_clr -> tick -> NOW` cone D-031 took the thread compare out of. The fix
+  would be a pre-decoded write class registered in `loom_host_ctl`.
+
+Neither is planned. The typical corner, which is the one the datasheet signs
+at 50 MHz, has +5.38 ns; the slow corner is stated at its measured clock
+(PLAN M4); and this run's detailed routing, 3 h 54 min, is six minutes inside
+D-025 on the lowest overflow since D-028, which says the placement variance
+of about half an hour is now the whole margin. Each fix would cost a
+hardening of its own and add logic to a design whose `gds` job already takes
+5 h 02 min of GitHub's six hours.

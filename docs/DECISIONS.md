@@ -689,3 +689,15 @@ the threads a non-one-hot select writes. (Written out as `s != 0 && (s &
 (s - 1)) == 0`: the slang frontend has no `$onehot`.) The ISO-1 miter keeps
 the host's binary thread field and hands each copy `0001 << thread`, and the
 timer harness binds `h_sel`.
+
+Outcome (2026-09-24, run 35940928210 on d1ea0ac): every job passed and D-031
+stays. Detailed routing 3 h 54 min with Metal3 overflow 1,945, under D-025's
+four hours by six minutes on less congestion than slice B's run (placement
+variance); the `gds` job took 5 h 02 min. Timing: typical +5.38 ns (+3.56
+before), fast +10.60, slow -3.53 ns (-6.08 before) with the negative slack
+halved (-135.6 ns from -293.8), 96 endpoints. No path in the slow corner's
+report starts at the debug thread select any more; the two families left
+(the X stage's thread number into the W-stage result, and the host's debug
+register address into `NOW` and the pin registers) are in `docs/AREA.md`,
+"The slow corner after D-031", with the fix each would take and the reason
+neither is planned.
