@@ -30,6 +30,10 @@ Everything else runs on both backends, error cases included: UART framing
 error, overrun, glitch and break; I2C NACK, refused data byte, clock
 stretching and stuck-SCL timeout; SPI slave idle byte, dropped byte and a
 transaction cut off in the middle of a byte.
+
+``LOOM_FW_SET`` chooses the set: unset or ``default`` as above;
+``model_only`` runs only the skipped scenarios, for the one long run that
+shows they pass on the RTL too (``docs/PLAN.md`` M4); ``all`` runs both.
 """
 
 import logging
@@ -73,10 +77,16 @@ def _make(scenario):
 #: ``(name, reason)`` of every scenario that runs on the golden model only.
 SKIPPED = []
 
+_SET = os.environ.get("LOOM_FW_SET", "default")
+if _SET not in ("default", "model_only", "all"):
+    raise RuntimeError("LOOM_FW_SET=%r: expected default, model_only or all" % _SET)
+
 for _module in MODULES:
     for _scenario in scenarios(_module):
-        if _scenario.model_only:
+        if _scenario.model_only and _SET == "default":
             SKIPPED.append((_scenario.name, _scenario.model_only))
+            continue
+        if not _scenario.model_only and _SET == "model_only":
             continue
         if _scenario.name in globals():
             raise RuntimeError("two firmware scenarios are called %r" % _scenario.name)

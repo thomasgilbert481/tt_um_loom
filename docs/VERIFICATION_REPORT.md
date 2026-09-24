@@ -76,10 +76,11 @@ miss". The state on 2026-09-22 is:]
   recorded reason each; four of five hand-written mutants killed at the first
   seed.
 - L3 protocol: 94 scenarios on the model and 80 on the RTL across twelve
-  programs (the 14 left out of the RTL are slow cases, each marked with the
-  reason: 115200-baud UART, most of the SPI mode sweep, the longest PS/2
-  frames, the USB host at +-0.25 per cent of the bit rate, the 257-byte
-  EEPROM read), with no divergence between the sides, including error cases
+  programs (the 14 left out of the routine RTL run are slow cases, each
+  marked with the reason: 115200-baud UART, most of the SPI mode sweep, the
+  longest PS/2 frames, the USB host at +-0.25 per cent of the bit rate, the
+  257-byte EEPROM read; all 14 passed on the RTL in one separate run), with
+  no divergence between the sides, including error cases
   (framing error, NACK, clock stretching, CAN CRC, stuff and form errors and
   a missing ACK, USB retries and STALL). The USB device meets every USB 2.0
   low-speed timing limit it is checked against in the bit engine's manual
