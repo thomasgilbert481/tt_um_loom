@@ -19,6 +19,7 @@ import pytest
 
 from tools.loomasm import assemble_file
 from tools.loomisa import REPO, load
+from tools.protomodels.bench import Model, pad_of
 from tools.protomodels.swd import (ACK_FAULT, ACK_OK, ACK_WAIT, SWITCH_SEQUENCE,
                                    SwdDp)
 
@@ -64,6 +65,38 @@ def test_swd_connects_and_reads_the_dpidr(backend):
     assert loom.badop() == 0
 
 
+class Swclk(Model):
+    """Every SWCLK edge, by cycle, with the level it went to."""
+
+    def __init__(self):
+        self.pad, self.prev, self.edges = pad_of("OUT0"), None, []
+
+    def observe(self, lines):
+        now = lines.get(self.pad)
+        if self.prev is not None and now != self.prev:
+            self.edges.append((lines.cycle, now))
+        self.prev = now
+
+
+def test_swd_every_swclk_high_phase_is_one_tick(backend):
+    """Each high phase of SWCLK is exactly one tick (32 clocks, a multiple of
+    the slot), through the connect sequence and a whole read; a low phase is
+    at least one tick, and longer where the program pauses the clock with
+    SETD 1. The first version paused with SETD 0: a pause that fell late in a
+    tick made the next rising edge late and the high phase after it short
+    (tools finding T-1, docs/VERIFICATION.md)."""
+    bench, port, loom = setup(backend)
+    swclk = bench.add(Swclk())
+    loom.push(0, [READ])
+    assert read_dpidr(loom) == (DPIDR, ACK_OK)
+    edges = swclk.edges
+    assert len(edges) > 2 * 100                          # the connect and a packet
+    highs = [b - a for (a, la), (b, _) in zip(edges, edges[1:]) if la == 1]
+    lows = [b - a for (a, la), (b, _) in zip(edges, edges[1:]) if la == 0]
+    assert set(highs) == {TICK}, sorted(set(highs))
+    assert min(lows) == TICK
+
+
 def test_swd_a_second_read_needs_no_second_connect(backend):
     """The connect runs once; each host word is one packet."""
     bench, port, loom = setup(backend)
@@ -104,7 +137,7 @@ def test_swd_master_assembles_strict_with_no_diagnostic():
     program = assemble_file(FIRMWARE / "swd_master.loom", isa=ISA, strict=True)
     assert program.diagnostics == []
     report = program.deadlines[0]
-    assert report.period == 28                  # the .tick it is proved for
+    assert report.period == 32                  # the .tick it is proved for
     assert report.pairs and not report.infeasible and not report.unbounded
     assert report.worst_slack >= 0
     assert list(program.threads) == [0]

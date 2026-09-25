@@ -47,7 +47,7 @@ the M2 convention for the rate.
 | `ws2812.loom` | DOUT = OUT0 | 52 | 1 clock per tick (set by the program) | 4 clocks (two `.bounded` POPs) | the WS2812B waveform at 50 MHz: T0H 20, T1H 40, period 64 clocks |
 | `ps2_host.loom` | CLK = IN0, DATA = IN1 | 45 | 64 clocks per tick (set by the program), timeouts only | no deadline pairs | 10 kHz and 16.67 kHz device clock |
 | `jtag_master.loom` | TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0 | 43 | 32 clocks per half TCK period | 0 clocks | TICK 32: 781 kHz TCK |
-| `swd_master.loom` | SWCLK = OUT0, SWDIO = BIDIR0 (push-pull, pull-up) | 92 | 28 clocks per half SWCLK period | 0 clocks | TICK 32: 781 kHz SWCLK |
+| `swd_master.loom` | SWCLK = OUT0, SWDIO = BIDIR0 (push-pull, pull-up) | 91 | 32 clocks per half SWCLK period | 0 clocks | TICK 32: 781 kHz SWCLK |
 | `i2c_slave_eeprom.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 111, and 128 of data at 0x180 | none: the master owns SCL, no deadline pairs | no deadline pairs; SDA valid about 30 clocks after SCL falls (tVD 45 at 400 kHz) | 100 kHz and 400 kHz SCL (UM10204 Standard and Fast mode timing) |
 | `can_loopback.loom` | TX = OUT0, RX = IN0 | 79 (thread 0) + 140 (thread 1) | thread 0: 100 clocks per bit; thread 1: 12 clocks per tick, 8 ticks per bit | 28 clocks (thread 0), 4 clocks (thread 1) | 500 kbit/s (TICK 100; thread 1 TICK 12 + 128/256) and 125 kbit/s (TICK 400; TICK 50) |
 | `usb_ls_device.loom` | D+ = BIDIR0, D- = BIDIR1 (push-pull while sending; 1.5 kOhm pull-up on D-) | 511 of 512 (all four quarters, slices A and B) | 33 clocks per tick, one tick per bit (set by the program: 33 + 85/256) | 1 clock | USB low speed, 1.5 Mbit/s at 50 MHz; host at +-0.25 %; 2-bit host gaps |
@@ -312,6 +312,13 @@ words = loom.pop(0, 4)                              # four received frames
   Only `clk` is a subroutine: a second level of `CALL` fits the two-entry
   return stack but not the deadline checker, which lets every `RET` return
   to every call site.
+- Every high phase of SWCLK is one tick; the program pauses the clock (a
+  longer low phase) with `SETD 1` where the path between two clocks is
+  longer than a tick. The first version claimed a 28-clock tick and paused
+  with `SETD 0`: its data loop needs 8 slots (32 clocks) from a falling edge
+  to the next rising one, which a `SETD 0` before `clk`'s `RET` hid from the
+  checker, and a pause that fell late in a tick gave high phases of 20 and 28
+  clocks (tools finding T-1). `test_fw_swd.py` now measures every edge.
 
 ## i2c_slave_eeprom.loom: 24C02-style I2C EEPROM
 

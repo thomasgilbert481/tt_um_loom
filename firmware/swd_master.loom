@@ -34,10 +34,15 @@
 ;
 ; Bit rate: one tick is half a SWCLK period, SWCLK = clk / (2 * TICK_INT).
 ; The host sets TICK_INT (and TICK_FRAC) before RUN, as for the M2
-; programs. The schedule is proved for ticks of 28 clocks or more (.tick
+; programs. The schedule is proved for ticks of 32 clocks or more (.tick
 ; below), which is what the data loop costs between one falling edge of
-; SWCLK and the next rising one; the tests run at TICK_INT 32, so SWCLK is
-; 781 kHz at 50 MHz.
+; SWCLK and the next rising one: 8 slots. The tests run at TICK_INT 32, so
+; SWCLK is 781 kHz at 50 MHz. (The first version claimed 28: `clk` ended
+; with SETD 0 before RET, "to cut a RET-to-RET loop" that does not exist,
+; which made the checker count that path from the SETD, one slot short; and
+; the pauses below used SETD 0, whose next rising edge came late, and the
+; high phase after it short, whenever the SETD fell late in a tick. Tools
+; finding T-1, docs/VERIFICATION.md. The pauses are SETD 1 now.)
 ;
 ; Between packets, and while the host is taking result words out, SWCLK
 ; simply stops: the master owns the clock, so the SETD that re-anchors
@@ -60,7 +65,7 @@
 
         .thread 0
         .pins   SWCLK = OUT0, SWDIO = BIDIR0
-        .tick   28                      ; the shortest half period proved
+        .tick   32                      ; the shortest half period proved
         .equ    H    = 1                ; ticks per half SWCLK period
         .equ    LRN  = 56               ; line-reset cycles (the spec: 50)
         .equ    SWSEQ = 0xE79E          ; JTAG-to-SWD, least significant first
@@ -71,7 +76,7 @@ start:  .csr    OUTGRP, (1 << 5) | 0    ; one pin wide, based at SWDIO
         SETP    SWCLK, 0                ; SWCLK idles low
         SETP    SWDIO, 1
         OEP     SWDIO, 1                ; the host owns the line to begin with
-        SETD    0
+        SETD    1                       ; a whole tick before the first rising edge
         LDI     r4, 0
         LDIH    r4, 0x80                ; 0x8000
 
@@ -80,7 +85,7 @@ lr1:    CALL    clk
         DJNZ    r2, lr1
         MOV16   r0, SWSEQ               ; JTAG-to-SWD select sequence
         LDI     r1, 16
-        SETD    0                       ; the clock pauses here: re-anchor
+        SETD    1                       ; the clock pauses here: a whole tick
 sw:     OUT     r0                      ; SWDIO = the next bit
         SHRI    r0, 1
         CALL    clk
@@ -108,7 +113,7 @@ rq:     OUT     r0                      ; the packet request, LSB first
         CALL    clk
         LDI     r6, 0                   ; the ACK, three bits, LSB first
         LDI     r1, 3
-        SETD    0                       ; the clock pauses here: re-anchor
+        SETD    1                       ; the clock pauses here: a whole tick
 ack:    SHRI    r6, 1
         JP      SWDIO, 0, ak0
         ORI     r6, 4                   ; a 1 enters at bit 2
@@ -121,7 +126,7 @@ ak0:    CALL    clk
         LDI     r3, 2                   ; two result words
 dword:  LDI     r0, 0
         LDI     r1, 16
-        SETD    0                       ; the clock pauses here: re-anchor
+        SETD    1                       ; the clock pauses here: a whole tick
 dbit:   SHRI    r0, 1
         JP      SWDIO, 0, db0
         OR      r0, r0, r4              ; a 1 enters at bit 15
@@ -172,5 +177,4 @@ clk:    WAITD   H
         SETP    SWCLK, 1                ; both ends sample SWDIO here
         WAITD   H
         SETP    SWCLK, 0                ; both ends change SWDIO here
-        SETD    0                       ; cuts the RET-to-RET loop the checker
-        RET                             ; would otherwise see (i2c_master.loom)
+        RET                             ; at most 8 slots to the next WAITD H
