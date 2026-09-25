@@ -322,8 +322,14 @@ nabit:  SHO                             ; (a stuff bit costs an SHO, not a CNT)
         DJNZ    r6, na0
         .csr    CRC_POLY, CRC16_POLY, r4
         .csr    CRC_INIT, CRC16_INIT, r4
-        SETD    0                       ; (for the deadline checker: the loop
+        SETD    1                       ; (for the deadline checker: the loop
         RET                             ; above has no anchor of its own)
+; SETD 1 rather than 0 (tools finding T-1): the checker's context-free RET also
+; pairs this SETD with txdat's WAITD RESP - 1 through return sites newaddr
+; never returns to, and a SETD 0 read late in its tick could not be proved
+; there. At run time nothing changes: on both real returns the next thing to
+; read TD is rxtok's WAITB, at least 9 slots (36 clocks) on, when NOW + 1 has
+; passed as NOW would have, so the WAITB still only tests.
 na0:    LDI     r5, 0
         ST      r2, r5, EP1F
         LDI     r5, 128
