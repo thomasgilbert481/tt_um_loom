@@ -53,8 +53,12 @@
 ; still go out; sending the delimiter as a 16th data bit lets the engine put
 ; it there by itself. After the delimiter TX stays recessive (ACK slot, ACK
 ; delimiter, EOF). Before SOF thread 0 waits for at least 10 bit times of
-; recessive bus. It does not arbitrate or read its bits back, sends no error
-; frames and does not retransmit: thread 1's status is the report.
+; recessive bus, then SOF goes out on the second tick after the frame is set
+; up (SETD 1, not SETD 0: the deadline checker cannot tell that the idle
+; check ended by timeout, on a tick, so it cannot prove a SETD 0 there is not
+; late in its tick; one more bit time of idle is harmless; tools finding T-1,
+; docs/VERIFICATION.md). It does not arbitrate or read its bits back, sends
+; no error frames and does not retransmit: thread 1's status is the report.
 ;
 ; Receive. Hard synchronisation only: thread 1 waits for a falling edge,
 ; restarts its tick generator there by rewriting TICK_INT (SEMANTICS 4: the
@@ -120,7 +124,8 @@ idle:   SETD    11                      ; 10 to 11 bit times ...
         LDSR    r7
         LDI     r7, 13
         CSRW    CNT, r7
-        SETD    0
+        SETD    1                       ; SOF on the second tick from here: a
+                                        ; whole bit whatever the phase (T-1)
         CALL    txbits                  ; SOF, ID[10:0], RTR
         MOV     r7, r0
         SHLI    r7, 12

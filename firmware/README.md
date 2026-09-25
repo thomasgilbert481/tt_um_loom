@@ -384,6 +384,9 @@ words = loom.pop(0, 4)                              # four received frames
   edges land on the tick; the decision (the CRC register against the
   expected value) takes 8 slots of the 36-clock budget, the worst slack of
   the program.
+- **SOF** goes out on the second tick after the frame is set up (`SETD 1`):
+  the checker cannot tell that the idle check ended by timeout, on a tick,
+  so a `SETD 0` there could not be proved on time (tools finding T-1).
 - **Not done**: arbitration (thread 0 waits for 10 idle bits before SOF and
   does not read its bits back), error and overload frames, retransmission,
   extended frames, resynchronisation.
