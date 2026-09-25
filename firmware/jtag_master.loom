@@ -24,9 +24,14 @@
 ;
 ; Bit rate: one tick is half a TCK period, TCK = clk / (2 * TICK_INT). The
 ; host sets TICK_INT (and TICK_FRAC) before RUN, as for the M2 programs.
-; The schedule is proved for ticks of 28 clocks or more (.tick below), which
-; is what the bit loop costs: 7 slots between the falling edge of TCK and
-; the next rising one.
+; The schedule is proved for ticks of 32 clocks or more (.tick below), which
+; is what the longest path costs: 8 slots between a falling edge of TCK and
+; the next rising one, in the bit loop and on the way into it. (The first
+; version put a SETD 0 after each falling edge, "to cut a RET-to-RET loop";
+; there is no such loop, and the SETD hid a 9-slot path into the shift
+; sequence, which stretched one TCK low phase by 4 clocks at TICK 32: tools
+; finding T-1, docs/VERIFICATION.md. The first word's shifter and count are
+; now set up before the last state-walk clock.)
 ;
 ; Leaving Shift-DR shifts one more bit (the clock that carries TMS = 1 is
 ; still a shift clock, IEEE 1149.1 figure 6-5). For a read-only register
@@ -73,7 +78,10 @@ tlr:    CALL    tck
         CALL    tck
         SETP    TMS, 0
         CALL    tck
+        LDI     r0, 0                   ; the first word's shifter and count, set
+        LDI     r1, 16                  ; here, where the path has slots to spare
         CALL    tck
+        JMP     bit
 
 ; Thirty-two shifts, least significant bit first, into two words.
 word:   LDI     r0, 0
@@ -104,5 +112,4 @@ tck:    WAITD   H
         SETP    TCK, 1                  ; the TAP samples TMS and TDI here
         WAITD   H
         SETP    TCK, 0                  ; the TAP moves TDO here
-        SETD    0                       ; cuts the RET-to-RET loop the checker
-        RET                             ; would otherwise see (i2c_master.loom)
+        RET                             ; at most 8 slots to the next WAITD H

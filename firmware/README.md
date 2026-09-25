@@ -46,7 +46,7 @@ the M2 convention for the rate.
 | `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 105 | 5 clocks per tick, 16 ticks per SCL period | 0 clocks | TICK 8: 390 kHz SCL; 100 kHz is TICK 31 + 64/256 |
 | `ws2812.loom` | DOUT = OUT0 | 52 | 1 clock per tick (set by the program) | 4 clocks (two `.bounded` POPs) | the WS2812B waveform at 50 MHz: T0H 20, T1H 40, period 64 clocks |
 | `ps2_host.loom` | CLK = IN0, DATA = IN1 | 45 | 64 clocks per tick (set by the program), timeouts only | no deadline pairs | 10 kHz and 16.67 kHz device clock |
-| `jtag_master.loom` | TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0 | 41 | 32 clocks per half TCK period | 0 clocks | TICK 32: 781 kHz TCK |
+| `jtag_master.loom` | TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0 | 43 | 32 clocks per half TCK period | 0 clocks | TICK 32: 781 kHz TCK |
 | `swd_master.loom` | SWCLK = OUT0, SWDIO = BIDIR0 (push-pull, pull-up) | 92 | 28 clocks per half SWCLK period | 0 clocks | TICK 32: 781 kHz SWCLK |
 | `i2c_slave_eeprom.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 111, and 128 of data at 0x180 | none: the master owns SCL, no deadline pairs | no deadline pairs; SDA valid about 30 clocks after SCL falls (tVD 45 at 400 kHz) | 100 kHz and 400 kHz SCL (UM10204 Standard and Fast mode timing) |
 | `can_loopback.loom` | TX = OUT0, RX = IN0 | 79 (thread 0) + 140 (thread 1) | thread 0: 100 clocks per bit; thread 1: 12 clocks per tick, 8 ticks per bit | 28 clocks (thread 0), 4 clocks (thread 1) | 500 kbit/s (TICK 100; thread 1 TICK 12 + 128/256) and 125 kbit/s (TICK 400; TICK 50) |
@@ -280,6 +280,12 @@ words = loom.pop(0, 4)                              # four received frames
   before the edge that shifts it. Leaving Shift-DR clocks one more bit
   (IEEE 1149.1 figure 6-5), which is harmless for a read-only register.
   Between operations TCK simply stops: the master owns the clock.
+- Every half period is one tick; the only longer ones are the two low phases
+  in which a result word is pushed. The first version ran a slot over on the
+  way into the shift sequence and on every bit that read a 1, giving 36/28
+  clock low/high phases at TICK 32: a `SETD 0` after each falling edge,
+  meant to cut a checker loop that does not exist, hid the 9-slot path from
+  the checker (tools finding T-1). `test_fw_jtag.py` now measures every edge.
 
 ## swd_master.loom: SWD master, connect and DPIDR
 

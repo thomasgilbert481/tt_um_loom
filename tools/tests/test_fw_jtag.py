@@ -18,6 +18,7 @@ import pytest
 
 from tools.loomasm import assemble_file
 from tools.loomisa import REPO, load
+from tools.protomodels.bench import Model, pad_of
 from tools.protomodels.jtag import JtagTap
 
 ISA = load()
@@ -64,6 +65,39 @@ def test_jtag_reads_any_idcode_bit_pattern(backend, idcode):
     bench, tap, loom = setup(backend, idcode=idcode)
     loom.push(0, [READ])
     assert word_pair(loom.pop(0, 2)) == idcode
+
+
+class Tck(Model):
+    """Every TCK edge, by cycle."""
+
+    def __init__(self):
+        self.pad, self.prev, self.edges = pad_of("OUT0"), None, []
+
+    def observe(self, lines):
+        now = lines.get(self.pad)
+        if self.prev is not None and now != self.prev:
+            self.edges.append(lines.cycle)
+        self.prev = now
+
+
+def test_jtag_every_tck_half_period_is_one_tick(backend):
+    """Each half period is exactly one tick (32 clocks, a multiple of the
+    slot, so a deadline met lands every edge on the grid), except the two low
+    phases in which a result word is pushed (SETD 1 re-anchors there, so the
+    clock simply waits). The first version was a slot too slow on the path
+    into the shift sequence and on every bit that read a 1 (the OR): 36-clock
+    low phases and 28-clock high ones, 26 of the 87 (tools finding T-1,
+    docs/VERIFICATION.md)."""
+    bench, tap, loom = setup(backend)
+    tck = bench.add(Tck())
+    loom.push(0, [READ])
+    assert word_pair(loom.pop(0, 2)) == IDCODE
+    # one operation: 44 TCK periods, 88 edges, the clock stopped at both ends;
+    # the pause while the two result words are pushed is between the words
+    halves = [b - a for a, b in zip(tck.edges, tck.edges[1:])]
+    assert len(tck.edges) == 88
+    long = [h for h in halves if h != TICK]
+    assert len(long) == 2 and all(TICK < h <= 3 * TICK for h in long), halves
 
 
 def test_jtag_a_second_command_resets_the_tap_again(backend):
