@@ -42,7 +42,7 @@ the M2 convention for the rate.
 | `uart_tx_fifo.loom` | TX = OUT0 | 26 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
 | `uart_rx.loom` | RX = IN0 | 47 | 8 clocks per tick, 8 ticks per bit | 20 clocks | 64 clocks/bit (781 kbaud); 115200 baud (TICK 54 + 64/256); +-3 % sender error |
 | `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 72 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
-| `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 50 | 32 clocks per tick, 4 ticks per SCK period | 8 clocks | TICK 32: 390 kHz SCK, modes 0 and 3 |
+| `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 48 | none: the master's SCK times it, no deadline pairs | no deadline pairs; MISO 28 to 35 clocks after each sampling edge | 390 kHz SCK (128 clocks, TICK 32 for the silence timeout), modes 0 and 3 |
 | `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 105 | 5 clocks per tick, 16 ticks per SCL period | 0 clocks | TICK 8: 390 kHz SCL; 100 kHz is TICK 31 + 64/256 |
 | `ws2812.loom` | DOUT = OUT0 | 52 | 1 clock per tick (set by the program) | 4 clocks (two `.bounded` POPs) | the WS2812B waveform at 50 MHz: T0H 20, T1H 40, period 64 clocks |
 | `ps2_host.loom` | CLK = IN0, DATA = IN1 | 45 | 64 clocks per tick (set by the program), timeouts only | no deadline pairs | 10 kHz and 16.67 kHz device clock |
@@ -162,20 +162,24 @@ words = loom.pop(0, 4)                              # four received frames
 - **Result** (pop thread 0): one word per byte the master clocked in, bits
   7:0 as sampled on MOSI. A byte that arrives while `OUTQ` is full is
   dropped (the host is not keeping up); nothing else is lost.
-- **Rate**: one tick is a quarter of an SCK period, `TICK_INT` = clocks per
-  SCK period / 4. What limits the rate is not the bit loop but the 21 slots
-  between two bytes (push the byte received, pop the next one to send, put
-  its first bit on MISO): 84 clocks inside the three quarters of a period
-  (96 clocks at TICK 32) that separate a byte's last sampling edge from the
-  next byte's first one. A master that pauses between bytes can clock the
-  bits themselves faster.
+- **Rate**: the master's SCK times everything; the tick only times the
+  silence (16 ticks) after which CS_n is looked at, and the tests set it to a
+  quarter of the SCK period, TICK 32. What limits the rate is not the bit
+  loop but the work between two bytes (push the byte received, pop the next
+  one to send, put its first bit on MISO): the slave waits for the next edge
+  27 slots after the X cycle that saw a byte's last one, so bytes back to back
+  need an SCK period of about 110 clocks or more (tested at 128). A master
+  that pauses between bytes can clock the bits themselves faster.
 - **Modes 0 and 3**: both sample MOSI and MISO on the rising edge, so one
   loop serves both and the idle level and the falling edge are never looked
   at. Modes 1 and 2 sample on the falling edge and are not supported.
 - Each bit is one `WAITE SCK, RISE` (the master samples there), then MOSI is
-  sampled and the next MISO bit is written at a deadline one tick later, a
-  quarter period before the trailing edge: that `SETD 0` to `WAITD 1`
-  interval is the deadline pair the checker proves (24 of 32 clocks).
+  sampled and the next MISO bit is written six slots after the X cycle that
+  saw the edge (seven after a 1 bit): 28 to 35 clocks after the edge, long
+  before the next. The first version wrote it at a deadline one tick after
+  the edge (`SETD 0` on the edge, then `WAITD 1`); after an edge the `SETD`
+  can fall anywhere in a tick, so that deadline cannot be proved (tools
+  finding T-1), and the slave now keeps no schedule of its own.
   While deselected the slave watches `INQ` and pre-loads, so the master may
   raise SCK two slots after CS_n falls; MISO holds its last bit between
   transactions (a Tiny Tapeout pad cannot be let go). SCK silence for 16

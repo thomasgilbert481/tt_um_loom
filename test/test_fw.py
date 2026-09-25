@@ -34,6 +34,8 @@ transaction cut off in the middle of a byte.
 ``LOOM_FW_SET`` chooses the set: unset or ``default`` as above;
 ``model_only`` runs only the skipped scenarios, for the one long run that
 shows they pass on the RTL too (``docs/PLAN.md`` M4); ``all`` runs both.
+``LOOM_FW_ONLY`` (a comma-separated list of module names, such as
+``test_fw_spi_slave``) keeps only those modules, for checking one program.
 """
 
 import logging
@@ -79,6 +81,12 @@ def _make(scenario):
 SKIPPED = []
 
 _SET = os.environ.get("LOOM_FW_SET", "default")
+_ONLY = [m for m in os.environ.get("LOOM_FW_ONLY", "").split(",") if m]
+if _ONLY:
+    _unknown = set(_ONLY) - {m.__name__.rsplit(".", 1)[-1] for m in MODULES}
+    if _unknown:
+        raise RuntimeError("LOOM_FW_ONLY names no such module: %s" % sorted(_unknown))
+    MODULES = tuple(m for m in MODULES if m.__name__.rsplit(".", 1)[-1] in _ONLY)
 if _SET not in ("default", "model_only", "all"):
     raise RuntimeError("LOOM_FW_SET=%r: expected default, model_only or all" % _SET)
 

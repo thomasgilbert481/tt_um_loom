@@ -148,24 +148,28 @@ def test_a_queued_byte_replaces_the_idle_byte_before_the_next_transaction(backen
     assert loom.pop(0, 2) == [0x03, 0x04]
 
 
-def test_miso_changes_a_quarter_period_after_the_sampling_edge(backend):
-    """The deadline the checker proves, measured on the pads.
+def test_miso_changes_once_per_bit_soon_after_the_sampling_edge(backend):
+    """What the master needs of MISO, measured on the pads.
 
     0xAA alternates, so every one of the seven intervals between sampling
-    edges holds exactly one MISO change, one tick (a quarter period) after
-    the edge that starts it: the deadline of the ``WAITD 1``, plus the slot
-    that writes the pin and the two cycles the pad register takes, plus the
-    up-to-a-slot the edge itself takes to reach an X cycle.
+    edges holds exactly one MISO change. The slave writes it six slots after
+    the X cycle that sees the edge, seven when the bit it just sampled was a
+    1 (the ORI); that X cycle is the pad's two synchroniser clocks and up to
+    three more after the edge, and the pin follows two clocks after the
+    write. So the change is after the edge and long before the next one. No
+    deadline times it: the first version changed MISO one tick after the
+    edge, which after an edge cannot be proved (tools finding T-1).
     """
     bench, master, loom = setup(backend)
     watch = bench.add(Miso())
     loom.push(0, [0xAA])
-    assert transfer(bench, master, b"\x00") == bytes([0xAA])
+    assert transfer(bench, master, bytes([0xA5])) == bytes([0xAA])  # MOSI: 1s and 0s
     assert len(watch.rises) == 8
     for rise, nxt in zip(watch.rises, watch.rises[1:]):
         inside = [c for c in watch.changes if rise < c < nxt]
         assert len(inside) == 1, (rise, inside)
-        assert TICK + SLOT <= inside[0] - rise <= TICK + 4 * SLOT
+        assert 6 * SLOT + 4 <= inside[0] - rise <= 7 * SLOT + 7
+        assert nxt - inside[0] >= 2 * TICK                     # half a period of setup
 
 
 def test_a_byte_is_dropped_when_outq_is_full(backend):

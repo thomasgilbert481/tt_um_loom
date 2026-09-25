@@ -18,18 +18,26 @@
 ; both; this program never looks at the idle level or at the falling edge.
 ; Modes 1 and 2 sample on the falling edge and are not supported.
 ;
-; Rate: one tick is a quarter of an SCK period, so TICK_INT = clocks per SCK
-; period / 4, written by the host through the debug space before RUN. MISO
-; changes one tick after the sampling edge: a quarter period before the
-; trailing edge, three quarters of a period before the master samples it.
-; The tick must be at least 32 clocks (.tick below), so at 50 MHz SCK is at
-; most 390 kHz with bytes back to back (what the tests use). The bit loop
-; alone would run four times faster; the limit is the work between two
-; bytes (push the byte received, pop the next one to send, put its first bit
-; on MISO): 21 slots, 84 clocks, in the three quarters of a period (96
-; clocks at TICK 32) between the last sampling edge of a byte and the first
-; edge of the next one, with MISO carrying the new bit 7 after 16 of them.
-; A master that pauses between bytes can clock the bits themselves faster.
+; Rate: the slave follows the master's SCK and keeps no schedule of its own.
+; It writes MISO six slots after the X cycle in which it sees the sampling
+; edge, seven when the bit it just sampled was a 1 (the ORI); that X cycle
+; comes the pad's two synchroniser clocks and up to three more after the
+; edge, and the pin follows two clocks after the write: 28 or 32 clocks after
+; the edge in the tests, 28 to 35 at any phase of SCK against the slot grid.
+; That is after the edge, whatever the master's hold time, and long before
+; the next one. The limit is the work between two bytes (push the byte
+; received, pop the next one to send, put its first bit on MISO): from the X
+; cycle that sees a byte's last sampling edge, the new bit 7 is on MISO after
+; 22 slots and the slave waits for the next edge from slot 27, so a master
+; clocking bytes back to back needs an SCK period of about 110 clocks or
+; more (not tested faster than the tests' 128 clocks, 390 kHz at 50 MHz).
+; The tick only times the silence before CS_n is looked at (TMO ticks); the
+; tests set it to a quarter of the SCK period, TICK_INT 32.
+;
+; (The first version changed MISO one tick after the edge, with SETD 0 on
+; the edge and WAITD 1: after an edge the SETD can fall anywhere in a tick,
+; so that deadline could not be met in general, only by an SCK in step with
+; the tick; tools finding T-1, docs/VERIFICATION.md.)
 ;
 ; Selection: while CS_n is high the slave watches INQ and pre-loads the next
 ; response byte as soon as one is queued, so its first bit is on MISO before
@@ -79,14 +87,12 @@ byte:   CALL    load                    ; the next byte to send, first bit on MI
 bit:    SETD    TMO                     ; the wait below gives up after TMO ticks
         WAITE   SCK, RISE, T            ; the master samples MOSI and MISO here
         BT      quiet
-        SETD    0                       ; anchor the schedule on the sampling edge
         SHLI    r2, 1
         JP      MOSI, 0, m0             ; sample MOSI
         ORI     r2, 1
 m0:     SHRI    r0, 1                   ; the next bit to send, into bit 0
         LDI     r6, 0                   ; this byte has left the queue for good
-        WAITD   1                       ; a quarter period later: change MISO
-        OUT     r0
+        OUT     r0                      ; the next bit on MISO, 6 slots after the edge
         DJNZ    r1, bit
 
         SETD    0                       ; TD = NOW: the WAITB cannot block
