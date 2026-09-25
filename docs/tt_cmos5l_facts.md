@@ -849,3 +849,28 @@ What they do, and why:
 - Timing sign-off is the typical corner only (`TIMING_VIOLATION_CORNERS` `*typ*`); the
   slow and fast corners are reported but never fail the flow. The macro's slow
   clock-to-output (6.25 ns) leaves +2.07 ns on its worst path at the slow corner.
+
+### Gate level with SDF delays, 2026-09-24
+
+The `gds` run's `GDS_logs` artifact carries the post-route SDF of all three
+corners (`runs/wokwi/final/sdf/<corner>/tt_um_loom__<corner>.sdf`, OpenSTA
+2.7.0). Icarus annotates it with `-gspecify -ginterconnect` and `$sdf_annotate`
+(`test/Makefile` with `SDF=`, `scripts/gl/run.sh` with `SDF` in the
+environment), with three limits found on run 35940928210:
+
+- **The SRAM macro stops the annotator.** Its Verilog model has no specify
+  block, and the full SDF ends the run with `vpi_scan` asserting on a NULL
+  handle. Dropping the macro's CELL block was not enough; dropping the 110
+  INTERCONNECT entries that end on its pins as well was.
+  `scripts/gl/sdf_filter.py` drops both (whether the CELL alone would be
+  harmless was not tried).
+- **Timing checks are ignored**, and the cells' negative-limit checks turn
+  their `delayed_*` nets into plain copies. An SDF run shows the design
+  working with real delays, not that setup and hold are met; STA is what
+  says that.
+- **Speed.** About 6 minutes of annotation, then about 1.9 s per simulated
+  microsecond with cell delays only; with the wire delays as well (66,000
+  INTERCONNECT entries, 0 to 0.2 ns at the typical corner) tens of times
+  slower. `test_mem.test_ld_reads_what_the_host_wrote` (330 us) passed with
+  the typical corner's cell delays in 11 minutes; the whole cocotb suite
+  (181 ms simulated) would take days.

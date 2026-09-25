@@ -29,6 +29,6 @@ cd "$BUILD/test" || exit 1
 rm -rf sim_build results.xml
 # grep -v drops Icarus's "sorry: ifnone" notes about the cell specify blocks.
 make GATES=yes ${mods:+COCOTB_TEST_MODULES=$mods} ${filt:+COCOTB_TEST_FILTER=$filt} \
-     ${plus:+PLUSARGS=$plus} 2>&1 | grep --line-buffered -v "sorry: ifnone" > gl.log
+     ${plus:+PLUSARGS=$plus} ${SDF:+SDF=$SDF} 2>&1 | grep --line-buffered -v "sorry: ifnone" > gl.log
 grep -E "TESTS=|FAIL " gl.log
 ! grep -q "<failure" results.xml 2>/dev/null

@@ -60,6 +60,14 @@ VERILOG_SOURCES += $(MACRO_MODELS)
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
 
+# SDF=<file>: annotate the netlist with that SDF (PHY-GL-SDF, docs/PLAN.md
+# M4). Icarus keeps specify-block delays only with -gspecify and applies
+# INTERCONNECT only with -ginterconnect; it applies the
+# SDF's delays but does not evaluate timing checks. Off unless SDF is set.
+ifneq ($(SDF),)
+COMPILE_ARGS    += -gspecify -ginterconnect '-DSDF_FILE="$(SDF)"'
+endif
+
 endif
 
 # Allow sharing configuration between design and testbench via `include`:

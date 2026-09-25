@@ -46,6 +46,12 @@ module tb ();
       .rst_n  (rst_n)     // not reset
   );
 
+`ifdef SDF_FILE
+  // Gate level with delays (test/Makefile, SDF=<file>): the post-route SDF of
+  // one corner onto the netlist instance.
+  initial $sdf_annotate(`SDF_FILE, user_project);
+`endif
+
 `ifndef GL_TEST
   // Executing an instruction word that was never written is always a test or
   // firmware bug, but RTL simulation hides it: the decoder's `if`s and `case`s

@@ -423,8 +423,13 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] If the `gds` artefact includes SDF (checked 2026-09-24: it does, the
       `GDS_logs` artifact carries `runs/wokwi/final/sdf/` for all three
       corners, run 35940928210): one timing-annotated gate-level run of the
-      L3 suite at the typical corner, recorded as PHY-GL-SDF. Open: whether
-      Icarus annotates the IHP cell models' `specify` blocks.
+      L3 suite at the typical corner, recorded as PHY-GL-SDF. Checked
+      2026-09-24: Icarus annotates the cells (not the SRAM macro, which
+      `scripts/gl/sdf_filter.py` drops), ignores timing checks, and runs about
+      1.9 s per simulated microsecond with cell delays, so the whole L3 suite
+      (181 ms) would take days; a smoke test passed (`test_mem`, 330 us, 11
+      min; `docs/tt_cmos5l_facts.md` section 12). What remains is a chosen
+      subset: one scenario per protocol, run overnight on the freeze netlist.
 - [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
       measured slow-corner clock, both with their slack.
 - [ ] Firmware freeze 2026-12-01.
