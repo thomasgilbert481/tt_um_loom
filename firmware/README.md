@@ -39,7 +39,7 @@ the M2 convention for the rate.
 
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
-| `uart_tx_fifo.loom` | TX = OUT0 | 18 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
+| `uart_tx_fifo.loom` | TX = OUT0 | 26 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
 | `uart_rx.loom` | RX = IN0 | 47 | 8 clocks per tick, 8 ticks per bit | 20 clocks | 64 clocks/bit (781 kbaud); 115200 baud (TICK 54 + 64/256); +-3 % sender error |
 | `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 72 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
 | `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 50 | 32 clocks per tick, 4 ticks per SCK period | 8 clocks | TICK 32: 390 kHz SCK, modes 0 and 3 |
@@ -100,9 +100,15 @@ words = loom.pop(0, 4)                              # four received frames
 - **Rate**: one tick is one bit, `TICK_INT` = clocks per bit.
 - Every edge is the first instruction after the `WAITD` that times it, so all
   edges sit one slot after their deadlines: exact when the bit is a multiple
-  of 4 clocks, within one slot otherwise (tested at 115200 baud). Queued words
-  go out back to back with one stop bit; after an idle period the start bit
-  waits for the next tick boundary, so it is always a full bit.
+  of 4 clocks, within one slot otherwise (tested at 115200 baud). After each
+  stop bit a `WAITB INQ_NE, T` (its deadline has passed, so it returns at
+  once) tells a queued word from none: a queued word goes out back to back,
+  timed from the stop bit, with one stop bit; otherwise `POP` blocks and
+  `SETD 1` puts the start bit on the second tick boundary after the word
+  arrives, a whole bit whatever point of a tick it arrived at. The first
+  version used `SETD 0` after the `POP` in both cases and started 10 in 64
+  words after an idle gap a slot late and 4 clocks short (tools finding T-1);
+  `test_fw_uart.py` sweeps the arrival over every point of the tick.
 
 ## uart_rx.loom: UART receiver into OUTQ
 

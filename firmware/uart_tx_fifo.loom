@@ -18,20 +18,35 @@
 ; times it, so every edge lands the same one slot after its deadline (plus
 ; 0 to 3 clocks of slot-grid lateness, SEMANTICS 2): with a tick that is a
 ; multiple of 4 clocks the edges are exactly periodic, otherwise they dither
-; by one slot and never drift. After an idle period the start bit waits for
-; the next tick boundary (SETD 0 then WAITD 1), so it is always a full bit;
-; words already queued go out back to back with exactly one stop bit.
+; by one slot and never drift. After the stop bit a non-blocking test
+; (WAITB INQ_NE, T: the stop bit's deadline has passed, so it returns at
+; once, T = 0 exactly when a word is queued; SEMANTICS 6.4) splits the two
+; cases:
+;   - a word is queued: it goes out back to back, one tick after the stop
+;     bit, still timed from the stop bit's WAITD: exactly one stop bit;
+;   - nothing is queued: POP blocks, and SETD 1 then WAITD 1 puts the start
+;     bit on the second tick boundary after the POP returns, so it is a whole
+;     bit whatever point of a tick the POP returned at.
+; (The first version used SETD 0 for both. After a POP that blocked, the
+; SETD can run anywhere in a tick, and its WAITD 1 was late whenever the next
+; tick came within two slots, which shortened the start bit by up to 7
+; clocks: tools finding T-1, docs/VERIFICATION.md.)
 
         .thread 0
         .pins   TX = OUT0
         .tick   24                      ; the fastest rate the schedule is proved for
 
 start:  SETP    TX, 1                   ; the line idles high
+        JMP     idle
 
-byte:   POP     r0                      ; next word from the host (blocks while empty)
-        SETD    0                       ; TD = the tick boundary just passed
-        LDI     r1, 8                   ; eight data bits
-        WAITD   1                       ; the next tick boundary
+stop:   LDI     r1, 8                   ; the next byte's bit count, ahead of time
+        WAITD   1
+        SETP    TX, 1                   ; stop bit
+byte:   WAITB   INQ_NE, T               ; TD has passed: T = 0 only if a word is queued
+        BT      idle
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, so INQ holds a word"
+        POP     r0                      ; cannot block
+        WAITD   1                       ; one tick after the stop bit: one stop bit
         SETP    TX, 0                   ; start bit
 
 bit:    SHRI    r0, 1                   ; C = the next data bit, LSB first
@@ -43,7 +58,11 @@ bit:    SHRI    r0, 1                   ; C = the next data bit, LSB first
 one:    WAITD   1
         SETP    TX, 1
         DJNZ    r1, bit
+        JMP     stop
 
-stop:   WAITD   1
-        SETP    TX, 1                   ; stop bit; the next start bit is at
-        JMP     byte                    ; least one tick later
+idle:   POP     r0                      ; next word from the host (blocks while empty)
+        LDI     r1, 8                   ; eight data bits
+        SETD    1                       ; TD a whole tick past the next boundary
+        WAITD   1                       ; so the start bit is a whole bit
+        SETP    TX, 0                   ; start bit
+        JMP     bit

@@ -81,6 +81,26 @@ def test_uart_tx_at_115200_baud_edges_within_one_slot(backend):
     assert rx.frames[1].start - rx.frames[0].start == pytest.approx(10 * bits, abs=SLOT)
 
 
+def test_uart_tx_start_bit_is_whole_after_an_idle_gap_of_any_length(backend):
+    """After an idle gap the word arrives at some point of a tick, and the
+    start bit must still be a whole bit. Thirty-two gaps one clock apart put
+    the arrival at every point of the 32-clock tick. The first version of the
+    program started the bit a slot late and 4 clocks short when the word
+    arrived in the last slot before a tick: 10 of 64 such words (tools
+    finding T-1, docs/VERIFICATION.md)."""
+    bench = backend.bench()
+    rx = bench.add(UartRx("OUT0", 32))
+    loom, _ = boot(backend, bench, "uart_tx_fifo", 32)
+    for gap in range(32):
+        count = len(rx.frames)
+        loom.push(0, b"U")                                 # 0x55: an edge every bit
+        assert bench.run_until(lambda: len(rx.frames) == count + 1, 20000, every=16)
+        bench.step(400 + gap)                              # idle, then the next word
+    assert rx.data == b"U" * 32 and not rx.errors
+    for frame in rx.frames:
+        assert [off for _, off in rx.edge_offsets(frame)] == [0] * len(frame.edges)
+
+
 def test_uart_tx_ignores_the_high_byte_of_a_word(backend):
     bench = backend.bench()
     rx = bench.add(UartRx("OUT0", 32))
