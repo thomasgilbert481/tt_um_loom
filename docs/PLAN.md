@@ -393,8 +393,18 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       commit; if it does not finish inside six hours the last slice comes out
       and the run repeats. After the freeze, RTL changes only for a bug found
       by verification, each with a re-hardening.
-- [ ] Manchester loopback at the manual-mode rate (L3-MANCH, in place of the
-      10 Mbit target, D-029).
+- [x] Manchester loopback at the manual-mode rate (L3-MANCH, in place of the
+      10 Mbit target, D-029). Done 2026-09-24 by an agent (finished by the
+      director after two stalls): `manchester_loopback.loom`, TX thread 0 and
+      RX thread 1, 173 words, 2.083 Mbit/s (TICK 12, the fastest the checker
+      proves) and 1 Mbit/s, on both backends; five spec questions ruled in
+      `docs/spec-questions/firmware-m4.md`.
+- [ ] Tools finding T-1 (`docs/VERIFICATION.md`): the deadline checker takes
+      the sound budget after `SETD m`, `ceil(((m + k - 1) * P + 1) / 4)` slots,
+      and the 15 pairs in 8 programs that fail it today are each given their
+      whole tick in the program (`SETD m + 1`) or a printed argument that a
+      late first `WAITD` is harmless, then retested on both backends. Before
+      the firmware freeze.
 - [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
       remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
       the RTL (done 2026-09-24: all 14 `model_only` scenarios pass on the

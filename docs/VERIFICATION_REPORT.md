@@ -38,7 +38,7 @@ covers by construction.
 | Layer | What runs | Where the numbers come from |
 |---|---|---|
 | L2 co-simulation | the RTL and an independently written golden model, in lockstep on every cycle, on constrained-random programs with the host port driven during the run | `test/test_cosim.py`, `tools/loomgen` |
-| L3 protocol tests | the firmware programs (UART TX/RX, SPI master and slave, I2C master and a 24C02-style I2C EEPROM slave, WS2812, PS/2 host, JTAG and SWD masters, a CAN 2.0A node, a USB low-speed HID device) against Python protocol models, the same test bodies on the model and on the RTL through the real SPI pads | `tools/tests/test_fw_*.py`, `test/test_fw.py` |
+| L3 protocol tests | the firmware programs (UART TX/RX, SPI master and slave, I2C master and a 24C02-style I2C EEPROM slave, WS2812, PS/2 host, JTAG and SWD masters, a CAN 2.0A node, a USB low-speed HID device, a Manchester loopback) against Python protocol models, the same test bodies on the model and on the RTL through the real SPI pads | `tools/tests/test_fw_*.py`, `test/test_fw.py` |
 | L5 gate level | the whole cocotb suite on the hardened netlist with the foundry's cell models, in CI on every hardening | `gl_test` job; `scripts/gl/` locally |
 | L4 formal | 19 properties on the scheduler, FIFOs, timer, pins, SPI port and decoder, unbounded where the engine closes them | `formal/`, `scripts/formal.sh` |
 | L7 mutation | 823 one-line faults in the RTL, each run against the suite until something fails | `tools/mutate` |
@@ -75,8 +75,8 @@ miss". The state on 2026-09-22 is:]
   so every built feature is exercised; 553 coverage bins, 33 empty with a
   recorded reason each; four of five hand-written mutants killed at the first
   seed.
-- L3 protocol: 94 scenarios on the model and 80 on the RTL across twelve
-  programs (the 14 left out of the routine RTL run are slow cases, each
+- L3 protocol: 105 scenarios on the model and 91 on the RTL across
+  thirteen programs (the 14 left out of the routine RTL run are slow cases, each
   marked with the reason: 115200-baud UART, most of the SPI mode sweep, the
   longest PS/2 frames, the USB host at +-0.25 per cent of the bit rate, the
   257-byte EEPROM read; all 14 passed on the RTL in one separate run), with

@@ -443,13 +443,19 @@ stuff value is 0 for USB and `~RVAL` for CAN. A stuff bit starts the next run
 `T` is set by a violation and never cleared by `SHI`; firmware clears it with
 `CSRW FLAGS` or lets a timed wait clear it. The timed waits of 6.4 set `T`
 on a timeout too, so a receiver clears `T` before a frame and tests it after
-the `SHI`s, not after a wait. The loops that result: USB
+the `SHI`s, not after a wait. `HALF` cannot be read by the thread either, so a
+Manchester receiver that may have left a frame between the two halves of a
+bit writes `BE_CFG` before the next frame, which clears it. The loops that
+result: USB
 low-speed transmit and receive are `SHO; WAITD 1; BNZ` and `SHI; WAITD 1;
 BNZ` at a tick of 33.33 clocks (`TICK_INT = 33, TICK_FRAC = 85`), three of
 the eight slots per bit, with NRZI, stuffing, CRC5/CRC16 and D+/D- done by
 the engine and SYNC, PID, EOP (an `SE0` written with two `SETP`) and the
 handshake done by firmware; Manchester is `SHO; WAITD 1; SHO; WAITD 1; BNZ`
-at a half-bit tick. The thread cannot read `PEND`, so a frame whose
+at a half-bit tick; a data bit leaves `SR` on the first `SHO` of its two
+and enters it on the second `SHI`, so a loop that ends on `Z` leaves the
+transmitter between the halves of its last bit and the receiver after it.
+The thread cannot read `PEND`, so a frame whose
 stuffing runs up to a fixed-form field sends that field's first bit through
 the engine as a data bit, and a due stuff bit goes out before it: CAN's CRC
 delimiter is sent as a sixteenth bit of the CRC field (`SR = CRC | 1`).

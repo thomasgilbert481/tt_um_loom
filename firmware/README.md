@@ -17,7 +17,7 @@ The four M3 programs after `i2c_master` in the table are thread 0 as well
 and need nothing the M2 hardware does not have. Two of them break that
 convention: `ws2812` and `ps2_host` have a rate fixed by a datasheet rather
 than chosen by the host, so they write their own `TICK_INT` with `.csr` and
-**the host must not set it**; so does `usb_ls_device`, the last row, which
+**the host must not set it**; so does `usb_ls_device`, the last M3 row, which
 also needs slices A and B (the encoders of `SEMANTICS.md` 6.9.1 and `LD`/`ST`
 of 6.11). `ws2812` also uses the deadline-latched pin write of
 `SEMANTICS.md` 6.10 (`SETP pin, v, D`), which the M2 programs deliberately do
@@ -31,6 +31,11 @@ master owns SCL. `can_loopback` runs on two threads, a transmitter on
 thread 0 and a receiver on thread 1, with the bit engine's CAN stuffing,
 destuffing and CRC15 (slice A, 6.9.1); the host sets both threads' ticks,
 as the M2 convention has it.
+
+The last row, `manchester_loopback`, is the M4 program for L3-MANCH (D-029):
+a Manchester transmitter on thread 0 and a receiver on thread 1 at the rate
+the bit engine's manual mode reaches, with slice A's encoder (6.9.1) and
+the M2 convention for the rate.
 
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
@@ -46,16 +51,19 @@ as the M2 convention has it.
 | `i2c_slave_eeprom.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 111, and 128 of data at 0x180 | none: the master owns SCL, no deadline pairs | no deadline pairs; SDA valid about 30 clocks after SCL falls (tVD 45 at 400 kHz) | 100 kHz and 400 kHz SCL (UM10204 Standard and Fast mode timing) |
 | `can_loopback.loom` | TX = OUT0, RX = IN0 | 79 (thread 0) + 140 (thread 1) | thread 0: 100 clocks per bit; thread 1: 12 clocks per tick, 8 ticks per bit | 28 clocks (thread 0), 4 clocks (thread 1) | 500 kbit/s (TICK 100; thread 1 TICK 12 + 128/256) and 125 kbit/s (TICK 400; TICK 50) |
 | `usb_ls_device.loom` | D+ = BIDIR0, D- = BIDIR1 (push-pull while sending; 1.5 kOhm pull-up on D-) | 511 of 512 (all four quarters, slices A and B) | 33 clocks per tick, one tick per bit (set by the program: 33 + 85/256) | 1 clock | USB low speed, 1.5 Mbit/s at 50 MHz; host at +-0.25 %; 2-bit host gaps |
+| `manchester_loopback.loom` | TX = OUT0, RX = IN0 | 60 (thread 0) + 113 (thread 1) | 12 clocks per tick, one tick per half-bit, both threads | 0 clocks (both threads) | 2.083 Mbit/s (TICK 12) and 1 Mbit/s (TICK 25), wire loopback; a sender at +-0.1 % (TICK 12) and +-0.2 % (TICK 25) |
 
 Every program assembles with `--strict` and no diagnostic at all: each
 deadline pair is proved and none is unbounded (the M2 five in
-`tools/tests/test_fw_build.py`, the M3 programs in their own test modules).
-Each fits in thread 0's quarter of the 512-word memory of D-020, except
-the last three: `i2c_slave_eeprom`'s data fills thread 3's quarter;
+`tools/tests/test_fw_build.py`, the M3 and M4 programs in their own test
+modules). Each fits in thread 0's quarter of the 512-word memory of D-020,
+except three of the M3 programs: `i2c_slave_eeprom`'s data fills thread 3's quarter;
 `can_loopback`'s thread 1 (140 words from 0x080) runs 12 words into thread
 2's quarter, which no thread of that program runs from; and
 `usb_ls_device` needs the whole memory for itself (a thread-0-only
 program: the other three threads must not be started with it loaded).
+`manchester_loopback`'s two threads each stay in their own quarter (60
+words from 0x000, 113 from 0x080).
 
 `ws2812` gets there with two `.bounded` declarations
 (`tools/loomasm/README.md` sections 4 and 7). Its byte fetch needs a `POP`
@@ -414,12 +422,64 @@ words = loom.pop(0, 4)                              # four received frames
   ignored harmlessly; after a bus reset the device keeps its address, so a
   host that resets it must reload the program.
 
+## manchester_loopback.loom: Manchester transmitter and receiver
+
+- **Pins**: TX = OUT0 (push-pull, idle low), RX = IN0; wire OUT0 to IN0 for
+  the loopback, or let any sender of the same frames drive IN0. Thread 0
+  sends, thread 1 receives every frame on RX. Start threads 0 and 1.
+- **Frame**: IEEE 802.3 Manchester (0 = high then low, 1 = low then high),
+  most significant bit first, done by the engine (`ENC = 2`, `DIR` MSB
+  first). The sync word 0xAAAB (fourteen preamble bits 1010..10, then the
+  start marker 11), 0 to 4 data words, then the line low: the bit after the
+  last word has no mid-bit transition, and that code violation ends the
+  frame. Frames are 16 idle bit times apart.
+- **Host command** (push to thread 0): a word with n in bits 2:0 (5..7 are
+  taken as 4), then the n data words. Thread 0 pops all of them before the
+  frame starts, so a slow host delays a frame but never breaks one.
+- **Result** (pop thread 1): a status word, then the d data words it
+  announces. Status bits 2:0 d; bit 3 violation (a bit with no mid-bit
+  transition inside the frame: reception stops there and d counts the words
+  received whole before it); bit 4 bad sync (S misread, or hit by the
+  violation); bit 5 too long (more than four data words: d = 4, the last
+  four). After a report thread 1 waits for two idle bit times before it
+  looks for the next frame, so a report must fit OUTQ (four words) or be
+  popped before the next frame starts.
+- **Rate**: set by the host for both threads, one tick per half-bit:
+  TICK 12 is 2.083 Mbit/s at 50 MHz, the fastest the checker proves; TICK
+  25 is 1 Mbit/s. `TICK_FRAC` may be used.
+- **Why 12 clocks**: the 6.9.1 loop (`WAITD 1; SHx; WAITD 1; SHx; BNZ`) has a
+  three-slot interval. Each word is that loop for most of its bits and
+  straight-line code around the word boundary, where each half-bit carries
+  one more instruction (load or store the word, move the word registers,
+  reload `CNT`, count words, test `T`), so every interval of both threads
+  is three slots at most: 0 clocks of slack. `LD`/`ST` take two slots, which
+  is why the words live in registers and a frame carries at most four
+  (`docs/spec-questions/firmware-m4.md` item 1).
+- **Transmit timing**: every edge is one slot after its tick, so at TICK 12
+  (a multiple of the slot) every half-bit is exactly 12 clocks; at TICK 25
+  the edges are within 3 clocks of their grid (SEMANTICS 2).
+- **Receive timing**: thread 1 hard-synchronises once, on the first rising
+  edge after two idle bit times (the middle of the sync word's first bit),
+  by rewriting its `TICK_INT` after a delay of `(3P/2 - 11) / 4` slots that
+  it computes from `TICK_INT`. Each sample then falls 4 clocks into its
+  half-bit at TICK 12 and 9 to 12 at TICK 25 (measured in loopback; up to 3
+  more for a sender not on the chip's clock grid). There is no resynchronisation: with 4-word frames the
+  golden model receives a sender off by -0.25 % to +0.30 % at TICK 12 and
+  +-0.30 % at TICK 25 (and fails at -0.30 %, +0.40 % and +-0.40 %); the
+  tests use +-0.1 % and +-0.2 %. A missing transition in a word's first bit
+  looks like the end marker; the receiver tells them apart by waiting three
+  half-bits for an edge (item 5 of the spec questions).
+- **Not done**: frames longer than four words, a length or CRC field (the
+  end marker delimits the frame, the status reports what arrived),
+  resynchronisation on data edges, and any medium access: thread 0 sends
+  whenever the host asks.
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
-`test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py` and
-`test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
+`test_fw_manchester.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks
@@ -450,13 +510,17 @@ for; `test_fw_usb.py` asks for both on the model backend only.
 (`features={"FIFO", "SETPD"}`), which the RTL has unconditionally, so
 `test_fw_ws2812.py` adds that feature for the model backend only; see
 `docs/spec-questions/firmware-m3.md` item 2. In the same way
-`test_fw_i2c_slave.py` builds the model with `DMEM` and
-`test_fw_can.py` with `BE`, `BEENC` and `SETPD`, both with the 512-word
+`test_fw_i2c_slave.py` builds the model with `DMEM`,
+`test_fw_can.py` with `BE`, `BEENC` and `SETPD`, and
+`test_fw_manchester.py` with `BE` and `BEENC`, all with the 512-word
 memory. Their references are `tools.protomodels.i2c_master.I2cBusMaster`
 (a master timed by UM10204 table 10 at 100 and 400 kHz, which checks tVD on
 every bit the device drives) and `tools.protomodels.can` (the bus as a wired
 AND, and a node with its own bit clock that ACKs, sends, spoils its own
 frames with a stuff or a CRC error on request, and can force a dominant bit
-into the chip's frame to make a form error). The one `model_only` body among
-them is the 257-byte sequential read of the whole array (300000 clocks);
+into the chip's frame to make a form error), and
+`tools.protomodels.manchester` (a wire from TX to RX, or a sender with
+its own clock, a settable rate offset and an injectable missing
+transition, plus a decoder that holds the chip's transmitter to its
+half-bit grid). The one `model_only` body among them is the 257-byte sequential read of the whole array (300000 clocks);
 its 12-byte sibling covers the wrap at 0xFF on both backends.

@@ -1,0 +1,259 @@
+; manchester_loopback.loom
+; A Manchester (IEEE 802.3 convention) transmitter and receiver at the rate
+; the bit engine's manual mode reaches (SEMANTICS 6.9.1, D-029): a bit is two
+; SHO on the way out and two SHI on the way in, the second SHI setting T when
+; the transition in the middle of the bit is missing. Slice A of the engine
+; (ENC = 2) does the coding; nothing else beyond the M2 core is used.
+;
+; Pins: TX = OUT0 (push-pull, idle low), RX = IN0. Wire OUT0 to IN0 for the
+; loopback; any other Manchester source of the same frame format can drive
+; IN0 instead.
+;
+; Line code: 0 = high then low, 1 = low then high (a 1 has a rising edge in
+; the middle of the bit), most significant bit first.
+;
+; Frame, all at one bit rate:
+;   S     0xAAAB: fourteen bits 1010..10 (the preamble), then 11 (the start
+;         marker). From an idle-low line the frame's first edge is the rising
+;         middle of S's first bit, and every preamble edge is a mid-bit edge.
+;   D1..Dn  n = 0..4 data words.
+;   end   the line low from the end of the last bit: the next bit has no
+;         mid-bit transition, a code violation that ends the frame.
+; Between frames the line stays low for 16 bit times.
+;
+; Threads. Thread 0 transmits the frames the host pushes to INQ[0]; thread 1
+; receives every frame on RX and reports it on OUTQ[1]. They share nothing.
+;
+; Host words.
+;   INQ[0]:  a command word, bits 2:0 = n (5..7 are taken as 4, the other
+;            bits are ignored), then the n data words. Thread 0 pops all of
+;            them before the frame starts, so the frame never waits for the host.
+;   OUTQ[1]: a status word, then the d data words it announces, in order.
+;   Status:  bits 2:0 d (0..4); bit 3 violation (a bit with no mid-bit
+;            transition inside the frame: reception stopped there, and d counts
+;            the words received whole before it); bit 4 bad sync (S did not read
+;            back as its last 14 bits, 0x2AAB, or was itself hit by a
+;            violation); bit 5 too long (more than four data words before the
+;            end: d = 4, the last four). After every report thread 1 waits for
+;            two bit times of silence before it looks for the next frame.
+;
+; Rate: the host writes TICK_INT of both threads before RUN (the M2
+; convention); one tick is half a bit in both. TICK 12 is 2.083 Mbit/s at
+; 50 MHz, the fastest the deadline checker proves; TICK 25 is 1 Mbit/s.
+; TICK_FRAC may be used. Thread 1 reads TICK_INT to place its samples.
+;
+; Transmit. Each word is the 6.9.1 loop (WAITD 1; SHO; WAITD 1; SHO; BNZ)
+; for bits 3..14 and straight-line code for bit 15 and the next word's bits
+; 0..2, whose half-bit intervals each have one spare slot at TICK 12: that is
+; where the next word is loaded (LDSR after bit 15's first half, when SR has
+; given up its last bit), the word registers move down, CNT is reloaded and
+; the word count decides between the next word and the end. Every edge is
+; one slot after its tick.
+;
+; Receive. Thread 1 waits for two bit times with no edge, then for a rising
+; edge: the middle of S's first bit. It restarts its tick generator there
+; (SEMANTICS 4: a TICK_INT write clears ACC) after a delay of k slots, k =
+; (3P/2 - 11) / 4 for P = TICK_INT, so that every sample falls a few clocks
+; into its half-bit: 4 clocks at TICK 12, 9 to 12 at TICK 25 (loopback).
+; There is no resynchronisation after that edge. The first sample is the
+; first half of S's third bit. Words are read like the transmitter writes
+; them: the 6.9.1 loop for bits 4..13, straight-line code for bits 14 and 15
+; and the next word's bits 0..3, whose spare slots store the word (STSR), test
+; T for a violation in it, test T again after the next bit (the end marker),
+; move the word registers and reload CNT. T set at bit 0 of a word is the end
+; only if no edge follows for three half-bits; otherwise it is a violation.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   TX = OUT0, RX = IN0
+        .equ    CFG = (2 << 3) | (1 << 1)       ; ENC Manchester, DIR MSB first
+        .equ    SYNC = 0xAAAB           ; preamble 1010..10 and start marker 11
+        .equ    SYNC14 = SYNC & 0x3FFF  ; what thread 1 reads of it: the last 14 bits
+        .equ    GAP = 32                ; half-bits of idle after a frame
+
+; ---------------------------------------------------------------- transmit
+        .thread 0
+        .tick   12                      ; 2.083 Mbit/s: 12 clocks per half-bit
+        SETP    TX, 0                   ; idle low
+        .csr    BE_PINS, 16             ; out = OUT0
+        LDI     r0, 12                  ; CNT for the loop: bits 3..14
+
+next:   POP     r6                      ; the command word
+        ANDI    r6, 7                   ; n
+        CMPI    r6, 5                   ; C = (n >= 5)
+        BNC     npop
+        LDI     r6, 4
+npop:   CMPI    r6, 1                   ; C = (n >= 1)
+        BNC     go
+        POP     r2                      ; D1 .. Dn into r2 .. r5
+        CMPI    r6, 2
+        BNC     go
+        POP     r3
+        CMPI    r6, 3
+        BNC     go
+        POP     r4
+        CMPI    r6, 4
+        BNC     go
+        POP     r5
+go:     MOV16   r1, SYNC                ; r1 = S, then the data words behind it
+        ADDI    r6, 1                   ; words to send, S included
+        .csr    BE_CFG, CFG             ; also clears HALF and FIRST (6.9.1)
+        LDSR    r1
+        SETD    1                       ; CNT is 0 here (after reset and after
+                                        ; every frame), so bits 0..2 leave it
+
+; bits 0..2 of a word: one spare slot after each half
+tx0:    WAITD   1
+        SHO                             ; bit 0, first half
+        MOV     r1, r2                  ; the words move down: r1 is the next
+        WAITD   1
+        SHO                             ; bit 0, second half
+        MOV     r2, r3
+        WAITD   1
+        SHO                             ; bit 1
+        MOV     r3, r4
+        WAITD   1
+        SHO
+        MOV     r4, r5
+        WAITD   1
+        SHO                             ; bit 2
+        CSRW    CNT, r0                 ; 12 data bits in the loop
+        WAITD   1
+        SHO
+txl:    WAITD   1                       ; bits 3..14 (SEMANTICS 6.9.1)
+        SHO                             ; first half: takes the bit, CNT - 1
+        WAITD   1
+        SHO                             ; second half: Z = (CNT == 0)
+        BNZ     txl
+        WAITD   1                       ; bit 15
+        SHO
+        LDSR    r1                      ; SR has given its last bit: next word
+        WAITD   1
+        SHO
+        DJNZ    r6, tx0                 ; another word, or the end
+        WAITD   1
+        SETP    TX, 0                   ; the end: low from the last bit's end
+        WAITD   GAP
+        JMP     next
+
+; ----------------------------------------------------------------- receive
+        .thread 1
+        .tick   12                      ; 2.083 Mbit/s: 12 clocks per half-bit
+        .csr    BE_PINS, 8 << 5         ; in = IN0
+
+hunt:   LDI     r5, 16                  ; CNT at bit 14: six second halves in
+                                        ; the block, then ten in the loop
+        CSRR    r7, TICK_INT            ; P, kept for the restart
+        MOV     r6, r7
+        SHRI    r6, 1
+        ADD     r6, r6, r7              ; 3P/2
+        SUBI    r6, 11                  ; C = (3P/2 >= 11)
+        BNC     k1
+        SHRI    r6, 2                   ; k = (3P/2 - 11) / 4 slots of delay
+        BNZ     kok
+k1:     LDI     r6, 1                   ; at least one (DJNZ from 0 would wrap)
+kok:    LDI     r4, 0
+        LDSR    r4                      ; SR = 0, so S reads back as SYNC14
+        .csr    BE_CFG, CFG, r4         ; also clears HALF: the next SHI is a
+                                        ; first half (6.9.1)
+idle:   SETD    4                       ; three to four half-bits ...
+        WAITE   RX, ANY, T              ; ... with no edge on RX
+        BNT     idle                    ; an edge: not idle yet
+        WAITE   RX, RISE                ; the middle of S's first bit
+dly:    DJNZ    r6, dly                 ; k slots
+        CSRW    TICK_INT, r7            ; ACC <= 0: the tick grid starts here
+        SETD    1                       ; 2 clocks after the restart edge, so the
+                                        ; pair to rx2 has 2P - 2 = 22 clocks for
+                                        ; its 5 slots (the listing credits 24)
+        CSRW    FLAGS, r6               ; T = 0 (the idle wait set it); r6 = 0
+                                        ; is also the word count
+        LDI     r7, 12
+        CSRW    CNT, r7                 ; bits 2 and 3 of S, then ten in the loop
+        JMP     rx2                     ; first sample: the first half of bit 2
+
+rxl:    WAITD   1                       ; bits 4..13 (SEMANTICS 6.9.1)
+        SHI                             ; first half: kept in FIRST
+        WAITD   1
+        SHI                             ; second half: the bit, CNT - 1, and
+        BNZ     rxl                     ; T if it equals the first half
+        WAITD   1                       ; bit 14
+        SHI
+        CSRW    CNT, r5
+        WAITD   1
+        SHI
+        INC     r6                      ; one more word, S included
+        WAITD   1                       ; bit 15
+        SHI
+        WAITD   1
+        SHI
+        STSR    r4                      ; the word is whole
+        WAITD   1                       ; next word, bit 0
+        SHI
+        BT      viol                    ; a violation in the word just stored
+        WAITD   1
+        SHI
+        BT      fin                     ; bit 0 has no transition: the end?
+        WAITD   1                       ; bit 1
+        SHI
+        MOV     r0, r1                  ; the words move down for the next STSR
+        WAITD   1
+        SHI
+        MOV     r1, r2
+rx2:    WAITD   1                       ; bit 2 (S enters here)
+        SHI
+        MOV     r2, r3
+        WAITD   1
+        SHI
+        MOV     r3, r4
+        WAITD   1                       ; bit 3
+        SHI
+        WAITD   1
+        SHI
+        JMP     rxl
+
+fin:    SETD    4                       ; three to four half-bits ...
+        WAITE   RX, ANY, T              ; ... with no edge: the line is idle
+        LDI     r7, 0                   ; status flags
+        BT      report                  ; the end marker: a clean frame
+        LDI     r7, 8                   ; the frame goes on: a violation in
+        BRA     report                  ; bit 0 of the next word
+viol:   MOV     r4, r3                  ; drop the word with the violation
+        MOV     r3, r2
+        MOV     r2, r1
+        MOV     r1, r0
+        DEC     r6
+        LDI     r7, 8                   ; violation
+
+; r6 words were received whole, S included, the newest in r4 (r0..r4)
+report: CMPI    r6, 1                   ; C = (S was received whole)
+        BC      rs
+        ORI     r7, 16                  ; bad sync: not even S; r6 = 0
+        BRA     rpush
+rs:     SUBI    r6, 1                   ; d, the data words
+        CMPI    r6, 5                   ; C = (d >= 5)
+        BNC     rup
+        ORI     r7, 32                  ; too long: the last four, S is gone
+        LDI     r6, 4
+        BRA     rpush
+rup:    MOV     r5, r6                  ; move the words down 4 - d places, so
+rupl:   CMPI    r5, 4                   ; that S is r0 and the data r1 .. rd
+        BZ      rsync
+        MOV     r0, r1
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r4
+        INC     r5
+        BRA     rupl
+rsync:  MOV16   r5, SYNC14
+        CMP     r0, r5
+        BZ      rpush
+        ORI     r7, 16                  ; bad sync
+rpush:  OR      r7, r7, r6              ; the status word: flags | d
+        PUSH    r7
+        CMPI    r6, 0
+        BZ      hunt
+rpl:    PUSH    r1                      ; the data words, oldest first
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r4
+        DJNZ    r6, rpl
+        JMP     hunt

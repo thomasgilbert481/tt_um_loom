@@ -129,7 +129,24 @@ reference model, check data and timing.
   CRC16, NRZI, stuffing, EOP, handshake; device enumeration up to SET_ADDRESS
   and a HID report.
 - L3-CAN (M4): frame TX and RX loopback with stuffing, CRC15, ACK slot.
-- L3-MANCH (M4): 10 Mbit Manchester TX/RX loopback in auto mode at 60 MHz.
+- L3-MANCH (M4): Manchester TX/RX loopback at the manual-mode rate (D-029
+  cut the 10 Mbit, auto-mode target): 2.083 Mbit/s and 1 Mbit/s at 50 MHz,
+  frames of one to four words, a node at a rate offset, an injected
+  violation.
+
+**Tools finding T-1 (2026-09-24): the deadline checker is optimistic after
+`SETD`.** Every program's header says each deadline pair is proved, and
+`tools/loomasm/README.md` says a real miss is never missed. That holds for
+intervals that start at a `WAITD` (both ends are on the thread's slot
+grid, and `floor(k * P / 4) = ceil((k * P - 3) / 4)`), but not for those that
+start at `SETD m`: the `SETD` reads `NOW` up to `P - 1` clocks after the tick
+that set it, so the deadline can come after `(m + k - 1) * P + 1` clocks, not
+`(m + k) * P`. Found by the Manchester program's author (`firmware-m4.md`
+item 4). Against the sound bound 15 `SETD` pairs in 8 programs fail, most of
+them a `SETD 0` whose first `WAITD` expects a whole tick; what a late first
+`WAITD` does is shorten the interval that follows it. No test has failed
+on it; whether any test reaches the late case has not been checked. Fix
+in `docs/PLAN.md` M4.
 
 ### L4: formal (SymbiYosys)
 
@@ -265,7 +282,7 @@ run it.
 | L2-RAND, L2-TRACE, L2-SLOT | `tools/loomgen` + `test/test_cosim.py` | lockstep on every cycle: retire record, pads, `HOST_IRQ`, guard registers, periodic full state. Both sides built from `CTRL.CAPS`, so the M2 features (FIFOs, bit engine, `SETP ... D`) are exercised, and two seeds drive the host port throughout the run. Slice A (2026-09-22): the generator drives `ENC`, `STUFF` and `DIFF` in a build with `CAPS[9]`; the default run and a 36 + 4 seed sweep at seed base 1000 (`LOOM_COSIM_SEEDS=36 LOOM_COSIM_SEED_BASE=1000 LOOM_COSIM_SPI_SEEDS=4`) both end with zero divergences between the two independently written implementations of 6.9.1, with every one of the 25 slice A bins hit. Slice B (the same day): the generator emits `LD`/`ST` into a per-thread data window in a build with `CAPS[5]`; the default run and a 36 + 4 seed sweep at seed base 2000 end with zero divergences between the two implementations of 6.11, all five `LD`/`ST` bins hit |
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
-| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD, and from 2026-09-23 L3-USB-LS, L3-I2C-S, L3-CAN | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 94 scenarios on the model, 80 on the RTL (the rest marked `model_only` with the reason; all 14 of those passed on the RTL too in one run with `LOOM_FW_SET=model_only`, 2026-09-24, 351 s), no divergence between the sides |
+| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD, from 2026-09-23 L3-USB-LS, L3-I2C-S, L3-CAN, and from 2026-09-24 L3-MANCH | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 105 scenarios on the model, 91 on the RTL (the rest marked `model_only` with the reason; all 14 of those passed on the RTL too in one run with `LOOM_FW_SET=model_only`, 2026-09-24, 351 s), no divergence between the sides |
 | L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` for all four threads with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit); two harness findings came with slice B, F-6 (properties that took the LD/ST completion slot for an instruction) and F-7 (ISO-1 not comparing slice B's state or a thread's stores) |
 | L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; no open survivor since 2026-09-24 (the last one killed by a new `test_mem` check); the results section below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
