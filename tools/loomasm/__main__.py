@@ -40,6 +40,10 @@ def main(argv=None) -> int:
                         help="treat deadline errors as a failure")
     parser.add_argument("--no-deadline-check", action="store_true",
                         help="skip the deadline analysis entirely")
+    parser.add_argument("--sound-setd", action="store_true",
+                        help="take each SETD's phase in its tick off the "
+                             "budget of the pairs it starts (tools finding "
+                             "T-1; not yet the default)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="print errors only, not warnings")
     args = parser.parse_args(argv)
@@ -47,7 +51,8 @@ def main(argv=None) -> int:
     try:
         program = assemble_file(args.source, strict=False,
                                 deadline_check=not args.no_deadline_check,
-                                imem_words=args.imem_words)
+                                imem_words=args.imem_words,
+                                sound_setd=args.sound_setd)
     except AsmError as exc:
         _report(exc.diagnostics, sys.stderr)
         return 1

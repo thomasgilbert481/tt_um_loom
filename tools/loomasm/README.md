@@ -309,6 +309,20 @@ For each thread the checker
      ticks before that `SETD`'s own deadline, and
    - `k` ticks from a `WAITD` anchor, which adds nothing of its own.
 
+   With `--sound-setd` (`sound_setd=True`), a `SETD` pair's budget is
+   `(m + k) * P - phase + 3` clocks instead: `phase` is the most clocks the
+   `SETD` can run after the tick that set the `NOW` it reads, and 3 is the
+   target `WAITD`'s grace (it is on time in any X cycle up to the first one at
+   or after its tick). The phase is bounded by a forward pass over the whole
+   graph: a `WAITD k` completes at most 3 clocks after its tick, a `CSRW
+   TICK_INT`/`TICK_FRAC` restarts the tick 2 clocks before the next slot's X
+   cycle, every slot adds 4, and the thread's entry, an unbounded instruction,
+   a timed wait or a whole period with no known position make it unknown,
+   `P - 1`. The listing prints each pair's `(SETD phase <= N)`. `WAITD` pairs
+   do not change: their own lag and their target's grace cancel, and `k * P`
+   is exact. This is tools finding T-1 (`docs/VERIFICATION.md`); it is not
+   the default yet because six programs fail it (`docs/PLAN.md` M4).
+
 Control flow: `JMP`/`CALL` follow their absolute target, `RET` returns to the
 address after **every** `CALL` in the thread, `HALT` ends the path, and the
 conditional transfers (`BZ BNZ BC BNC BT BNT DJNZ JP`) take both edges.
@@ -369,8 +383,12 @@ runs out.
 ### What it is sound about
 
 - Paths are over-approximated, never under-approximated: unreachable paths and
-  impossible `RET` targets can make the reported worst case **pessimistic**,
-  but a real deadline miss on any executable path is never missed.
+  impossible `RET` targets can make the reported worst case **pessimistic**.
+- A real deadline miss on an executable path is never missed **with
+  `--sound-setd`**. Without it, which is still the default, a pair that starts
+  at a `SETD` is credited as though the `SETD` ran on its tick, which is up to
+  `P - 1` clocks optimistic (T-1). Pairs that start at a `WAITD` are exact
+  either way.
 - It never needs to know the values in registers.
 
 ### Known limits

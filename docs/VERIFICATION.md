@@ -145,8 +145,13 @@ that set it, so the deadline can come after `(m + k - 1) * P + 1` clocks, not
 item 4). Against the sound bound 15 `SETD` pairs in 8 programs fail, most of
 them a `SETD 0` whose first `WAITD` expects a whole tick; what a late first
 `WAITD` does is shorten the interval that follows it. No test has failed
-on it; whether any test reaches the late case has not been checked. Fix
-in `docs/PLAN.md` M4.
+on it; whether any test reaches the late case has not been checked. The
+checker has the sound rule as `--sound-setd` (2026-09-24): a forward pass
+bounds each `SETD`'s phase from the last `WAITD` completion or tick restart,
+so a `SETD` that follows a `WAITD` closely keeps most of its budget. With it
+11 pairs in 6 programs fail (`can_loopback` 1, `jtag_master` 1, `spi_slave`
+1, `swd_master` 5, `uart_tx_fifo` 1, `usb_ls_device` 1); it becomes the
+default once they are fixed (`docs/PLAN.md` M4).
 
 ### L4: formal (SymbiYosys)
 

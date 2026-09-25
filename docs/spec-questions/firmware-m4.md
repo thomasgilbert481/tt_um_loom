@@ -96,7 +96,10 @@ contrary to its README ("a real deadline miss ... is never missed").
 slot grid, and `floor(k * P / 4) = ceil((k * P - 3) / 4)`. Measured against
 the sound bound, `ceil(((m + k - 1) * P + 1) / 4)` slots, 15 `SETD` pairs in 8
 programs fail today (most are `SETD 0` followed by a first `WAITD` that
-expects a whole tick). The checker takes the sound bound, and each failing
+expects a whole tick); the phase-aware form the checker now has
+(`--sound-setd`), which knows where a `SETD` that closely follows a `WAITD`
+or a tick restart runs, leaves 11 pairs in 6 programs, this one not among
+them. The checker takes the sound bound, and each failing
 pair is either given its whole tick in the program (`SETD m + 1`, at most one
 tick more latency at the start of a sequence) or shown harmless by an
 argument the listing prints, the way `.bounded` is. Recorded as tools finding

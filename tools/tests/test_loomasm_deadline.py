@@ -501,3 +501,92 @@ def test_the_summary_marks_an_unbounded_pair():
     text = "\n".join(summary_lines(result))
     assert "UNBOUNDED" in text
     assert "1 unbounded" in text
+
+
+# --------------------------------------------- the SETD's phase (T-1, sound)
+# docs/VERIFICATION.md tools finding T-1: a SETD reads NOW up to P - 1 clocks
+# after the tick that set it, so with sound_setd the phase comes off the budget
+# of each pair it starts, and the target's slot-grid grace (3 clocks) goes on.
+
+def sound(text):
+    return asm(text, sound_setd=True).deadlines[0]
+
+
+def test_default_is_still_the_old_optimistic_rule():
+    pair = report(src(".thread 0", ".tick 100",
+                      "SETD 0", "NOP", "WAITD 1", "HALT")).pairs[0]
+    assert pair.src_phase is None and pair.limit == 100
+
+
+def test_a_setd_at_the_thread_entry_has_an_unknown_phase():
+    pair = sound(src(".thread 0", ".tick 100",
+                     "SETD 0", "NOP", "WAITD 1", "HALT")).pairs[0]
+    assert pair.src_phase == 99                        # P - 1
+    assert pair.limit == 100 - 99 + 3                  # 4 clocks: one slot
+    assert pair.feasible is False                      # NOP, WAITD: 8 clocks
+
+
+def test_setd_one_gives_the_whole_tick_back():
+    pair = sound(src(".thread 0", ".tick 100",
+                     "SETD 1", "NOP", "WAITD 1", "HALT")).pairs[0]
+    assert pair.limit == 200 - 99 + 3 and pair.feasible is True
+
+
+def test_a_setd_right_after_a_waitd_is_at_most_seven_clocks_into_its_tick():
+    result = sound(src(".thread 0", ".tick 100",
+                       "SETD 1", "WAITD 1", "SETD 0", "NOP", "WAITD 1", "HALT"))
+    pair = [p for p in result.pairs if p.src_addr == 2][0]
+    assert pair.src_phase == 3 + 4                     # WAITD lag + one slot
+    assert pair.limit == 100 - 7 + 3
+
+
+def test_a_tick_restart_fixes_the_phase_two_clocks_before_the_next_slot():
+    result = sound(src(".thread 0", ".tick 100",
+                       "SETD 1", "WAITP IN0, 1, T", "CSRW TICK_INT, r7",
+                       "SETD 0", "NOP", "WAITD 1", "HALT"))
+    pair = [p for p in result.pairs if p.src_addr == 3][0]
+    assert pair.src_phase == 4 - 2
+
+
+def test_a_timed_wait_or_a_pop_before_the_setd_makes_the_phase_unknown():
+    for waiter in ("WAITP IN0, 1, T", "POP r0"):
+        result = sound(src(".thread 0", ".tick 100",
+                           "SETD 1", "WAITD 1", waiter,
+                           "SETD 0", "NOP", "WAITD 1", "HALT"))
+        pair = [p for p in result.pairs if p.src_addr == 3][0]
+        assert pair.src_phase == 99, waiter
+
+
+def test_a_whole_period_without_a_known_position_makes_the_phase_unknown():
+    body = ["NOP"] * 30                                # 120 clocks > P = 100
+    result = sound(src(".thread 0", ".tick 100", "SETD 1", "WAITD 1",
+                       *body, "SETD 0", "WAITD 1", "HALT"))
+    pair = [p for p in result.pairs if p.src_addr == 32][0]
+    assert pair.src_phase == 99
+
+
+def test_the_phase_is_the_worst_over_every_path_into_the_setd():
+    result = sound(src(".thread 0", ".tick 100",
+                       "SETD 1", "WAITD 1",
+                       "BZ far",                        # 2: one path skips ahead
+                       "NOP", "NOP", "NOP",
+                       "far: SETD 0", "WAITD 1", "HALT"))
+    pair = [p for p in result.pairs if p.src_name == "SETD" and p.src_addr == 6][0]
+    # the long way: the SETD's X cycle is five slots after the WAITD's
+    # (BZ, three NOPs, then its own); the short way, two
+    assert pair.src_phase == 3 + 4 * 5
+
+
+def test_waitd_pairs_do_not_change():
+    text = src(".thread 0", ".tick 33",
+               "SETD 1", "WAITD 1", "NOP", "WAITD 1", "HALT")
+    old = [p for p in report(text).pairs if p.src_name == "WAITD"][0]
+    new = [p for p in sound(text).pairs if p.src_name == "WAITD"][0]
+    assert (old.limit, old.slack) == (new.limit, new.slack) == (33, 25)
+
+
+def test_the_error_names_the_phase():
+    program = asm(src(".thread 0", ".tick 100",
+                      "SETD 0", "NOP", "WAITD 1", "HALT"), sound_setd=True)
+    messages = [d.message for d in program.errors]
+    assert any("1 x 100 - 99 (SETD phase) + 3 = 4 clocks" in m for m in messages)

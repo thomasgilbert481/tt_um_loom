@@ -175,6 +175,9 @@ class _Assembler:
         self.csrs = csr_table(isa)
         self.enums = enum_tables(isa)          # operand base -> {NAME: value}
         self.td_csr = isa.csr_by_name.get("TD")
+        #: CSRs whose write restarts the tick generator (SEMANTICS 4)
+        self.tick_csrs = {isa.csr_by_name[n] for n in ("TICK_INT", "TICK_FRAC")
+                          if n in isa.csr_by_name}
 
         self.labels: Dict[str, int] = {}
         self.equs: Dict[str, int] = {}
@@ -757,7 +760,8 @@ class _Assembler:
 
     # ------------------------------------------------------------------ result
     def finish(self, stmts: List[Stmt], source: str,
-               run_deadline_check: bool) -> Program:
+               run_deadline_check: bool,
+               sound_setd: bool = dl.SOUND_SETD_DEFAULT) -> Program:
         program = Program(isa_version=self.isa.version, source=source,
                           imem_words=self.imem_words)
         program.words = dict(self.words)
@@ -785,7 +789,9 @@ class _Assembler:
                 report = dl.analyse_thread(
                     thread, self.nodes[thread], self.tick[thread],
                     self.pc_bits, self.check_enabled[thread],
-                    self.slot_clocks, self.td_csr)
+                    self.slot_clocks, self.td_csr,
+                    entry=self.thread_origin(thread),
+                    tick_csrs=self.tick_csrs, sound_setd=sound_setd)
                 program.deadlines[thread] = report
                 self.diagnostics.extend(dl.diagnostics_for(report, self.filename))
         program.diagnostics = sorted(
@@ -796,7 +802,8 @@ class _Assembler:
 # ---------------------------------------------------------------- entry points
 def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" = None,
                   strict: bool = False, deadline_check: bool = True,
-                  imem_words: "Optional[int]" = None) -> Program:
+                  imem_words: "Optional[int]" = None,
+                  sound_setd: bool = dl.SOUND_SETD_DEFAULT) -> Program:
     """Assemble source text. See :func:`assemble` for the argument meanings."""
     from .listing import build_listing
 
@@ -808,7 +815,7 @@ def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" =
     # Pass 2 always runs: statements that failed to size emit nothing, so every
     # operand error in the file is reported alongside the layout errors.
     asm.pass2(stmts)
-    program = asm.finish(stmts, filename, deadline_check)
+    program = asm.finish(stmts, filename, deadline_check, sound_setd)
     program.listing = build_listing(program, stmts, isa)
     fatal = [d for d in program.diagnostics if d.fatal]
     if fatal or (strict and program.errors):
@@ -818,12 +825,13 @@ def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" =
 
 def assemble_file(path, *, isa: "Optional[Isa]" = None, strict: bool = False,
                   deadline_check: bool = True,
-                  imem_words: "Optional[int]" = None) -> Program:
+                  imem_words: "Optional[int]" = None,
+                  sound_setd: bool = dl.SOUND_SETD_DEFAULT) -> Program:
     path = pathlib.Path(path)
     text = path.read_text(encoding="utf-8")
     return assemble_text(text, str(path).replace(os.sep, "/"), isa=isa,
                          strict=strict, deadline_check=deadline_check,
-                         imem_words=imem_words)
+                         imem_words=imem_words, sound_setd=sound_setd)
 
 
 def assemble(text_or_path, *, filename: "Optional[str]" = None,

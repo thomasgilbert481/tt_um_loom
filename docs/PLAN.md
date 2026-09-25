@@ -399,12 +399,15 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       RX thread 1, 173 words, 2.083 Mbit/s (TICK 12, the fastest the checker
       proves) and 1 Mbit/s, on both backends; five spec questions ruled in
       `docs/spec-questions/firmware-m4.md`.
-- [ ] Tools finding T-1 (`docs/VERIFICATION.md`): the deadline checker takes
-      the sound budget after `SETD m`, `ceil(((m + k - 1) * P + 1) / 4)` slots,
-      and the 15 pairs in 8 programs that fail it today are each given their
-      whole tick in the program (`SETD m + 1`) or a printed argument that a
-      late first `WAITD` is harmless, then retested on both backends. Before
-      the firmware freeze.
+- [ ] Tools finding T-1 (`docs/VERIFICATION.md`). Done 2026-09-24: the
+      checker's sound rule, `--sound-setd` (a `SETD` pair's budget less the
+      `SETD`'s phase, bounded by a forward pass; 10 tests). Open: the 11
+      pairs in 6 programs that fail it (`can_loopback` 1, `jtag_master` 1,
+      `spi_slave` 1, `swd_master` 5, `uart_tx_fifo` 1, `usb_ls_device` 1),
+      each given its whole tick in the program (`SETD m + 1`, or a
+      restructure where that costs throughput, as it would in
+      `uart_tx_fifo`'s back-to-back bytes) and retested on both backends;
+      then `--sound-setd` becomes the default. Before the firmware freeze.
 - [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
       remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
       the RTL (done 2026-09-24: all 14 `model_only` scenarios pass on the

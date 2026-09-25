@@ -6,8 +6,17 @@ it at ``NOW + m``; ``WAITD k`` advances it by ``k`` ticks and stalls until
 instructions always finishes before the later deadline: every slot is exactly
 four clocks (``docs/SEMANTICS.md`` section 2), so the budget is
 
-* ``(m + k)`` tick periods from a ``SETD m`` to the next ``WAITD k``, and
-* ``k`` tick periods from a ``WAITD`` to the next ``WAITD k``.
+* ``k`` tick periods from a ``WAITD`` to the next ``WAITD k``, and
+* ``(m + k)`` tick periods from a ``SETD m`` to the next ``WAITD k``, less the
+  clocks the ``SETD`` may run after the tick that set the ``NOW`` it reads (its
+  *phase*), plus the three clocks of the target's own slot-grid grace.
+
+A ``WAITD`` completes at most three clocks after its tick, and the next
+``WAITD``'s slot is four clocks wide, so ``k * P`` is exact for it. A ``SETD``
+can run anywhere in a tick unless the code before it fixes where: the phase
+analysis (:func:`_phases`) bounds it from the last ``WAITD k`` completion or
+tick restart (``CSRW TICK_INT``/``TICK_FRAC``) on every path, and falls back to
+``P - 1`` clocks (tools finding T-1, ``docs/VERIFICATION.md``).
 
 The checker builds each thread's control-flow graph, cuts it at every anchor,
 and takes the longest path, in slots, from each anchor to every ``WAITD``
@@ -107,6 +116,10 @@ class DeadlinePair:
     #: ``WAITD`` anchor, and None when a ``CSRW TD`` on the path has made the
     #: anchor's own value meaningless (the budget then falls back to k * P).
     src_ticks: Optional[int] = 0
+    #: For a ``SETD`` anchor, the most clocks it can run after the tick that
+    #: set the ``NOW`` it reads (T-1); None for a ``WAITD`` anchor, whose
+    #: three clocks are the grace of the slot grid and cancel out.
+    src_phase: Optional[int] = None
 
     @property
     def unbounded(self) -> bool:
@@ -128,7 +141,15 @@ class DeadlinePair:
 
     @property
     def limit(self) -> Optional[int]:
-        return None if self.period is None else self.budget_ticks * self.period
+        """The most clocks the path may take: ``budget_ticks * P``, less the
+        ``SETD``'s phase and plus the target's grace of ``slot_clocks - 1``
+        (which is exactly what a ``WAITD`` anchor's own lag cancels)."""
+        if self.period is None:
+            return None
+        base = self.budget_ticks * self.period
+        if self.src_phase is None:
+            return base
+        return base - self.src_phase + (self.slot_clocks - 1)
 
     @property
     def slack(self) -> Optional[int]:
@@ -327,14 +348,84 @@ def _longest_paths(graph: _Graph,
     return result
 
 
+#: The phase is not known: the SETD may read NOW at any point of a tick.
+UNKNOWN_PHASE = math.inf
+
+#: Whether a SETD pair's budget takes the SETD's phase into account (T-1).
+#: Off by default until the programs that fail the sound budget are fixed
+#: (docs/PLAN.md M4); ``loomasm --sound-setd`` and ``sound_setd=True`` turn
+#: it on. Off, a SETD is taken to run on its tick, which is optimistic.
+SOUND_SETD_DEFAULT = False
+
+
+def _phase_after(node: Node, phase_in: float, tick_csrs: Set[int],
+                 slot_clocks: int) -> float:
+    """Clocks since the last known tick position, at the X cycle of the
+    instruction that follows ``node`` on a path."""
+    cost = _slot_cost(node)
+    if cost == UNBOUNDED or node.name in TIMED_WAITS:
+        # completes when an event or a timeout says: no fixed position
+        return UNKNOWN_PHASE
+    if is_deadline_target(node):
+        # a WAITD k (on time, which the pair into it proves) completes in the
+        # first X cycle at or after its tick: at most slot_clocks - 1 later
+        return (slot_clocks - 1) + slot_clocks * cost
+    if node.name == "CSRW" and node.fields.get("csr") in tick_csrs:
+        # SEMANTICS 4: the write clears ACC at its commit edge, two clocks
+        # after its X cycle, and the next tick is a whole period after that
+        return slot_clocks * cost - 2
+    return phase_in + slot_clocks * cost
+
+
+def _phases(graph: _Graph, entry: Optional[int], period: int,
+            tick_csrs: Set[int], slot_clocks: int) -> Dict[int, float]:
+    """For every node, the most clocks its X cycle can lie after the last
+    known tick position, over every path into it (a forward dataflow over the
+    whole graph, uncut). The thread's entry, a node nothing jumps to, and any
+    path through an unbounded instruction or a timed wait start from
+    :data:`UNKNOWN_PHASE`; so does a path that has gone a whole period
+    without a known position."""
+    nodes = graph.nodes
+    preds: Dict[int, List[int]] = {addr: [] for addr in nodes}
+    for addr in nodes:
+        for succ in graph.raw_succs(addr):
+            preds[succ].append(addr)
+    if entry is None or entry not in nodes:
+        entry = min(nodes)
+    phase: Dict[int, float] = {}
+    work: List[int] = []
+    for addr in nodes:
+        if addr == entry or not preds[addr]:
+            phase[addr] = UNKNOWN_PHASE
+            work.append(addr)
+    while work:
+        addr = work.pop()
+        out = _phase_after(nodes[addr], phase[addr], tick_csrs, slot_clocks)
+        if out >= period:
+            out = UNKNOWN_PHASE
+        for succ in graph.raw_succs(addr):
+            old = phase.get(succ)
+            new = out if old is None else max(old, out)
+            if new != old:
+                phase[succ] = new
+                work.append(succ)
+    return phase
+
+
 def analyse_thread(thread: int, nodes: Sequence[Node], period: Optional[int],
                    pc_bits: int = 10, enabled: bool = True,
                    slot_clocks: int = SLOT_CLOCKS,
-                   td_csr: Optional[int] = None) -> ThreadDeadlines:
+                   td_csr: Optional[int] = None,
+                   entry: Optional[int] = None,
+                   tick_csrs: Iterable[int] = (),
+                   sound_setd: bool = SOUND_SETD_DEFAULT) -> ThreadDeadlines:
     """Analyse one thread's section.
 
     ``td_csr`` is the number of the ``TD`` CSR from ``isa.yaml``; it lets the
     checker notice a ``CSRW TD`` that makes a ``SETD``'s own ticks meaningless.
+    ``entry`` is the thread's first address and ``tick_csrs`` the numbers of
+    ``TICK_INT`` and ``TICK_FRAC``, for the phase of each ``SETD``; with
+    ``sound_setd`` the phase is taken off each ``SETD`` pair's budget (T-1).
     """
     report = ThreadDeadlines(thread=thread, period=period, enabled=enabled,
                              slot_clocks=slot_clocks)
@@ -363,6 +454,8 @@ def analyse_thread(thread: int, nodes: Sequence[Node], period: Optional[int],
             "falling off the end); those paths are not followed")
 
     solved = _longest_paths(graph, td_csr)
+    phases = (_phases(graph, entry, period, set(tick_csrs), slot_clocks)
+              if period is not None and sound_setd else {})
     for anchor in sorted(anchors, key=lambda n: n.addr):
         merged: Dict[int, _Path] = {}
         for succ in graph.raw_succs(anchor.addr):
@@ -375,22 +468,36 @@ def analyse_thread(thread: int, nodes: Sequence[Node], period: Optional[int],
         for target in sorted(merged):
             dst = table[target]
             cost, rewritten = merged[target]
+            src_phase = None
             if anchor.name == "SETD":
                 # SETD m sets TD = NOW + m, so its own m is part of the budget,
                 # unless a CSRW TD on the path replaced the deadline it set.
                 src_ticks = None if rewritten else int(anchor.fields.get("imm", 0))
+                if period is not None and sound_setd:
+                    known = phases.get(anchor.addr, UNKNOWN_PHASE)
+                    src_phase = int(min(known, period - 1))
             else:
                 src_ticks = 0               # WAITD anchors add nothing of their own
             report.pairs.append(DeadlinePair(
                 thread=thread, src_addr=anchor.addr, src_name=anchor.name,
                 src_line=anchor.line, dst_addr=target, dst_line=dst.line,
                 ticks=int(dst.fields.get("imm", 0)), slots=cost,
-                period=period, slot_clocks=slot_clocks, src_ticks=src_ticks))
+                period=period, slot_clocks=slot_clocks, src_ticks=src_ticks,
+                src_phase=src_phase))
     if any(not p.anchor_credit_known for p in report.pairs):
         report.notes.append(
             "a CSRW TD lies between a SETD and a WAITD on some path, so that "
             "SETD's own ticks are not credited to the budget (pessimistic)")
     return report
+
+
+def _budget_text(pair: DeadlinePair) -> str:
+    """``k x P``, or with a SETD's phase ``k x P - phase + grace``."""
+    text = "%d x %d" % (pair.budget_ticks, pair.period)
+    if pair.src_phase is not None:
+        text += " - %d (SETD phase) + %d" % (pair.src_phase,
+                                            pair.slot_clocks - 1)
+    return text
 
 
 def diagnostics_for(report: ThreadDeadlines, filename: str) -> List[Diagnostic]:
@@ -409,9 +516,9 @@ def diagnostics_for(report: ThreadDeadlines, filename: str) -> List[Diagnostic]:
             out.append(Diagnostic(
                 ERROR, DEADLINE, filename, pair.dst_line,
                 "deadline cannot be met (%s): %d slots = %d clocks, budget "
-                "%d x %d = %d clocks, short by %d" % (
-                    where, int(pair.slots), pair.clocks, pair.budget_ticks,
-                    pair.period, pair.limit, -pair.slack)))
+                "%s = %d clocks, short by %d" % (
+                    where, int(pair.slots), pair.clocks, _budget_text(pair),
+                    pair.limit, -pair.slack)))
     return out
 
 
@@ -441,6 +548,8 @@ def summary_lines(report: ThreadDeadlines) -> List[str]:
         budget = "-" if pair.limit is None else str(pair.limit)
         slack = "-" if pair.slack is None else str(pair.slack)
         mark = "" if pair.feasible is not False else "  MISSED"
+        if pair.src_phase is not None:
+            mark += "  (SETD phase <= %d)" % pair.src_phase
         if not pair.anchor_credit_known:
             mark += "  (TD rewritten: SETD ticks not credited)"
         lines.append("  %-22s %-22s %6d %8d %6d %9s %9s%s" % (
