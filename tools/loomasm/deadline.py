@@ -352,10 +352,10 @@ def _longest_paths(graph: _Graph,
 UNKNOWN_PHASE = math.inf
 
 #: Whether a SETD pair's budget takes the SETD's phase into account (T-1).
-#: Off by default until the programs that fail the sound budget are fixed
-#: (docs/PLAN.md M4); ``loomasm --sound-setd`` and ``sound_setd=True`` turn
-#: it on. Off, a SETD is taken to run on its tick, which is optimistic.
-SOUND_SETD_DEFAULT = False
+#: On since 2026-09-25, when the last program that failed it was fixed.
+#: ``sound_setd=False`` (``loomasm --optimistic-setd``) gives the rule from
+#: before, which takes a SETD to run on its tick, only for comparison.
+SOUND_SETD_DEFAULT = True
 
 
 def _phase_after(node: Node, phase_in: float, tick_csrs: Set[int],

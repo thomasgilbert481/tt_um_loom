@@ -309,8 +309,8 @@ For each thread the checker
      ticks before that `SETD`'s own deadline, and
    - `k` ticks from a `WAITD` anchor, which adds nothing of its own.
 
-   With `--sound-setd` (`sound_setd=True`), a `SETD` pair's budget is
-   `(m + k) * P - phase + 3` clocks instead: `phase` is the most clocks the
+   A `SETD` pair's budget is then `(m + k) * P - phase + 3` clocks, not
+   `(m + k) * P`: `phase` is the most clocks the
    `SETD` can run after the tick that set the `NOW` it reads, and 3 is the
    target `WAITD`'s grace (it is on time in any X cycle up to the first one at
    or after its tick). The phase is bounded by a forward pass over the whole
@@ -320,8 +320,10 @@ For each thread the checker
    a timed wait or a whole period with no known position make it unknown,
    `P - 1`. The listing prints each pair's `(SETD phase <= N)`. `WAITD` pairs
    do not change: their own lag and their target's grace cancel, and `k * P`
-   is exact. This is tools finding T-1 (`docs/VERIFICATION.md`); it is not
-   the default yet because six programs fail it (`docs/PLAN.md` M4).
+   is exact. This is tools finding T-1 (`docs/VERIFICATION.md`); it has
+   been the rule since 2026-09-25, when the six programs that failed it were
+   fixed. `--optimistic-setd` (`sound_setd=False`) gives the rule from
+   before, which takes a `SETD` to run on its tick, only for comparison.
 
 Control flow: `JMP`/`CALL` follow their absolute target, `RET` returns to the
 address after **every** `CALL` in the thread, `HALT` ends the path, and the
@@ -384,11 +386,10 @@ runs out.
 
 - Paths are over-approximated, never under-approximated: unreachable paths and
   impossible `RET` targets can make the reported worst case **pessimistic**.
-- A real deadline miss on an executable path is never missed **with
-  `--sound-setd`**. Without it, which is still the default, a pair that starts
-  at a `SETD` is credited as though the `SETD` ran on its tick, which is up to
-  `P - 1` clocks optimistic (T-1). Pairs that start at a `WAITD` are exact
-  either way.
+- A real deadline miss on an executable path is never missed. (Before
+  tools finding T-1 a pair that starts at a `SETD` was credited as though the
+  `SETD` ran on its tick, up to `P - 1` clocks optimistic; that rule is left
+  only as `--optimistic-setd`.)
 - It never needs to know the values in registers.
 
 ### Known limits

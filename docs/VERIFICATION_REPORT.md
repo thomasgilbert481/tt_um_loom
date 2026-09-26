@@ -127,6 +127,7 @@ found eight holes in the test suite. Per layer:
 | L4 formal, PIN-1 | **a real bug**: an open-drain pin could drive high on a shared bus, depending on the order three registers were written in | BUGS 5, D-023, F-2 |
 | L4 formal, TIMER-1 | the property as worded was false: `reached` is a half-window compare, not monotone | F-1, SEMANTICS 4 |
 | L4 formal, SPI-1 | a reset while SCK is high inserts a phantom edge; the host protocol now says to release CS_n around a reset | F-3, HOST_PROTOCOL |
+| Deadline checker, T-1 | the budget after a `SETD` assumed the `SETD` ran on its tick; three programs had real timing faults it hid (a UART start bit 4 clocks short after some idle gaps, JTAG TCK at 36/28 clocks on 26 of 87 half periods, SWD high phases of 20 and 28 clocks where 32 were meant) | T-1, VERIFICATION.md; each program fixed with an edge-by-edge test |
 | L7 mutation | eight promises no test compared (debug-register cross-talk, `CSRR TICK_FRAC`, `BE_CFG` readback, MISO idle level, CS_n rising mid-byte, `PIN_IN[15:13]`, `TICK_INT = 0` and long periods, `CTRL.RESET` setting TD) | VERIFICATION.md L7 table |
 
 No mutant survives without a documented reason. The last one, in

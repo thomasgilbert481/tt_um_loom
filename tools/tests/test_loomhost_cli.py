@@ -15,7 +15,7 @@ def test_cli_loads_runs_and_decodes_a_uart(capsys):
     assert code == 0
     assert "ID 0x4C4D VERSION 0.1" in out
     assert "imem_words=1024" in out
-    assert "loaded 18 words, verified" in out
+    assert "loaded 26 words, verified" in out
     assert "TICK_INT = 0x0020 (32)" in out
     assert "UART: b'Hi!' (0 framing errors)" in out
     assert "BADOP 0x0000" in out and "SFLAGS 0x03" in out and "IRQ 0" in out

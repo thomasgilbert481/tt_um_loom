@@ -103,7 +103,9 @@ them. The checker takes the sound bound, and each failing
 pair is either given its whole tick in the program (`SETD m + 1`, at most one
 tick more latency at the start of a sequence) or shown harmless by an
 argument the listing prints, the way `.bounded` is. Recorded as tools finding
-T-1 in `docs/VERIFICATION.md`; `docs/PLAN.md` M4 has the work.
+T-1 in `docs/VERIFICATION.md`; `docs/PLAN.md` M4 has the work. Done
+2026-09-25: all six programs fixed and the sound rule made the default;
+`docs/VERIFICATION.md` says what each pair was at run time.
 
 ## 5. The end marker and a violation in the first bit of a word look alike
 

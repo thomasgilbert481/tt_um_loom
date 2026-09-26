@@ -41,7 +41,10 @@ next:   WAITD   1                       ; both paths land here; the deadline, no
 ; Timing notes for the deadline checker: the longest path between two WAITD
 ; instructions is the data-bit loop taken the long way round, DJNZ, SHRI, BC,
 ; SETP, JMP, WAITD = 6 slots = 24 clocks, far under the 434-clock tick, so the
-; schedule is met with 410 clocks of margin. Each data-bit SETP executes the
+; schedule is met with 410 clocks of margin. (The SETD 0 / WAITD 1 pair after
+; the POP has slack 0, by construction: the SETD may run at any point of a
+; tick, and the WAITD in the very next slot is still on time, which is the
+; whole point of the pair; tools finding T-1.) Each data-bit SETP executes the
 ; same 3 slots after its deadline on both paths, so the path a bit takes
 ; through the loop does not move its edge.
 ;

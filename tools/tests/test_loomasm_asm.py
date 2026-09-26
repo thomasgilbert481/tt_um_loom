@@ -532,15 +532,17 @@ def test_write_image_creates_the_directory(tmp_path):
 
 
 def test_listing_has_a_header_a_row_and_a_deadline_summary():
-    program = asm(src(".thread 0", ".tick 50", "SETD 0", "NOP", "WAITD 1"))
+    # SETD 1: at the thread entry a SETD's phase is unknown, so a SETD 0 two
+    # slots before its WAITD 1 could not be proved (tools finding T-1)
+    program = asm(src(".thread 0", ".tick 50", "SETD 1", "NOP", "WAITD 1"))
     text = program.listing_text()
     assert "ADDR  WORD  TH  TIMING     LINE  SOURCE" in text
     assert "one_slot" in text and "wait" in text
     assert "thread 0 deadline analysis (tick period 50 clocks)" in text
-    assert "slack" in text
+    assert "slack" in text and "(SETD phase <= 49)" in text
     assert "0 errors" in text
     # the source text of every line survives into the listing
-    assert "SETD 0" in text and "WAITD 1" in text
+    assert "SETD 1" in text and "WAITD 1" in text
 
 
 def test_listing_shows_the_extra_words_of_a_multi_word_statement():

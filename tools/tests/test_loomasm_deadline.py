@@ -21,13 +21,21 @@ def report(text):
     return asm(text).deadlines[0]
 
 
+def optimistic(text):
+    """The pre-T-1 rule, (m + k) * P for a SETD pair. Path counting is the same
+    under both rules, and the tests that pin it use this rule so their budgets
+    read as plain multiples of the tick; the sound rule, the default, has its
+    own tests at the end of the file."""
+    return asm(text, sound_setd=False).deadlines[0]
+
+
 def test_slot_is_four_clocks_as_semantics_section_2_says():
     assert SLOT_CLOCKS == int(ISA.meta["slot_clocks"]) == 4
 
 
 # ------------------------------------------------------------- straight line
 def test_straight_line_counts_the_instructions_between_and_the_waitd():
-    result = report(src(".thread 0", ".tick 100",
+    result = optimistic(src(".thread 0", ".tick 100",
                         "SETD 0", "NOP", "NOP", "WAITD 1", "HALT"))
     assert len(result.pairs) == 1
     pair = result.pairs[0]
@@ -96,7 +104,7 @@ def test_the_shorter_path_alone_would_have_been_feasible():
         "        NOP",
         "join:   WAITD 1",
         "        HALT")
-    result = report(text)
+    result = optimistic(text)
     # short path BZ BRA WAITD = 3 slots fits; long path BZ NOP NOP WAITD does not
     assert result.pairs[0].slots == 4
     assert result.pairs[0].clocks == 16 and result.pairs[0].limit == 12
@@ -105,7 +113,7 @@ def test_the_shorter_path_alone_would_have_been_feasible():
 
 # --------------------------------------------------------------------- loops
 def test_djnz_loop_that_contains_a_waitd_is_bounded():
-    result = report(src(
+    result = optimistic(src(
         ".thread 0", ".tick 100",
         "        LDI r1, 8",
         "        SETD 0",
@@ -170,7 +178,7 @@ def test_an_infeasible_schedule_is_an_error_level_diagnostic():
 
 
 def test_exactly_meeting_the_deadline_is_feasible():
-    result = report(src(".thread 0", ".tick 12",
+    result = optimistic(src(".thread 0", ".tick 12",
                         "SETD 0", "NOP", "NOP", "WAITD 1", "HALT"))
     assert result.pairs[0].clocks == 12 and result.pairs[0].limit == 12
     assert result.pairs[0].slack == 0 and result.pairs[0].feasible is True
@@ -211,7 +219,7 @@ def bounded_src(reason=GUARD, instruction="POP r0", declare=True):
 
 @pytest.mark.parametrize("instruction", ["POP r0", "PUSH r0"])
 def test_a_declared_fifo_access_costs_one_slot_and_the_pair_is_proved(instruction):
-    result = report(bounded_src(instruction=instruction))
+    result = optimistic(bounded_src(instruction=instruction))
     pair = result.pairs[0]
     assert not pair.unbounded
     assert pair.slots == 2                  # the POP/PUSH and the WAITD
@@ -308,7 +316,7 @@ def test_halt_ends_a_path():
 
 
 def test_each_thread_is_analysed_separately():
-    program = asm(src(
+    program = asm(sound_setd=False, text=src(
         ".thread 0", ".tick 100", "SETD 0", "NOP", "WAITD 1", "HALT",
         ".thread 1", ".tick 8", "SETD 0", "NOP", "NOP", "WAITD 1", "HALT"))
     assert program.deadlines[0].infeasible == []
@@ -360,12 +368,16 @@ def test_a_setd_anchor_contributes_its_own_ticks_to_the_budget():
     pair = result.pairs[0]
     assert pair.src_ticks == 3 and pair.ticks == 1
     assert pair.budget_ticks == 4                    # m + k
-    assert pair.limit == 40
+    # (m + k) x P, less the SETD's phase (unknown at the entry: P - 1), plus
+    # the target's grace of 3 (T-1)
+    assert pair.src_phase == 9 and pair.limit == 40 - 9 + 3
     assert pair.slots == 4 and pair.clocks == 16
-    assert pair.slack == 24 and pair.feasible is True
+    assert pair.slack == 18 and pair.feasible is True
 
 
-@pytest.mark.parametrize("m,limit,feasible", [(0, 10, False), (2, 30, True)])
+@pytest.mark.parametrize("m,limit,feasible", [(0, 10 - 9 + 3, False),
+                                                (1, 20 - 9 + 3, False),
+                                                (2, 30 - 9 + 3, True)])
 def test_the_setd_credit_can_decide_feasibility(m, limit, feasible):
     result = report(src(".thread 0", ".tick 10",
                         "SETD %d" % m, "NOP", "NOP", "NOP", "WAITD 1", "HALT"))
@@ -390,8 +402,9 @@ def test_the_infeasible_message_quotes_the_combined_budget():
                       "HALT"))
     message = program.deadline_errors[0].message
     assert "6 slots = 24 clocks" in message
-    assert "budget 2 x 10 = 20 clocks" in message    # (m + k) x P
-    assert "short by 4" in message
+    # (m + k) x P, less the SETD's phase, plus the target's grace (T-1)
+    assert "budget 2 x 10 - 9 (SETD phase) + 3 = 14 clocks" in message
+    assert "short by 10" in message
 
 
 def test_a_csrw_td_on_the_path_withdraws_the_setd_credit():
@@ -400,7 +413,8 @@ def test_a_csrw_td_on_the_path_withdraws_the_setd_credit():
     pair = result.pairs[0]
     assert pair.src_ticks is None
     assert pair.anchor_credit_known is False
-    assert pair.budget_ticks == 1 and pair.limit == 100      # k * P, not 6 * P
+    assert pair.budget_ticks == 1                            # k, not 6
+    assert pair.limit == 100 - 99 + 3                        # k * P - phase + 3
     assert any("CSRW TD" in note for note in result.notes)
 
 
@@ -462,18 +476,18 @@ def test_waitd_0_does_not_anchor_a_loop_out_of_unboundedness():
 
 
 def test_waitd_0_still_costs_its_slot_against_a_real_deadline():
-    tight = report(src(".thread 0", ".tick 12",
+    tight = optimistic(src(".thread 0", ".tick 12",
                        "SETD 0", "WAITD 0", "NOP", "WAITD 1", "HALT"))
     assert tight.pairs[0].slots == 3 and tight.pairs[0].clocks == 12
     assert tight.pairs[0].feasible is True
-    short = report(src(".thread 0", ".tick 8",
+    short = optimistic(src(".thread 0", ".tick 8",
                        "SETD 0", "WAITD 0", "NOP", "WAITD 1", "HALT"))
     assert short.pairs[0].feasible is False
 
 
 # ------------------------------------------------------------------ summary
 def test_the_summary_block_lists_every_pair_and_the_worst_slack():
-    result = report(src(".thread 0", ".tick 100",
+    result = optimistic(src(".thread 0", ".tick 100",
                         "SETD 0", "NOP", "WAITD 1", "NOP", "NOP", "WAITD 1",
                         "HALT"))
     from tools.loomasm.deadline import summary_lines
@@ -512,10 +526,11 @@ def sound(text):
     return asm(text, sound_setd=True).deadlines[0]
 
 
-def test_default_is_still_the_old_optimistic_rule():
-    pair = report(src(".thread 0", ".tick 100",
-                      "SETD 0", "NOP", "WAITD 1", "HALT")).pairs[0]
-    assert pair.src_phase is None and pair.limit == 100
+def test_the_sound_rule_is_the_default_and_the_old_one_is_kept_for_comparison():
+    text = src(".thread 0", ".tick 100", "SETD 0", "NOP", "WAITD 1", "HALT")
+    assert report(text).pairs[0].src_phase == 99
+    old = asm(text, sound_setd=False).deadlines[0].pairs[0]
+    assert old.src_phase is None and old.limit == 100
 
 
 def test_a_setd_at_the_thread_entry_has_an_unknown_phase():

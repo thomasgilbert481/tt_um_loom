@@ -16,12 +16,15 @@ FIRMWARE = REPO / "firmware"
 
 #: program -> (declared tick in clocks, words) as documented in firmware/README.md
 PROGRAMS = {
-    "uart_tx_fifo": (24, 18),
+    "uart_tx_fifo": (24, 26),
     "uart_rx": (8, 47),
     "spi_master": (28, 72),
-    "spi_slave": (32, 50),
+    "spi_slave": (32, 48),
     "i2c_master": (5, 105),
 }
+#: Programs with no deadline pair at all, by design: spi_slave follows the
+#: master's SCK and keeps no schedule of its own (tools finding T-1).
+NO_PAIRS = {"spi_slave"}
 M2_BUILT = {"PUSH", "POP", "WAITB"}
 
 
@@ -42,6 +45,9 @@ def test_every_deadline_pair_is_proved(program):
     name, prog = program
     report = prog.deadlines[0]
     assert report.period == PROGRAMS[name][0]
+    if name in NO_PAIRS:
+        assert report.pairs == []
+        return
     assert report.pairs and not report.infeasible and not report.unbounded
     assert report.worst_slack >= 0
 

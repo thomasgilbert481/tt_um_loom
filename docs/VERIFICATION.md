@@ -146,12 +146,31 @@ item 4). Against the sound bound 15 `SETD` pairs in 8 programs fail, most of
 them a `SETD 0` whose first `WAITD` expects a whole tick; what a late first
 `WAITD` does is shorten the interval that follows it. No test has failed
 on it; whether any test reaches the late case has not been checked. The
-checker has the sound rule as `--sound-setd` (2026-09-24): a forward pass
-bounds each `SETD`'s phase from the last `WAITD` completion or tick restart,
-so a `SETD` that follows a `WAITD` closely keeps most of its budget. With it
-11 pairs in 6 programs fail (`can_loopback` 1, `jtag_master` 1, `spi_slave`
-1, `swd_master` 5, `uart_tx_fifo` 1, `usb_ls_device` 1); it becomes the
-default once they are fixed (`docs/PLAN.md` M4).
+checker has had the sound rule since 2026-09-24 (a forward pass bounds each
+`SETD`'s phase from the last `WAITD` completion or tick restart, so a `SETD`
+that follows a `WAITD` closely keeps most of its budget), and it has been
+the default since 2026-09-25, when the six programs that failed it were
+fixed. The 11 pairs they failed, and what each was at run time:
+
+- `uart_tx_fifo` (1): a real fault. After an idle gap the start bit came a
+  slot late and 4 clocks short on 10 of 64 words. Now a queued word and an
+  idle one take different paths, one stop bit back to back as before.
+- `jtag_master` (1) and `swd_master` (5): real faults, hidden by a `SETD 0`
+  before `RET` that was meant to cut a checker loop that does not exist and
+  made the checker count a falling-to-rising path one slot short. JTAG ran
+  36/28 clock low/high TCK phases on 26 of the 87 half periods of an IDCODE
+  read; SWD had SWCLK high phases of 20 and 28 clocks where 32 were meant,
+  and its declared tick was 28 where its loop needs 32.
+- `spi_slave` (1): MISO was timed one tick after each sampling edge, which
+  after an edge cannot be proved; nothing in SPI needs it, and MISO now
+  changes a fixed six or seven slots after the edge.
+- `can_loopback` (1) and `usb_ls_device` (1): right at run time (the first
+  followed a timed wait that ends on a tick; the second was paired through
+  return sites its subroutine never returns to), now written with `SETD 1`,
+  which the checker can prove and which changes nothing that matters.
+
+The three real faults each have a test now that measures every edge on the
+pads and fails on the old program; before T-1 no test did.
 
 ### L4: formal (SymbiYosys)
 

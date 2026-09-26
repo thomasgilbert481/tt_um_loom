@@ -140,7 +140,14 @@ def test_uart_tx_schedule_is_met_with_a_large_margin(tx):
     assert result.infeasible == []
     assert result.unbounded == []
     assert result.worst_slots == 6
-    assert result.worst_slack == 410
+    # SETD 0 right after the POP, then WAITD 1 in the very next slot: after a
+    # SETD read at any point of a tick that one slot is exactly what fits, so
+    # the pair's slack is 0 by construction (tools finding T-1); the data
+    # loop, WAITD to WAITD, keeps its 410 clocks
+    from_setd = [p for p in result.pairs if p.src_name == "SETD"]
+    from_waitd = [p for p in result.pairs if p.src_name == "WAITD"]
+    assert [p.slack for p in from_setd] == [0]
+    assert min(p.slack for p in from_waitd) == 410
 
 
 def test_uart_tx_pop_is_re_anchored_by_setd_so_nothing_is_unbounded(tx):
