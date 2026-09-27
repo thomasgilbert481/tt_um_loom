@@ -9,48 +9,90 @@ You can also include images in this folder and reference them in the markdown. E
 
 ## How it works
 
-Loom is a programmable protocol emulator: a tiny I/O processor whose
-instruction set is built for reading pins, writing pins and hitting timing.
-Four hardware threads share one 4-stage pipeline in strict round robin, so
-every instruction takes exactly one thread slot (4 clocks) and the timing of a
-program can be read off its listing. Each thread has a local timebase with a
-fractional prescaler and a deadline register: `WAITD k` advances the deadline
-by k ticks and waits for it, which gives jitter-free bit timing regardless of
-the code path, and every wait can time out against the same deadline. Each
-thread also owns a bit engine (shift register, programmable CRC, NRZ/NRZI/
-Manchester coding, USB/CAN bit stuffing) for the per-bit work that firmware
-cannot do fast enough, and a pair of FIFOs to the host.
+Loom is a small programmable I/O processor for bit-level protocols: firmware
+decides what the pins do, and the chip's timing model makes that firmware's
+timing exact and checkable before it runs.
 
-A SPI slave port (mode 0) on ui[6:4] and uo[7] loads programs into the
-instruction memory, moves data through the FIFOs, and can halt, single-step
-and read or write every register of every thread. The remaining 20 pins (5
-inputs, 6 outputs, 8 bidirectional with per-pin open-drain mode) are the
-emulated protocol pins, addressed by firmware as a uniform pin index space.
+- **Four hardware threads** share one four-stage pipeline in strict round
+  robin. Every instruction takes one slot of its own thread, four clocks
+  (`LD` and `ST` take two), whatever the other threads do, so the timing of
+  a program can be read off its assembler listing. There are no caches and
+  no stalls except the waits a program asks for.
+- **A timebase per thread**: a tick of `TICK_INT + TICK_FRAC/256` clocks, a
+  tick counter `NOW` and a deadline register `TD`. `SETD m` anchors the
+  deadline at `NOW + m`, and `WAITD k` moves it on by `k` ticks and waits
+  for it, so edges land on the tick grid whatever path the code took. The
+  timed waits (for a pin level, an edge, a shared flag, a FIFO or the bit
+  engine) give up at the same deadline, and `SETP pin, v, D` stages a pin
+  write that is applied exactly at the next one. The assembler checks every
+  deadline against the tick before the program is loaded: it warns about a
+  path it cannot bound, and with `--strict` it writes no image for a
+  schedule that can miss a deadline.
+- **A bit engine per thread**, used one instruction per bit: a 16-bit shift
+  register with a bit counter, a programmable CRC of up to 16 bits,
+  NRZ/NRZI/Manchester coding, USB and CAN bit stuffing with a violation
+  flag, and a differential output for USB's D+ and D-.
+- **Memory and FIFOs**: a 512 x 16 SRAM holds the four threads' programs and
+  their data (`LD`/`ST`); each thread has a four-word input and output FIFO
+  to the host.
+- **The host port** is an SPI slave (mode 0) on `ui[4]` (CS_n), `ui[5]`
+  (SCK), `ui[6]` (MOSI) and `uo[7]` (MISO), with an interrupt line on
+  `uo[6]`. Through it the host loads programs, moves data through the FIFOs,
+  runs, halts and single-steps the threads, and reads or writes every
+  register.
+- **The protocol pins** are the other 19, one index space for firmware:
+  IN0..IN4 (`ui[0..3]`, `ui[7]`), OUT0..OUT5 (`uo[0..5]`) and
+  BIDIR0..BIDIR7 (`uio[7:0]`), each bidirectional pin with its own
+  open-drain mode.
 
-UART, SPI and I2C (master and slave) are firmware programs shipped in the
-repository, along with WS2812, PS/2, JTAG and SWD. USB low-speed, CAN and
-10 Mbit Manchester are stretch targets that the bit engines are designed for.
+Thirteen protocol programs come with the design (besides two small UART
+demos from the first milestone), each with a test whose bodies run both on
+the golden model and on the RTL through the real SPI pads: UART transmit
+and receive, SPI master and slave, I2C master, a 24C02-style I2C EEPROM,
+WS2812, PS/2 host, JTAG (IDCODE read), SWD (DPIDR read), a CAN 2.0A node, a
+USB low-speed HID mouse (enumeration and an interrupt IN endpoint) and a
+Manchester loopback. `firmware/README.md` in the repository lists their
+pins, sizes and rates.
 
-Current state of this file: M0. The silicon-facing description above is the
-architecture; the RTL in `src/` at M0 is a hard-wired UART transmitter used to
-prove the flow ("LOOM\r\n" at 115200 on OUT0 while IN0 is high). This
-section is rewritten at M5.
+Clock: 50 MHz at the typical corner. At the slow corner (1.08 V, 125 C) the
+design closes at about 42 MHz.
 
 ## How to test
 
-M0: hold ui[0] high and watch uo[0] with a serial adapter at 115200 8N1; you
-should see "LOOM" repeating.
+After reset all four threads are halted: nothing runs until the host loads
+a program and starts a thread.
 
-Final (M5): connect a SPI master to ui[4] (CS_n), ui[5] (SCK), ui[6] (MOSI)
-and uo[7] (MISO); on the RP2040 demo board these are the SPI0 pins. Use the Python host library in `tools/loomhost` (works with
-the Tiny Tapeout demo board's RP2040, a Raspberry Pi Pico bridge, or an FTDI
-adapter) to load a program from `firmware/` and run it. The repository has a
-test for every firmware program, and the same scripts run against the RTL
-simulation, the FPGA prototype and the chip.
+1. **The host.** `tools/loomhost` in the repository talks to Loom through
+   the host port. On the RP2040 Tiny Tapeout demo board the RP2040's SPI0
+   pins are exactly Loom's host pins, and `--ttboard PORT` drives them
+   through the board's MicroPython. The v3 demo board (RP2350B) maps the
+   pins differently and needs a PIO or bit-banged transfer, which is not
+   written yet. A Raspberry Pi Pico wired to the host pins and running
+   `tools/loomhost/micropython/pico_bridge.py` works too (`--pico PORT`);
+   that folder's README has the wiring. SCK must be at most the Loom clock
+   divided by 8. Both transports are tested against simulated serial ports
+   only: no hardware existed before the chip.
+2. **Assemble** a program to an image:
+   `python -m tools.loomasm --strict firmware/uart_tx_fifo.loom -o uart.json`
+3. **Load and run** it. The UART transmitter sends on OUT0 (`uo[0]`); at
+   50 MHz, `TICK_INT 434` and `TICK_FRAC 8` make 115200 baud:
+
+   ```
+   python -m tools.loomhost --ttboard COM5 --image uart.json load "csr 0 TICK_INT 434" "csr 0 TICK_FRAC 8" "run 0" "push 0 'Hello'"
+   ```
+
+   and a USB-UART adapter on `uo[0]` at 115200 8N1 shows `Hello`.
+
+Every other program runs the same way; its header gives the host commands,
+the pins and the tick to set. The repository's documents describe the rest:
+`docs/ARCHITECTURE.md`, `docs/SEMANTICS.md` (the cycle-exact definition of
+every instruction), `docs/HOST_PROTOCOL.md` and
+`docs/VERIFICATION_REPORT.md`.
 
 ## External hardware
 
-None required. Optional: a USB-UART adapter, a SPI flash or I2C EEPROM
-breakout, a WS2812 LED strip, a PS/2 keyboard, and a logic analyser for the
-protocol demos. A Raspberry Pi Pico or FTDI adapter can act as the SPI host
-instead of the demo board's RP2040.
+The SPI host: the demo board's RP2040, or a Pico. For the protocol programs,
+as wanted: a USB-UART adapter, an SPI device or master, I2C pull-ups, a
+WS2812 strip, a PS/2 keyboard, a JTAG or SWD target, a CAN transceiver
+(TXD on OUT0, RXD on IN0), for USB low speed the D+ and D- lines with a
+1.5 kOhm pull-up on D-, and a logic analyser to watch it all.

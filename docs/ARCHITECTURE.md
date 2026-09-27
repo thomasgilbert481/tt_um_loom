@@ -129,10 +129,11 @@ threads are halted, then sets bits in `RUN`. `HALT` clears the thread's RUN bit
 and raises HOST_IRQ if enabled. The host can also halt, resume and single-step
 (execute exactly one instruction) any thread.
 
-OPEN (area-gated, M3): a 16-entry boot ROM selected by IN4 (`ui_in[7]`) high
-at reset that transmits a fixed string on OUT0 at 115200 baud, so first
-silicon can be checked with nothing but a scope. Costs about 200 cells.
-(`ui_in[4]` was the v0.1 choice; it is now the host chip select.)
+Not built (OPEN-4, closed by D-027; `CAPS[6]` reads 0): a 16-entry boot ROM
+selected by IN4 (`ui_in[7]`) high at reset that would transmit a fixed
+string on OUT0 at 115200 baud, so first silicon could be checked with
+nothing but a scope, for about 200 cells. First silicon is checked through
+the host port instead.
 
 ## 5. Programmer's model (per thread unless stated)
 

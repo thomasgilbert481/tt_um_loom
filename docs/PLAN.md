@@ -449,8 +449,16 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 
 ### M5: documentation and submission package (by 2026-12-20)
 
-- [ ] `docs/info.md` (Tiny Tapeout datasheet page) complete with pinout,
-      how-to-test, external hardware.
+- [x] `docs/info.md` (Tiny Tapeout datasheet page) complete with pinout,
+      how-to-test, external hardware. Rewritten 2026-09-26 for the design as
+      built; the pinout lives in `info.yaml` and is current. Revisit at the
+      freeze only if the design changes (slice C).
+- [ ] Host transfer for the v3 demo board (RP2350B): its pin map is not the
+      RP2040's, so the SPI0 function set of D-012 does not carry over
+      (`docs/tt_cmos5l_facts.md` section 5). A PIO or bit-banged `_lx` in
+      `tools/loomhost/micropython/tt_helper.py`, chosen by board. Host
+      software only, so it can land after the freeze; `docs/info.md` says it
+      is not written yet.
 - [ ] `README.md`: architecture, why it is different, results table (area,
       clock, protocols, coverage, mutation score, formal properties), how to
       build, how to program, honest limitations.
