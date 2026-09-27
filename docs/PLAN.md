@@ -735,3 +735,26 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   (b32c152) and later docs stay local until that run finishes; then push
   b32c152 for slice B's reading. Next: read 35812463112; push slice B;
   then D-031; then the USB LS, CAN and I2C EEPROM firmware on the slices.
+- 2026-09-23 (evening) to 2026-09-24, Opus 5.5 as director: slice B's
+  hardening passed (run 35871222851: routing 3 h 29 min, typical +3.56 ns,
+  slow -6.08 ns) and slice B stays; the formal properties that took the
+  LD/ST completion slot for an instruction were fixed (F-6). D-031 built,
+  verified and hardened (run 35940928210: every job passed, routing 3 h
+  54 min, six minutes inside D-025; typical +5.38 ns, slow -3.53 ns, about
+  42 MHz) and stays. F-7: ISO-1 extended to slice B's state and a thread's
+  own stores, proved for all four threads. The M3 firmware landed
+  (`usb_ls_device`, `i2c_slave_eeprom`, `can_loopback`) and M4's
+  `manchester_loopback` (L3-MANCH, D-029); spec rulings 9 and 16 built; the
+  last mutant killed, so no survivor is open; the 14 model-only scenarios
+  passed on the RTL; an opt-in SDF gate-level mode. Tools finding T-1: the
+  deadline checker was optimistic after a `SETD`.
+- 2026-09-25 to 2026-09-26, Opus 5.5: T-1 closed. The six programs that
+  failed the sound rule were fixed one at a time; three were real timing
+  faults (`uart_tx_fifo`, `jtag_master`, `swd_master`), each now with a test
+  that measures every edge, and the sound rule is the default. The
+  documents were brought to the design as built: `docs/info.md` (the
+  datasheet), `README.md`, `ARCHITECTURE.md`, VERIFICATION_REPORT section
+  6 and BUGS rows 7 to 10. The 14 model-only scenarios pass on the RTL
+  again after the fixes. New M5 item: a host transfer for the v3 demo board
+  (RP2350B). Next: Thomas's slice C decision on 2026-11-01 (recommended:
+  do not build it), then the RTL freeze on 2026-11-08.
