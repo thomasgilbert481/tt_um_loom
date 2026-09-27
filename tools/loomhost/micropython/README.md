@@ -7,7 +7,8 @@ transports is unit-tested against fake serial ports
 
 ## `pico_bridge.py`: a Raspberry Pi Pico as a USB-to-SPI bridge
 
-For the FPGA prototype, or any Loom whose host pins are wired out. Copy it to
+For any Loom whose host pins are wired out (it was written for the FPGA
+prototype, which D-024 dropped). Copy it to
 the Pico as `main.py` (`mpremote cp pico_bridge.py :main.py`), then:
 
 ```python

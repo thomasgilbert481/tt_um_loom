@@ -24,19 +24,19 @@ periodic bit timing jitter-free, and a small "bit engine" (shift register,
 programmable CRC, NRZ/NRZI/Manchester encoder, bit-stuffing) that does the
 per-bit work that firmware cannot do fast enough. A SPI slave port lets a host
 load programs, exchange data through per-thread FIFOs, and halt, single-step and
-inspect any thread. The same host protocol drives the RTL simulation, the FPGA
-prototype and the silicon.
+inspect any thread. The same host protocol drives the golden model, the RTL
+simulation and the silicon (the FPGA prototype was dropped, D-024).
 
 ## 2. Why this and not a PIO clone or a PRU clone
 
 | Property | RP2040 PIO | TI PRU | Loom |
 |---|---|---|---|
-| Sequencers | 4 SMs per block, 32 shared instructions | 2 full 32-bit RISC cores | 4 threads on one pipeline, 512 to 1024 shared instructions |
+| Sequencers | 4 SMs per block, 32 shared instructions | 2 full 32-bit RISC cores | 4 threads on one pipeline, 512 shared instructions (the SRAM macro, D-020) |
 | Timing model | per-instruction delay + side-set; paths balanced by hand | count cycles by hand | deadline register (`WAITD`) with fractional ticks; timing independent of the path taken |
 | Data-dependent behaviour | weak (few branches, no ALU) | strong | 16-bit ALU, flags, DJNZ, CALL/RET, pin-conditional branches |
-| Bit-level helpers | shifters, autopush/pull | none | shifter + CRC + NRZI/Manchester + stuffing + auto mode |
+| Bit-level helpers | shifters, autopush/pull | none | shifter + CRC + NRZI/Manchester + stuffing (+ auto mode if slice C is built) |
 | Waits with timeout | no | no | every wait can abort at the deadline and set a T flag |
-| Emulating a *device* (I2C EEPROM, SPI flash, PS/2 keyboard) | awkward | fine | first-class: data memory + FIFOs + pattern waits |
+| Emulating a *device* (I2C EEPROM, SPI flash, PS/2 keyboard) | awkward | fine | first-class: data memory + FIFOs + edge and level waits |
 | Debug | none on-chip | JTAG | halt / step / read-write every register over the host port |
 
 What we deliberately leave out: interrupts, memory-mapped peripherals,
@@ -129,11 +129,11 @@ threads are halted, then sets bits in `RUN`. `HALT` clears the thread's RUN bit
 and raises HOST_IRQ if enabled. The host can also halt, resume and single-step
 (execute exactly one instruction) any thread.
 
-Not built (OPEN-4, closed by D-027; `CAPS[6]` reads 0): a 16-entry boot ROM
-selected by IN4 (`ui_in[7]`) high at reset that would transmit a fixed
-string on OUT0 at 115200 baud, so first silicon could be checked with
-nothing but a scope, for about 200 cells. First silicon is checked through
-the host port instead.
+Not built (closed at the M2 review, section 15 item 4; `CAPS[6]` reads 0): a
+16-entry boot ROM selected by IN4 (`ui_in[7]`) high at reset that would
+transmit a fixed string on OUT0 at 115200 baud, so first silicon could be
+checked with nothing but a scope, for about 200 cells. First silicon is
+checked through the host port instead.
 
 ## 5. Programmer's model (per thread unless stated)
 
@@ -190,8 +190,7 @@ Reserved CSR numbers read 0 and ignore writes.
 - Each thread has a tick generator: a 16.8 fixed-point accumulator divider off
   `clk`. `TICK_INT=1, TICK_FRAC=0` gives one tick per clock. Fractional dividers
   let 50 MHz produce a 1.5 Mbit USB bit clock (33.33 clocks) with one clock of
-  jitter, which USB tolerates. For 10 Mbit Manchester run the chip at 40 or
-  60 MHz instead; see section 13.
+  jitter, which USB tolerates. 10 Mbit Manchester is not a target (D-029).
 - `NOW` increments on every tick and wraps at 2^16.
 - `WAITD k`: `TD <= TD + k`, then stall until `NOW` has reached `TD`. "Reached" is
   the wrap-safe test `(NOW - TD) mod 2^16 < 2^15`. Because the deadline advances
@@ -243,8 +242,8 @@ Reserved CSR numbers read 0 and ignore writes.
 - `JP pin, v, rel` branches on a single pin. `WAITP`/`WAITE` wait on a level or
   an edge (rise, fall, any). Pattern waits on a pin *group* (mask + value, for
   I2C START = SDA falling while SCL high) are done with `WAITE` on the edge pin
-  followed by `JP` on the other pin; a dedicated group-match wait is OPEN for M3
-  if the area allows.
+  followed by `JP` on the other pin; a dedicated group-match wait was not
+  built (section 15, item 5).
 
 ## 8. Bit engine (one per thread)
 
@@ -304,8 +303,8 @@ Serial LFSR, one data bit per update, `CRC_POLY` programmable, `CRCI` loads
 `CRC_INIT`. Convention: an n-bit CRC is left-aligned in the 16-bit accumulator,
 and so is its polynomial. The assembler ships presets: USB CRC5 (0x05, init
 0x1F), USB CRC16 (0x8005, init 0xFFFF), CAN CRC15 (0x4599), CRC-8 SMBus (0x07).
-Ethernet FCS (CRC-32) is not covered by the 16-bit unit; it is OPEN as a single
-shared 32-bit unit at M4 if area allows, otherwise the host computes it.
+Ethernet FCS (CRC-32) is not covered by the 16-bit unit; a shared 32-bit unit
+was not built (section 15, item 5), so the host computes it.
 
 ## 9. FIFOs, shared flags, host interrupt
 
@@ -337,8 +336,8 @@ definition, register map and worked examples: `docs/HOST_PROTOCOL.md`.
 
 The debug space is readable at any time and writable while the thread is
 halted. This is what lets `tools/loomhost` compare a thread's full architectural
-state against the Python golden model after every step, on RTL, on the FPGA and
-on silicon, with one script.
+state against the Python golden model after every step, on the RTL and on
+silicon, with one script (the FPGA prototype was dropped, D-024).
 
 ## 11. Instruction set
 
@@ -476,12 +475,15 @@ leaks into the core.
 
 ## 13. Clock and area budget
 
-Clock: 50 MHz nominal (`CLOCK_PERIOD` 20 ns in `src/config.json`). Close timing at
-16.7 ns (60 MHz) in STA so that 50 MHz has margin and 60 MHz is usable for
-10 Mbit Manchester (6 clocks per bit, 3 per half bit). USB low-speed prefers
-48 MHz (32 clocks per bit); the fractional tick divider makes 50 MHz acceptable.
+Clock: 50 MHz nominal (`CLOCK_PERIOD` 20 ns in `src/config.json`), signed off at
+the typical corner; the slow corner (1.08 V, 125 C) closes at about 42 MHz
+(D-031's hardening, `docs/AREA.md`). The first plan, closing at 16.7 ns
+(60 MHz) for 10 Mbit Manchester, went with that target (D-029). USB low speed
+prefers 48 MHz (32 clocks per bit); the fractional tick divider makes 50 MHz
+acceptable.
 
-Area, first-order estimate in standard cells (VERIFY at M1 synthesis). The 6x4
+Area, first-order estimate in standard cells, from before M1 (the measured
+numbers are in `docs/AREA.md`). The 6x4
 block is 1289.28 x 710.64 um = 0.916 mm² of die area; at the flow's 60 percent
 placement density that is about 550K um² of cells. The competition brief
 budgets roughly 1K cells per tile, so about 24K cells for 24 tiles before
@@ -509,6 +511,11 @@ trims listed under section 12. Table entries are for the flop option:
 
 If a macro is available the logic total is about 9K cells plus the macro, which
 leaves room for 8-deep FIFOs, data memory, the boot ROM and the CRC-32 unit.
+
+As built: 31,393 standard cells after placement plus the macro (D-031's
+hardening), and routing time rather than area bounds the design (D-025). The
+FIFOs stayed 4 deep, data memory is the instruction memory (D-027), and the
+boot ROM and the CRC-32 unit were not built (section 15).
 
 ## 14. Module hierarchy (for the implementer)
 

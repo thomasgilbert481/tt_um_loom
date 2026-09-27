@@ -3,8 +3,8 @@
 A transport moves one SPI transaction: ``transfer(tx) -> rx`` clocks the
 bytes ``tx`` out on MOSI with chip select low around the whole call and
 returns the bytes that came back on MISO. Everything above that line
-(``tools.loomhost.loom.Loom``) is shared by the golden model, the FPGA and the
-chip.
+(``tools.loomhost.loom.Loom``) is shared by the golden model, the RTL
+simulation and the chip.
 
 * :class:`ModelTransport` runs the transaction against the golden model
   (``tools.loomsim``), advancing it a realistic number of clocks per byte so

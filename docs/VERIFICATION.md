@@ -10,8 +10,9 @@ every ID and whether a test or proof exists for it).
 ## Principles
 
 1. **One golden model, many targets.** `tools/loomsim` is the reference for
-   architectural behaviour. RTL simulation, the FPGA, and the silicon are all
-   compared against it through the same host protocol and the same scripts.
+   architectural behaviour. RTL simulation and the silicon are both compared
+   against it through the same host protocol and the same scripts (the FPGA
+   was dropped, D-024).
 2. **The ISA has one source.** `isa/isa.yaml` generates the decoder tables, the
    assembler, the model, the docs and the formal decode properties. Spec and
    implementation cannot drift silently.
@@ -36,7 +37,7 @@ every ID and whether a test or proof exists for it).
 | Lint | `verilator --lint-only -Wall`, Yosys `synth` sanity | CI `lint` job |
 | Gate level | TT `gl_test` action (cmos5l cell models) | CI |
 | Physical | TT `gds` action (LibreLane), local iic-osic-tools Docker for iteration | CI, laptop |
-| FPGA | Yosys + nextpnr-ice40, iCEBreaker (iCE40UP5K), Pico SPI bridge | `fpga/` |
+| FPGA | Yosys + nextpnr-ice40, iCEBreaker (iCE40UP5K), Pico SPI bridge; dropped, the design does not fit (D-024) | `fpga/` |
 | Mutation | `tools/mutate` (own, small) | CI nightly |
 
 ## Layers and checks
