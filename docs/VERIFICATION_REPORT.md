@@ -75,11 +75,12 @@ miss". The state on 2026-09-22 is:]
   so every built feature is exercised; 553 coverage bins, 33 empty with a
   recorded reason each; four of five hand-written mutants killed at the first
   seed.
-- L3 protocol: 105 scenarios on the model and 91 on the RTL across
+- L3 protocol: 108 scenarios on the model and 94 on the RTL across
   thirteen programs (the 14 left out of the routine RTL run are slow cases, each
-  marked with the reason: 115200-baud UART, most of the SPI mode sweep, the
-  longest PS/2 frames, the USB host at +-0.25 per cent of the bit rate, the
-  257-byte EEPROM read; all 14 passed on the RTL in one separate run), with
+  marked with the reason: 115200-baud UART reception, most of the SPI mode
+  sweep, the longest PS/2 frames, the USB host at +-0.25 per cent of the bit
+  rate, the 257-byte EEPROM read; all 14 pass on the RTL in a separate run,
+  last repeated on 2026-09-26 after the T-1 firmware fixes), with
   no divergence between the sides, including error cases
   (framing error, NACK, clock stretching, CAN CRC, stuff and form errors and
   a missing ACK, USB retries and STALL). The USB device meets every USB 2.0
@@ -105,8 +106,9 @@ miss". The state on 2026-09-22 is:]
   co-simulation, with the generator driving the new configuration bits,
   found no divergence in the default run or in a 40-seed sweep, with all 25
   new coverage bins hit.
-- L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 71 of 71
-  on the last full hardening (run 35524275302).
+- L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 100 of
+  100 on the last full hardening (run 35940928210; the one test of the
+  flop-memory build is skipped there).
 - L7 mutation: 823 mutants, 99.7 per cent killed with 44 documented
   equivalents set aside (`tools/mutate/equivalents.json` gives each its
   reason), every module at 98.8 per cent or better; no open survivor since
@@ -141,23 +143,28 @@ lived in, and TIMER-2 now proves the property it exposed.
 
 ## 6. Physical results
 
-From `docs/AREA.md`, the last full hardening (run 35524275302, `main`
-f081f4a, 2026-09-20): 28,842 standard cells plus one 512x16 SRAM macro on a
-6x4 Tiny Tapeout block (utilisation 51.4 per cent), DRC, LVS and antenna
-clean, precheck clean, gate-level tests 71 of 71. Timing at 20 ns: +5.98 ns
-setup at the typical corner (the flow's sign-off corner), +10.92 ns fast,
-and -2.48 ns at the slow corner (1.08 V, 125 C) on 23 endpoints of one
-block, so the clock guaranteed over every corner is 44 MHz and the nominal
-clock is 50 MHz with 6 ns of margin. D-028 (hardened 2026-09-23, run
-35779039938) removed those 23 endpoints by deleting the host's thread
-decode from the latch-fire path and routed fastest of any run (Metal3
-overflow 1,248); the worst path is now the host debug thread select into a
-pin register through weakly buffered logic, -6.36 ns at the slow corner
-and +3.56 ns at the typical one, so the numbers the datasheet states are
-50 MHz at the typical corner and 38 MHz over every corner, with D-031 (a
-registered one-hot host thread select) proposed as the next structural
-step. That a netlist which only lost logic also lost 2.4 ns of typical
-margin is itself a finding about the flow's placement variance.
+From `docs/AREA.md`, the last full hardening (run 35940928210, `main`
+d1ea0ac, 2026-09-24: D-031 on slices A and B): 31,393 standard cells plus
+one 512x16 SRAM macro on a 6x4 Tiny Tapeout block (utilisation 54.7 per
+cent), DRC, LVS and antenna clean, precheck clean, gate-level tests 100 of
+100 (the one test of the flop-memory build is skipped). Timing at 20 ns:
++5.38 ns setup at the typical corner (the flow's sign-off corner),
++10.60 ns fast, and -3.53 ns at the slow corner (1.08 V, 125 C) on 96
+endpoints, so the datasheet states 50 MHz at the typical corner and about
+42 MHz over every corner.
+
+The slow corner was worked on twice. The run of 2026-09-20 (35524275302)
+missed it by 2.48 ns on 23 endpoints behind the deadline-latch fire logic.
+D-028 (run 35779039938) deleted the host's thread decode from that path,
+and the worst path became the host debug thread select fanned out into a
+pin register through weakly buffered logic (-6.36 ns). D-031, a registered
+one-hot debug thread select, took that family off the list: -6.08 to
+-3.53 ns against the run before it. The 96 endpoints left are two families
+of the same shape, the X stage's thread number and the host's debug
+register address into the tick logic; their fixes are known and not planned
+(`docs/AREA.md`, "The slow corner after D-031"). That a netlist which only
+lost logic (D-028) also lost 2.4 ns of typical margin is itself a finding
+about the flow's placement variance.
 
 Routing time, not area, bounds the design: a two per cent increase in cells
 in one corner of the floorplan tripled the global router's Metal3 overflow
@@ -165,6 +172,7 @@ and pushed detailed routing past GitHub's six-hour job limit (D-022, run
 35470401774), which matters because Tiny Tapeout re-runs the flow at
 submission. The design was returned to the shape that routes in under four
 hours and every hardware change since is judged by that rule (D-025).
+D-031's run routed in 3 h 54 min, six minutes inside it.
 
 ## 7. Known limitations and open items
 
@@ -211,3 +219,7 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
 - 2026-09-22: started (D-030). Sections 1, 2, 3, 5, 6 and 7 describe `main`
   after the M2 review; sections 4 and 8 are outlines to be filled at the
   freeze.
+- 2026-09-23 to 2026-09-26: F-7 (ISO-1 for all four threads with slice B),
+  T-1 (the deadline checker's rule after a `SETD`) and the last mutation
+  survivor added to sections 4, 5 and 7; section 6 and the L5 line follow
+  the D-031 hardening.

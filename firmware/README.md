@@ -54,7 +54,8 @@ the M2 convention for the rate.
 | `manchester_loopback.loom` | TX = OUT0, RX = IN0 | 60 (thread 0) + 113 (thread 1) | 12 clocks per tick, one tick per half-bit, both threads | 0 clocks (both threads) | 2.083 Mbit/s (TICK 12) and 1 Mbit/s (TICK 25), wire loopback; a sender at +-0.1 % (TICK 12) and +-0.2 % (TICK 25) |
 
 Every program assembles with `--strict` and no diagnostic at all: each
-deadline pair is proved and none is unbounded (the M2 five in
+deadline pair is proved, apart from the three intervals declared `.bounded`
+below, and none is unbounded (the M2 five in
 `tools/tests/test_fw_build.py`, the M3 and M4 programs in their own test
 modules). Each fits in thread 0's quarter of the 512-word memory of D-020,
 except three of the M3 programs: `i2c_slave_eeprom`'s data fills thread 3's quarter;
@@ -76,6 +77,12 @@ are only as sound as the argument in the program header: 10 slots against a
 44-clock budget and 9 against 40, which is where the 4-clock worst slack in
 the table comes from. `docs/spec-questions/firmware-m3.md` item 1 has the
 history.
+
+`uart_tx_fifo` has the third declaration since its T-1 fix: the `POP` of a
+word queued behind the stop bit, guarded by a `WAITB INQ_NE, T` two slots
+earlier (a `BT` between them leaves for the idle path when nothing is
+queued), on an interval of 5 slots against the 24-clock budget of its
+proved `.tick`.
 
 ```
 python -m tools.loomasm firmware/uart_rx.loom --strict --listing

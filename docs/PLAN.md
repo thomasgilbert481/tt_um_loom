@@ -411,7 +411,9 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] Firmware and tools continue to 2026-12-01 (no hardening, D-018): the
       remaining L3 cases, the slow 115200-baud and mode-sweep scenarios on
       the RTL (done 2026-09-24: all 14 `model_only` scenarios pass on the
-      RTL with `LOOM_FW_SET=model_only` in `test/test_fw.py`, 351 s), the two open timer mutants closed (done: one by D-028, the
+      RTL with `LOOM_FW_SET=model_only` in `test/test_fw.py`, 351 s; repeated
+      2026-09-26 at 2c8fa48, after the T-1 firmware fixes: 14 of 14, 256 s),
+      the two open timer mutants closed (done: one by D-028, the
       other killed 2026-09-24 by a `test_mem` check once slice B made it
       reachable, with `test_mem` added to the mutation ladder).
       Two tools items from the M3 firmware rulings, both done 2026-09-24:
