@@ -5,6 +5,7 @@ Command line for the L7 mutation tool (`docs/VERIFICATION.md`, MUT-RUN).
     python -m tools.mutate run  --jobs 8 --out r.jsonl
     python -m tools.mutate report r.jsonl             # the L7 tables
     python -m tools.mutate show <mutant id>           # one mutant's diff
+    python -m tools.mutate rekey r.jsonl [--write]    # carry equivalents to moved lines
 
 `run` must be started from a shell that has sourced `scripts/dev_env.sh`, so
 Verilator, Icarus and cocotb are on PATH. It never writes to `src/`.
@@ -26,7 +27,12 @@ from tools.mutate.operators import (
     iter_operator_counts,
     mutations_for_file,
 )
-from tools.mutate.report import full_report, load_equivalents, survivor_rows
+from tools.mutate.report import (
+    EQUIVALENTS_PATH,
+    full_report,
+    load_equivalents,
+    survivor_rows,
+)
 from tools.mutate.runner import (
     REPO,
     TARGET_MODULES,
@@ -244,6 +250,38 @@ def cmd_show(args) -> int:
     return 0
 
 
+def cmd_rekey(args) -> int:
+    from tools.mutate.rekey import carried, rekey, summary
+
+    equivalents = load_equivalents()
+    records = {}
+    for name in args.results:
+        for r in load_results(pathlib.Path(name)):
+            records[r.mutation.ident] = r.mutation
+    if not records:
+        raise SystemExit("no results in %s" % ", ".join(args.results))
+    modules = sorted({records[i].module for i in equivalents if i in records})
+    current = collect(modules, None, args.define)
+    result = rekey(equivalents, records, current)
+    for r in result:
+        print("%-9s %-40s %-40s %s" % (r.status, r.old_id, r.new_id or "-", r.note))
+    print()
+    print("%d documented equivalents: %s" % (len(result), summary(result)))
+    dropped = [r for r in result if r.new_id is None]
+    if dropped:
+        print("%d drop out and need their claim made again" % len(dropped))
+    print("every carried reason is still to be re-read at the next pass")
+    if args.write:
+        new = carried(equivalents, result)
+        EQUIVALENTS_PATH.write_text(
+            json.dumps(dict(sorted(new.items())), indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        print("wrote %s (%d entries)" % (EQUIVALENTS_PATH, len(new)))
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="python -m tools.mutate", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -279,6 +317,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sp.add_argument("ident", help="a mutant id, or enough of one to match")
     sp.add_argument("--context", type=int, default=4, help="lines of context")
     sp.set_defaults(func=cmd_show)
+
+    kp = sub.add_parser(
+        "rekey", help="move equivalents.json entries whose lines only moved to their new ids"
+    )
+    kp.add_argument("results", nargs="+", help="results file(s) of the run that documented them")
+    kp.add_argument("--define", action="append", default=[], help="a macro to treat as defined")
+    kp.add_argument("--write", action="store_true", help="rewrite equivalents.json")
+    kp.set_defaults(func=cmd_rekey)
 
     args = p.parse_args(argv)
     return args.func(args)

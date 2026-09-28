@@ -434,7 +434,19 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       every recorded equivalent below a changed line in `loom_core` is
       already keyed to the wrong line. Re-run the campaign on the frozen RTL,
       re-key `equivalents.json` (each reason re-checked, not copied), and
-      quote that score in the report.
+      quote that score in the report. Keys done 2026-09-27: `python -m
+      tools.mutate rekey` against the M2 pass's saved results carried all 44
+      by exact line text to d1ea0ac's `src/` (28 same, 16 moved in
+      `loom_core` and `loom_timer`, none dropped), which D-032 makes the
+      final RTL unless a bug fix changes it. Every reason re-read the same
+      day against that source and each still holds: the 16 moved ones (the
+      `infl` gate, W-stage payload reset values read only through `w_valid`,
+      a lint sink, the latch's far half-window edge, `TICK_SEEN`'s reset
+      value) and the 28 in `loom_fifo`, `loom_pins` and `loom_spi_host`,
+      whose files are unchanged since the pass and whose outside assumptions
+      (`loom_host_ctl` acting on `byte_done` only inside a transaction, the
+      FIFO parameters) still hold. What is left is the run itself: about
+      seven hours at twelve jobs on the laptop, best started when it is idle.
 - [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
       the mutation table, the formal findings, the routing budget, D-024's
       statement that nothing ran on hardware and what stands in for it.

@@ -108,9 +108,24 @@ equivalent mutant *and* the reason is written down, so the reasons live in
 then marks each survivor `equivalent - <reason>` or **open**, and gives a kill
 rate with the equivalents taken out of the denominator next to the raw one.
 
-The key is the mutant id, whose last field is a digest of the mutated line. An
-entry therefore stops applying the moment that line of RTL changes, and the
-claim has to be made again rather than being inherited by a different mutant.
+The key is the mutant id, whose last field is a digest of the file, the line
+number and the mutated line. An entry therefore stops applying the moment that
+line of RTL changes, and the claim has to be made again rather than being
+inherited by a different mutant. It also stops applying when an edit above
+the line only moves it. For that case:
+
+```sh
+"$LOOM_PY" -m tools.mutate rekey old_run.jsonl [more.jsonl ...]   # dry run
+"$LOOM_PY" -m tools.mutate rekey old_run.jsonl --write
+```
+
+reads what each documented id was from the results of the run that
+documented it, finds the mutant the current source generates from the same
+file, operator, original line and mutated line, and moves the reason to
+that mutant's id. Nothing looser is carried: a line whose text changed
+drops out and is reported. A carried reason still has to be re-read at the
+next pass, because the code around an unchanged line can change what it
+does.
 
 An **open** survivor is a hole in the suite, not a tidy-up job: it wants a new
 check, and the bug ledger rule in `CLAUDE.md` applies to what the new check
@@ -141,10 +156,12 @@ Two traps worth knowing if a run has to be restarted:
 | `operators.py` | the mutator: `Mutation`, `mutations_for_text`, `mutations_for_file` |
 | `runner.py` | work directories, the ladder, the thread pool, `MutantResult` |
 | `report.py` | the kill-rate, per-operator, per-check and survivor tables |
+| `rekey.py` | carrying `equivalents.json` entries to lines that only moved |
 | `equivalents.json` | the documented equivalent mutants, id -> reason |
 | `__main__.py` | the command line |
 
-Its own tests are `tools/tests/test_mutate_operators.py` (the operators) and
+Its own tests are `tools/tests/test_mutate_operators.py` (the operators),
 `tools/tests/test_mutate_runner.py` (the ladder, the results parsing, the
-checkout, the sampling, the report). Neither needs a simulator, so
-`scripts/check_all.sh` runs both through `pytest -q tools`.
+checkout, the sampling, the report) and `tools/tests/test_mutate_rekey.py`
+(the re-keying rule). None needs a simulator, so `scripts/check_all.sh` runs
+them through `pytest -q tools`.
