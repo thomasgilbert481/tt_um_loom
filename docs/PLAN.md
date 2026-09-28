@@ -385,9 +385,15 @@ result recorded, bounded or proved.
       not built (D-032).** D-031's run is the baseline now and routed in 3 h
       54 min, over the bar, and no program needs auto mode. The hardware is
       complete.
-- [ ] Fable review, M3: the slices' numbers, ISO-1's state, the freeze commit.
+- [x] Fable review, M3: the slices' numbers, ISO-1's state, the freeze commit.
       Brief written 2026-09-27 (`docs/reviews/m3-review.md`: state, numbers,
-      six questions, recommendations); Thomas starts the session.
+      six questions, recommendations); Thomas starts the session. Done
+      2026-09-28 in the directing session at Thomas's request, so not an
+      independent second opinion (the review says so): M3 met and closed;
+      D-033 (freeze date kept, early evidence, final-run fallback order,
+      no pinning, release assets) and D-034 (8x4 on the organisers'
+      confirmation, proposed); two new items, the four-protocol demo below
+      and the v3 host transfer before submission.
 
 ### M4: RTL freeze and the evidence (freeze 2026-11-08; by 2026-12-01)
 
@@ -396,8 +402,10 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 `docs/VERIFICATION_REPORT.md` complete in draft.
 
 - [ ] 2026-11-08: RTL freeze (D-030). Final `gds` run by hand on the freeze
-      commit; if it does not finish inside six hours the last slice comes out
-      and the run repeats. After the freeze, RTL changes only for a bug found
+      commit; if it does not finish inside six hours, re-run it once, then
+      move to 8x4 if the organisers have confirmed it, and only then take
+      D-031 out (D-033, which replaced "the last slice comes out"). Record
+      the action and tools commits the run used. After the freeze, RTL changes only for a bug found
       by verification, each with a re-hardening. Measured 2026-09-28 (run
       36366875261, the unchanged design again): the flow is deterministic,
       every metric identical, and the runner's speed moved the `gds` job to
@@ -470,7 +478,13 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       subset: one scenario per protocol, run overnight on the freeze netlist.
 - [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
       measured slow-corner clock, both with their slack.
-- [ ] 8x4, when the organisers confirm it for the shuttle: a DECISIONS entry
+- [ ] Four protocols at once (M3 review): four programs on four threads,
+      pins remapped so they do not collide, each protocol's timing checked
+      on the RTL against its single-thread run. The claim that one thread
+      cannot disturb another's timing is proved (ISO-1) and tested with
+      synthetic loops, but no test runs real protocols side by side. Before
+      the firmware freeze; no hardware change.
+- [ ] 8x4, when the organisers confirm it for the shuttle (D-034, proposed): a DECISIONS entry
       and the `tiles` line on main (with the stale comment above it in
       `info.yaml`); the branch run 36427897067 already passed every job at
       8x4 with the macro and stripe keys unchanged. Its datasheet numbers
@@ -488,7 +502,8 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       (`docs/tt_cmos5l_facts.md` section 5). A PIO or bit-banged `_lx` in
       `tools/loomhost/micropython/tt_helper.py`, chosen by board. Host
       software only, so it can land after the freeze; `docs/info.md` says it
-      is not written yet.
+      is not written yet. It must land before submission (M3 review): the
+      chips will most likely ship on this board.
 - [ ] `README.md`: architecture, why it is different, results table (area,
       clock, protocols, coverage, mutation score, formal properties), how to
       build, how to program, honest limitations.
@@ -498,7 +513,10 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       annotations, waveforms from the RTL L3 runs (the 433- and 434-clock
       `SETP ... D` edges at a 433.5-clock tick), the gate-level log, the
       mutation table.
-- [ ] Tag `v1.0-rc1`; final `gds` run archived as a release asset.
+- [ ] Tag `v1.0-rc1`; final `gds` run archived as a release asset (D-033:
+      `tt_submission`, `gds_render`, `precheck_reports`,
+      `gatelevel_test_results` and the metrics the report quotes, as soon as
+      the freeze run passes; the M6 run's the same way at `v1.0`).
 
 ### M6: submit (by 2027-01-11)
 
@@ -793,3 +811,12 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   SEMANTICS 6.9, the README and the report say so. The Jane Street
   follow-up went out the same day (Thomas). Next: the M3 review with Fable
   (the slices' numbers, ISO-1, the freeze commit), then M4.
+- 2026-09-28, Opus 5.5: Jane Street answered: the SRAM macro can go on the
+  shuttle (D-020's last condition), 6x4 until 8x4 is confirmed. The
+  unchanged design hardened twice identically (the flow is deterministic;
+  the runner moved the job 5 h 02 to 5 h 11 min), and once at 8x4 on a
+  branch with Thomas's yes (every job passed, `gds` job 4 h 02 min, slow
+  corner -1.14 ns). The M3 review was done in this session at Thomas's
+  request: M3 closed, D-033 and D-034 (proposed), the four-protocol demo
+  added. Next: 8x4 when the organisers confirm it, the mutation run and the
+  SDF subset on idle nights, the four-protocol demo.

@@ -658,6 +658,9 @@ Rejected: keeping 2026-12-01 and spending the difference on another protocol
 Consequences: PLAN M3 ends 2026-11-01 with the slice C decision, M4 is the
 freeze and the evidence, M5's demo material is listings, waveforms, the
 gate-level log and the mutation table, with no video.
+Amended 2026-09-28 by D-033: a final run over six hours is re-run once,
+then moved to 8x4 if the organisers have confirmed it, and only then does
+the last change (D-031) come out.
 
 ## D-031 2026-09-23 Fable, proposed; built 2026-09-23 by Opus 5.5: a registered one-hot thread select for the host debug port
 
@@ -740,3 +743,55 @@ the fastest rate a shipped program is tested at is the Manchester
 loopback's 2.083 Mbit/s. The comments in `src/` that still say "until
 slice C" are left alone: a `src/` change starts a hardening, and the
 behaviour they describe is now permanent.
+
+## D-033 2026-09-28 Opus 5.5 (M3 review): the freeze keeps its date, its evidence may come early, and the final run's fallback is re-run, then 8x4, then D-031 out
+
+Decision: the RTL freeze stays on 2026-11-08 (D-030). The freeze commit is
+the last commit before that date that touches `src/`, `info.yaml` or
+`macro/`, and its `gds` run is started by hand. Freeze-time evidence (the
+mutation run, the SDF subset) may be produced before the date on d1ea0ac's
+`src/`; it stands for the freeze while `src/` is unchanged, the report names
+the commit it was produced on, and the SDF subset is redone if the block
+changes. If the final run passes GitHub's six hours: re-run it once; if that
+also fails and the organisers have confirmed 8x4, move to 8x4 (D-034); only
+then revert D-031. The action and its tools stay unpinned on main. The
+freeze run and the M6 run record the action and tools commits they used,
+and each one's passing artefacts go up as release assets (`v1.0-rc1`,
+`v1.0`).
+Why: run 36366875261 showed the flow is deterministic: identical inputs,
+identical metrics, and a runner 3 per cent slower. A timeout of an unchanged
+design is the runner, so a re-run is the cheap first answer. Removing D-031
+buys time only through a different netlist (slice B's routed in 3 h 29 min)
+and costs 2.5 ns at the slow corner, while 8x4 measured 4 h 02 min (run
+36427897067). Unpinned CI warns of an upstream change before submission,
+where Tiny Tapeout's current flow is the one that counts. Artefacts live 90
+days, so the M6 run is the one the submission points at.
+Rejected: freezing now (nothing to gain, and it closes the bug window);
+pinning the action now (it would hide an upstream change until submission);
+keeping D-030's "the last slice comes out" as the first fallback.
+Consequences: D-030's fallback clause is replaced by the order above; PLAN
+M4's freeze item and M5's release item carry it. The M3 review is
+`docs/reviews/m3-review.md`. It was not independent: Thomas asked for it in
+the directing session, which also wrote its brief.
+
+## D-034 2026-09-28 Opus 5.5 (M3 review), proposed: 8x4 once the organisers confirm it
+
+Proposal: when the organisers confirm 8x4 for the shuttle, main moves to
+it: `tiles: "8x4"` and the stale comment above it in `info.yaml`, one
+hardening, and the datasheet, AREA, the README and the report updated from
+that run. It is a physical change, not an RTL one, so it is allowed after
+the freeze too, up to M6. Needs Thomas's yes, given ahead of time or on
+the day.
+Why: the unchanged design at 8x4 (run 36427897067, branch `exp-8x4`):
+every job passed; the macro placement and the stripe keys carried over
+unchanged; Magic's twelve overlaps are the four stripe crossings D-021
+watches, at the same places as at 6x4; utilisation 40.8 per cent;
+global-routing overflow 3 against 2,019; the `gds` job 4 h 02 min against
+5 h 11; setup slack typical +6.78 and slow -1.14 ns against +5.38 and
+-3.53. It turns the six-hour risk from 49 minutes of margin into almost two
+hours and leaves one slow-corner path family instead of two.
+Rejected: switching before the organisers confirm; they asked for 6x4 until
+then.
+Consequences: branch `exp-8x4` stays as the evidence and is not merged; the
+switch is its own commit on main. The SDF subset is produced on whichever
+block is final.

@@ -160,7 +160,8 @@ Two readings of the table:
    session's own dispatch was refused by its permission settings). It
    reproduced every metric and took 3 per cent longer, so the freeze run's
    risk is the runner's speed and a change in the action, not the design.
-   Pin the action at the freeze, with the freeze run.
+   Pin the action at the freeze, with the freeze run. (The review below
+   decided against pinning and for recording the commits instead: Q2.)
 3. Leave the slow corner at its stated number, and leave ISO-1's caveat
    documented, because both fixes are hardware changes on a design that
    D-032 declared complete.
@@ -172,3 +173,151 @@ Two readings of the table:
    changes nothing but the `tiles` line. The switch is a DECISIONS entry
    and one commit on main, and that commit's hardening would be the freeze
    run if it lands close to 2026-11-08.
+
+## Review (Opus 5.5, 2026-09-28, in the directing session)
+
+Thomas asked for the review to be done in the directing session rather than
+in a separate Fable session. That costs the independence the plan wanted
+from it (the risk table calls the Fable reviews "the second opinion"): the
+brief and the answers below come from the same session. Section 8 of the
+verification report records that. Everything below was checked against the
+repository and the runs named, not taken from the brief.
+
+### M3: met
+
+The exit criterion holds as the brief states it, five weeks early: both
+slices hardened inside D-025, the six named programs and two more pass on
+both backends, and ISO-1 is proved for all four threads. D-032 removed the
+one optional item. M3 is closed.
+
+### Q1. The freeze stays on 2026-11-08; its evidence may be produced early
+
+Freezing now gains nothing: `src/` has not changed since d1ea0ac, and no
+change is planned. Keeping the date keeps a window in which a bug found by
+verification can still be fixed at no procedural cost. So (D-033):
+
+- The freeze date stays 2026-11-08 (D-030). The freeze commit is the last
+  commit before that date that touches `src/`, `info.yaml` or `macro/`,
+  and its hardening is started by hand.
+- Freeze-time evidence (the mutation run, the SDF subset) may be produced
+  now, on d1ea0ac's `src/`. It stands for the freeze as long as `src/` is
+  unchanged, and the report names the commit it was produced on. A `tiles`
+  change alone leaves `src/` as it is, so an 8x4 switch keeps the mutation
+  evidence; the SDF subset reads the netlist and is redone on the final
+  block.
+
+### Q2. The final run: re-run first, then 8x4, and only then D-031 out
+
+The same-netlist run changes what D-030's fallback should be. Identical
+inputs give identical results, so a freeze run that passes six hours has
+met a slow runner, not a problem in the design. Removing D-031 would buy
+time only because slice B's netlist happened to route faster (3 h 29 min),
+and would cost 2.5 ns at the slow corner. The order is therefore (D-033):
+
+1. re-run once, by hand: the netlist is deterministic, the runner is not;
+2. if that also fails and the organisers have confirmed 8x4, switch to 8x4
+   (Q7): 4 h 02 min measured, almost two hours of margin;
+3. only then revert D-031, whose predecessor's job took 4 h 38 min.
+
+On pinning: do not pin the action or its tools on main. The action has not
+changed since 2026-09-14, the tools last changed on 2026-09-21 (8x4 only),
+and following the branch keeps CI an early warning of anything Tiny Tapeout
+changes before submission, when their current flow is the one that counts.
+Record instead, for every run that matters (the freeze run and the M6 run),
+the action and tools commits it used. Identical inputs give identical
+metrics, so any difference between two such runs names a flow change. If an
+upstream change breaks the flow, pin while it is investigated: the action
+by commit in `uses:`, its tools through the action's `tools-ref` input.
+
+### Q3. Artefacts: archive every run that matters; M6 refreshes them
+
+A run's artefacts live 90 days. The freeze run's cover the deadline, and
+PLAN M6's fresh-clone run, due by 2027-01-11, produces new ones right before
+submission. Archive `tt_submission`, `gds_render`, `precheck_reports` and
+`gatelevel_test_results` of both as release assets as soon as each passes
+(the freeze run's at `v1.0-rc1`, the M6 run's at `v1.0`), with the metrics
+the report quotes. Nothing else is needed from the flow.
+
+### Q4. The slow corner: leave it, and state it
+
+Leave both path families. Each fix is an RTL change after D-032, with a
+hardening, a mutation delta and formal re-runs to pay for a number at a
+corner the flow does not sign off. If 8x4 is adopted, only one family is
+left, at -1.14 ns (about 47 MHz), and the datasheet states that. A
+multicycle constraint on the host debug address path was considered: the
+address is registered cycles before its write strobe, so it may well hold,
+but a wrong timing exception is a silicon bug, and proving this one is more
+work than the 3 MHz it would state. Not taken.
+
+### Q5. ISO-1's caveat: keep it, as a documented property of the ISA
+
+A hardware store guard would be more than a `src/` change after D-032: it
+would break a shipped program. `i2c_slave_eeprom` keeps its 256 bytes in
+thread 3's quarter while running on thread 0, which is exactly what the
+shared memory is for (D-027). Stores anywhere are the ISA's design, and
+isolation holds for programs that keep their stores off the memory other
+running threads use. SEMANTICS 6.11, the report's section 7 and the README
+already say so; nothing to add.
+
+### Q6. Section 8 of the report
+
+It should record, with dates and commits:
+
+- who did what: Fable 5.1 set the architecture and plan (2026-09-14 to
+  2026-09-17) and reviewed M2; Opus 5 implemented from 2026-09-18; Opus
+  5.5 directed from 2026-09-23 and did this review; Thomas made the owner's
+  calls (D-013 solo, D-024 no FPGA, D-028 delegated, D-032 no slice C, the
+  8x4 experiment), and every push went through his account;
+- how METH-1 was enforced in practice: separate agents for model and RTL,
+  briefs that forbade reading the other side, the spec-question files and
+  the rulings that closed them;
+- what went wrong in the method, not only what it caught: T-1 (the
+  deadline checker's own rule was unsound, and three shipped programs had
+  real faults, found by a firmware author rather than a test); F-6 and F-7
+  (formal harnesses went stale when slice B added state); the last mutant,
+  which the ladder never ran against `test_mem`; BUGS 4 (a test bug only
+  the gate level exposed); the red lint CI from 950cafd to c5e7ca1; and
+  that this review was not independent;
+- the per-layer bug counts from `docs/BUGS.md` as METH-2's summary.
+
+### Q7. 8x4: adopt on the organisers' confirmation
+
+Yes. The branch run answers every question the brief asked: every job
+passed, the macro placement and the stripe keys carried over unchanged, the
+twelve Magic overlaps are the four stripe crossings D-021 already watches
+(Metal4 stripes over the macro's Metal4 obstruction, at the same x as at
+6x4, split into two more boxes by a different extraction boundary),
+congestion is gone, and the `gds` job has almost two hours of margin. Main
+moves when the organisers confirm 8x4 for the shuttle, not before: they
+asked for 6x4 until then. The switch is a physical change, not an RTL one,
+so it is allowed after the freeze too, up to M6, with its own hardening
+(D-034, proposed). When it lands: `tiles` and the stale comment above it in
+`info.yaml`, the datasheet's slow-corner clock, AREA's current row, the
+README and section 6 of the report, and the SDF subset if it already ran at
+6x4.
+
+### Two more things the brief did not ask
+
+- **The demo the architecture is built for does not exist yet.** Every
+  program runs alone on thread 0 (the two loopbacks use two threads). The
+  claim that sets Loom apart, that one thread cannot disturb another's
+  timing, is proved formally (ISO-1) and tested with synthetic loops
+  (`test_timing`), but no test runs four real protocols at once. Build it
+  before the firmware freeze: four programs on four threads, pins remapped
+  so they do not collide, each protocol's timing checked on the RTL against
+  its single-thread run. It is the strongest demo material M5 can have, and
+  it needs no hardware change.
+- **The v3 demo board transfer moves up.** The chips will most likely ship
+  on the RP2350B board, where `--ttboard` does not work today. It is host
+  software, so it can land after the freeze, but it must land before
+  submission, because the datasheet's how-to-test has to work on the board
+  the chips come on.
+
+### What Thomas decides
+
+1. Whether 8x4 is pre-approved: if yes, the switch is made the day the
+   organisers confirm it, without another round trip.
+2. When the laptop can run overnight: the mutation run (about seven hours)
+   and the SDF subset each need an idle night.
+3. Whether to ask Fable for an independent read of this review later. It is
+   optional, and the plan does not depend on it.
