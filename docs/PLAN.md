@@ -386,6 +386,8 @@ result recorded, bounded or proved.
       54 min, over the bar, and no program needs auto mode. The hardware is
       complete.
 - [ ] Fable review, M3: the slices' numbers, ISO-1's state, the freeze commit.
+      Brief written 2026-09-27 (`docs/reviews/m3-review.md`: state, numbers,
+      six questions, recommendations); Thomas starts the session.
 
 ### M4: RTL freeze and the evidence (freeze 2026-11-08; by 2026-12-01)
 
