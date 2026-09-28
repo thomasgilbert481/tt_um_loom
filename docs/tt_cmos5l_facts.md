@@ -128,6 +128,16 @@ fmax. See §4 for the system-level limit.
 
 ### Is `8x4` valid for the cmos5l flow? **No — not today.**
 
+**Update 2026-09-28: the tools now have it.** tt-support-tools commit `d66cf17` on branch
+`ihp-sg13cmos5l` (2026-09-21, "feat(ihp): 8x4 tile size for ihp-sg13cmos5l") adds
+`8x4: "0 0 1724.16 710.64"` to `tile_sizes.yaml` and `def/tt_block_8x4_pgvdd.def`
+(<https://github.com/TinyTapeout/tt-support-tools/commit/d66cf17>). That DEF differs from the 6x4
+one only in `DIEAREA` and the row lengths: same core origin (x = 2.88 µm), same rows, and every
+pin at the same position. So the validator accepts 8x4 now, and this design's macro placement,
+which is tied to its own stripe keys rather than to the die width, should carry over. Whether the
+shuttle takes 8x4 designs is the organisers' call: keep 6x4 until they say so (their guidance of
+2026-09-28 is noted at the end of this section). The text below is the 2026-09-15 state.
+
 - `tile_sizes.yaml` (above) tops out at **`8x2` (1724.16 × 313.74 µm = 540,938 µm² [DERIVED])**
   and **`6x4` (1289.28 × 710.64 µm = 916,214 µm² [DERIVED])**. There is **no `8x4` key**.
 - Validation is purely "is this key in `tile_sizes`":
@@ -542,7 +552,8 @@ the "not trivial" warning on <https://tinytapeout.com/specs/memory/>.
 
 ## 8. Gotchas worth acting on
 
-1. **`8x4` does not exist yet.** Design for `6x4` (1289.28 × 710.64 µm) as the ceiling; it is also
+1. **`8x4` did not exist on 2026-09-15** (the tools added it on 2026-09-21, section 2; the
+   organisers still say to design to 6x4). Design for `6x4` (1289.28 × 710.64 µm) as the ceiling; it is also
    the larger of the two big options (6x4 ≈ 0.92 mm² vs 8x2 ≈ 0.54 mm² [DERIVED]). If 8x4 lands,
    it is a `tile_sizes.yaml` entry + a `tt_block_8x4_pgvdd.def`; watch
    <https://github.com/TinyTapeout/tt-support-tools/tree/ihp-sg13cmos5l/tech/ihp-sg13cmos5l>.

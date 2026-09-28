@@ -134,7 +134,12 @@ Two readings of the table:
    lands before the freeze, is a switch worth one hardening of the
    unchanged design at 8x4 on a branch, adopted only if every job passes
    with clearly more routing margin? The macro placement and the PDN
-   stripe keys of D-021 would need checking against the new block.
+   stripe keys of D-021 would need checking against the new block. Checked
+   the same day: the tools branch has had the 8x4 tile and its block DEF
+   since 2026-09-21 (tt-support-tools `d66cf17`), and that DEF differs from
+   the 6x4 one only in die width and row length (same origin, rows and pin
+   positions), so the experiment is the one-line `tiles` change in
+   `info.yaml` on a branch, and could run before the organisers confirm.
 
 ## What the directing session recommends
 
