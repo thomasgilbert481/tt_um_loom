@@ -124,6 +124,18 @@ Two readings of the table:
    it was checked") is filled at the freeze. Is there anything from the
    architecture phase (2026-09-14 to 2026-09-17) that it should record?
 
+7. **8x4.** Added 2026-09-28. The organisers answered the macro question
+   (a design with the IHP SRAM macro can go on the shuttle, D-020) and said
+   to keep designing to 6x4 and treat 8x4 as an upgrade if Tiny Tapeout
+   enables it for CMOS5L. 8x4 would be about 34 per cent more area on the
+   same stripe pitch (`docs/tt_cmos5l_facts.md` section 2), which matters
+   here because routing time, not area, is the constraint: at 54.7 per cent
+   utilisation the design routes in 4 h 00 min on a slow runner. If 8x4
+   lands before the freeze, is a switch worth one hardening of the
+   unchanged design at 8x4 on a branch, adopted only if every job passes
+   with clearly more routing margin? The macro placement and the PDN
+   stripe keys of D-021 would need checking against the new block.
+
 ## What the directing session recommends
 
 1. Keep 2026-11-08 as the freeze date. Treat d1ea0ac's `src/` as the freeze

@@ -564,7 +564,8 @@ its timing contract (which cycle outputs change relative to inputs).
 7. WATCH: `8x4` is not a valid `tiles` value in the cmos5l flow (largest is
    `6x4`; `8x2`/`6x4` were never used on the first cmos5l shuttle). If Tiny
    Tapeout adds `8x4` before M4, switching is a one-line `info.yaml` change and
-   a re-budget; do not design for it.
+   a re-budget; do not design for it. The organisers said the same on
+   2026-09-28: keep designing to 6x4 and treat 8x4 as an upgrade.
 2. RESOLVED 2026-09-22 (M2 review): FIFO depth stays 4. A low-speed USB data
    packet is at most 8 bytes, four words, and depth is wiring (D-025).
 3. RESOLVED 2026-09-22 (D-027): data memory is the instruction memory,

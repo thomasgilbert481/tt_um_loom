@@ -157,6 +157,9 @@ fmax. See §4 for the system-level limit.
   <https://blog.janestreet.com/protocol-emulator-asic-competition/>
 - [DERIVED] If an `8x4` DEF is ever added on the same pitch it would be
   1724.16 × 710.64 µm = 1,225,257 µm², i.e. **+33.7 % over 6x4** — consistent with JS's "~30 % more".
+- 2026-09-28, the organisers by email to this project (not on the blog yet): keep designing to
+  6x4 and treat 8x4 as an upgrade if Tiny Tapeout enables it; and a design with the IHP SRAM
+  macro can go on the shuttle (D-020).
 
 ### Chip-level context (mux config)
 

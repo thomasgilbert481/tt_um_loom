@@ -238,6 +238,13 @@ power-script wrapper (question in the Discord thread), Jane Street's answer on
 macros (email of 2026-09-17), and one 6x4 hardening of the real core with the
 macro, placed on the stripe grid (macro x = 12 + 67.44k um, pin edge facing
 free rows). If Tiny Tapeout rejects the waiver, the fallback is the latch array.
+Condition met 2026-09-28: the organisers answered the email of 2026-09-17 (a
+follow-up went out on 2026-09-27): a design with the IHP SRAM macro can go on
+the shuttle, and Tiny Tapeout is preparing a reference template for macros
+on CMOS5L. The 6x4 hardening condition was met on 2026-09-19 and every
+hardening since has passed precheck with the macro. What stays open is only
+a comparison: when that reference template is public, check its placement
+and PDN recipe against D-021's.
 
 ## D-021 2026-09-18 Opus 5: the core's hardening config takes the macro recipe (under D-020)
 
