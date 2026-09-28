@@ -24,6 +24,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 2026-09-23 | M3 slice B: LD/ST on the instruction memory (D-027) on slice A | main 54ebaa1, run 35871222851, 6x4 | 30,869 stdcells + 1 macro (+861) | 3,225 | 54.7% | typ +3.56 ns; fast +9.37 ns; slow -6.08 ns (93 endpoints, TNS -293.8 ns); hold +0.30 typ / +0.64 slow / +0.10 fast, 0 violations | **every job passed**: gds 4 h 38 min, precheck 1 h 52 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10 (the stripe crossings D-021 watches); stdcell area 448,160 um2; power 12.7 mW; detailed routing 3 h 29 min, Metal3 overflow 2,252: under D-025's four hours, so slice B stays |
 | 2026-09-24 | D-031: one-hot host debug thread select, on slice B | main d1ea0ac, run 35940928210, 6x4 | 31,393 stdcells + 1 macro (+524 placed; generic synthesis -156) | 3,227 | 54.7% | typ +5.38 ns; fast +10.60 ns; slow -3.53 ns (96 endpoints, TNS -135.6 ns); hold +0.29 typ / +0.63 slow / +0.09 fast, 0 violations | **every job passed**: gds 5 h 02 min, precheck 1 h 59 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10; stdcell area 447,957 um2; power 12.5 mW; detailed routing 3 h 54 min, Metal3 overflow 1,945 (total 2,019): under D-025's four hours, by six minutes, on less congestion than slice B's run, so D-031 stays; max-slew 215 slow / 65 typ, max-cap 30-31. The debug-thread family is gone from the worst paths: slow -6.08 -> -3.53 ns (about 38 -> 42.5 MHz at that corner), typical +3.56 -> +5.38 ns. The gds job's 5 h 02 min is the longest yet, 58 minutes inside GitHub's six hours |
 | 2026-09-28 | the same netlist again, dispatched by hand to measure run-to-run variance (no change to `src/`, `info.yaml` or `macro/` since d1ea0ac) | main 3832179, run 36366875261, 6x4 | 31,393 stdcells + 1 macro | 3,227 (same netlist) | 54.7% | identical to the row above: typ +5.38 ns; fast +10.60 ns; slow -3.53 ns (96 endpoints, TNS -135.6 ns); hold +0.29 typ / +0.63 slow / +0.09 fast | **every job passed**, and every number the report reads equals run 35940928210's to the last digit (cells, stdcell area 447,957 um2, power 12.5 mW, Metal3 overflow 1,945 / 2,019, slew and cap counts): the flow is deterministic for identical inputs. Only time moved, which is the runner: detailed routing 4 h 00 min (3 h 54 before), `gds` job 5 h 11 min (5 h 02), precheck 2 h 26 min (1 h 59), gl_test 44 min |
+| 2026-09-28 | experiment: the same design on the **8x4** block (branch `exp-8x4`, only `tiles` changed; not on main) | branch exp-8x4 48eeef6 (main ec28c56's `src/`), run 36427897067, 8x4 | 31,407 stdcells + 1 macro (+14) | same RTL | 40.8% | typ +6.78 ns; fast +11.47 ns; slow -1.14 ns (23 endpoints, TNS -11.8 ns); hold +0.30 typ / +0.62 slow / +0.09 fast | **every job passed**: gds 4 h 02 min, precheck 2 h 31 min, gl_test 35 min, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 12 (10 at 6x4); stdcell area 448,213 um2; power 12.4 mW; global-routing overflow Metal3 2, total 3 (1,945 / 2,019 at 6x4); detailed routing 2 h 53 min; max-slew 83 slow / 18 typ, max-cap 8-10. The slow corner's 23 endpoints are one family, the host's debug register address into thread 3's `NOW` and the pin registers; the X-stage family is gone |
 
 ### Routing time is the binding constraint, 2026-09-20
 
@@ -37,6 +38,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 35871222851 | slice B on that (+861 cells, +136 flops) | 2,252 / 2,289 | 3 h 29 min | 4 h 38 min, finished |
 | 35940928210 | D-031 on that (generic synthesis -156 cells, +2 flops) | 1,945 / 2,019 | 3 h 54 min | 5 h 02 min, finished |
 | 36366875261 | the same netlist again, by hand, 3832179 | 1,945 / 2,019 | 4 h 00 min | 5 h 11 min, finished |
+| 36427897067 | the same design on **8x4** (branch exp-8x4) | 2 / 3 | 2 h 53 min | 4 h 02 min, finished |
 
 Detailed routing is the long pole of the whole flow and it is superlinear in
 congestion: two per cent more cells, concentrated in the timers, tripled the
@@ -78,6 +80,37 @@ hours if routing passes about 4 h 49 min, and the unchanged design sits 49
 minutes inside the limit. Its routing also measured 4 h 00 min 07 s, so
 D-025's four-hour line for accepting a change is inside the runner's noise
 for this design. That line gates changes only, and D-032 plans none.
+
+### The same design on 8x4, 2026-09-28
+
+The organisers said on 2026-09-28 to keep designing to 6x4 and treat 8x4 as
+an upgrade; the cmos5l tools have had the 8x4 block since 2026-09-21
+(`docs/tt_cmos5l_facts.md` section 2). Run 36427897067 hardened main's
+design with nothing changed but `tiles`, on branch `exp-8x4`, to see what
+the upgrade buys. Against the same design at 6x4 (run 36366875261):
+
+| | 6x4 | 8x4 |
+|---|---|---|
+| Utilisation | 54.7 % | 40.8 % |
+| Global-routing overflow, Metal3 / total | 1,945 / 2,019 | 2 / 3 |
+| Detailed routing | 4 h 00 min | 2 h 53 min |
+| `gds` job (GitHub's limit is 6 h) | 5 h 11 min | 4 h 02 min |
+| Setup slack, typical / fast | +5.38 / +10.60 ns | +6.78 / +11.47 ns |
+| Setup slack, slow (1.08 V, 125 C) | -3.53 ns, 96 endpoints (about 42.5 MHz) | -1.14 ns, 23 endpoints (about 47.3 MHz) |
+| Max-slew violations, slow / typical | 215 / 65 | 83 / 18 |
+
+Every job passed at 8x4. The congestion is gone, the `gds` job has almost
+two hours of margin instead of 49 minutes, and the X-stage path family
+(`tx_th` into the W stage) no longer violates at any corner; the one family
+left at the slow corner is the host's debug register address into thread
+3's `NOW` and the pin registers, whose fix is already noted above. What
+did not shrink as much as the overflow: detailed routing still takes almost
+three hours, so its time follows the amount of wiring more than the
+congestion once the congestion is low. Two things to read before adopting
+it: Magic's illegal-overlap count is 12 against 10 (the stripe crossings
+D-021 watches; precheck passes), and main moves only when the organisers
+confirm 8x4 (a DECISIONS entry and the `tiles` line; the macro and stripe
+keys carried over unchanged).
 
 ### M2 RTL, Yosys generic synthesis (not hardened), 2026-09-18
 

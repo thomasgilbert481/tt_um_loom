@@ -140,6 +140,15 @@ Two readings of the table:
    the 6x4 one only in die width and row length (same origin, rows and pin
    positions), so the experiment is the one-line `tiles` change in
    `info.yaml` on a branch, and could run before the organisers confirm.
+   **Measured 2026-09-28** (Thomas approved the branch run; run
+   36427897067 on `exp-8x4`, `docs/AREA.md` "The same design on 8x4"):
+   every job passed; utilisation 40.8 per cent; global-routing overflow
+   2 / 3 against 1,945 / 2,019; detailed routing 2 h 53 min and the `gds`
+   job 4 h 02 min against 4 h 00 and 5 h 11; slack typical +6.78, fast
+   +11.47, slow -1.14 ns on 23 endpoints (about 47 MHz) against +5.38,
+   +10.60 and -3.53 ns on 96. The macro and stripe keys carried over
+   unchanged. So the question is only whether to adopt it: the recommendation
+   below says yes, as soon as the organisers confirm 8x4 for the shuttle.
 
 ## What the directing session recommends
 
@@ -157,3 +166,9 @@ Two readings of the table:
    D-032 declared complete.
 4. Archive the freeze run's `tt_submission` artefact as a release asset as
    soon as it passes, instead of waiting for M5.
+5. Move to 8x4 as soon as the organisers confirm it for the shuttle: it
+   turns the six-hour risk (49 minutes of margin) into almost two hours,
+   removes the congestion and one of the two slow-corner families, and
+   changes nothing but the `tiles` line. The switch is a DECISIONS entry
+   and one commit on main, and that commit's hardening would be the freeze
+   run if it lands close to 2026-11-08.

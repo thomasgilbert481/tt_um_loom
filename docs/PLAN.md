@@ -470,6 +470,11 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       subset: one scenario per protocol, run overnight on the freeze netlist.
 - [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
       measured slow-corner clock, both with their slack.
+- [ ] 8x4, when the organisers confirm it for the shuttle: a DECISIONS entry
+      and the `tiles` line on main (with the stale comment above it in
+      `info.yaml`); the branch run 36427897067 already passed every job at
+      8x4 with the macro and stripe keys unchanged. Its datasheet numbers
+      (clock at the slow corner) and AREA's current row change with it.
 - [ ] Firmware freeze 2026-12-01.
 
 ### M5: documentation and submission package (by 2026-12-20)
@@ -527,7 +532,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 | Instruction memory too large in flops | high | M1 synth numbers early; three imem options behind one wrapper; 128-entry fallback |
 | SRAM macro on cmos5l: reportedly working in the community with a macro-matched PDN, but macros currently fail the TT precheck and no cmos5l example is public | closed 2026-09-28 | decided by M2 gate from a real hardening run that includes precheck, plus Jane Street's answer; FLOPS fallback stays live until macros pass precheck; not assumed anywhere in the core. Closed: every hardening since 2026-09-19 passes precheck with the macro, and the organisers confirmed on 2026-09-28 that a design with it can go on the shuttle (D-020). Left: compare Tiny Tapeout's macro reference template with D-021's recipe when it is public |
 | Solo project: no second pair of hands for bench work or reviews | certain | milestones small and green at every session end; scope cut at reviews, never late; stretch protocols optional; Fable reviews are the second opinion |
-| Area is 6x4, not the 8x4 the brief first described (about 25 percent less) | certain today | budget written for 6x4; 8x4 is a one-line upgrade if it appears. The organisers' guidance (2026-09-28): keep designing to 6x4 and treat 8x4 as an upgrade if Tiny Tapeout enables it. If it lands before the freeze, harden the unchanged design at 8x4 on a branch and switch only if everything passes with more routing margin (M3 review, question 7) |
+| Area is 6x4, not the 8x4 the brief first described (about 25 percent less) | certain today | budget written for 6x4; 8x4 is a one-line upgrade if it appears. The organisers' guidance (2026-09-28): keep designing to 6x4 and treat 8x4 as an upgrade if Tiny Tapeout enables it. If it lands before the freeze, harden the unchanged design at 8x4 on a branch and switch only if everything passes with more routing margin (M3 review, question 7). Measured 2026-09-28 (run 36427897067, branch `exp-8x4`): every job passed, `gds` job 4 h 02 min against 5 h 11, overflow 3 against 2,019, slow corner -1.14 ns against -3.53 (`docs/AREA.md`). Switch main when the organisers confirm |
 | One fewer routing layer than SG13G2 (`RT_MAX_LAYER = Metal4`) | medium | keep density at or below 60 percent; check congestion at M1 hardening |
 | Register-file read mux limits clock | medium | close at 60 MHz target in STA; if needed, split X into two cycles per slot (5-stage, still hazard-free with 4 threads only if we add one bubble; prefer shrinking to 6 registers per thread instead) |
 | LibreLane linter (Verilator) rejects code | medium | `verilator --lint-only -Wall` in CI from day one |
