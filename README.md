@@ -13,9 +13,10 @@ timing that is exact and checked before the program is loaded. A host (the
 Tiny Tapeout demo board's microcontroller, or any SPI master) loads programs
 and moves data through a four-pin SPI port.
 
-**Status (2026-09-26):** built, hardened and verified, except for one
-optional feature: the bit engine's autonomous mode (slice C), which is
-decided by its numbers on 2026-11-01. The RTL freezes on 2026-11-08.
+**Status (2026-09-27):** the hardware is complete, hardened and verified.
+The one optional feature, an autonomous mode for the bit engine, was left
+out (D-032): no program needs it and the routing budget has no room for it.
+The RTL freezes on 2026-11-08, after which it changes only for a bug.
 `docs/PLAN.md` has the milestones and the session log, `docs/DECISIONS.md`
 the reasons for each choice.
 
@@ -123,6 +124,9 @@ python -m tools.loomhost --model firmware/uart_tx_fifo.loom --uart-rx OUT0:32 \
   hardware; `docs/VERIFICATION_REPORT.md` section 2 says what stands in for
   a bench.
 - The slow corner closes at about 42 MHz, not 50 MHz.
+- The bit engine has no autonomous mode (D-032): every bit costs its thread
+  at least one instruction slot. The fastest rate a shipped program is
+  tested at is 2.083 Mbit/s, the Manchester loopback's.
 - Thread isolation is proved with the host's debug port quiet, and it takes
   as given that no other thread stores into the memory the thread reads.
   With the debug port in use it is false by design: the port is shared (F-4).

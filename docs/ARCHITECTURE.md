@@ -34,7 +34,7 @@ simulation and the silicon (the FPGA prototype was dropped, D-024).
 | Sequencers | 4 SMs per block, 32 shared instructions | 2 full 32-bit RISC cores | 4 threads on one pipeline, 512 shared instructions (the SRAM macro, D-020) |
 | Timing model | per-instruction delay + side-set; paths balanced by hand | count cycles by hand | deadline register (`WAITD`) with fractional ticks; timing independent of the path taken |
 | Data-dependent behaviour | weak (few branches, no ALU) | strong | 16-bit ALU, flags, DJNZ, CALL/RET, pin-conditional branches |
-| Bit-level helpers | shifters, autopush/pull | none | shifter + CRC + NRZI/Manchester + stuffing (+ auto mode if slice C is built) |
+| Bit-level helpers | shifters, autopush/pull | none | shifter + CRC + NRZI/Manchester + stuffing, one instruction per bit |
 | Waits with timeout | no | no | every wait can abort at the deadline and set a T flag |
 | Emulating a *device* (I2C EEPROM, SPI flash, PS/2 keyboard) | awkward | fine | first-class: data memory + FIFOs + edge and level waits |
 | Debug | none on-chip | JTAG | halt / step / read-write every register over the host port |
@@ -166,7 +166,7 @@ Global: `SFLAGS[7:0]` shared flags, `OD_MASK[7:0]` open-drain mode per BIDIR pin
 | 0x03 | INGRP | RW | base[4:0], cnt[9:5] | `IN` reads cnt pins starting at base |
 | 0x04 | BE_CFG | RW | see 8.1 | bit-engine mode, direction, encoding, stuffing, sample phase |
 | 0x05 | BE_PINS | RW | out[4:0], in[9:5] | bit-engine output pin index and input pin index |
-| 0x06 | BE_RELOAD | RW | 5 | CNT reload value in auto mode (1..16) |
+| 0x06 | BE_RELOAD | RW | 5 | CNT reload value for auto mode (1..16); auto mode is not built (D-032), so nothing reads it |
 | 0x07 | CRC_POLY | RW | 16 | polynomial, convention in 8.2 |
 | 0x08 | CRC_INIT | RW | 16 | value loaded by `CRCI` |
 | 0x09 | NOW | R | 16 | local time |
@@ -202,11 +202,12 @@ Reserved CSR numbers read 0 and ignore writes.
   clocks, so each edge lands 0 to 3 clocks after its deadline. It is exactly
   periodic when `k * period` is a multiple of 4 clocks, and dithers by one slot
   otherwise (432/436 clocks at a 434-clock tick, 0.5 percent of a 115200 baud
-  bit). Two mechanisms give clock-exact edges for any period: the bit engine in
-  auto mode, and deadline-latched pin writes, where `SETP pin, v, D` stages the
-  write and the hardware applies it on the exact clock the thread's next
-  deadline is reached, normally the one the following `WAITD` sets (M2,
-  decision D-016, cycle-exact rules in `docs/SEMANTICS.md` 6.10).
+  bit). Deadline-latched pin writes give clock-exact edges for any period:
+  `SETP pin, v, D` stages the write and the hardware applies it on the exact
+  clock the thread's next deadline is reached, normally the one the following
+  `WAITD` sets (M2, decision D-016, cycle-exact rules in `docs/SEMANTICS.md`
+  6.10). The bit engine's auto mode was planned as a second way and is not
+  built (D-032).
 - `SETD k`: `TD <= NOW + k`. Use it to re-anchor the schedule to an external
   event (for example right after `WAITE` sees the start-bit edge; then
   `WAITD` of 1.5 bit times lands the first sample mid-bit).
@@ -247,7 +248,9 @@ Reserved CSR numbers read 0 and ignore writes.
 
 ## 8. Bit engine (one per thread)
 
-The bit engine owns SR, CNT, CRC and an encoder. Firmware uses it two ways.
+The bit engine owns SR, CNT, CRC and an encoder. Firmware drives it one bit
+per instruction (manual mode); auto mode, below, was designed and is not
+built (D-032).
 
 **Manual mode.** `SHO` moves one bit from SR to the BE output pin (through the
 encoder), updates CRC, decrements CNT. `SHI` samples the BE input pin (through
@@ -261,7 +264,8 @@ USB low-speed needs, and at 1.5 Mbit/s the manual loop uses three of the
 eight slots per bit. Manchester in manual mode is two `SHO` per bit, one per
 half bit, with the engine tracking the phase.
 
-**Auto mode** (M3 slice C, optional, D-026). Revised at the M2 review: the
+**Auto mode** (M3 slice C, D-026): **not built (D-032).** What it would
+have been, as revised at the M2 review: the
 engine does not run on its own datapath. When `MODE` and `TICK_SEEN` are
 set, the thread's slot performs an implicit `SHO` (TX) or `SHI` (RX)
 alongside its instruction, through the same X-stage logic manual mode uses.
@@ -273,20 +277,22 @@ firmware places the tick with `SETD`. At CNT zero, TX reloads SR from INQ if
 thread's own FIFO port. The thread supervises with `WAITB` and handles
 framing. One engine action per slot, so a tick period of at least 4 clocks:
 12.5 Mbit/s NRZ, about 6 Mbit/s Manchester at 50 MHz. 10 Mbit Manchester is
-not a target (D-029). Slice C is built only if the routing budget of D-025
-allows it after slices A and B; until then `MODE` reads 0.
+not a target (D-029). Slice C was to be built only if the routing budget of
+D-025 allowed it after slices A and B. After D-031 the baseline routed over
+that budget's bar, and no program needs auto mode, so `MODE` reads 0 for
+good (D-032).
 
 ### 8.1 BE_CFG bits
 
 | Bits | Field | Values |
 |---|---|---|
-| 0 | MODE | 0 manual, 1 auto (slot-injected, D-026; reads 0 until slice C exists) |
+| 0 | MODE | 0 manual; 1 would be auto (slot-injected, D-026), which is not built (D-032), so the bit reads 0 and ignores writes |
 | 1 | DIR | 0 LSB first, 1 MSB first |
-| 2 | RXTX | 0 transmit (drive out pin), 1 receive (sample in pin): auto mode only (slice C); `SHO` and `SHI` carry their own direction, so it reads 0 until slice C |
+| 2 | RXTX | 0 transmit (drive out pin), 1 receive (sample in pin): auto mode only; `SHO` and `SHI` carry their own direction, and auto mode is not built (D-032), so it reads 0 |
 | 4:3 | ENC | 0 NRZ, 1 NRZI (USB: 0 = toggle), 2 Manchester (IEEE 802.3: 0 = high-to-low), 3 reserved |
 | 6:5 | STUFF | 0 none, 1 USB (a 0 after six 1s), 2 CAN (the complement after five equal bits; the stuff bit starts the next run), 3 reserved; cycle-exact rules in SEMANTICS 6.9.1 |
 | 7 | INV | invert the pin sense |
-| 8 | AUTOPULL / AUTOPUSH | reload from INQ (TX) or push to OUTQ (RX) at CNT==0; auto mode only (slice C), reads 0 until then |
+| 8 | AUTOPULL / AUTOPUSH | reload from INQ (TX) or push to OUTQ (RX) at CNT==0; auto mode only, not built (D-032): reads 0 |
 | 9 | CRC_EN | update CRC on data bits (stuffed bits never touch CRC) |
 | 10 | DIFF | `SHO` also drives the next pin index with the complement (USB D+/D-), through the group-write path (D-026, slice A) |
 | 12:11 | reserved | was PHASE; dropped at the M2 review (D-026): the sample lands a fixed few clocks after the tick and firmware places the tick |

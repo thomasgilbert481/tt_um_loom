@@ -701,3 +701,35 @@ report starts at the debug thread select any more; the two families left
 register address into `NOW` and the pin registers) are in `docs/AREA.md`,
 "The slow corner after D-031", with the fix each would take and the reason
 neither is planned.
+
+## D-032 2026-09-27 Thomas: slice C (bit-engine auto mode) is not built; the hardware is complete
+
+Decision: the bit engine stays in manual mode. Slice C of D-026 is not
+built: `BE_CFG`'s `MODE` (bit 0), `RXTX` (bit 2), `AUTOPULL` (bit 8) and
+bits 12:11 keep reading 0 and ignoring writes, `CAPS[8]` stays 0, and
+`BE_RELOAD` stays a register that nothing reads. No further hardware change
+is planned. Until the freeze on 2026-11-08 (D-030), and after it, the RTL
+changes only for a bug that verification finds.
+Why: the numbers close the gate. D-025 lets a change stack on the design
+only when the baseline shows Metal3 overflow under 3,500 and detailed
+routing under 3 h 45 min. Slice B's run met that bar, but D-031 was built
+after it, and the baseline is now D-031's run (35940928210): overflow 1,945,
+routing 3 h 54 min, over the bar and six minutes inside D-025's four hours,
+with the `gds` job at 5 h 02 min of GitHub's six. And nothing on the plan
+needs auto mode. USB low speed, the stretch protocol D-029 kept, meets its
+timing in manual mode (`docs/spec-questions/firmware-m3.md` item 10), and
+so do CAN and the Manchester loopback. The director recommended this on
+2026-09-26; Thomas took it on 2026-09-27, ahead of the 2026-11-01 date in
+PLAN M3.
+Rejected: building slice C anyway, a hardening that the routing numbers
+say is unlikely to finish in time, for a feature no program uses; a reduced
+auto mode, still a stacked change on a baseline over the bar.
+Consequences: PLAN M3's slice C item is closed. The local LibreLane
+session of D-025 has no slice left to pre-check and is dropped, unless a
+bug fix after the freeze needs it. ARCHITECTURE 8 and 8.1 and SEMANTICS 6.9
+say "not built" where they said "until slice C". The limit it leaves is
+the one manual mode has: every bit costs its thread at least one slot, and
+the fastest rate a shipped program is tested at is the Manchester
+loopback's 2.083 Mbit/s. The comments in `src/` that still say "until
+slice C" are left alone: a `src/` change starts a hardening, and the
+behaviour they describe is now permanent.

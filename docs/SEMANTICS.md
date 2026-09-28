@@ -60,8 +60,9 @@ Consequences that both implementations must reproduce:
   is a multiple of 4 clocks the lateness is constant and the edges are exactly
   periodic; otherwise they dither (at 434 clocks per tick, UART bit edges
   alternate 432 and 436 clocks while the 10-bit frame spacing is exactly 4340).
-  Clock-exact edges for any period are the job of the bit engine in auto mode
-  (M2/M3) and of deadline-latched pin writes (planned for M2, D-016).
+  Clock-exact edges for any period are the job of deadline-latched pin writes
+  (M2, D-016, section 6.10); the bit engine's auto mode, planned as a second
+  way, is not built (D-032).
 
 ## 3. What an instruction sees in its X cycle
 
@@ -156,8 +157,9 @@ words; `t * 0x100` for 1024). Instruction memory is **not** reset.
 `CAPS` (read-only, 16 bits): `[2:0]` log2 of the FIFO depth, `[3]` FIFOs built,
 `[4]` bit engine built (manual mode), `[5]` data memory built, `[6]` boot ROM
 built, `[7]` deadline-latched `SETP` built (M2), `[8]` bit engine auto mode
-built (M3 slice C), `[9]` bit-engine encoders, stuffing and DIFF built (M3
-slice A, 6.9.1), `[11:10]` zero, `[15:12]` log2 of `IMEM_WORDS`. The M1
+built (M3 slice C; never set, because slice C is not built: D-032), `[9]`
+bit-engine encoders, stuffing and DIFF built (M3 slice A, 6.9.1), `[11:10]`
+zero, `[15:12]` log2 of `IMEM_WORDS`. The M1
 build with 256 words reads 0x8000; the M2 build with the 512-word macro reads
 0x909A, and 0x929A with slice A.
 
@@ -327,7 +329,8 @@ an edge and is visible from the following cycle, like every other register.
 - `CTRL.RESET` of thread `t` also empties `INQ[t]` and `OUTQ[t]`.
 - `WAITB c` conditions (6.4): 1 is `OUTQ_CNT[t] < FIFO_DEPTH`, 2 is
   `INQ_CNT[t] > 0`, 3 is `TICK_SEEN[t]`, 0 is "bit engine idle", which is
-  always true until auto mode exists (M3).
+  always true: auto mode, which would have given it a meaning, is not built
+  (D-032).
 
 ### 6.8 Host interrupt **[M2]**
 
@@ -369,21 +372,20 @@ detect what the engine supports; slice A (6.9.1) adds `ENC`, `STUFF` and
   `load: LDSR r0; CSRW CNT, r1; bit: SHO; WAITD 1; BNZ bit` is three slots per
   bit.
 
-Auto mode (`MODE`, `RXTX`, `AUTOPULL`) is **[M3 slice C]**, optional under
-D-025 and D-026: if built, the engine acts in the thread's own slot as an
-implicit `SHO`/`SHI` alongside the slot's instruction, with the transmit edge
-applied through the deadline latch at the next tick edge and the receive
-sample taken in the slot's X cycle. Its cycle-exact text is written here when
-slice C is decided (2026-11-01), not before. `SHO`/`SHI` executed while the
-bit engine is not built are `NOP` + `BADOP`, as section 9 says.
+Auto mode (`MODE`, `RXTX`, `AUTOPULL`) was **[M3 slice C]**, optional under
+D-025 and D-026, and is **not built** (D-032): those fields read 0 and ignore
+writes, `CAPS[8]` reads 0, and this document has no cycle-exact text for it
+(`docs/ARCHITECTURE.md` 8 describes the shape it would have had). `SHO`/`SHI`
+executed while the bit engine is not built are `NOP` + `BADOP`, as section 9
+says.
 
 #### 6.9.1 Encoders, stuffing and the differential output **[M3 slice A]** (D-026)
 
 Slice A stores three more `BE_CFG` fields: `ENC` (bits 4:3: 0 NRZ, 1 NRZI,
 2 Manchester; 3 is reserved and is stored as 0), `STUFF` (bits 6:5: 0 none,
 1 USB, 2 CAN; 3 is reserved and is stored as 0) and `DIFF` (bit 10). `MODE`
-(bit 0), `RXTX` (bit 2), `AUTOPULL` (bit 8) and bits 12:11 still read 0 and
-ignore writes until slice C. `CAPS[9]` reads 1 and `VERSION` reads 3 from
+(bit 0), `RXTX` (bit 2), `AUTOPULL` (bit 8) and bits 12:11 read 0 and ignore
+writes (slice C is not built, D-032). `CAPS[9]` reads 1 and `VERSION` reads 3 from
 slice A on; a build without slice A is the M2 engine of 6.9 exactly (the
 golden model builds it as the feature `BEENC` on top of `BE`).
 

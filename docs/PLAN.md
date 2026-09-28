@@ -292,12 +292,13 @@ result recorded, bounded or proved.
       every job on 2026-09-23: routing 2 h 57 min, Metal3 overflow 1,248
       (the lowest yet), typ +3.56 ns, slow -6.36 ns on a new worst path
       (host debug thread select to `pin_oe_reg[6]`); D-031 proposed.
-- [ ] One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
+- [x] ~~One session: can LibreLane run locally (the Docker image in `CLAUDE.md`,
       the pinned PDK) to the end of global routing and stop? Record the answer
       in `docs/tt_cmos5l_facts.md`. If yes, every slice reads its overflow
-      there before it goes to CI. Deferred 2026-09-24 until the slice C
-      decision: no other slice is planned, so its only use would be slice C
-      or a post-freeze fix. What it takes, from `tt-gds-action@ihp-cmos5l`:
+      there before it goes to CI.~~ **Dropped 2026-09-27 (D-032):** with slice
+      C not built no slice is left to pre-check; kept only for a bug fix
+      after the freeze, should one need it. What it takes, from
+      `tt-gds-action@ihp-cmos5l`:
       `pip install librelane==3.1.0.dev3`, tt-support-tools branch
       `ihp-sg13cmos5l`, the PDK from the action's `install_sg13cmos5l.sh`,
       and Docker reachable from WSL for LibreLane's container; then
@@ -373,14 +374,17 @@ result recorded, bounded or proved.
       stuff, form and no-ACK errors) at 125 and 500 kbit/s. Spec questions
       8 to 16 of `docs/spec-questions/firmware-m3.md` ruled; the text fixes
       (SEMANTICS 4, 6.9, 6.9.1, `CRCI` in `isa.yaml`) came with them.
-- [ ] 2026-11-01, slice C decided by the numbers: auto mode in the
+- [x] 2026-11-01, slice C decided by the numbers: auto mode in the
       slot-injected shape (D-026) only if slice B's hardening shows Metal3
       overflow under 3,500 and detailed routing under 3 h 45 min, and Thomas
       wants it. If built: SEMANTICS text, model, RTL, co-simulation,
       hardening, all before 2026-11-08. Input from the firmware: slice B's
       numbers meet the bar, and USB low speed, the stretch protocol D-029
       kept, meets its timing in manual mode (firmware-m3 item 10), so no
-      program on the plan needs auto mode.
+      program on the plan needs auto mode. **Decided 2026-09-27 by Thomas:
+      not built (D-032).** D-031's run is the baseline now and routed in 3 h
+      54 min, over the bar, and no program needs auto mode. The hardware is
+      complete.
 - [ ] Fable review, M3: the slices' numbers, ISO-1's state, the freeze commit.
 
 ### M4: RTL freeze and the evidence (freeze 2026-11-08; by 2026-12-01)
@@ -453,8 +457,8 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 
 - [x] `docs/info.md` (Tiny Tapeout datasheet page) complete with pinout,
       how-to-test, external hardware. Rewritten 2026-09-26 for the design as
-      built; the pinout lives in `info.yaml` and is current. Revisit at the
-      freeze only if the design changes (slice C).
+      built; the pinout lives in `info.yaml` and is current. The design is
+      complete (D-032); revisit at the freeze only if a bug fix changes it.
 - [ ] Host transfer for the v3 demo board (RP2350B): its pin map is not the
       RP2040's, so the SPI0 function set of D-012 does not carry over
       (`docs/tt_cmos5l_facts.md` section 5). A PIO or bit-banged `_lx` in
@@ -509,7 +513,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 | Register-file read mux limits clock | medium | close at 60 MHz target in STA; if needed, split X into two cycles per slot (5-stage, still hazard-free with 4 threads only if we add one bubble; prefer shrinking to 6 registers per thread instead) |
 | LibreLane linter (Verilator) rejects code | medium | `verilator --lint-only -Wall` in CI from day one |
 | Host SPI sampling errors at high SCK | low | spec SCK <= clk/8; formal SPI-1; test at the limit |
-| Scope creep on stretch protocols | high | RTL freeze 2026-11-08 (D-030); USB LS is the only stretch with a fixed slot; slice C only under D-025's numbers |
+| Scope creep on stretch protocols | high | RTL freeze 2026-11-08 (D-030); USB LS is the only stretch with a fixed slot; slice C not built (D-032), decided under D-025's numbers |
 | Semester crunch (564 project, finals) | high | RTL frozen 2026-11-08, before the crunch; November is firmware and the report; December is docs; buffer week before the deadline |
 | Model rate limits stall sessions | medium | milestones are small; every session ends with a committed, green state; `CLAUDE.md` explains how to resume |
 | TT precheck failures (pin hygiene, unused signals, `ena`) | medium | run precheck on every push from M0 |
@@ -758,3 +762,10 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   again after the fixes. New M5 item: a host transfer for the v3 demo board
   (RP2350B). Next: Thomas's slice C decision on 2026-11-01 (recommended:
   do not build it), then the RTL freeze on 2026-11-08.
+- 2026-09-27, Thomas and Opus 5.5: slice C decided early, not built
+  (D-032): D-031's run is the baseline and routed over D-025's stacking bar,
+  and no program needs auto mode. The hardware is complete; the RTL changes
+  from here only for a bug that verification finds. ARCHITECTURE 8 and 8.1,
+  SEMANTICS 6.9, the README and the report say so. The Jane Street
+  follow-up went out the same day (Thomas). Next: the M3 review with Fable
+  (the slices' numbers, ISO-1, the freeze commit), then M4.

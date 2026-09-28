@@ -192,7 +192,9 @@ D-031's run routed in 3 h 54 min, six minutes inside it.
 - Not attempted: 10 Mbit Ethernet, 10 Mbit Manchester (D-029).
 - The bit-engine encoders (slice A) and data memory (slice B) are built and
   hardened, and the M3 firmware passes on both backends; auto mode (slice C)
-  is decided on 2026-11-01 (`docs/PLAN.md` M3). The USB device fills the
+  is not built (D-032): every bit costs its thread at least one slot, and
+  the fastest tested rate is the Manchester loopback's 2.083 Mbit/s. The USB
+  device fills the
   whole instruction memory, so it runs alone in thread 0; `can_loopback`
   hard-synchronises on each start of frame only, so a sender must be within
   about 0.2 per cent of the bit rate.
@@ -223,3 +225,4 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
   T-1 (the deadline checker's rule after a `SETD`) and the last mutation
   survivor added to sections 4, 5 and 7; section 6 and the L5 line follow
   the D-031 hardening.
+- 2026-09-27: section 7 records D-032, slice C not built.
