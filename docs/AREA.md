@@ -23,6 +23,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 2026-09-23 | M3 slice A: encoders, stuffing, DIFF (D-026) on D-028 | main 8c487cc, run 35812463112, 6x4 | 30,008 stdcells + 1 macro (+1,205) | 3,089 | 52.7% | typ +4.80 ns; fast +10.13 ns; slow -4.04 ns (50 endpoints); hold +0.31 typ / +0.65 slow / +0.12 fast, 0 violations | **every job passed**: gds 4 h 36 min, precheck 1 h 57 min, gl_test pass (the slice A tests at gate level too), viewer; DRC 0, LVS 0, antenna 0; Magic overlaps 10; stdcell area 430,316 um2; power 11.7 mW; detailed routing 3 h 27 min, Metal3 overflow 2,924 (total 3,004); max-slew 160 slow / 34 typ. D-025's reading: routing under 4 h and overflow under 4,000, so slice A stays; the baseline is also under 3,500 and 3 h 45 min, so slice B may stack on it. Typical margin +4.80 against +3.56 on the run before (a logic deletion) and +5.98 before that: three runs within 2.4 ns of each other are the flow's variance, not the design's trend |
 | 2026-09-23 | M3 slice B: LD/ST on the instruction memory (D-027) on slice A | main 54ebaa1, run 35871222851, 6x4 | 30,869 stdcells + 1 macro (+861) | 3,225 | 54.7% | typ +3.56 ns; fast +9.37 ns; slow -6.08 ns (93 endpoints, TNS -293.8 ns); hold +0.30 typ / +0.64 slow / +0.10 fast, 0 violations | **every job passed**: gds 4 h 38 min, precheck 1 h 52 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10 (the stripe crossings D-021 watches); stdcell area 448,160 um2; power 12.7 mW; detailed routing 3 h 29 min, Metal3 overflow 2,252: under D-025's four hours, so slice B stays |
 | 2026-09-24 | D-031: one-hot host debug thread select, on slice B | main d1ea0ac, run 35940928210, 6x4 | 31,393 stdcells + 1 macro (+524 placed; generic synthesis -156) | 3,227 | 54.7% | typ +5.38 ns; fast +10.60 ns; slow -3.53 ns (96 endpoints, TNS -135.6 ns); hold +0.29 typ / +0.63 slow / +0.09 fast, 0 violations | **every job passed**: gds 5 h 02 min, precheck 1 h 59 min, gl_test pass, viewer; DRC 0, LVS 0, antenna 0; Magic illegal overlaps 10; stdcell area 447,957 um2; power 12.5 mW; detailed routing 3 h 54 min, Metal3 overflow 1,945 (total 2,019): under D-025's four hours, by six minutes, on less congestion than slice B's run, so D-031 stays; max-slew 215 slow / 65 typ, max-cap 30-31. The debug-thread family is gone from the worst paths: slow -6.08 -> -3.53 ns (about 38 -> 42.5 MHz at that corner), typical +3.56 -> +5.38 ns. The gds job's 5 h 02 min is the longest yet, 58 minutes inside GitHub's six hours |
+| 2026-09-28 | the same netlist again, dispatched by hand to measure run-to-run variance (no change to `src/`, `info.yaml` or `macro/` since d1ea0ac) | main 3832179, run 36366875261, 6x4 | 31,393 stdcells + 1 macro | 3,227 (same netlist) | 54.7% | identical to the row above: typ +5.38 ns; fast +10.60 ns; slow -3.53 ns (96 endpoints, TNS -135.6 ns); hold +0.29 typ / +0.63 slow / +0.09 fast | **every job passed**, and every number the report reads equals run 35940928210's to the last digit (cells, stdcell area 447,957 um2, power 12.5 mW, Metal3 overflow 1,945 / 2,019, slew and cap counts): the flow is deterministic for identical inputs. Only time moved, which is the runner: detailed routing 4 h 00 min (3 h 54 before), `gds` job 5 h 11 min (5 h 02), precheck 2 h 26 min (1 h 59), gl_test 44 min |
 
 ### Routing time is the binding constraint, 2026-09-20
 
@@ -35,6 +36,7 @@ Reading of the macro row: the macro freed a third of the core (stdcell area 710,
 | 35812463112 | slice A on that (+1,205 cells, +61 flops) | 2,924 / 3,004 | 3 h 27 min | 4 h 36 min, finished |
 | 35871222851 | slice B on that (+861 cells, +136 flops) | 2,252 / 2,289 | 3 h 29 min | 4 h 38 min, finished |
 | 35940928210 | D-031 on that (generic synthesis -156 cells, +2 flops) | 1,945 / 2,019 | 3 h 54 min | 5 h 02 min, finished |
+| 36366875261 | the same netlist again, by hand, 3832179 | 1,945 / 2,019 | 4 h 00 min | 5 h 11 min, finished |
 
 Detailed routing is the long pole of the whole flow and it is superlinear in
 congestion: two per cent more cells, concentrated in the timers, tripled the
@@ -50,6 +52,32 @@ inconvenience. Judge an RTL change that adds wiring by what it does to
 Knobs if a future change needs the room: `PL_TARGET_DENSITY_PCT` (60 today,
 and the placer has space at 51.5 per cent utilisation), cell padding, or a
 smaller version of the change itself (D-022's outcome note).
+
+### The same netlist twice, 2026-09-28
+
+Run 36366875261 hardened the design of run 35940928210 again, with nothing
+changed in `src/`, `info.yaml` or `macro/`, to find out what the freeze run
+of an unchanged design will do. Two answers:
+
+- **The flow is deterministic.** Every number the report reads came out
+  identical: cells, area, power, Metal3 overflow 1,945 and total 2,019,
+  slack at all three corners, 96 slow-corner endpoints, slew and cap counts.
+  The "half an hour of placement variance" of D-025 therefore comes from
+  changes to the input, however small, and not from the flow. The freeze
+  run of an unchanged design reproduces this netlist, as long as the
+  `ihp-cmos5l` branch of the Tiny Tapeout action (a branch, not a pinned
+  version) does not change underneath it.
+- **Time is the runner's.** The same work took 4 h 00 min 07 s of detailed
+  routing against 3 h 54 min (2.6 per cent), 5 h 11 min 22 s of `gds` job
+  against 5 h 02 min (3 per cent), and 2 h 26 min of precheck against
+  1 h 59 min (a separate job with its own six hours).
+
+The margin that is left: the `gds` job spent 71 minutes outside detailed
+routing this time, so on a runner like this one it fails GitHub's six
+hours if routing passes about 4 h 49 min, and the unchanged design sits 49
+minutes inside the limit. Its routing also measured 4 h 00 min 07 s, so
+D-025's four-hour line for accepting a change is inside the runner's noise
+for this design. That line gates changes only, and D-032 plans none.
 
 ### M2 RTL, Yosys generic synthesis (not hardened), 2026-09-18
 

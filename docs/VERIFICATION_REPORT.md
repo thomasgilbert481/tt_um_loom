@@ -151,7 +151,10 @@ cent), DRC, LVS and antenna clean, precheck clean, gate-level tests 100 of
 +5.38 ns setup at the typical corner (the flow's sign-off corner),
 +10.60 ns fast, and -3.53 ns at the slow corner (1.08 V, 125 C) on 96
 endpoints, so the datasheet states 50 MHz at the typical corner and about
-42 MHz over every corner.
+42 MHz over every corner. A second hardening of the unchanged design on
+2026-09-28 (run 36366875261) reproduced every one of these numbers exactly:
+the flow is deterministic for identical inputs, and only the runner's speed
+changed the time (the `gds` job took 5 h 11 min against 5 h 02 min).
 
 The slow corner was worked on twice. The run of 2026-09-20 (35524275302)
 missed it by 2.48 ns on 23 endpoints behind the deadline-latch fire logic.
@@ -226,3 +229,4 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
   survivor added to sections 4, 5 and 7; section 6 and the L5 line follow
   the D-031 hardening.
 - 2026-09-27: section 7 records D-032, slice C not built.
+- 2026-09-28: section 6 records the same-netlist run, 36366875261.

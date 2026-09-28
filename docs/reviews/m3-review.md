@@ -90,11 +90,17 @@ Two readings of the table:
 
 2. **The final `gds` run and six hours.** D-030's fallback, "the last slice
    comes out", now means D-031, and removing it would bring the slow corner
-   back to -6.08 ns. Whether the same inputs reproduce 3 h 54 min is not
-   measured, and neither is how much GitHub's runners vary. Is a same-netlist
-   run before the freeze worth it, to measure that while there is time to
-   act? Is there a fallback other than removing D-031 if the freeze run
-   runs long?
+   back to -6.08 ns. Measured on 2026-09-28 (run 36366875261, the unchanged
+   design hardened again, `docs/AREA.md` "The same netlist twice"): the flow
+   is deterministic, every metric identical to run 35940928210's, so the
+   freeze run of an unchanged design reproduces this netlist; only the
+   runner's speed moves the time, here by 3 per cent (`gds` job 5 h 11 min,
+   detailed routing 4 h 00 min, 49 minutes inside six hours). Is there a
+   fallback other than removing D-031 if the freeze run runs long? And
+   should the workflow pin the Tiny Tapeout action to a commit instead of
+   the `ihp-cmos5l` branch, so that nothing can move underneath the freeze
+   (a change to `gds.yaml` starts a hardening, so it would ride with the
+   freeze run)?
 
 3. **Artefact lifetime.** The runs' artefacts expire after 90 days: run
    35940928210's on 2026-12-23, before the 2027-01-18 deadline. A run on
@@ -124,11 +130,11 @@ Two readings of the table:
    candidate and do the freeze-time evidence on it now (the mutation re-run
    with re-keyed equivalents, the SDF subset). If nothing in `src/` changes
    by 2026-11-08, that evidence is the freeze's evidence unchanged.
-2. Measure before the freeze: one `gds` run of the unchanged design, started
-   by hand (`gh workflow run gds.yaml --ref main`), gives the run-to-run
-   variance of identical inputs and whether the `ihp-cmos5l` action branch
-   has moved since 2026-09-24. Thomas has to start it: the session's attempt
-   to dispatch it was refused by its permission settings.
+2. Done 2026-09-28: Thomas started the same-netlist run by hand (the
+   session's own dispatch was refused by its permission settings). It
+   reproduced every metric and took 3 per cent longer, so the freeze run's
+   risk is the runner's speed and a change in the action, not the design.
+   Pin the action at the freeze, with the freeze run.
 3. Leave the slow corner at its stated number, and leave ISO-1's caveat
    documented, because both fixes are hardware changes on a design that
    D-032 declared complete.

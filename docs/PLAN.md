@@ -398,7 +398,12 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] 2026-11-08: RTL freeze (D-030). Final `gds` run by hand on the freeze
       commit; if it does not finish inside six hours the last slice comes out
       and the run repeats. After the freeze, RTL changes only for a bug found
-      by verification, each with a re-hardening.
+      by verification, each with a re-hardening. Measured 2026-09-28 (run
+      36366875261, the unchanged design again): the flow is deterministic,
+      every metric identical, and the runner's speed moved the `gds` job to
+      5 h 11 min, 49 minutes inside six hours (`docs/AREA.md`, "The same
+      netlist twice"). Its artefacts expire on 2026-12-27, so the freeze run
+      is still needed for the submission.
 - [x] Manchester loopback at the manual-mode rate (L3-MANCH, in place of the
       10 Mbit target, D-029). Done 2026-09-24 by an agent (finished by the
       director after two stalls): `manchester_loopback.loom`, TX thread 0 and
