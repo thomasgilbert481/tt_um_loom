@@ -10,7 +10,7 @@ project:
   # Jane Street competition allocation. The cmos5l flow's largest valid size today
   # is 6x4 (1289.28 x 710.64 um); "8x4" is not in tile_sizes.yaml yet and fails
   # validation. Switch to 8x4 only when Tiny Tapeout adds it (see docs/tt_cmos5l_facts.md).
-  tiles: "6x4"
+  tiles: "8x4"
 
   top_module:  "tt_um_loom"
 
