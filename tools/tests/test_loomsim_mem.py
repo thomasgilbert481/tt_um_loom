@@ -706,3 +706,25 @@ def test_a_loaded_setd_word_never_moves_td():
     regs = machine.threads[0].regs
     assert regs[1] == setd
     assert regs[4] == regs[3]
+
+
+def test_a_pending_store_the_host_writes_follows_mem_ld():
+    """6.11: a host write of debug 0x28 sets MEM_PEND, MEM_LD and MEM_RD and
+    leaves the held address and store word as the thread's last access left
+    them, and ``MEM_LD == 0`` marks a store. After ``ST`` (held word 0xBEEF)
+    and then ``LD`` (held address 0x41), a host-written {MEM_PEND, MEM_LD = 0}
+    therefore completes as a store of 0xBEEF at 0x41. This pins the model's
+    reading of the text; the RTL wrote nothing here until BUGS 11 was fixed
+    (``test_mem.test_mem_forged_pending_store_follows_mem_ld``)."""
+    machine = build([("ST", dict(rd=1, ra=2, imm=0)),
+                     ("LD", dict(rd=3, ra=2, imm=1)),
+                     ("HALT", {})],
+                    data={0x40: 0x1111, 0x41: 0xDA14})
+    run(machine, regs={1: 0xBEEF, 2: 0x40, 3: 0})
+    assert machine.imem[0x40] == 0xBEEF
+    assert machine.threads[0].regs[3] == 0xDA14
+    machine.host_write_debug(0, MEM_REG, mem_word(1, 0, 3))
+    machine.step_cycle()
+    step(machine)
+    assert machine.host_read_debug(0, MEM_REG) == mem_word(0, 0, 3)
+    assert machine.imem[0x41] == 0xBEEF

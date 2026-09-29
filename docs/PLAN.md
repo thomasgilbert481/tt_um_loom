@@ -440,7 +440,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       image never loaded (firmware-m3 item 9, the check `test/tb.v` makes
       on the RTL), and the assembler's listing marks a thread whose reset
       vector holds another section's word or data (item 16).
-- [ ] Mutation re-run on the freeze commit. The 99.7 per cent in M2 was
+- [x] Mutation re-run on the freeze commit. The 99.7 per cent in M2 was
       measured on the M2 RTL; slices A and B, D-028 and D-031 have changed
       `loom_core`, `loom_timer`, `loom_be` and `loom_host_ctl` since, and a
       mutant's id carries its line number (`tools/mutate/operators.py`), so
@@ -458,8 +458,12 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       value) and the 28 in `loom_fifo`, `loom_pins` and `loom_spi_host`,
       whose files are unchanged since the pass and whose outside assumptions
       (`loom_host_ctl` acting on `byte_done` only inside a transaction, the
-      FIFO parameters) still hold. What is left is the run itself: about
-      seven hours at twelve jobs on the laptop, best started when it is idle.
+      FIFO parameters) still hold. Run 2026-09-29 (D-033, on d1ea0ac): 911
+      mutants, 99.9 per cent killed with 60 equivalents set aside; 26 new
+      equivalents documented, eleven holes closed by new tests (seven about
+      threads 1 to 3), and one open survivor that led to BUGS 11, a real
+      RTL/spec divergence at debug 0x28 whose fix waits for Thomas
+      (`docs/VERIFICATION.md`, freeze-time run).
 - [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
       the mutation table, the formal findings, the routing budget, D-024's
       statement that nothing ran on hardware and what stands in for it.

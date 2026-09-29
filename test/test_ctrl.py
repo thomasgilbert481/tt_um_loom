@@ -6,7 +6,7 @@ import cocotb
 from cocotb.triggers import ClockCycles
 
 from spi_host import (
-    LoomHost, ISA, asm, run_snippet, SP_CTRL, CTRL_SFLAGS, CTRL_SFLAGS_CLR,
+    LoomHost, ISA, asm, run_snippet, SP_CTRL, SP_IMEM, CTRL_SFLAGS, CTRL_SFLAGS_CLR,
     DBG_PC, DBG_FLAGS, DBG_RS0, DBG_RS1_DEPTH, DBG_WAIT_ACTIVE, DBG_TD, DBG_DT,
     CSR_FLAGS, CSR_NOW, CSR_TD, CSR_TID, CSR_OUTGRP, CSR_INGRP, CSR_SFLAGS,
     CSR_OD_MASK, CSR_TICK_INT, CSR_TICK_FRAC, CAPS_FIFO, CAPS_BE, CAPS_DMEM,
@@ -425,3 +425,70 @@ async def test_csr_tick_frac_readback(dut):
     assert await host.read_csr(2, CSR_TICK_FRAC) == 0x96
     assert await host.read_csr(1, CSR_TICK_FRAC) == fracs[1], "one thread only"
     assert await host.badop() == 0
+
+
+@cocotb.test()
+async def test_ctrl_reset_clears_flags_and_depth_of_its_thread_only(dut):
+    """`CTRL.RESET` bit t sets thread t's flags to 0 and its `DEPTH` to 0,
+    leaves `RS1` itself alone, and touches nothing of the other threads
+    (SEMANTICS 7). Every thread starts with all three flags set and its own
+    call depth, and each is reset in turn. Added after the freeze-time
+    mutation run: a reset that set Z (loom_core_L1447), left `DEPTH` at 1
+    (L1461) or cleared the wrong thread's `DEPTH` bits (L1461, an index
+    mistake only threads 1 to 3 can see) passed every check."""
+    host = LoomHost(dut)
+    await host.start()
+    depth = {0: 1, 1: 2, 2: 3, 3: 2}
+    rs1 = {t: 0x100 + t for t in range(4)}
+    for victim in range(4):
+        for t in range(4):
+            await host.write_debug(t, DBG_FLAGS, 0b111)
+            await host.write_debug(t, DBG_RS1_DEPTH, (depth[t] << 10) | rs1[t])
+        await host.reset_thread(victim)
+        for t in range(4):
+            flags = await host.read_debug(t, DBG_FLAGS) & 0b111
+            word = await host.read_debug(t, DBG_RS1_DEPTH)
+            want_flags = 0 if t == victim else 0b111
+            want_depth = 0 if t == victim else depth[t]
+            assert flags == want_flags, \
+                f"reset of thread {victim}: thread {t} flags {flags:#05b}, want {want_flags:#05b}"
+            assert (word >> 10) & 3 == want_depth, \
+                f"reset of thread {victim}: thread {t} depth {(word >> 10) & 3}, want {want_depth}"
+            assert word & 0x3FF == rs1[t], \
+                f"thread {t}: RS1 {word & 0x3FF:#05x}, the reset must leave it alone"
+
+
+#: BADOP[15]: the chip refused a host IMEM access (HOST_PROTOCOL).
+BADOP_ACCESS = 1 << 15
+
+
+@cocotb.test()
+async def test_imem_access_is_refused_at_every_phase_while_a_thread_runs(dut):
+    """While a thread runs, a host IMEM write is refused, sets BADOP[15] and
+    changes nothing, whichever of the thread's four clocks the write lands
+    on (SEMANTICS 7). One thread runs alone here, so in three of its four
+    clocks its slot is in D, X or W and in the fourth only in F: a busy term
+    that lost RUN (loom_core_L1550, `|run_r` read as `&run_r`) refused
+    three writes in four and passed every check until the freeze-time
+    mutation run. An idle gap of 1 to 4 clocks before each write spreads the
+    writes over the four phases."""
+    host = LoomHost(dut)
+    await host.start()
+    scratch = 0x7E
+    await host.write(SP_IMEM, scratch, [0x1111])
+    await host.load_program({0x00: asm("JMP", abs=0x00)}, verify=False)
+    await host.set_reset_pc(0, 0x00)
+    await host.reset_thread(0)
+    await host.run(0b0001)
+    for n in range(8):
+        await ClockCycles(dut.clk, 1 + n % 4)
+        await host.clear_badop()
+        await host.write(SP_IMEM, scratch, [0x2000 + n])
+        bad = await host.badop()
+        assert bad & BADOP_ACCESS, \
+            f"write {n}: accepted while thread 0 runs (BADOP {bad:#06x})"
+    await host.halt()
+    await ClockCycles(dut.clk, 20)
+    await host.clear_badop()
+    word = await host.read1(SP_IMEM, scratch)
+    assert word == 0x1111, f"a refused write changed the word to {word:#06x}"

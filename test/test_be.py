@@ -1158,3 +1158,45 @@ async def test_debug_enc_word(dut):
     assert await host.badop() == 0
     mon.stop()
     await ClockCycles(dut.clk, 2)
+
+
+@cocotb.test()
+async def test_be_reload_write_stays_in_its_thread(dut):
+    """`CSRW BE_RELOAD` in thread 1 writes thread 1's `BE_RELOAD` and no
+    other thread's: the bit-engine CSRs are per thread (SEMANTICS 6.9).
+    `BE_RELOAD` does nothing while auto mode is not built (D-032), but it is
+    a readable register. Added after the freeze-time mutation run: a write
+    that ignored the committing thread (loom_be_L0133) passed every check."""
+    host = LoomHost(dut)
+    await host.start()
+    before = {0: 3, 1: 7, 2: 11, 3: 19}
+    for t, v in before.items():
+        await host.write_csr(t, CSR_BE_RELOAD, v)
+    await run_snippet(host, [asm("CSRW", csr=CSR_BE_RELOAD, ra=1)],
+                      thread=1, start=0x40, regs={1: 25})
+    got = {t: await host.read_csr(t, CSR_BE_RELOAD) for t in range(4)}
+    want = {**before, 1: 25}
+    assert got == want, f"BE_RELOAD per thread {got}, want {want}"
+
+
+@cocotb.test()
+async def test_host_be_cfg_write_clears_only_its_threads_encoder_state(dut):
+    """A host write of thread t's `BE_CFG` clears thread t's encoder state
+    and no other thread's: the state is per thread and is cleared by every
+    write to that thread's `BE_CFG` (6.9.1). Added after the freeze-time
+    mutation run: a clear that ignored the host's thread select
+    (loom_be_L0148) passed every check."""
+    host = LoomHost(dut)
+    await host.start()
+    seed = {t: 0x5A ^ (t * 0x11) for t in range(4)}
+    for victim in range(4):
+        enc = {}
+        for t in range(4):
+            await host.write_debug(t, DBG_ENC, seed[t])
+            enc[t] = await host.read_debug(t, DBG_ENC)
+            assert enc[t] != 0, f"thread {t}: the encoder state did not take {seed[t]:#04x}"
+        await host.write_csr(victim, CSR_BE_CFG, 0)
+        got = {t: await host.read_debug(t, DBG_ENC) for t in range(4)}
+        want = {t: (0 if t == victim else enc[t]) for t in range(4)}
+        assert got == want, \
+            f"host BE_CFG write to thread {victim}: encoder state {got}, want {want}"

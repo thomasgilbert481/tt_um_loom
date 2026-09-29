@@ -310,7 +310,7 @@ run it.
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
 | L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD, from 2026-09-23 L3-USB-LS, L3-I2C-S, L3-CAN, and from 2026-09-24 L3-MANCH | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 108 scenarios on the model, 94 on the RTL (the rest marked `model_only` with the reason; all 14 of those pass on the RTL too with `LOOM_FW_SET=model_only`: 2026-09-24, 351 s, and again on 2026-09-26 at 2c8fa48 after the T-1 firmware fixes, 256 s), no divergence between the sides |
 | L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` for all four threads with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit); two harness findings came with slice B, F-6 (properties that took the LD/ST completion slot for an instruction) and F-7 (ISO-1 not comparing slice B's state or a thread's stores) |
-| L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside, every module over MUT-TARGET; no open survivor since 2026-09-24 (the last one killed by a new `test_mem` check); the results section below |
+| L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | M2 full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside; freeze-time run on d1ea0ac (2026-09-29): 911 mutants, 99.9 per cent with 60 equivalents set aside, eleven holes closed by new tests, one open survivor that is a bug (BUGS 11); the two results sections below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |
 
 ## Mutation testing results (L7), 2026-09-21
@@ -389,6 +389,77 @@ re-checked, not copied, and the ladder must list every L1 module.
 Cost for the next pass: a run that skips the 44 recorded equivalents saves
 about 33 CPU-hours of the 68, because an equivalent is a survivor and pays for
 the whole ladder.
+
+## Mutation testing results (L7), freeze-time run, 2026-09-29
+
+The run D-033 allows before the freeze, on d1ea0ac's `src/` (tree 18a484a,
+unchanged since: D-032), with the M2 pass's selection: `tools.mutate run
+--jobs 12 --core-sample 300 --seed 1`, every mutant of the five small modules
+and a stratified 300 of `loom_core`'s 2,252. That is **911 mutants**: slice A
+grew `loom_be` from 181 to 279, and `loom_core`'s sample is a different 300
+because its lines moved. The 44 equivalents were re-keyed first
+(`tools.mutate rekey`, all carried) and their reasons re-read; 34 of them fall
+inside this sample. The check sequence is longer than in M2 (about 19 minutes
+in series against 5, with the slice A and B tests), so a survivor costs more:
+the run took 17.5 hours of wall clock, about 11 of them with the laptop
+asleep, and 740,000 s of check time. Results are in
+`/home/homa/loom_m4_full.jsonl` on the development machine; the table is the
+tool's report with the analysis below applied.
+
+| Module | Mutants | Killed by the run | Killed by the new tests | Equivalent | Open | Kill rate, equivalents excluded |
+|---|---|---|---|---|---|---|
+| `loom_be` | 279 | 277 | 2 | 0 | 0 | 100 % |
+| `loom_core` | 299 | 261 | 8 | 29 | 1 | 99.6 % |
+| `loom_fifo` | 36 | 32 | 0 | 4 | 0 | 100 % |
+| `loom_pins` | 82 | 77 | 0 | 5 | 0 | 100 % |
+| `loom_spi_host` | 57 | 38 | 0 | 19 | 0 | 100 % |
+| `loom_timer` | 158 | 154 | 1 | 3 | 0 | 100 % |
+| **all** | **911** | **839** | **11** | **60** | **1** | **99.9 %** |
+
+Raw, the run killed 92.1 per cent, and `loom_core` alone (88.2 per cent with
+only the carried equivalents set aside) missed MUT-TARGET. Its 38 new
+survivors, one by one:
+
+- **26 equivalents**, each with its reason in `equivalents.json`: 16 reset
+  values of X- and W-stage payload registers that are reloaded on every
+  clock and reach state only through `w_valid` (SCHED-2); two lint sinks;
+  the debug read register's reset value, which the host only ever takes at
+  a read's acknowledge; a redundant `valid_f` in the step-request clear
+  (`valid_f` is `run_r | step_req_r`); three mutants of pin index 13's edge
+  detection, which is not a pin and reads 0 on both sides; `busy_f` and
+  `infl`'s reset value, under the SPI-timing constraint the `infl`
+  equivalents already carry; and a loop bound one past the end of every
+  per-thread vector the loop assigns.
+- **11 holes**, promises no test compared, now each a test that kills the
+  mutants that named it (proved one mutant at a time with `--only`):
+
+| Test | Hole | Mutants it kills |
+|---|---|---|
+| `test_mem.test_ld_and_st_on_every_thread` | `ST` and `LD` from threads 1 to 3: every earlier test used thread 0, so an offset mistake in the per-thread held store word passed | 2 |
+| `test_mem.test_mem_debug_0x28_is_per_thread` | debug 0x28 of threads 1 to 3, read and write | 2 |
+| `test_ctrl.test_ctrl_reset_clears_flags_and_depth_of_its_thread_only` | what `CTRL.RESET` clears (flags, `DEPTH`) and that it clears nothing of another thread's | 3 |
+| `test_ctrl.test_imem_access_is_refused_at_every_phase_while_a_thread_runs` | a host IMEM write while one thread runs, at each of the four clock phases: a busy term that lost `RUN` refused three in four | 1 |
+| `test_be.test_be_reload_write_stays_in_its_thread` | a thread's `CSRW BE_RELOAD` writing every thread's | 1 |
+| `test_be.test_host_be_cfg_write_clears_only_its_threads_encoder_state` | a host `BE_CFG` write clearing every thread's encoder state | 1 |
+| `test_setpd.test_setpd_csrw_td_across_the_half_window` | rule 2 for a `CSRW TD` 20,000 ticks ahead of or behind NOW (only deadlines between 2^14 and 2^15 ticks away tell bit 14 from bit 15) | 1 |
+
+- **1 open, and it is a bug** (BUGS 11). `loom_core_L1417` changes the
+  reset value of `mem_we_all`, a hidden per-thread copy of the access type.
+  Reading why it survived showed that the RTL decides whether a completion
+  stores from that copy, which a host write of debug 0x28 does not touch,
+  where SEMANTICS 6.11 and the golden model decide it from `MEM_LD`; and
+  that an `LD` overwrites the held store word, which 6.11 holds for `ST`
+  only. So a pending store the host writes at debug 0x28 does not store.
+  `test_mem.test_mem_forged_pending_store_follows_mem_ld` fails on the RTL
+  and its twin in `tools/tests/test_loomsim_mem.py` passes on the model; the
+  RTL test runs with `expect_fail` until the fix, which is a hardware change
+  and waits for Thomas's decision.
+
+What this run adds to the M2 lessons: seven of the eleven holes are thread
+1 to 3 or cross-thread behaviour that the suite had only ever checked on
+thread 0 (the rest are the whole effect of a reset, a clock phase and a far
+deadline), and the one bug sat in state the host can write but not fully
+restore. Check the other threads, and read every surviving reset value.
 
 ## What "done" means for a check
 

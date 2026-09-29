@@ -30,6 +30,7 @@ from cocotb.triggers import ClockCycles
 from spi_host import (
     LoomHost, PadMonitor, asm, SP_CTRL, SP_DEBUG, CTRL_PIN_OUT, CTRL_CAPS,
     DBG_LATCH, DBG_TD, DBG_NOW, CSR_TICK_INT, CSR_TICK_FRAC, CAPS_LAT,
+    CSR_NOW, CSR_TD,
 )
 
 OUT0, OUT1, OUT2 = 16, 17, 18
@@ -372,3 +373,47 @@ async def test_setpd_two_threads_one_edge(dut):
         assert not await host.read_debug(3, DBG_LATCH) & LAT_VALID
     mon.stop()
     await ClockCycles(dut.clk, 2)
+
+
+@cocotb.test()
+async def test_setpd_csrw_td_across_the_half_window(dut):
+    """Rule 2 for a `CSRW TD` far from NOW. A deadline set 20000 ticks ahead
+    is not reached, so the staged write waits; one set 20000 ticks behind is
+    reached (the half window is 2^15 ticks, SEMANTICS 4), so the staged write
+    applies at the `CSRW`'s commit edge, before the slot after it. Added
+    after the freeze-time mutation run: rule 2 reading bit 14 of the
+    difference instead of bit 15 (loom_timer_L0121) differs only for
+    deadlines between 2^14 and 2^15 ticks away, which no test set."""
+    host, mon = await fresh(dut)
+    t, base = 3, 0xC0
+    for op, fires in (("ADD", False), ("SUB", True)):
+        await host.write(SP_CTRL, CTRL_PIN_OUT, 0)
+        prog = {base + 0: setpd(OUT0, 1),                  # staged
+                base + 1: asm("CSRR", rd=1, csr=CSR_NOW),
+                base + 2: asm(op, rd=1, ra=1, rb=2),       # NOW +- 20000
+                base + 3: asm("CSRW", csr=CSR_TD, ra=1),   # a rule-2 TD write
+                base + 4: setp(OUT1, 1),                   # the next slot
+                base + 5: asm("HALT")}
+        await host.load_program(prog, verify=False)
+        await host.set_reset_pc(t, base)
+        await host.reset_thread(t)
+        await host.write_reg(t, 2, 20000)
+        start = mon.now
+        await host.run(1 << t)
+        await host.wait_halted(1 << t)
+        marker = rises(mon, 1, start)
+        out0 = rises(mon, 0, start)
+        lat = await host.read_debug(t, DBG_LATCH)
+        assert len(marker) == 1, f"{op}: marker rises {marker}"
+        if fires:
+            assert len(out0) == 1 and out0[0] < marker[0], \
+                f"{op}: a deadline 20000 ticks behind is reached, the staged " \
+                f"write applies at the CSRW commit; OUT0 rose at {out0}, marker {marker}"
+            assert not lat & LAT_VALID, f"{op}: latch {lat:#04x}, the write was applied"
+        else:
+            assert out0 == [], \
+                f"{op}: a deadline 20000 ticks ahead is not reached; OUT0 rose at {out0}"
+            assert lat & LAT_VALID, f"{op}: latch {lat:#04x}, the write must still be staged"
+    mon.stop()
+    await ClockCycles(dut.clk, 2)
+

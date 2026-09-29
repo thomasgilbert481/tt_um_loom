@@ -559,6 +559,102 @@ class _FlopsDut:
         self._log = tb._log
 
 
+# ------------------------------------------------------------ every thread
+#: Program bases for the four threads, inside the memory map above.
+BASES = (PROG0, PROG1, PROG23, PROG23 + 8)
+
+
+@cocotb.test()
+async def test_ld_and_st_on_every_thread(dut):
+    """`ST` and `LD` work from every thread, not only thread 0: the held
+    store word and `MEM_RD` are per-thread state (6.11), so a store from
+    thread t writes the word thread t held. Each thread stores its own value
+    and loads it back, and the host reads all four. Added after the
+    freeze-time mutation run: offset mistakes in the per-thread held word
+    (loom_core_L0259, L1513) passed every check, because every earlier
+    `LD`/`ST` ran on thread 0."""
+    host = await fresh(dut)
+    await seed_data(host)
+    await host.clear_badop()
+    values = [0xA808 | (t * 0x0111) for t in range(4)]      # distinct, non-zero
+    for t in range(4):
+        await run_snippet(host, [asm("ST", rd=1, ra=2, imm=8 + t),
+                                 asm("LD", rd=4, ra=2, imm=8 + t)],
+                          thread=t, start=BASES[t],
+                          regs={1: values[t], 2: DATA, 4: 0x5555})
+        got = await host.read_reg(t, 4)
+        assert got == values[t], \
+            f"thread {t}: LD after ST gave {got:#06x}, it stored {values[t]:#06x}"
+    back = await host.read(SP_IMEM, DATA + 8, 4)
+    assert back == values, \
+        f"host readback {[hex(w) for w in back]}, stored {[hex(w) for w in values]}"
+    assert await host.badop() == 0
+
+
+@cocotb.test()
+async def test_mem_debug_0x28_is_per_thread(dut):
+    """Each thread's debug 0x28 reads back what was written to it, and a
+    write to one thread's leaves the other three alone (6.11, HOST_PROTOCOL
+    SPACE 4). Added after the freeze-time mutation run: an offset mistake in
+    the per-thread `MEM_RD` field on the read side or the write side
+    (loom_core_L1222, L1519) passed every check, which used thread 0 only.
+    No thread is stepped, so the pending bits written here start nothing."""
+    host = await fresh(dut)
+    values = [MEM_LD | 5, MEM_PEND | 2, MEM_PEND | MEM_LD | 7, 3]
+    for t in range(4):
+        await host.write_debug(t, DBG_MEM, values[t])
+    got = [await host.read_debug(t, DBG_MEM) for t in range(4)]
+    assert got == values, \
+        f"debug 0x28 per thread {[hex(v) for v in got]}, wrote {[hex(v) for v in values]}"
+    for t in range(4):
+        new = values[t] ^ 0x07
+        await host.write_debug(t, DBG_MEM, new)
+        got = [await host.read_debug(u, DBG_MEM) for u in range(4)]
+        want = [new if u == t else values[u] for u in range(4)]
+        assert got == want, \
+            f"after writing thread {t}: {[hex(v) for v in got]}, want {[hex(v) for v in want]}"
+        await host.write_debug(t, DBG_MEM, values[t])
+    for t in range(4):
+        await host.write_debug(t, DBG_MEM, 0)
+
+
+#: BUGS 11: the RTL decides whether a completion stores from a hidden copy of
+#: the access type, which a host write of debug 0x28 does not touch, and an
+#: `LD` overwrites the held store word. Until the RTL follows `MEM_LD` this
+#: test must fail; `expect_fail` keeps it running as evidence without turning
+#: the suite red, and the fix removes the flag. The golden model already
+#: passes it (tools/tests/test_loomsim_mem.py).
+BUGS_11_OPEN = True
+
+
+@cocotb.test(expect_fail=BUGS_11_OPEN)
+async def test_mem_forged_pending_store_follows_mem_ld(dut):
+    """A host write of debug 0x28 sets `MEM_PEND`, `MEM_LD` and `MEM_RD` and
+    leaves the held address and store word as the thread's last access left
+    them (6.11); `MEM_LD == 0` marks a store. So a pending access the host
+    writes with `MEM_LD == 0` completes as a store of the held store word at
+    the held address, whatever access set them. Here the last `ST` stored
+    0xBEEF and the last access, an `LD`, held DATA + 1: after the host writes
+    {MEM_PEND, MEM_LD = 0} and steps the thread, DATA + 1 holds 0xBEEF."""
+    host = await fresh(dut)
+    words = await seed_data(host)
+    await arm(host, {PROG0: asm("ST", rd=1, ra=2, imm=0),
+                     PROG0 + 1: asm("LD", rd=3, ra=2, imm=1),
+                     PROG0 + 2: asm("HALT")},
+              regs={1: 0xBEEF, 2: DATA, 3: 0})
+    await host.run(0b0001)
+    await host.wait_halted(0b0001)
+    assert await host.read1(SP_IMEM, DATA) == 0xBEEF
+    assert await host.read_reg(0, 3) == words[1]
+    await host.write_debug(0, DBG_MEM, MEM_PEND | 3)       # MEM_LD = 0: a store
+    await host.step(0)
+    await ClockCycles(dut.clk, 20)
+    assert await host.read_debug(0, DBG_MEM) & MEM_PEND == 0
+    got = await host.read1(SP_IMEM, DATA + 1)
+    assert got == 0xBEEF, \
+        f"DATA + 1 holds {got:#06x}: the pending store did not write the held word 0xBEEF"
+
+
 #: The gate-level netlist is the MACRO build and has no FLOPS instance.
 ABSENT = os.environ.get("GATES", "").lower() == "yes"
 

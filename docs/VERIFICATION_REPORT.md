@@ -41,7 +41,7 @@ covers by construction.
 | L3 protocol tests | the firmware programs (UART TX/RX, SPI master and slave, I2C master and a 24C02-style I2C EEPROM slave, WS2812, PS/2 host, JTAG and SWD masters, a CAN 2.0A node, a USB low-speed HID device, a Manchester loopback) against Python protocol models, the same test bodies on the model and on the RTL through the real SPI pads | `tools/tests/test_fw_*.py`, `test/test_fw.py` |
 | L5 gate level | the whole cocotb suite on the hardened netlist with the foundry's cell models, in CI on every hardening | `gl_test` job; `scripts/gl/` locally |
 | L4 formal | 19 properties on the scheduler, FIFOs, timer, pins, SPI port and decoder, unbounded where the engine closes them | `formal/`, `scripts/formal.sh` |
-| L7 mutation | 823 one-line faults in the RTL, each run against the suite until something fails | `tools/mutate` |
+| L7 mutation | one-line faults in the RTL, each run against the suite until something fails: 823 in the M2 pass, 911 in the freeze-time run | `tools/mutate` |
 
 ## 3. Method: one contract, two independent implementations
 
@@ -109,16 +109,19 @@ miss". The state on 2026-09-22 is:]
 - L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 100 of
   100 on the last full hardening (run 35940928210; the one test of the
   flop-memory build is skipped there).
-- L7 mutation: 823 mutants, 99.7 per cent killed with 44 documented
-  equivalents set aside (`tools/mutate/equivalents.json` gives each its
-  reason), every module at 98.8 per cent or better; no open survivor since
-  2026-09-24 (section 5).
+- L7 mutation: the M2 pass, 823 mutants, 99.7 per cent killed with 44
+  documented equivalents set aside (`tools/mutate/equivalents.json` gives
+  each its reason). The freeze-time run on d1ea0ac (2026-09-29, D-033): 911
+  mutants, 99.9 per cent killed with 60 equivalents set aside, every module
+  at 99.6 per cent or better, after eleven holes it found were closed by new
+  tests; its one open survivor led to a real bug, BUGS 11 (section 5).
 
 ## 5. What verification found
 
-The ledger in `docs/BUGS.md` has five rows at the time of writing; the
-formal findings are F-1 to F-3 in `formal/README.md`; the mutation pass
-found eight holes in the test suite. Per layer:
+The ledger in `docs/BUGS.md` has eleven rows (2026-09-29); the formal
+findings are F-1 to F-7 in `formal/README.md`; the M2 mutation pass found
+eight holes in the test suite and the freeze-time run eleven more and one
+bug. Per layer:
 
 | Found by | What | Where recorded |
 |---|---|---|
@@ -131,6 +134,8 @@ found eight holes in the test suite. Per layer:
 | L4 formal, SPI-1 | a reset while SCK is high inserts a phantom edge; the host protocol now says to release CS_n around a reset | F-3, HOST_PROTOCOL |
 | Deadline checker, T-1 | the budget after a `SETD` assumed the `SETD` ran on its tick; three programs had real timing faults it hid (a UART start bit 4 clocks short after some idle gaps, JTAG TCK at 36/28 clocks on 26 of 87 half periods, SWD high phases of 20 and 28 clocks where 32 were meant) | T-1, VERIFICATION.md; each program fixed with an edge-by-edge test |
 | L7 mutation | eight promises no test compared (debug-register cross-talk, `CSRR TICK_FRAC`, `BE_CFG` readback, MISO idle level, CS_n rising mid-byte, `PIN_IN[15:13]`, `TICK_INT = 0` and long periods, `CTRL.RESET` setting TD) | VERIFICATION.md L7 table |
+| L7 mutation, freeze-time run | eleven more, seven of them about threads 1 to 3 or another thread's state (`LD`/`ST` and debug 0x28 on threads 1 to 3, what `CTRL.RESET` clears per thread, per-thread bit-engine CSRs, host IMEM access at every clock phase, a `CSRW TD` far from NOW) | VERIFICATION.md L7, freeze-time run |
+| L7 mutation, freeze-time run | **a real bug**: a pending store the host writes at debug 0x28 does not store, because the RTL keeps a hidden copy of the access type (reachable only through that debug write) | BUGS 11, open |
 
 No mutant survives without a documented reason. The last one, in
 `loom_timer`, had been read as reachable only through a CTRL.RESET of a
@@ -188,8 +193,10 @@ D-031's run routed in 3 h 54 min, six minutes inside it.
   (F-4: the port, the register-file write port and the staged-write port
   are shared, as HOST_PROTOCOL already states). WAIT-1's bound is bounded
   at depth 40, not proved unbounded.
-- The mutation score is from the M2 RTL; it is re-measured on the freeze
-  commit, with every equivalent's reason re-checked (section 5).
+- BUGS 11 is open: a pending access the host writes at debug 0x28
+  completes by a hidden copy of the access type rather than by `MEM_LD`.
+  Only a host write that disagrees with the thread's last access reaches
+  it; the fix is a hardware change waiting for Thomas's decision.
 - The slow corner does not close at 20 ns (section 6); the datasheet states
   both clocks.
 - Not attempted: 10 Mbit Ethernet, 10 Mbit Manchester (D-029).
@@ -230,3 +237,5 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
   the D-031 hardening.
 - 2026-09-27: section 7 records D-032, slice C not built.
 - 2026-09-28: section 6 records the same-netlist run, 36366875261.
+- 2026-09-29: sections 2, 4, 5 and 7 record the freeze-time mutation run
+  and BUGS 11.
