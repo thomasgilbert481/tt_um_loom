@@ -489,12 +489,18 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       subset: one scenario per protocol, run overnight on the freeze netlist.
 - [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
       measured slow-corner clock, both with their slack.
-- [ ] Four protocols at once (M3 review): four programs on four threads,
+- [x] Four protocols at once (M3 review): four programs on four threads,
       pins remapped so they do not collide, each protocol's timing checked
       on the RTL against its single-thread run. The claim that one thread
       cannot disturb another's timing is proved (ISO-1) and tested with
       synthetic loops, but no test runs real protocols side by side. Before
-      the firmware freeze; no hardware change.
+      the firmware freeze; no hardware change. Done 2026-10-06:
+      `tools/tests/test_fw_four_at_once.py`, UART TX, SPI master, I2C master
+      and WS2812 on threads 0 to 3, each the shipped program with only its
+      thread and pins changed; every run makes the same host transactions
+      and differs only in the RUN mask, and each protocol's edges are the
+      same clocks with all four running as alone, on the model and on the
+      RTL (70 s).
 - [x] 8x4, when the organisers confirm it for the shuttle (D-034, adopted 2026-10-06 by Thomas, who took the organisers' 2026-09-28 answer as the confirmation; switched on main the same day, its hardening is the check): a DECISIONS entry
       and the `tiles` line on main (with the stale comment above it in
       `info.yaml`); the branch run 36427897067 already passed every job at

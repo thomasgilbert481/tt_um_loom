@@ -99,6 +99,19 @@ loom.run(0)
 words = loom.pop(0, 4)                              # four received frames
 ```
 
+## Four at once
+
+`tools/tests/test_fw_four_at_once.py` runs four of these programs side by
+side, one per thread, each in its own quarter of the memory and on its own
+pins: `uart_tx_fifo` on thread 0 (TX = OUT0), `spi_master` on thread 1 (MOSI
+= OUT1, SCK = OUT2, CS_n = OUT3, MISO = IN0, its `OUTGRP` moved with its
+pins), `i2c_master` on thread 2 (BIDIR0, BIDIR1) and `ws2812` on thread 3
+(DOUT = OUT4). Nothing else in the sources changes: the test rewrites the
+`.thread` and `.pins` lines and assembles each for the 512-word memory. With
+the same host transactions before RUN, every pin edge of each protocol is on
+the same clock with all four running as when it runs alone, which is the
+claim the barrel pipeline makes (SEMANTICS 2, ISO-1).
+
 ## uart_tx_fifo.loom: UART transmitter fed from INQ
 
 - **Host command** (push to thread 0): one word per byte; bits 7:0 are sent,

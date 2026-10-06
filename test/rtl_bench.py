@@ -52,7 +52,10 @@ Why the design is what it is
   with ``x_cycle`` = W cycle - 1 and the mnemonic decoded through
   ``tools.loomisa``, or ``None`` in a bubble cycle, as the model's
   ``step_cycle`` returns them. The record is read only while an observer is
-  registered.
+  registered. On the gate-level netlist (``make GATES=yes``, the SDF runs of
+  ``scripts/gl/run.sh``) there is no ``u_loom`` hierarchy and so no retire
+  record: observers always get ``None`` there, and only scenarios that
+  judge the pins mean anything at gate level.
 
 Differences from ``Bench`` that a test can see:
 
@@ -162,9 +165,12 @@ class RtlBench:
         self._half = Timer(HALF_NS, unit="ns")   # one trigger, reused
         self._ui = self._uio = -1
         self._mnemonic = {}
-        loom = dut.user_project.u_loom
-        self._tr = (loom.tr_valid, loom.tr_thread, loom.tr_pc, loom.tr_ir, loom.tr_done,
-                    loom.tr_we, loom.tr_rd, loom.tr_val, loom.tr_flags, loom.tr_next_pc)
+        try:
+            loom = dut.user_project.u_loom
+            self._tr = (loom.tr_valid, loom.tr_thread, loom.tr_pc, loom.tr_ir, loom.tr_done,
+                        loom.tr_we, loom.tr_rd, loom.tr_val, loom.tr_flags, loom.tr_next_pc)
+        except AttributeError:
+            self._tr = None                 # the gate-level netlist: pins only
         resume(self._reset)(reset_cycles)
 
     # --------------------------------------------------------------- setup
@@ -231,7 +237,7 @@ class RtlBench:
 
     def _record(self, cycle: int) -> Optional[RetireRecord]:
         tr = self._tr
-        if not _int(tr[0]):
+        if tr is None or not _int(tr[0]):
             return None
         ir = _int(tr[3])
         mnemonic = self._mnemonic.get(ir, False)

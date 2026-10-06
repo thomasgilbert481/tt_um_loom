@@ -75,8 +75,10 @@ miss". The state on 2026-09-22 is:]
   so every built feature is exercised; 553 coverage bins, 33 empty with a
   recorded reason each; four of five hand-written mutants killed at the first
   seed.
-- L3 protocol: 108 scenarios on the model and 94 on the RTL across
-  thirteen programs (the 14 left out of the routine RTL run are slow cases, each
+- L3 protocol: 109 scenarios on the model and 95 on the RTL across
+  thirteen programs, one of them four programs at once, one per thread,
+  whose pin edges each fall on the same clock as when that program runs
+  alone (`test_fw_four_at_once`: ISO-1 on the pins; the 14 left out of the routine RTL run are slow cases, each
   marked with the reason: 115200-baud UART reception, most of the SPI mode
   sweep, the longest PS/2 frames, the USB host at +-0.25 per cent of the bit
   rate, the 257-byte EEPROM read; all 14 pass on the RTL in a separate run,
