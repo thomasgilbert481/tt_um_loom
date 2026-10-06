@@ -774,7 +774,7 @@ M4's freeze item and M5's release item carry it. The M3 review is
 `docs/reviews/m3-review.md`. It was not independent: Thomas asked for it in
 the directing session, which also wrote its brief.
 
-## D-034 2026-09-28 Opus 5.5 (M3 review), proposed: 8x4 once the organisers confirm it
+## D-034 2026-09-28 Opus 5.5 (M3 review), proposed; adopted 2026-10-06 by Thomas: 8x4
 
 Proposal: when the organisers confirm 8x4 for the shuttle, main moves to
 it: `tiles: "8x4"` and the stale comment above it in `info.yaml`, one
@@ -795,3 +795,13 @@ then.
 Consequences: branch `exp-8x4` stays as the evidence and is not merged; the
 switch is its own commit on main. The SDF subset is produced on whichever
 block is final.
+Adopted 2026-10-06 by Thomas, who reads the organisers' answer of
+2026-09-28 ("8x4 is looking likely", expected within weeks and ahead of
+the freeze) as their confirmation. Main switches now rather than waiting
+for the announcement: `tiles: "8x4"`, with the stale comment above it in
+`info.yaml` rewritten. The design is e52759a's (the BUGS 11 fix), whose
+6x4 hardening passed every job, so this commit's hardening changes the
+block only, one change as D-025 asks. If the organisers end up not
+taking 8x4, the `tiles` line goes back: the 6x4 result is known
+(run 37475045879).
+

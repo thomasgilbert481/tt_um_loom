@@ -495,7 +495,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       cannot disturb another's timing is proved (ISO-1) and tested with
       synthetic loops, but no test runs real protocols side by side. Before
       the firmware freeze; no hardware change.
-- [ ] 8x4, when the organisers confirm it for the shuttle (D-034, proposed): a DECISIONS entry
+- [x] 8x4, when the organisers confirm it for the shuttle (D-034, adopted 2026-10-06 by Thomas, who took the organisers' 2026-09-28 answer as the confirmation; switched on main the same day, its hardening is the check): a DECISIONS entry
       and the `tiles` line on main (with the stale comment above it in
       `info.yaml`); the branch run 36427897067 already passed every job at
       8x4 with the macro and stripe keys unchanged. Its datasheet numbers
@@ -839,3 +839,8 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   threads, the fix's six new mutants, and the equivalents re-keyed with the
   new `rekey --from-rev`. Pushing the fix starts its 6x4 hardening, which is
   the check D-025 and D-033 ask for.
+- 2026-10-06, Opus 5.5: Thomas said to begin all three remaining items and
+  to treat 8x4 as confirmed. Main moves to 8x4 (D-034 adopted) on the BUGS
+  11 fix's design, so the hardening changes the block only; then the
+  four-protocol demo, and the timing-annotated gate-level subset on the
+  8x4 netlist once that run is in.
