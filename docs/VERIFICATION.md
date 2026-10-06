@@ -451,9 +451,13 @@ survivors, one by one:
   that an `LD` overwrites the held store word, which 6.11 holds for `ST`
   only. So a pending store the host writes at debug 0x28 does not store.
   `test_mem.test_mem_forged_pending_store_follows_mem_ld` fails on the RTL
-  and its twin in `tools/tests/test_loomsim_mem.py` passes on the model; the
-  RTL test runs with `expect_fail` until the fix, which is a hardware change
-  and waits for Thomas's decision.
+  and its twin in `tools/tests/test_loomsim_mem.py` passes on the model.
+  Fixed on 2026-10-05 (BUGS 11): the completion stores when `MEM_LD` is 0,
+  only an `ST` replaces the held word, and `mem_we_all` and its mutant are
+  gone. The fix's six new mutants (the changed `imem_we` line, the new
+  `if (w_mem_st)`, the rewritten store-word line) were run with `--only`,
+  and the 70 equivalents were re-keyed to the fixed source
+  (`tools.mutate rekey --from-rev`, all carried).
 
 What this run adds to the M2 lessons: seven of the eleven holes are thread
 1 to 3 or cross-thread behaviour that the suite had only ever checked on

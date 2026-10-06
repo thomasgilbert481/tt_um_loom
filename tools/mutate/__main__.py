@@ -5,7 +5,7 @@ Command line for the L7 mutation tool (`docs/VERIFICATION.md`, MUT-RUN).
     python -m tools.mutate run  --jobs 8 --out r.jsonl
     python -m tools.mutate report r.jsonl             # the L7 tables
     python -m tools.mutate show <mutant id>           # one mutant's diff
-    python -m tools.mutate rekey r.jsonl [--write]    # carry equivalents to moved lines
+    python -m tools.mutate rekey --from-rev HEAD      # carry equivalents to moved lines
 
 `run` must be started from a shell that has sourced `scripts/dev_env.sh`, so
 Verilator, Icarus and cocotb are on PATH. It never writes to `src/`.
@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 import time
 from typing import List, Optional, Sequence
@@ -26,6 +27,7 @@ from tools.mutate.operators import (
     Mutation,
     iter_operator_counts,
     mutations_for_file,
+    mutations_for_text,
 )
 from tools.mutate.report import (
     EQUIVALENTS_PATH,
@@ -258,8 +260,18 @@ def cmd_rekey(args) -> int:
     for name in args.results:
         for r in load_results(pathlib.Path(name)):
             records[r.mutation.ident] = r.mutation
+    if args.from_rev:
+        # The mutants the source had at that revision, which is what an id
+        # keyed against it names: exact, and needs no saved results file.
+        for module in sorted({i.split("_L", 1)[0] for i in equivalents}):
+            rel = "src/%s.v" % module
+            text = subprocess.run(
+                ["git", "show", "%s:%s" % (args.from_rev, rel)], cwd=str(REPO),
+                check=True, capture_output=True, text=True).stdout
+            for m in mutations_for_text(text, rel, defines=args.define):
+                records.setdefault(m.ident, m)
     if not records:
-        raise SystemExit("no results in %s" % ", ".join(args.results))
+        raise SystemExit("no records: give a results file or --from-rev")
     modules = sorted({records[i].module for i in equivalents if i in records})
     current = collect(modules, None, args.define)
     result = rekey(equivalents, records, current)
@@ -321,7 +333,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     kp = sub.add_parser(
         "rekey", help="move equivalents.json entries whose lines only moved to their new ids"
     )
-    kp.add_argument("results", nargs="+", help="results file(s) of the run that documented them")
+    kp.add_argument("results", nargs="*", help="results file(s) of the run that documented them")
+    kp.add_argument(
+        "--from-rev", default="",
+        help="git revision the ids were keyed against; its source supplies the records",
+    )
     kp.add_argument("--define", action="append", default=[], help="a macro to treat as defined")
     kp.add_argument("--write", action="store_true", help="rewrite equivalents.json")
     kp.set_defaults(func=cmd_rekey)

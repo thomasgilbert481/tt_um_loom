@@ -88,3 +88,24 @@ def test_the_real_mutator_after_a_line_is_inserted_above():
     assert {r.status for r in result} == {"moved"}
     assert sorted(carried(eq, result)) == sorted(m.ident for m in after)
     assert summary(result) == "%d moved" % len(before)
+
+
+def test_equivalents_are_keyed_to_the_current_source():
+    """Every id in equivalents.json is a mutant the source in `src/` makes
+    now. An edit to `src/` that moves a documented line fails here until
+    `python -m tools.mutate rekey --from-rev <the revision it was keyed
+    against> --write` carries the entries along."""
+    from tools.mutate.__main__ import collect
+    from tools.mutate.report import load_equivalents
+    from tools.mutate.runner import TARGET_MODULES
+    ids = {m.ident for m in collect(list(TARGET_MODULES), None, [])}
+    stale = sorted(set(load_equivalents()) - ids)
+    assert stale == [], "equivalents.json names mutants the source no longer has: %s" % stale
+
+
+def test_rekey_from_a_git_revision_runs(capsys):
+    """`rekey --from-rev HEAD` builds its records from `git show HEAD:src/...`
+    (no results file needed) and finds every module's mutants there."""
+    from tools.mutate.__main__ import main
+    assert main(["rekey", "--from-rev", "HEAD"]) == 0
+    assert "documented equivalents" in capsys.readouterr().out

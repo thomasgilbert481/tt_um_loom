@@ -225,10 +225,12 @@ module loom_core #(
   reg [3:0]  lat_valid_all, lat_val_all;   // deadline latch (6.10)
   reg [19:0] lat_pin_all;
   // Data memory (6.11). Per thread: MEM_PEND, MEM_LD and MEM_RD[2:0] of
-  // section 5, and the access itself - the address, the word an ST writes
-  // and the write bit - held until the thread's next valid slot takes it.
-  // MEM_PEND is the valid bit of the held access.
-  reg [3:0]  mem_pend_all, mem_ld_all, mem_we_all;
+  // section 5, and the access itself - the address and the word an ST
+  // writes - held until the thread's next valid slot takes it. MEM_PEND is
+  // the valid bit of the held access, and MEM_LD == 0 is what makes it a
+  // store, also when the host wrote it at debug 0x28 (BUGS 11: a hidden
+  // copy of the access type used to decide).
+  reg [3:0]  mem_pend_all, mem_ld_all;
   reg [11:0] mem_rd_all;
   reg [4*IMEM_AW-1:0] mem_addr_all;
   reg [63:0] mem_data_all;
@@ -255,7 +257,7 @@ module loom_core #(
 
   assign imem_addr  = mem_fetch ? mem_f_addr : pc_f[IMEM_AW-1:0];
   assign imem_en    = valid_f;
-  assign imem_we    = mem_fetch & mem_we_all[ph];
+  assign imem_we    = mem_fetch & ~mem_ld_all[ph];
   assign imem_wdata = mem_data_all[fsel*16 +: 16];
 
   // ============================================================= D stage
@@ -1414,7 +1416,6 @@ module loom_core #(
       lat_pin_all   <= 20'd0;
       mem_pend_all  <= 4'd0;
       mem_ld_all    <= 4'd0;
-      mem_we_all    <= 4'd0;
       mem_rd_all    <= 12'd0;
       mem_addr_all  <= {(4*IMEM_AW){1'b0}};
       mem_data_all  <= 64'd0;
@@ -1503,14 +1504,16 @@ module loom_core #(
         // three section-5 fields at debug 0x28 while the thread is halted
         // and leaves the held address and store word alone, and CTRL.RESET
         // or a debug PC write clears MEM_PEND only, so a thread never
-        // completes an access it did not start (SEMANTICS 7).
+        // completes an access it did not start (SEMANTICS 7). Only an ST
+        // replaces the held store word; an LD holds its address alone, so a
+        // pending store the host writes stores the last ST's word (BUGS 11).
         if (cw_pc[i] & w_mem_req) begin
           mem_pend_all[i]      <= 1'b1;
           mem_ld_all[i]        <= ~w_mem_st;
-          mem_we_all[i]        <= w_mem_st;
           mem_rd_all[i*3 +: 3] <= w_rd;
           mem_addr_all[i*IMEM_AW +: IMEM_AW] <= w_mem_addr;
-          mem_data_all[i*16 +: 16]           <= w_rval;
+          if (w_mem_st)
+            mem_data_all[i*16 +: 16]         <= w_rval;
         end else if (cw_pc[i] & w_mem_done) begin
           mem_pend_all[i]      <= 1'b0;
         end else if (dbg_we[i] & dw_mem) begin

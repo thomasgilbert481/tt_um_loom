@@ -462,8 +462,11 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       mutants, 99.9 per cent killed with 60 equivalents set aside; 26 new
       equivalents documented, eleven holes closed by new tests (seven about
       threads 1 to 3), and one open survivor that led to BUGS 11, a real
-      RTL/spec divergence at debug 0x28 whose fix waits for Thomas
-      (`docs/VERIFICATION.md`, freeze-time run).
+      RTL/spec divergence at debug 0x28 (`docs/VERIFICATION.md`,
+      freeze-time run). Fixed 2026-10-05 at Thomas's go-ahead (the RTL
+      follows `MEM_LD`; four flops fewer), re-verified on both backends and
+      in formal, and hardened by the fix's own `gds` run. That fix commit's
+      `src/` is the new freeze candidate.
 - [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
       the mutation table, the formal findings, the routing budget, D-024's
       statement that nothing ran on hardware and what stands in for it.
@@ -824,3 +827,11 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   request: M3 closed, D-033 and D-034 (proposed), the four-protocol demo
   added. Next: 8x4 when the organisers confirm it, the mutation run and the
   SDF subset on idle nights, the four-protocol demo.
+- 2026-10-05 to 2026-10-06, Opus 5.5: BUGS 11 fixed at Thomas's go-ahead.
+  `loom_core` stores when `MEM_LD` is 0 and only an `ST` replaces the held
+  word; `mem_we_all` is gone. SEMANTICS 6.11 says it outright. Verified: the
+  BUGS 11 test passes without `expect_fail`, the full RTL suite (209
+  tests), every formal group as recorded, ISO-1 re-proved for all four
+  threads, the fix's six new mutants, and the equivalents re-keyed with the
+  new `rekey --from-rev`. Pushing the fix starts its 6x4 hardening, which is
+  the check D-025 and D-033 ask for.

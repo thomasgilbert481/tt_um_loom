@@ -459,7 +459,6 @@ module loom_iso_miter #(
     assert (u_a.u_view.s_mpend == u_b.u_view.s_mpend);
     assert (u_a.u_view.s_mld   == u_b.u_view.s_mld);
     assert (u_a.u_view.s_mrd   == u_b.u_view.s_mrd);
-    assert (u_a.u_view.s_mwe   == u_b.u_view.s_mwe);
     assert (u_a.u_view.s_maddr == u_b.u_view.s_maddr);
     assert (u_a.u_view.s_mdata == u_b.u_view.s_mdata);
     assert (u_a.u_view.s_mp_en    == u_b.u_view.s_mp_en);

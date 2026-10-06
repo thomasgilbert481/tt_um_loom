@@ -109,7 +109,6 @@ module loom_iso_view #(
     // ------------------------------------- data memory (6.11, slice B)
     input wire [3:0]  mem_pend_all,
     input wire [3:0]  mem_ld_all,
-    input wire [3:0]  mem_we_all,
     input wire [11:0] mem_rd_all,
     input wire [4*AW-1:0] mem_addr_all,
     input wire [63:0] mem_data_all,
@@ -237,12 +236,12 @@ module loom_iso_view #(
   wire [4:0]  s_latpin  = lat_pin_all[5*T +: 5];
 
   // Data memory (6.11, slice B): MEM = {MEM_PEND, MEM_LD, MEM_RD} of
-  // SEMANTICS 5, and the held access (address, store word, write bit),
-  // which is thread T's state although the host cannot read it. All reset.
+  // SEMANTICS 5, and the held access (address and store word; MEM_LD says
+  // whether it stores, BUGS 11), which is thread T's state although the
+  // host cannot read it. All reset.
   wire          s_mpend = mem_pend_all[T];
   wire          s_mld   = mem_ld_all[T];
   wire [2:0]    s_mrd   = mem_rd_all[3*T +: 3];
-  wire          s_mwe   = mem_we_all[T];
   wire [AW-1:0] s_maddr = mem_addr_all[AW*T +: AW];
   wire [15:0]   s_mdata = mem_data_all[16*T +: 16];
   // Thread T's use of the memory port, in its own F cycle (SEMANTICS 2: a
@@ -415,7 +414,7 @@ module loom_iso_view #(
   wire c_t_latw     = |lw_out_mask;
   wire c_pipe_full  = vd && vx && w_valid;
   wire c_t_store    = s_mp_we;                         // T's ST stores
-  wire c_t_load     = s_mp_en && s_mpend && !s_mwe;    // T's LD reads
+  wire c_t_load     = s_mp_en && s_mpend && s_mld;     // T's LD reads
 
 endmodule
 
@@ -444,7 +443,7 @@ bind loom_core loom_iso_view #(.T(`ISO_T), .FAW(2), .AW(IMEM_AW)) u_view (
     .swirq_r(swirq_r), .lat_valid_all(lat_valid_all),
     .lat_val_all(lat_val_all), .lat_pin_all(lat_pin_all),
     .mem_pend_all(mem_pend_all), .mem_ld_all(mem_ld_all),
-    .mem_we_all(mem_we_all), .mem_rd_all(mem_rd_all),
+    .mem_rd_all(mem_rd_all),
     .mem_addr_all(mem_addr_all), .mem_data_all(mem_data_all),
     .imem_en(imem_en), .imem_we(imem_we), .imem_addr(imem_addr),
     .imem_wdata(imem_wdata),

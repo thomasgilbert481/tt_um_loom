@@ -533,7 +533,11 @@ the other threads do.
 `MEM = {MEM_PEND, MEM_LD, MEM_RD[2:0]}` is per-thread state (section 5),
 readable and writable at debug 0x28; a host write there sets those three
 bits and leaves the held address and store word as the thread's last access
-left them. `CTRL.RESET` and a debug write of `PC` clear `MEM_PEND` and
+left them. A completion stores exactly when `MEM_LD` is 0 at that slot,
+whoever wrote it, and the store word is the one the thread's last `ST` held
+(an `LD` holds its address only). (BUGS 11: until 2026-10-05 the RTL decided
+the store from a hidden copy of the access type and let an `LD` replace the
+held word; the golden model followed this text.) `CTRL.RESET` and a debug write of `PC` clear `MEM_PEND` and
 nothing else (section 7), so a thread never completes an access it did not
 start. Host IMEM access stays as section 7 says: it needs no slot in
 flight, and a data access is a valid slot. A word written by `ST` is an

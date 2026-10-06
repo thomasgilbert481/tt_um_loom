@@ -618,16 +618,7 @@ async def test_mem_debug_0x28_is_per_thread(dut):
         await host.write_debug(t, DBG_MEM, 0)
 
 
-#: BUGS 11: the RTL decides whether a completion stores from a hidden copy of
-#: the access type, which a host write of debug 0x28 does not touch, and an
-#: `LD` overwrites the held store word. Until the RTL follows `MEM_LD` this
-#: test must fail; `expect_fail` keeps it running as evidence without turning
-#: the suite red, and the fix removes the flag. The golden model already
-#: passes it (tools/tests/test_loomsim_mem.py).
-BUGS_11_OPEN = True
-
-
-@cocotb.test(expect_fail=BUGS_11_OPEN)
+@cocotb.test()
 async def test_mem_forged_pending_store_follows_mem_ld(dut):
     """A host write of debug 0x28 sets `MEM_PEND`, `MEM_LD` and `MEM_RD` and
     leaves the held address and store word as the thread's last access left
@@ -635,7 +626,13 @@ async def test_mem_forged_pending_store_follows_mem_ld(dut):
     writes with `MEM_LD == 0` completes as a store of the held store word at
     the held address, whatever access set them. Here the last `ST` stored
     0xBEEF and the last access, an `LD`, held DATA + 1: after the host writes
-    {MEM_PEND, MEM_LD = 0} and steps the thread, DATA + 1 holds 0xBEEF."""
+    {MEM_PEND, MEM_LD = 0} and steps the thread, DATA + 1 holds 0xBEEF.
+
+    BUGS 11: the RTL used to decide the store from a hidden copy of the
+    access type, which a host write of debug 0x28 does not touch, and an
+    `LD` overwrote the held store word, so this test failed (it ran with
+    `expect_fail` from 2026-09-29 until the fix). The golden model's twin is
+    in tools/tests/test_loomsim_mem.py."""
     host = await fresh(dut)
     words = await seed_data(host)
     await arm(host, {PROG0: asm("ST", rd=1, ra=2, imm=0),
