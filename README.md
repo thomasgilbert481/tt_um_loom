@@ -13,7 +13,7 @@ timing that is exact and checked before the program is loaded. A host (the
 Tiny Tapeout demo board's microcontroller, or any SPI master) loads programs
 and moves data through a four-pin SPI port.
 
-**Status (2026-09-27):** the hardware is complete, hardened and verified.
+**Status (2026-10-06):** the hardware is complete, hardened and verified.
 The one optional feature, an autonomous mode for the bit engine, was left
 out (D-032): no program needs it and the routing budget has no room for it.
 The RTL freezes on 2026-11-08, after which it changes only for a bug.
@@ -24,13 +24,13 @@ the reasons for each choice.
 
 | What | Result | Where |
 |---|---|---|
-| Hardened in CI, 6x4 tiles | 31,393 standard cells and one 512x16 IHP SRAM macro, 54.7 % utilisation; DRC, LVS and antenna clean; Tiny Tapeout precheck passes; gate-level tests 100 of 100 | `docs/AREA.md`, run 35940928210 |
-| Clock | 50 MHz with +5.38 ns of setup slack at the typical corner (the flow's sign-off corner); about 42 MHz at the slow corner (1.08 V, 125 C) | `docs/AREA.md` |
+| Hardened in CI, 6x4 tiles | 31,197 standard cells and one 512x16 IHP SRAM macro, 54.8 % utilisation; DRC, LVS and antenna clean; Tiny Tapeout precheck passes; gate-level tests 109 of 109 | `docs/AREA.md`, run 37475045879 |
+| Clock | 50 MHz with +5.16 ns of setup slack at the typical corner (the flow's sign-off corner); about 42 MHz at the slow corner (1.08 V, 125 C) | `docs/AREA.md` |
 | Protocols | thirteen firmware programs, each tested on the golden model and on the RTL through the real SPI pads with the same test bodies: 108 scenarios on the model, 94 of them on the RTL in every CI run and the other 14 (slow cases) in a separate run | `firmware/README.md`, `test/test_fw.py` |
 | RTL against an independent golden model | lockstep co-simulation compared on every clock cycle, on constrained-random programs with the host port driven during the run, in every CI run | `test/test_cosim.py` |
 | Formal (SymbiYosys) | properties of the scheduler, FIFOs, timer, pins, SPI port, decoder and wait rule, proved for every depth (PDR or k-induction) apart from one bound checked to depth 40; thread isolation (a thread's state does not depend on what the other three run) proved for each of the four threads on a two-copy miter. Four properties were false as first worded; each is a recorded finding, one of them a real bug | `formal/README.md` |
-| Mutation testing | 823 one-line faults in the RTL: 99.7 % killed in the full pass with 44 documented equivalents set aside; the last two survivors have since been closed | `docs/VERIFICATION.md` L7 |
-| Test counts | 201 cocotb tests on the RTL, most of them through the pins; 1,665 Python tests on the tools and the golden model | `test/`, `tools/tests/` |
+| Mutation testing | the freeze-time run: 911 one-line faults in the RTL, 99.9 % killed with 60 documented equivalents set aside, after it found eleven holes in the tests (closed) and one real bug (BUGS 11, fixed) | `docs/VERIFICATION.md` L7 |
+| Test counts | 209 cocotb tests on the RTL, most of them through the pins; 1,676 Python tests on the tools and the golden model | `test/`, `tools/tests/` |
 | IHP SRAM macro on cmos5l | the 512x16 macro hardens and passes all nine precheck checks and the gate-level test; as far as we know the first published cmos5l SRAM result that passes the Tiny Tapeout precheck; the recipe is written up | `docs/tt_cmos5l_facts.md` section 11 |
 
 `docs/VERIFICATION_REPORT.md` puts the evidence together, with what each

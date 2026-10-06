@@ -465,8 +465,12 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       RTL/spec divergence at debug 0x28 (`docs/VERIFICATION.md`,
       freeze-time run). Fixed 2026-10-05 at Thomas's go-ahead (the RTL
       follows `MEM_LD`; four flops fewer), re-verified on both backends and
-      in formal, and hardened by the fix's own `gds` run. That fix commit's
-      `src/` is the new freeze candidate.
+      in formal, and hardened by the fix's own `gds` run (37475045879:
+      every job passed, gate level 109 of 109, detailed routing 3 h 25 min,
+      the job 4 h 43 min, slow corner still about 42 MHz). e52759a's `src/`
+      is the new freeze candidate; that run's artefacts expire on
+      2027-01-04, so the freeze or M6 run is still the one the submission
+      points at.
 - [ ] `docs/VERIFICATION_REPORT.md` drafted from what exists: the bug ledger,
       the mutation table, the formal findings, the routing budget, D-024's
       statement that nothing ran on hardware and what stands in for it.

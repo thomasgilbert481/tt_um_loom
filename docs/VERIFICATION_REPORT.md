@@ -106,9 +106,9 @@ miss". The state on 2026-09-22 is:]
   co-simulation, with the generator driving the new configuration bits,
   found no divergence in the default run or in a 40-seed sweep, with all 25
   new coverage bins hit.
-- L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 100 of
-  100 on the last full hardening (run 35940928210; the one test of the
-  flop-memory build is skipped there).
+- L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 109 of
+  109 on the last full hardening (run 37475045879, the BUGS 11 fix; the one
+  test of the flop-memory build is skipped there).
 - L7 mutation: the M2 pass, 823 mutants, 99.7 per cent killed with 44
   documented equivalents set aside (`tools/mutate/equivalents.json` gives
   each its reason). The freeze-time run on d1ea0ac (2026-09-29, D-033): 911
@@ -149,15 +149,17 @@ lived in, and TIMER-2 now proves the property it exposed.
 
 ## 6. Physical results
 
-From `docs/AREA.md`, the last full hardening (run 35940928210, `main`
-d1ea0ac, 2026-09-24: D-031 on slices A and B): 31,393 standard cells plus
-one 512x16 SRAM macro on a 6x4 Tiny Tapeout block (utilisation 54.7 per
-cent), DRC, LVS and antenna clean, precheck clean, gate-level tests 100 of
-100 (the one test of the flop-memory build is skipped). Timing at 20 ns:
-+5.38 ns setup at the typical corner (the flow's sign-off corner),
-+10.60 ns fast, and -3.53 ns at the slow corner (1.08 V, 125 C) on 96
-endpoints, so the datasheet states 50 MHz at the typical corner and about
-42 MHz over every corner. A second hardening of the unchanged design on
+From `docs/AREA.md`, the last full hardening (run 37475045879, `main`
+e52759a, 2026-10-06: the BUGS 11 fix on D-031's design): 31,197 standard
+cells plus one 512x16 SRAM macro on a 6x4 Tiny Tapeout block (utilisation
+54.8 per cent), DRC, LVS and antenna clean, precheck clean, gate-level
+tests 109 of 109 (the one test of the flop-memory build is skipped).
+Timing at 20 ns: +5.16 ns setup at the typical corner (the flow's sign-off
+corner), +10.44 ns fast, and -3.65 ns at the slow corner (1.08 V, 125 C)
+on 56 endpoints, so the datasheet states 50 MHz at the typical corner and
+about 42 MHz over every corner. Detailed routing took 3 h 25 min and the
+`gds` job 4 h 43 min. The run before the fix (35940928210, D-031) had
++5.38, +10.60 and -3.53 ns on 96 endpoints and the same two clocks. A second hardening of the unchanged design on
 2026-09-28 (run 36366875261) reproduced every one of these numbers exactly:
 the flow is deterministic for identical inputs, and only the runner's speed
 changed the time (the `gds` job took 5 h 11 min against 5 h 02 min).
@@ -236,4 +238,5 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
 - 2026-09-28: section 6 records the same-netlist run, 36366875261.
 - 2026-09-29: sections 2, 4, 5 and 7 record the freeze-time mutation run
   and BUGS 11.
-- 2026-10-06: BUGS 11 fixed in the RTL; sections 4, 5 and 7 follow.
+- 2026-10-06: BUGS 11 fixed in the RTL; sections 4, 5 and 7 follow, and
+  section 6 and the L5 line describe the fix's hardening, 37475045879.
