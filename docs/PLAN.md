@@ -853,3 +853,16 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   11 fix's design, so the hardening changes the block only; then the
   four-protocol demo, and the timing-annotated gate-level subset on the
   8x4 netlist once that run is in.
+- 2026-10-07, Opus 5.5: all three done. The 8x4 hardening (37547764383 on
+  fdd16ef) passed every job: gate level 109 of 109, overflow 48, detailed
+  routing 2 h 52 min, the job 4 h 04 min, slow corner about 43 MHz (the
+  branch's 47 was placement variance); fdd16ef is the freeze candidate.
+  The four-protocol demo passes on the model and the RTL (51ef88b), and
+  PHY-GL-SDF passes 14 of 14 on that netlist (a8b7749). Counts: 210 cocotb
+  tests in CI (run 37584500872), 1,677 tool tests. `CLAUDE.md` and
+  ARCHITECTURE follow 8x4. Next: nothing is planned in `src/`. On
+  2026-11-08 Thomas starts the freeze run by hand; record the action and
+  tools commits, put its timing with slack in the datasheet, archive the
+  release assets at `v1.0-rc1`, and fill VERIFICATION_REPORT sections 4
+  and 8. The v3 demo-board host transfer must land before submission; M5
+  demo material after that.

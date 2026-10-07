@@ -122,10 +122,15 @@ the line only moves it. For that case:
 reads what each documented id was from the results of the run that
 documented it, finds the mutant the current source generates from the same
 file, operator, original line and mutated line, and moves the reason to
-that mutant's id. Nothing looser is carried: a line whose text changed
-drops out and is reported. A carried reason still has to be re-read at the
-next pass, because the code around an unchanged line can change what it
-does.
+that mutant's id. Without a results file, `--from-rev REV` builds the old
+records from the source at git revision `REV` instead, which also covers
+ids no saved run produced: after an edit to `src/`, run
+`rekey --from-rev <the revision the ids were keyed against> --write` and
+commit it with the edit (`tools/tests/test_mutate_rekey.py` fails while an
+equivalent does not match the current source). Nothing looser is carried:
+a line whose text changed drops out and is reported. A carried reason
+still has to be re-read at the next pass, because the code around an
+unchanged line can change what it does.
 
 An **open** survivor is a hole in the suite, not a tidy-up job: it wants a new
 check, and the bug ledger rule in `CLAUDE.md` applies to what the new check

@@ -6,9 +6,9 @@ marked OPEN or VERIFY. Change a decision only by adding an entry to
 `docs/DECISIONS.md` first.
 
 Target: Jane Street protocol emulator ASIC competition, Tiny Tapeout on IHP
-`ihp-sg13cmos5l`, **6x4 tiles** (1289.28 x 710.64 um, the largest size the
-cmos5l flow accepts today; the blog's 8x4 is "in progress" and not yet in
-`tile_sizes.yaml`), deadline 2027-01-18. See `docs/PLAN.md` and
+`ihp-sg13cmos5l`, **8x4 tiles** (1724.16 x 710.64 um) since 2026-10-06
+(D-034; until then 6x4, 1289.28 x 710.64 um, which stays the fallback),
+deadline 2027-01-18. See `docs/PLAN.md` and
 `docs/tt_cmos5l_facts.md` (verified 2026-09-15).
 
 ## 1. What it is, in one paragraph
@@ -562,11 +562,13 @@ its timing contract (which cycle outputs change relative to inputs).
    none has been taped out on cmos5l. Decision still at M2, from a real
    hardening of both options plus Jane Street's and Tiny Tapeout's answer on
    macro acceptance.
-7. WATCH: `8x4` is not a valid `tiles` value in the cmos5l flow (largest is
-   `6x4`; `8x2`/`6x4` were never used on the first cmos5l shuttle). If Tiny
-   Tapeout adds `8x4` before M4, switching is a one-line `info.yaml` change and
-   a re-budget; do not design for it. The organisers said the same on
-   2026-09-28: keep designing to 6x4 and treat 8x4 as an upgrade.
+7. RESOLVED 2026-10-06 (D-034): the cmos5l tools have had an `8x4` tile
+   since 2026-09-21. The organisers said on 2026-09-28 to keep designing to
+   6x4 and treat 8x4 as an upgrade, and Thomas took that as the
+   confirmation. The switch was the one-line `info.yaml` change with the
+   design unchanged, and its hardening passed every job (run 37547764383).
+   6x4 stays the fallback: the same design passed every job there (run
+   37475045879).
 2. RESOLVED 2026-09-22 (M2 review): FIFO depth stays 4. A low-speed USB data
    packet is at most 8 bytes, four words, and depth is wiring (D-025).
 3. RESOLVED 2026-09-22 (D-027): data memory is the instruction memory,

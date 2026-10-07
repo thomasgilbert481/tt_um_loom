@@ -30,7 +30,7 @@ the reasons for each choice.
 | RTL against an independent golden model | lockstep co-simulation compared on every clock cycle, on constrained-random programs with the host port driven during the run, in every CI run | `test/test_cosim.py` |
 | Formal (SymbiYosys) | properties of the scheduler, FIFOs, timer, pins, SPI port, decoder and wait rule, proved for every depth (PDR or k-induction) apart from one bound checked to depth 40; thread isolation (a thread's state does not depend on what the other three run) proved for each of the four threads on a two-copy miter. Four properties were false as first worded; each is a recorded finding, one of them a real bug | `formal/README.md` |
 | Mutation testing | the freeze-time run: 911 one-line faults in the RTL, 99.9 % killed with 60 documented equivalents set aside, after it found eleven holes in the tests (closed) and one real bug (BUGS 11, fixed) | `docs/VERIFICATION.md` L7 |
-| Test counts | 209 cocotb tests on the RTL, most of them through the pins; 1,676 Python tests on the tools and the golden model | `test/`, `tools/tests/` |
+| Test counts | 210 cocotb tests on the RTL, most of them through the pins; 1,677 Python tests on the tools and the golden model | `test/`, `tools/tests/` |
 | IHP SRAM macro on cmos5l | the 512x16 macro hardens and passes all nine precheck checks and the gate-level test; as far as we know the first published cmos5l SRAM result that passes the Tiny Tapeout precheck; the recipe is written up | `docs/tt_cmos5l_facts.md` section 11 |
 
 `docs/VERIFICATION_REPORT.md` puts the evidence together, with what each

@@ -1,9 +1,15 @@
 # Loom (tt_um_loom): instructions for Claude sessions in this repo
 
 You are implementing a protocol emulator ASIC for the Jane Street competition
-(Tiny Tapeout, IHP CMOS5L, 6x4 tiles since the cmos5l flow offers no 8x4,
-deadline 2027-01-18). The architecture was set by Fable 5.1; you (usually
-Opus 5) implement it. Thomas Gilbert owns the project.
+(Tiny Tapeout, IHP CMOS5L, 8x4 tiles since 2026-10-06 with 6x4 as the
+fallback (D-034), deadline 2027-01-18). The architecture was set by Fable
+5.1; Opus 5 implemented it from 2026-09-18 and Opus 5.5 has directed since
+2026-09-23. Thomas Gilbert owns the project.
+
+Where it stands: the hardware is complete (D-032) and the RTL freezes on
+2026-11-08 (D-030, D-033); after that `src/` changes only for a bug found
+by verification, with a re-hardening. Firmware and tools change until the
+firmware freeze on 2026-12-01, docs until M5.
 
 ## Read order, every session
 
@@ -16,8 +22,9 @@ Opus 5) implement it. Thomas Gilbert owns the project.
 6. `isa/isa.yaml` and `docs/ISA.md` when touching anything that decodes or
    assembles.
 
-Do not read `docs/tt_cmos5l_facts.md` unless you are making the M2 memory
-decision or configuring the flow; it is reference material.
+Do not read `docs/tt_cmos5l_facts.md` unless you are configuring the flow,
+running gate level (section 12) or writing the demo-board host transfer
+(section 5); it is reference material.
 
 ## Rules
 
@@ -53,15 +60,18 @@ decision or configuring the flow; it is reference material.
   jobs in new files. The trigger block of `gds.yaml` (paths filter and
   concurrency) is ours under D-018.
 - **Hardening is expensive, and six hours is a hard budget.** The `gds` job
-  took 3 h 53 min with the macro (plus about 2 h of precheck beside it), and
-  GitHub kills a job at six hours, as it did to run 35470401774. Detailed
+  takes about four hours at 8x4 (4 h 04 min, run 37547764383; it reached
+  5 h 11 min at 6x4) plus about 2 h of precheck beside it, and GitHub kills
+  a job at six hours, as it did to run 35470401774. Detailed
   routing is the long pole and grows superlinearly with congestion: two per
   cent more cells in one corner of the floorplan tripled the Metal3 overflow
   and nearly doubled the routing time (D-022's outcome, `docs/AREA.md`). Judge
   an RTL change that adds wiring by the global router's overflow, not only by
   cell count. Commits that only touch docs or Python tools do not trigger a
   hardening (D-018). Before submission, run `gds` by hand on the exact commit
-  being submitted.
+  being submitted. A Claude session's own `gh workflow run` is refused by
+  the permission classifier, so ask Thomas to run
+  `gh workflow run gds.yaml --ref main --repo thomasgilbert481/tt_um_loom`.
   **A push that touches `src/`, `info.yaml` or `macro/` cancels a hardening
   in progress** (the workflow's concurrency group), and `git push` sends
   every unpushed local commit, so while a run is going make sure
