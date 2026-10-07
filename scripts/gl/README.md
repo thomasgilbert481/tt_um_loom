@@ -18,7 +18,15 @@ checks. Measured on run 35940928210's typical corner: about 6 minutes to
 annotate, then about 1.9 s per simulated microsecond with cell delays only;
 the wire delays make it tens of times slower again. So a test of a few hundred
 microseconds takes about 10 minutes, and the whole cocotb suite (181 ms) would
-take days: run a chosen subset.
+take days: run a chosen subset. (Measured again on 2026-10-07, run 37547764383:
+about 0.4 s per simulated microsecond; 14 firmware scenarios, 25 ms, in 58
+minutes in four parallel builds, `BUILD=` per process.)
+
+The firmware scenarios run here too (`MODULES=test_fw` and a `FILTER`):
+`test/rtl_bench.py` has no retire record on the netlist, so only scenarios
+that judge the pins mean anything, which is most of them. A `FILTER` with
+`|` in it must carry its own quotes, `"'a|b'"`, because the Makefile passes
+it to the shell unquoted.
 
 ```bash
 scripts/gl/fetch.sh 35419160398 /c/Users/Thoma/asic/gl_35419160398

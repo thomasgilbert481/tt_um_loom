@@ -477,7 +477,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       Started 2026-09-22: sections 1 to 3 and 5 to 7 describe `main` after
       the M2 review; sections 4 (evidence by layer) and 8 (what the AI did)
       are outlines to fill at the freeze; updated with each slice.
-- [ ] If the `gds` artefact includes SDF (checked 2026-09-24: it does, the
+- [x] If the `gds` artefact includes SDF (checked 2026-09-24: it does, the
       `GDS_logs` artifact carries `runs/wokwi/final/sdf/` for all three
       corners, run 35940928210): one timing-annotated gate-level run of the
       L3 suite at the typical corner, recorded as PHY-GL-SDF. Checked
@@ -487,6 +487,9 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       (181 ms) would take days; a smoke test passed (`test_mem`, 330 us, 11
       min; `docs/tt_cmos5l_facts.md` section 12). What remains is a chosen
       subset: one scenario per protocol, run overnight on the freeze netlist.
+      Done 2026-10-07 on the 8x4 netlist (run 37547764383, the freeze
+      candidate): 14 of 14 passed, one scenario per protocol plus the
+      four-at-once demo, in 58 minutes (PHY-GL-SDF, VERIFICATION L5).
 - [ ] Timing as stated in the datasheet: 50 MHz at the typical corner and the
       measured slow-corner clock, both with their slack.
 - [x] Four protocols at once (M3 review): four programs on four threads,

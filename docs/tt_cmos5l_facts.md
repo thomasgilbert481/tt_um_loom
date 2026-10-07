@@ -888,3 +888,9 @@ environment), with three limits found on run 35940928210:
   slower. `test_mem.test_ld_reads_what_the_host_wrote` (330 us) passed with
   the typical corner's cell delays in 11 minutes; the whole cocotb suite
   (181 ms simulated) would take days.
+- **Measured again on 2026-10-07** (run 37547764383, 8x4, typical corner,
+  cell delays): about 0.4 s per simulated microsecond in four parallel
+  processes, so the 1.9 above was pessimistic; 14 firmware scenarios (25 ms
+  simulated) passed in 58 minutes. The same UART scenario took 16 s on the
+  netlist without SDF and 158 s with it, which is how to tell the delays
+  were applied (Icarus also prints a TIMINGCHECK warning per cell).

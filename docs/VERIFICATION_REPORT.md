@@ -110,7 +110,9 @@ miss". The state on 2026-09-22 is:]
   new coverage bins hit.
 - L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 109 of
   109 on the last full hardening (run 37547764383, the BUGS 11 fix at 8x4;
-  the one test of the flop-memory build is skipped there).
+  the one test of the flop-memory build is skipped there). With that run's
+  typical-corner cell delays (PHY-GL-SDF), one firmware scenario per
+  protocol and the four-at-once demo, 14 of 14, passed on the netlist.
 - L7 mutation: the M2 pass, 823 mutants, 99.7 per cent killed with 44
   documented equivalents set aside (`tools/mutate/equivalents.json` gives
   each its reason). The freeze-time run on d1ea0ac (2026-09-29, D-033): 911
@@ -248,4 +250,4 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
 - 2026-10-06: BUGS 11 fixed in the RTL; sections 4, 5 and 7 follow, and
   section 6 and the L5 line describe the fix's hardening, 37475045879.
 - 2026-10-07: section 6 and the L5 line describe the 8x4 hardening,
-  37547764383.
+  37547764383, and the L5 line the SDF subset on its netlist.

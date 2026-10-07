@@ -245,6 +245,14 @@ property that only reaches bounded depth is listed as bounded, not proven.
 - PHY-AREA: utilisation and cell count tracked per milestone in `docs/AREA.md`.
 - PHY-GL: the L3 suite runs on the gate-level netlist through the TT `gl_test`
   job (cell models, functional).
+- PHY-GL-SDF: the firmware scenarios run on the gate-level netlist with the
+  typical corner's post-route cell delays (`scripts/gl/run.sh` with `SDF=`).
+  Done 2026-10-07 on the 8x4 netlist of run 37547764383: one scenario per
+  protocol, thirteen programs, plus `test_fw_four_at_once`, 14 of 14 passed
+  (25 ms simulated, 58 minutes in four parallel groups). Cell delays only:
+  Icarus ignores the timing checks and the wire delays make it tens of times
+  slower, so this shows the design working with real cell delays, while STA
+  is what says setup and hold are met.
 - PHY-PRECHECK: TT precheck clean on every push to main.
 
 ### L6: FPGA and bench
