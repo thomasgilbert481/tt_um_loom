@@ -879,7 +879,8 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   above clk / 8. `tools/loomhost/ttboard_sim.py` runs the helper itself in
   CPython: 15 new tool tests against a checking SPI slave (1,692 in all),
   and two new cocotb tests in `test_host` run a whole host session through
-  it on the RTL at the 4-clock minimums, one per board (212 in all; the
+  it on the RTL at the 4-clock minimums, one per board (212 in all, CI run
+  37622171783; the
   next `gl_test` will have 111). Eight hand-made faults in the helper were
   caught by the tool tests; on the RTL, three of four were caught, and the
   fourth (sampling MISO just after the SCK rise) is harmless on Loom, which
