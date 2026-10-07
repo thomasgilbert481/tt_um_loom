@@ -109,8 +109,8 @@ miss". The state on 2026-09-22 is:]
   found no divergence in the default run or in a 40-seed sweep, with all 25
   new coverage bins hit.
 - L5 physical: DRC, LVS and antenna clean; precheck clean; `gl_test` 109 of
-  109 on the last full hardening (run 37475045879, the BUGS 11 fix; the one
-  test of the flop-memory build is skipped there).
+  109 on the last full hardening (run 37547764383, the BUGS 11 fix at 8x4;
+  the one test of the flop-memory build is skipped there).
 - L7 mutation: the M2 pass, 823 mutants, 99.7 per cent killed with 44
   documented equivalents set aside (`tools/mutate/equivalents.json` gives
   each its reason). The freeze-time run on d1ea0ac (2026-09-29, D-033): 911
@@ -151,20 +151,23 @@ lived in, and TIMER-2 now proves the property it exposed.
 
 ## 6. Physical results
 
-From `docs/AREA.md`, the last full hardening (run 37475045879, `main`
-e52759a, 2026-10-06: the BUGS 11 fix on D-031's design): 31,197 standard
-cells plus one 512x16 SRAM macro on a 6x4 Tiny Tapeout block (utilisation
-54.8 per cent), DRC, LVS and antenna clean, precheck clean, gate-level
-tests 109 of 109 (the one test of the flop-memory build is skipped).
-Timing at 20 ns: +5.16 ns setup at the typical corner (the flow's sign-off
-corner), +10.44 ns fast, and -3.65 ns at the slow corner (1.08 V, 125 C)
-on 56 endpoints, so the datasheet states 50 MHz at the typical corner and
-about 42 MHz over every corner. Detailed routing took 3 h 25 min and the
-`gds` job 4 h 43 min. The run before the fix (35940928210, D-031) had
-+5.38, +10.60 and -3.53 ns on 96 endpoints and the same two clocks. A second hardening of the unchanged design on
-2026-09-28 (run 36366875261) reproduced every one of these numbers exactly:
-the flow is deterministic for identical inputs, and only the runner's speed
-changed the time (the `gds` job took 5 h 11 min against 5 h 02 min).
+From `docs/AREA.md`, the last full hardening (run 37547764383, `main`
+fdd16ef, 2026-10-07: the BUGS 11 fix's design on the 8x4 block, D-034):
+31,268 standard cells plus one 512x16 SRAM macro on an 8x4 Tiny Tapeout
+block (utilisation 41.1 per cent), DRC, LVS and antenna clean, precheck
+clean, gate-level tests 109 of 109 (the one test of the flop-memory build
+is skipped). Timing at 20 ns: +5.49 ns setup at the typical corner (the
+flow's sign-off corner), +10.64 ns fast, and -3.05 ns at the slow corner
+(1.08 V, 125 C) on 24 endpoints, so the datasheet states 50 MHz at the
+typical corner and about 43 MHz over every corner. Detailed routing took
+2 h 52 min and the `gds` job 4 h 04 min. The same design at 6x4 (run
+37475045879, e52759a) passed every job too, with +5.16, +10.44 and -3.65
+ns and a 4 h 43 min job, and is the fallback if 8x4 is withdrawn. Before
+the fix, D-031's run (35940928210) had +5.38, +10.60 and -3.53 ns, and a
+second hardening of that unchanged design on 2026-09-28 (run 36366875261)
+reproduced every one of its numbers exactly: the flow is deterministic for
+identical inputs, and only the runner's speed changed the time (the `gds`
+job took 5 h 11 min against 5 h 02 min).
 
 The slow corner was worked on twice. The run of 2026-09-20 (35524275302)
 missed it by 2.48 ns on 23 endpoints behind the deadline-latch fire logic.
@@ -185,7 +188,9 @@ and pushed detailed routing past GitHub's six-hour job limit (D-022, run
 35470401774), which matters because Tiny Tapeout re-runs the flow at
 submission. The design was returned to the shape that routes in under four
 hours and every hardware change since is judged by that rule (D-025).
-D-031's run routed in 3 h 54 min, six minutes inside it.
+D-031's run routed in 3 h 54 min, six minutes inside it. The move to 8x4
+(D-034) took the pressure off: global-routing overflow 48 against about
+2,000, routing 2 h 52 min, and the `gds` job 1 h 56 min inside six hours.
 
 ## 7. Known limitations and open items
 
@@ -242,3 +247,5 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
   and BUGS 11.
 - 2026-10-06: BUGS 11 fixed in the RTL; sections 4, 5 and 7 follow, and
   section 6 and the L5 line describe the fix's hardening, 37475045879.
+- 2026-10-07: section 6 and the L5 line describe the 8x4 hardening,
+  37547764383.

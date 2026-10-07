@@ -501,7 +501,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       and differs only in the RUN mask, and each protocol's edges are the
       same clocks with all four running as alone, on the model and on the
       RTL (70 s).
-- [x] 8x4, when the organisers confirm it for the shuttle (D-034, adopted 2026-10-06 by Thomas, who took the organisers' 2026-09-28 answer as the confirmation; switched on main the same day, its hardening is the check): a DECISIONS entry
+- [x] 8x4, when the organisers confirm it for the shuttle (D-034, adopted 2026-10-06 by Thomas, who took the organisers' 2026-09-28 answer as the confirmation; switched on main the same day; run 37547764383 passed every job, overflow 48, routing 2 h 52 min, the job 4 h 04 min, slow corner about 43 MHz; fdd16ef is the freeze candidate, its artefacts expire 2027-01-04): a DECISIONS entry
       and the `tiles` line on main (with the stale comment above it in
       `info.yaml`); the branch run 36427897067 already passed every job at
       8x4 with the macro and stripe keys unchanged. Its datasheet numbers

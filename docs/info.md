@@ -55,7 +55,7 @@ Manchester loopback. `firmware/README.md` in the repository lists their
 pins, sizes and rates.
 
 Clock: 50 MHz at the typical corner. At the slow corner (1.08 V, 125 C) the
-design closes at about 42 MHz.
+design closes at about 43 MHz.
 
 ## How to test
 

@@ -482,8 +482,8 @@ leaks into the core.
 ## 13. Clock and area budget
 
 Clock: 50 MHz nominal (`CLOCK_PERIOD` 20 ns in `src/config.json`), signed off at
-the typical corner; the slow corner (1.08 V, 125 C) closes at about 42 MHz
-(D-031's hardening, `docs/AREA.md`). The first plan, closing at 16.7 ns
+the typical corner; the slow corner (1.08 V, 125 C) closes at about 43 MHz
+(the 8x4 hardening of 2026-10-07, `docs/AREA.md`). The first plan, closing at 16.7 ns
 (60 MHz) for 10 Mbit Manchester, went with that target (D-029). USB low speed
 prefers 48 MHz (32 clocks per bit); the fractional tick divider makes 50 MHz
 acceptable.
@@ -518,8 +518,9 @@ trims listed under section 12. Table entries are for the flop option:
 If a macro is available the logic total is about 9K cells plus the macro, which
 leaves room for 8-deep FIFOs, data memory, the boot ROM and the CRC-32 unit.
 
-As built: 31,393 standard cells after placement plus the macro (D-031's
-hardening), and routing time rather than area bounds the design (D-025). The
+As built: 31,268 standard cells after placement plus the macro, on the 8x4
+block since 2026-10-06 (D-034; 41 per cent utilisation, 55 at 6x4), and at
+6x4 routing time rather than area bounded the design (D-025). The
 FIFOs stayed 4 deep, data memory is the instruction memory (D-027), and the
 boot ROM and the CRC-32 unit were not built (section 15).
 

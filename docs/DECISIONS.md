@@ -804,4 +804,10 @@ for the announcement: `tiles: "8x4"`, with the stale comment above it in
 block only, one change as D-025 asks. If the organisers end up not
 taking 8x4, the `tiles` line goes back: the 6x4 result is known
 (run 37475045879).
+Outcome (2026-10-07, run 37547764383 on fdd16ef): every job passed, gate
+level 109 of 109; global-routing overflow 48 against 2,131 at 6x4,
+detailed routing 2 h 52 min, the `gds` job 4 h 04 min (1 h 56 min inside
+six hours); slack typical +5.49, fast +10.64, slow -3.05 ns on 24
+endpoints, so the datasheet's slow-corner clock is about 43 MHz. 8x4
+stays.
 

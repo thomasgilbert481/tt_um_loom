@@ -4,7 +4,7 @@
 
 An entry for the [Jane Street protocol emulator ASIC competition](https://blog.janestreet.com/protocol-emulator-asic-competition/),
 built on [Tiny Tapeout](https://tinytapeout.com) for IHP's 130 nm CMOS5L
-process, 6x4 tiles. Open source, Apache-2.0.
+process, 8x4 tiles (D-034). Open source, Apache-2.0.
 
 Loom is a small programmable I/O processor for bit-level protocols. Four
 hardware threads share one pipeline in strict round robin, each with its own
@@ -24,8 +24,8 @@ the reasons for each choice.
 
 | What | Result | Where |
 |---|---|---|
-| Hardened in CI, 6x4 tiles | 31,197 standard cells and one 512x16 IHP SRAM macro, 54.8 % utilisation; DRC, LVS and antenna clean; Tiny Tapeout precheck passes; gate-level tests 109 of 109 | `docs/AREA.md`, run 37475045879 |
-| Clock | 50 MHz with +5.16 ns of setup slack at the typical corner (the flow's sign-off corner); about 42 MHz at the slow corner (1.08 V, 125 C) | `docs/AREA.md` |
+| Hardened in CI, 8x4 tiles | 31,268 standard cells and one 512x16 IHP SRAM macro, 41.1 % utilisation; DRC, LVS and antenna clean; Tiny Tapeout precheck passes; gate-level tests 109 of 109; detailed routing 2 h 52 min, the build job 4 h 04 min of GitHub's six hours | `docs/AREA.md`, run 37547764383 |
+| Clock | 50 MHz with +5.49 ns of setup slack at the typical corner (the flow's sign-off corner); about 43 MHz at the slow corner (1.08 V, 125 C) | `docs/AREA.md` |
 | Protocols | thirteen firmware programs, each tested on the golden model and on the RTL through the real SPI pads with the same test bodies: 109 scenarios on the model, 95 of them on the RTL in every CI run and the other 14 (slow cases) in a separate run. One runs four of the programs at once, one per thread, and checks that every pin edge of each lands on the same clock as when it runs alone | `firmware/README.md`, `test/test_fw.py` |
 | RTL against an independent golden model | lockstep co-simulation compared on every clock cycle, on constrained-random programs with the host port driven during the run, in every CI run | `test/test_cosim.py` |
 | Formal (SymbiYosys) | properties of the scheduler, FIFOs, timer, pins, SPI port, decoder and wait rule, proved for every depth (PDR or k-induction) apart from one bound checked to depth 40; thread isolation (a thread's state does not depend on what the other three run) proved for each of the four threads on a two-copy miter. Four properties were false as first worded; each is a recorded finding, one of them a real bug | `formal/README.md` |
@@ -123,7 +123,7 @@ python -m tools.loomhost --model firmware/uart_tx_fifo.loom --uart-rx OUT0:32 \
   did not fit the board on hand (D-024), so the silicon is the first
   hardware; `docs/VERIFICATION_REPORT.md` section 2 says what stands in for
   a bench.
-- The slow corner closes at about 42 MHz, not 50 MHz.
+- The slow corner closes at about 43 MHz, not 50 MHz.
 - The bit engine has no autonomous mode (D-032): every bit costs its thread
   at least one instruction slot. The fastest rate a shipped program is
   tested at is 2.083 Mbit/s, the Manchester loopback's.
