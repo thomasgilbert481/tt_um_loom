@@ -796,8 +796,8 @@ Consequences: branch `exp-8x4` stays as the evidence and is not merged; the
 switch is its own commit on main. The SDF subset is produced on whichever
 block is final.
 Adopted 2026-10-06 by Thomas, who reads the organisers' answer of
-2026-09-28 ("8x4 is looking likely", expected within weeks and ahead of
-the freeze) as their confirmation. Main switches now rather than waiting
+2026-09-28 (keep to 6x4 and treat 8x4 as an upgrade) as their
+confirmation. Main switches now rather than waiting
 for the announcement: `tiles: "8x4"`, with the stale comment above it in
 `info.yaml` rewritten. The design is e52759a's (the BUGS 11 fix), whose
 6x4 hardening passed every job, so this commit's hardening changes the
