@@ -529,3 +529,54 @@ async def test_reset_sets_td_to_now(dut):
     assert td in (now0, now1), "TD %#x after CTRL.RESET, NOW %#x..%#x" % (td, now0, now1)
     assert await host.read_debug(0, DBG_TD) != td or now0 == 0, \
         "CTRL.RESET of thread 1 must leave thread 0's TD alone"
+
+
+def _ttboard_session(dut, board_map, chip):
+    """The demo-board helper (tools/loomhost/micropython/tt_helper.py) itself,
+    run by tools/loomhost/ttboard_sim.py, moves every host transaction of a
+    whole session through the pads. The board's pin calls take no time and
+    its waits run at a 4 MHz Loom clock with SCK at 500 kHz, so every SCK
+    phase and the CS_n setup, hold and gap are exactly the 4 clocks
+    HOST_PROTOCOL allows."""
+    from rtl_bench import RTL_MAX_POLLS, RtlBench
+    from tools.loomasm import assemble
+    from tools.loomhost import Loom, TTBoardTransport
+    from tools.loomhost.ttboard_sim import BenchGpio, FakeTTBoard
+
+    bench = RtlBench(dut)
+    gpio = BenchGpio(bench, board_map, clk_hz=4_000_000)
+    t = TTBoardTransport(serial=FakeTTBoard(gpio, board_map, chip=chip),
+                         clock_hz=4_000_000, sck_hz=500_000)
+    loom = Loom(t, max_polls=RTL_MAX_POLLS)
+    assert loom.id() == 0x4C4D
+    program = assemble(".thread 0\nloop: POP r0\n XORI r0, 0x3F\n PUSH r0\n JMP loop\n")
+    loom.load(program)                                  # verified by read-back
+    loom.run(0)
+    loom.push(0, [0x00, 0x3F, 0x1234])
+    assert loom.pop(0, 3) == [0x3F, 0x00, 0x120B]
+    loom.halt(0)
+    assert t.irq() is False
+    loom.set_sflags(1)
+    loom.irq_enable(0x0100)
+    assert t.irq() is True, "HOST_IRQ (uo_out[6]) not seen on the board's GPIO"
+    return t.helper_mode, t.helper_pins
+
+
+@cocotb.test()
+async def test_ttboard_helper_v3_bitbang(dut):
+    """v3 demo board (RP2350B): the helper bit-bangs GP21/22/23, reads MISO
+    on GP40 and HOST_IRQ on GP39, from the firmware's GPIOMapTTDBv3."""
+    from rtl_bench import run_body
+    from tools.loomhost.ttboard_sim import DBV3_MAP
+    got = await run_body(dut, _ttboard_session, dut, DBV3_MAP, "RP2350B")
+    assert got == ("bitbang", (21, 22, 23, 40, 39))
+
+
+@cocotb.test()
+async def test_ttboard_helper_rp2040_spi0(dut):
+    """RP2040 demo board: the helper keeps hardware SPI0 on GP16..19 (D-012),
+    here clocked by the stand-in SPI block on the same pads."""
+    from rtl_bench import run_body
+    from tools.loomhost.ttboard_sim import RP2040_MAP
+    got = await run_body(dut, _ttboard_session, dut, RP2040_MAP, "RP2040")
+    assert got == ("spi", (17, 18, 19, 16, 15))

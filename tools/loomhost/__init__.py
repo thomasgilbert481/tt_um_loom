@@ -8,7 +8,8 @@ it, :class:`Loom` is the high-level API and the transports carry the bytes:
 * :class:`SimTransport` - the RTL: the bytes are clocked through the SPI pads
   of a bench that steps the simulated chip (``test/rtl_bench.py``);
 * :class:`PicoTransport` - USB serial to a Raspberry Pi Pico bridge;
-* :class:`TTBoardTransport` - the Tiny Tapeout demo board's RP2040 REPL.
+* :class:`TTBoardTransport` - a Tiny Tapeout demo board's MicroPython REPL
+  (RP2040 or v3); :mod:`.ttboard_sim` runs its helper against a bench.
 
 The serial transports import ``pyserial`` only when they open a port.
 Command line smoke tool: ``python -m tools.loomhost --help``.

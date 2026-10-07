@@ -12,8 +12,9 @@ any transport.
   HOST_MISO = uo_out[7], HOST_IRQ = uo_out[6]. On the Tiny Tapeout demo board
   (RP2040) these are GP17, GP18, GP19 and GP16, which is the RP2040's SPI0
   CSn/SCK/TX/RX function set, so `machine.SPI(0)` drives Loom without PIO. The
-  v3 demo board (RP2350B) maps project pins differently; use PIO or bit-bang
-  there (`docs/tt_cmos5l_facts.md` section 5).
+  v3 demo board (RP2350B) has them on GP21, GP22, GP23 and GP40; GP40 is an
+  SPI1 pin and the rest SPI0, so `tools/loomhost/micropython/tt_helper.py`
+  bit-bangs there (`docs/tt_cmos5l_facts.md` section 5).
 - SCK is sampled by the core clock through a 2-flop synchroniser and edge
   detector. Constraint: SCK period >= 8 core clocks (6.25 MHz at 50 MHz). CS_n
   must be low at least 4 core clocks before the first SCK edge and stay low

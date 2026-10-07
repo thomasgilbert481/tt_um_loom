@@ -83,8 +83,8 @@ chosen so that on the Tiny Tapeout demo board (RP2040) the hardware SPI0
 function set lands on them: GP17 CSn = ui_in[4], GP18 SCK = ui_in[5], GP19 TX =
 ui_in[6], GP16 RX = uo_out[7] (verified in `docs/tt_cmos5l_facts.md` section 5),
 so `machine.SPI(0)` works without PIO. The v3 demo board (RP2350B) has a
-different GPIO map; there the host transport bit-bangs or uses PIO, which works
-on any pins. Everything else is a 5-bit "pin index" that instructions and CSRs
+different GPIO map, where MISO is on an SPI1 pin and the rest on SPI0, so there
+the host transport bit-bangs, which works on any pins. Everything else is a 5-bit "pin index" that instructions and CSRs
 use uniformly:
 
 ```

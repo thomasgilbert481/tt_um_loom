@@ -13,13 +13,16 @@ host sends            bridge answers        meaning
 anything wrong        ``E <message>``       error
 ====================  ====================  =================================
 
-:class:`TTBoardTransport` talks to the Tiny Tapeout demo board's RP2040 over
-its MicroPython REPL (tt-micropython-firmware), in raw-REPL mode: it pastes
+:class:`TTBoardTransport` talks to a Tiny Tapeout demo board over its
+MicroPython REPL (tt-micropython-firmware), in raw-REPL mode: it pastes
 ``tools/loomhost/micropython/tt_helper.py`` once and then calls its
-``_lx('<hex>')`` per transaction. The helper drives the host port through the
-RP2040's SPI0, which lands exactly on Loom's host pins (HOST_PROTOCOL,
-Electrical): CS_n ``ui_in[4]`` = GP17, SCK ``ui_in[5]`` = GP18, MOSI
-``ui_in[6]`` = GP19, MISO ``uo_out[7]`` = GP16; HOST_IRQ ``uo_out[6]`` = GP15.
+``_lx('<hex>')`` per transaction. The helper finds Loom's host pins (CS_n
+``ui_in[4]``, SCK ``ui_in[5]``, MOSI ``ui_in[6]``, MISO ``uo_out[7]``,
+HOST_IRQ ``uo_out[6]``) in the firmware's pin map. On the RP2040 board they
+are GP17, GP18, GP19, GP16 and GP15, the RP2040's SPI0 function set, and SPI0
+moves the bytes; on the v3 board (RP2350B) they are GP21, GP22, GP23, GP40
+and GP39, which no one SPI block covers, and the helper bit-bangs SPI mode 0.
+``tools/loomhost/ttboard_sim.py`` runs the helper in CPython against the RTL.
 
 Both accept an already-open serial-like object (``serial=``), which is how
 the unit tests drive them with a fake.
@@ -101,25 +104,40 @@ class PicoTransport(Transport):
 
 
 class TTBoardTransport(Transport):
-    """The Tiny Tapeout demo board's RP2040, through its MicroPython raw REPL."""
+    """A Tiny Tapeout demo board (RP2040 or v3), through its MicroPython raw REPL."""
 
     RAW_PROMPT = b"raw REPL; CTRL-B to exit\r\n>"
 
     def __init__(self, port: Optional[str] = None, *, baudrate: int = 115200,
                  timeout: float = 5.0, project: str = "tt_um_loom",
                  clock_hz: int = 50_000_000, sck_hz: int = 1_000_000,
-                 serial=None, setup: bool = True) -> None:
+                 mode: Optional[str] = None, serial=None, setup: bool = True) -> None:
+        if sck_hz <= 0 or sck_hz * 8 > clock_hz:
+            raise ValueError("SCK must be at most the Loom clock / 8 (HOST_PROTOCOL, "
+                             "Electrical): %d Hz with a %d Hz clock" % (sck_hz, clock_hz))
+        if mode not in (None, "spi", "bitbang"):
+            raise ValueError("mode is None (from the board), 'spi' or 'bitbang'")
         if serial is None:
             if port is None:
                 raise TransportError("TTBoardTransport needs a port or a serial object")
             serial = _open_serial(port, baudrate, timeout)
         self.serial = serial
         self.clk_hz = clock_hz
+        #: What ``_lsetup`` chose: ``"spi"`` or ``"bitbang"``, then the
+        #: CS_n, SCK, MOSI, MISO and IRQ GPIO numbers (None until set up).
+        self.helper_mode: Optional[str] = None
+        self.helper_pins: Optional[tuple] = None
         self._enter_raw_repl()
         if setup:
             helper = (MICROPYTHON_DIR / "tt_helper.py").read_text(encoding="utf-8")
             self.exec(helper)
-            self.exec("_lsetup(%r, %d, %d)" % (project, int(clock_hz), int(sck_hz)))
+            args = "%r, %d, %d" % (project, int(clock_hz), int(sck_hz))
+            if mode is not None:
+                args += ", %r" % mode
+            words = self.exec("_lsetup(%s)" % args).split()
+            if len(words) >= 6 and words[-6] in ("spi", "bitbang"):
+                self.helper_mode = words[-6]
+                self.helper_pins = tuple(int(n) for n in words[-5:])
 
     # ---------------------------------------------------------- raw REPL
     def _read_until(self, token: bytes) -> bytes:

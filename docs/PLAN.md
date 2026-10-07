@@ -517,13 +517,16 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       how-to-test, external hardware. Rewritten 2026-09-26 for the design as
       built; the pinout lives in `info.yaml` and is current. The design is
       complete (D-032); revisit at the freeze only if a bug fix changes it.
-- [ ] Host transfer for the v3 demo board (RP2350B): its pin map is not the
+- [x] Host transfer for the v3 demo board (RP2350B): its pin map is not the
       RP2040's, so the SPI0 function set of D-012 does not carry over
-      (`docs/tt_cmos5l_facts.md` section 5). A PIO or bit-banged `_lx` in
-      `tools/loomhost/micropython/tt_helper.py`, chosen by board. Host
-      software only, so it can land after the freeze; `docs/info.md` says it
-      is not written yet. It must land before submission (M3 review): the
-      chips will most likely ship on this board.
+      (`docs/tt_cmos5l_facts.md` section 5). Done 2026-10-07: `tt_helper.py`
+      reads the pins from the firmware's `GPIOMap`, keeps SPI0 on the RP2040
+      board and bit-bangs SPI mode 0 on v3 (GP40, MISO, is an SPI1 pin).
+      Tested in simulation only: 15 tool tests against a checking SPI slave,
+      and `test_ttboard_helper_v3_bitbang` / `_rp2040_spi0` in
+      `test/test_host.py` run the helper's own code against the RTL host port
+      at the protocol's minimum timing. A first run on a real v3 board is
+      still wanted when one is available.
 - [ ] `README.md`: architecture, why it is different, results table (area,
       clock, protocols, coverage, mutation score, formal properties), how to
       build, how to program, honest limitations.
@@ -866,3 +869,20 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   release assets at `v1.0-rc1`, and fill VERIFICATION_REPORT sections 4
   and 8. The v3 demo-board host transfer must land before submission; M5
   demo material after that.
+- 2026-10-07 (later), Opus 5.5: the v3 demo-board host transfer. The
+  pico-sdk's RP2350 `io_bank0.h` shows GP21..23 as SPI0 but GP40 (MISO) as
+  SPI1 RX, so no SPI block fits. `tt_helper.py` now reads Loom's pins from
+  the firmware's `GPIOMap`, keeps hardware SPI0 on the RP2040 board and
+  bit-bangs SPI mode 0 elsewhere, with every SCK phase and the CS_n setup,
+  hold and gap at least half an SCK period by construction; it raises CS_n
+  and lowers SCK before the project reset. `TTBoardTransport` refuses SCK
+  above clk / 8. `tools/loomhost/ttboard_sim.py` runs the helper itself in
+  CPython: 15 new tool tests against a checking SPI slave (1,692 in all),
+  and two new cocotb tests in `test_host` run a whole host session through
+  it on the RTL at the 4-clock minimums, one per board (212 in all; the
+  next `gl_test` will have 111). Eight hand-made faults in the helper were
+  caught by the tool tests; on the RTL, three of four were caught, and the
+  fourth (sampling MISO just after the SCK rise) is harmless on Loom, which
+  moves MISO only after the fall. Not run on a real board. Next: the
+  2026-11-08 freeze run as planned; README final pass and M5 demo
+  material; a first run on a v3 board when one is available.

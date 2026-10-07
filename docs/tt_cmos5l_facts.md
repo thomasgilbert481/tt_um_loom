@@ -453,8 +453,21 @@ RP2040 F1 column is quoted from **Table 2, "General Purpose Input/Output (GPIO) 
 whose map is `ui_in[0..7] = GP17…GP24`, `uio[0..7] = GP25…GP32`, `uo_out[0..7] = GP33…GP40`,
 `RP_PROJCLK = 16`, `PROJECT_nRST = 14`, plus `ADC1..ADC5 = 41..45`
 (<https://github.com/TinyTapeout/tt-micropython-firmware/blob/main/src/ttboard/pins/gpio_map_dbv3.py>).
-GPIO numbers > 29 mean an RP2350B-class part, not an RP2040. **RP2350 SPI pin functions for that map
-were NOT checked** — do not assume the SPI0 trick above carries over.
+GPIO numbers > 29 mean an RP2350B-class part, not an RP2040.
+
+**RP2350 SPI functions on Loom's host pins (checked 2026-10-07)** against the pico-sdk register
+header <https://github.com/raspberrypi/pico-sdk/blob/master/src/rp2350/hardware_regs/include/hardware/regs/io_bank0.h>:
+`IO_BANK0_GPIO21_CTRL_FUNCSEL_VALUE_SPI0_SS_N`, `GPIO22_..._SPI0_SCLK`, `GPIO23_..._SPI0_TX`, but
+`GPIO40_..._SPI1_RX` (and `GPIO39_..._SPI0_TX`). So on v3, CS_n `ui_in[4]` = GP21, SCK `ui_in[5]` =
+GP22 and MOSI `ui_in[6]` = GP23 are SPI0, while MISO `uo_out[7]` = GP40 is SPI1: **no one hardware SPI
+block covers the host port**. `tools/loomhost/micropython/tt_helper.py` bit-bangs it there.
+
+Also from the firmware (`main` at d485c7a, 2026-09-08): `ttboard/boot/demoboard_detect.py` assigns
+`ttboard.pins.gpio_map.GPIOMap` at boot (v3 and unknown boards both get `GPIOMapTTDBv3`), so reading
+that attribute after boot gives the live map; v2.0.4's `GPIOMapTT04` has the same `UI_IN4..6`,
+`UO_OUT6..7` attribute names. `ttboard/util/platform/__init__.py` tells an RP2350B by whether
+`machine.Pin(40)` can be made. The firmware's `PIOClock` (state machine 0) is used only for project
+clocks below 3 Hz; above that `clock_project_PWM` uses PWM on GP16 (`demoboard.py`).
 
 ### PMODs
 

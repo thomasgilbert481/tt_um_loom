@@ -2,9 +2,9 @@
 
 The far end of each fake is a ModelTransport, so the whole Loom API runs
 through the Pico line protocol and through the TT board's raw REPL exactly as
-it would over USB, with the golden model standing in for the chip. The
-MicroPython programs themselves cannot run here; they are compiled to check
-their syntax.
+it would over USB, with the golden model standing in for the chip. Here the
+MicroPython programs are only compiled to check their syntax;
+test_ttboard_helper.py runs tt_helper.py itself.
 """
 
 import sys

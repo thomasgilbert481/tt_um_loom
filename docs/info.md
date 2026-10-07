@@ -63,15 +63,18 @@ After reset all four threads are halted: nothing runs until the host loads
 a program and starts a thread.
 
 1. **The host.** `tools/loomhost` in the repository talks to Loom through
-   the host port. On the RP2040 Tiny Tapeout demo board the RP2040's SPI0
-   pins are exactly Loom's host pins, and `--ttboard PORT` drives them
-   through the board's MicroPython. The v3 demo board (RP2350B) maps the
-   pins differently and needs a PIO or bit-banged transfer, which is not
-   written yet. A Raspberry Pi Pico wired to the host pins and running
-   `tools/loomhost/micropython/pico_bridge.py` works too (`--pico PORT`);
-   that folder's README has the wiring. SCK must be at most the Loom clock
-   divided by 8. Both transports are tested against simulated serial ports
-   only: no hardware existed before the chip.
+   the host port. `--ttboard PORT` drives it through the demo board's
+   MicroPython and works on both demo boards: the helper it pastes reads
+   the pin numbers from the board firmware's own map. On the RP2040 board
+   the RP2040's SPI0 pins are exactly Loom's host pins; on the v3 board
+   (RP2350B) MISO lands on an SPI1 pin, so the helper bit-bangs SPI mode 0
+   on GP21, GP22, GP23 and GP40. A Raspberry Pi Pico wired to the host pins
+   and running `tools/loomhost/micropython/pico_bridge.py` works too
+   (`--pico PORT`); that folder's README has the wiring. SCK must be at
+   most the Loom clock divided by 8. No hardware existed before the chip:
+   both transports are tested against simulated serial ports, and the
+   demo-board helper's own code also runs against the RTL's host port in
+   simulation, for both boards.
 2. **Assemble** a program to an image:
    `python -m tools.loomasm --strict firmware/uart_tx_fifo.loom -o uart.json`
 3. **Load and run** it. The UART transmitter sends on OUT0 (`uo[0]`); at
