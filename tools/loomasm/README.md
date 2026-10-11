@@ -66,8 +66,10 @@ Constant expressions use, from lowest precedence to highest:
 |        &        << >>        + -        * /        unary - +
 ```
 
-plus `( )`, symbols (labels and `.equ` names), and the two byte selectors
-`lo8(x)` = `x & 0xFF` and `hi8(x)` = `(x >> 8) & 0xFF`. Arithmetic is
+plus `( )`, symbols (labels and `.equ` names), the two byte selectors
+`lo8(x)` = `x & 0xFF` and `hi8(x)` = `(x >> 8) & 0xFF`, `min(a, b, ...)` and
+`max(a, b, ...)` (two or more values), and `pin(NAME)`, the index of a pin: a
+`.pins` alias defined earlier or an isa.yaml pin name. Arithmetic is
 arbitrary-precision; division truncates towards zero; division by zero and a
 negative or absurd shift count are errors. The range check happens where the
 value is used, and comes from `tools.loomisa`, so the message names the field:
@@ -75,6 +77,18 @@ value is used, and comes from `tools.loomisa`, so the message names the field:
 
 A **label may be referenced before it is defined**; an `.equ` symbol may not.
 `.equ` is evaluated where it is written.
+
+**Moving a program's pins.** `--pin NAME=PIN` on the command line (`pins=`
+on `assemble()`) moves the alias `NAME` of the source's `.pins` to `PIN`, an
+isa.yaml pin name or an index, without editing the source; each `NAME` must
+be an alias the source defines. Every use of the alias moves with it, so a
+program re-pins correctly when everything that depends on its pins is
+written with them: an `OD_MASK` bit as `1 << pin(SDA)`, an `OUT` group as
+`min(pin(MOSI), pin(SCK), pin(CS_N))` (`firmware/i2c_master.loom`,
+`firmware/spi_master.loom`). `pin()` is a function rather than a bare name
+so that an alias never shadows a label of the same name (`jtag_master` has a
+label `tck` and a pin `TCK`). Added for the Pmod builds of
+`firmware/README.md` (D-035).
 
 ## 3. Operands
 
@@ -427,7 +441,7 @@ runs out.
 | File | Holds |
 |---|---|
 | `lexer.py` | tokens, character literals, comma splitting |
-| `expr.py` | constant expressions, `lo8`/`hi8` |
+| `expr.py` | constant expressions, `lo8`/`hi8`, `min`/`max`, `pin()` |
 | `parser.py` | labels, mnemonic or directive, operand groups |
 | `assembler.py` | the two passes, directives, pseudo-ops, `Program` |
 | `deadline.py` | control-flow graph and the deadline analysis |

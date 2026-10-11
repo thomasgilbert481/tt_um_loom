@@ -524,7 +524,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       transmitter and receiver; HDLC transmitter and receiver. Then, as
       time allows, DShot600, DMX512 and Wiegand. Started 2026-10-11, one
       agent per protocol in its own worktree.
-- [ ] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
+- [x] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
       I2C master at exactly 100 and 400 kHz, checked against UM10204's
       timing; a UART baud-rate table; builds of the UART, SPI and I2C
       programs for Tiny Tapeout's recommended Pmod pinouts. Done
@@ -535,9 +535,15 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       backends (BUGS 13; 400 kHz itself needs a 125-clock period, which
       the 4-clock slot grid cannot give); the UART rate table, from
       `tools.loomhost.rates.tick`, swept on the model from 9600 baud to
-      1 Mbaud (transmitter) and 460800 baud (receiver). Left: the Pmod
-      builds. The PHY-GL-SDF scenarios of the changed programs are re-run
-      with the D-035 programs at the end.
+      1 Mbaud (transmitter) and 460800 baud (receiver); the Pmod builds:
+      the assembler's `--pin NAME=PIN` moves a program's `.pins` without
+      editing it, `pin()`, `min()` and `max()` let a program derive what
+      depends on its pins, `uart_tx_fifo`, `i2c_master` and `spi_master`
+      now do, and `tools/tests/test_fw_pmod.py` runs UART on the demo
+      board's own link and the UART Pmod, I2C on the I2C Pmod and the SPI
+      master reading a flash's JEDEC ID on the SPI Pmod, on both backends.
+      The PHY-GL-SDF scenarios of the changed programs are re-run with the
+      D-035 programs at the end.
 - [ ] Firmware freeze 2026-12-01.
 
 ### M5: documentation and submission package (by 2026-12-20)

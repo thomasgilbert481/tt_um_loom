@@ -3,7 +3,12 @@
 ; the FIFOs (POP, PUSH), nothing else.
 ;
 ; Pins: MOSI = OUT0, SCK = OUT1, CS_n = OUT2 (one OUT group, so MOSI, SCK and
-; CS_n change on the same clock edge), MISO = IN0.
+; CS_n change on the same clock edge), MISO = IN0. All four move with the
+; assembler's --pin, to any pins whose three outputs lie in a group of at
+; most six: the OUT group, the bit positions and the output enables are all
+; written with pin() (firmware/README.md, "Pmod builds"). Tiny Tapeout's SPI
+; Pmod pinout, for example: --pin CS_N=BIDIR0 --pin MOSI=BIDIR1
+; --pin MISO=BIDIR2 --pin SCK=BIDIR3.
 ;
 ; Host command format (FIFO space, thread 0): one word per byte.
 ;     bits 7:0   the byte to send on MOSI
@@ -36,20 +41,37 @@
 ; four modes. Bytes are loaded into r0[15:8] (SWAP, or REV for LSB first)
 ; and shifted out of bit 15.
 ;
-; Registers: r0 TX shifter, r1 bit count, r2 config word, r3 next MOSI bit,
-; r4 next OUT pattern, r5 RX shifter, r6 shift-step base {0, A, 0},
-; r7 the current command word.
+; (Changed 2026-10-11, D-035: the pin-dependent constants were literals for
+; MOSI, SCK and CS_n in OUT bits 0, 1 and 2; they are now derived from the
+; pins, the configuration is kept with CPOL already in SCK's place, and
+; putting each MOSI bit in its place costs one slot per bit.)
+;
+; Registers: r0 TX shifter, r1 bit count, r2 configuration (CPOL in SCK's
+; place, LSB first in bit 15), r3 next MOSI bit, r4 next OUT pattern, r5 RX
+; shifter, r6 shift-step base (A in SCK's place), r7 the current command
+; word.
 
         .thread 0
         .pins   MOSI = OUT0, SCK = OUT1, CS_N = OUT2, MISO = IN0
         .tick   28                      ; half an SCK period, at the fastest
         .equ    H = 1                   ; ticks per half period
+        ; The OUT group covers the three outputs, wherever --pin puts them,
+        ; and each one's bit in an OUT word.
+        .equ    OUTB = min(pin(MOSI), pin(SCK), pin(CS_N))
+        .equ    OUTN = max(pin(MOSI), pin(SCK), pin(CS_N)) - OUTB + 1
+        .equ    BMOSI = pin(MOSI) - OUTB
+        .equ    BSCK = pin(SCK) - OUTB
+        .equ    MSCK = 1 << BSCK
+        .equ    MCS = 1 << (pin(CS_N) - OUTB)
 
-start:  .csr    OUTGRP, 16 | (3 << 5)   ; OUT drives OUT0..OUT2 (clobbers r7)
+start:  .csr    OUTGRP, OUTB | (OUTN << 5)   ; OUT drives the three (clobbers r7)
         LDI     r2, 0                   ; mode 0, MSB first
         LDI     r6, 0                   ; A = 0: shift steps drive SCK low
-        LDI     r4, 4                   ; CS_n high, SCK low, MOSI low
+        LDI     r4, MCS                 ; CS_n high, SCK low, MOSI low
         OUT     r4
+        OEP     MOSI, 1                 ; then drive them: no-ops on OUT pins,
+        OEP     SCK, 1                  ; needed on BIDIR pins
+        OEP     CS_N, 1
 
 cmd:    POP     r0                      ; next command (blocks while INQ is empty)
         SETD    3                       ; re-anchor; covers the byte set-up below
@@ -59,17 +81,18 @@ cmd:    POP     r0                      ; next command (blocks while INQ is empt
         BC      config
         JP      CS_N, 0, go             ; CS_n already low: inside a transaction
         MOV     r4, r2
-        ANDI    r4, 2                   ; SCK idle level (CPOL), CS_n low, MOSI 0
+        ANDI    r4, MSCK                ; SCK idle level (CPOL), CS_n low, MOSI 0
         OUT     r4                      ; the transaction starts
 
 go:     MOV     r3, r2
-        SHRI    r3, 3                   ; C = config bit 2: LSB first
+        SHLI    r3, 1                   ; C = r2 bit 15: LSB first
         BC      lsb
         SWAP    r0, r0                  ; MSB first: the byte to r0[15:8]
         JMP     load
 lsb:    REV     r0, r0                  ; LSB first: bit 0 to bit 15 and so on
 load:   MOV     r3, r0
-        SHRI    r3, 15                  ; the first bit, for MOSI (OUT bit 0)
+        SHRI    r3, 15                  ; the first bit ...
+        SHLI    r3, BMOSI               ; ... in MOSI's place in the OUT word
         SHLI    r0, 1
         OR      r4, r3, r6              ; the first shift-step pattern
         LDI     r1, 8
@@ -77,9 +100,10 @@ load:   MOV     r3, r0
 
 bit:    WAITD   H                       ; shift step
         OUT     r4
-        XORI    r4, 2                   ; the sample step toggles SCK only
+        XORI    r4, MSCK                ; the sample step toggles SCK only
         MOV     r3, r0
-        SHRI    r3, 15                  ; the bit after this one
+        SHRI    r3, 15                  ; the bit after this one ...
+        SHLI    r3, BMOSI               ; ... in MOSI's place
         SHLI    r0, 1
         WAITD   H                       ; sample step
         OUT     r4
@@ -90,7 +114,7 @@ s0:     OR      r4, r3, r6              ; the next shift-step pattern
         DJNZ    r1, bit
 
         MOV     r3, r2                  ; the byte is in r5[7:0], first bit in bit 7
-        SHRI    r3, 3                   ; LSB first?
+        SHLI    r3, 1                   ; LSB first?
         BNC     rxok
         REV     r5, r5                  ; reverse the eight bits
         SHRI    r5, 8
@@ -103,21 +127,28 @@ nopush: SETD    1                       ; re-anchor after the (unbounded) PUSH
         SHLI    r3, 1                   ; C = bit 15: LAST
         BNC     cmd                     ; no: CS_n stays low for the next byte
         MOV     r4, r2
-        ANDI    r4, 2                   ; SCK to its idle level, CS_n still low
+        ANDI    r4, MSCK                ; SCK to its idle level, CS_n still low
         WAITD   H
         OUT     r4                      ; (the final trailing edge for CPHA 0)
-        ORI     r4, 4
+        ORI     r4, MCS
         WAITD   H
         OUT     r4                      ; CS_n high: end of the transaction
         JMP     cmd
 
-config: MOV     r2, r0                  ; bits 1:0 mode, bit 2 LSB first
-        MOV     r4, r0
-        ANDI    r4, 2                   ; CPOL, in the SCK position
+config: MOV     r4, r0
+        ANDI    r4, 2                   ; CPOL (bit 1) ...
+        SHRI    r4, 1
+        SHLI    r4, BSCK                ; ... in SCK's place
         MOV     r6, r0
-        SHLI    r6, 1                   ; CPHA, in the SCK position
-        XOR     r6, r6, r4
-        ANDI    r6, 2                   ; A = CPOL ^ CPHA
-        ORI     r4, 4                   ; idle: CS_n high, SCK = CPOL
+        MOV     r3, r0
+        SHRI    r3, 1
+        XOR     r6, r6, r3              ; bit 0: CPHA ^ CPOL
+        ANDI    r6, 1
+        SHLI    r6, BSCK                ; A = CPOL ^ CPHA, in SCK's place
+        MOV     r3, r0
+        SHRI    r3, 2                   ; bit 2, LSB first ...
+        SHLI    r3, 15                  ; ... to bit 15
+        OR      r2, r4, r3              ; the configuration, as r2 keeps it
+        ORI     r4, MCS                 ; idle: CS_n high, SCK = CPOL
         OUT     r4
         JMP     cmd

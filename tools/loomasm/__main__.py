@@ -1,9 +1,14 @@
 """Command line for the Loom assembler.
 
     python -m tools.loomasm SOURCE.loom [-o IMAGE.json] [--listing [FILE]]
+                            [--pin NAME=PIN ...]
 
 Exit status: 0 when the image was produced, 1 when assembly failed (or, with
 ``--strict``, when the deadline check found an infeasible schedule).
+
+``--pin SCL=BIDIR2`` moves a pin the source's ``.pins`` names, for example
+to put a program on a Tiny Tapeout Pmod's pins without editing it
+(``firmware/README.md``, "Pmod builds").
 """
 
 from __future__ import annotations
@@ -46,17 +51,29 @@ def main(argv=None) -> int:
                              "Optimistic; for comparison only")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="print errors only, not warnings")
+    parser.add_argument("--pin", action="append", default=[], metavar="NAME=PIN",
+                        help="move the pin alias NAME of the source's .pins to "
+                             "PIN (an isa.yaml pin name or an index); repeatable")
     args = parser.parse_args(argv)
+
+    pins = {}
+    for item in args.pin:
+        name, sep, value = item.partition("=")
+        if not sep or not name.strip() or not value.strip():
+            print("loomasm: --pin expects NAME=PIN, got %r" % item, file=sys.stderr)
+            return 1
+        pins[name.strip()] = value.strip()
 
     try:
         program = assemble_file(args.source, strict=False,
                                 deadline_check=not args.no_deadline_check,
                                 imem_words=args.imem_words,
-                                sound_setd=not args.optimistic_setd)
+                                sound_setd=not args.optimistic_setd,
+                                pins=pins)
     except AsmError as exc:
         _report(exc.diagnostics, sys.stderr)
         return 1
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print("loomasm: %s" % exc, file=sys.stderr)
         return 1
 

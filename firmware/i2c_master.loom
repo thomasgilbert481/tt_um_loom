@@ -3,9 +3,12 @@
 ; read a byte and answer ACK or NACK. Clock stretching is honoured with a
 ; timed WAITP on SCL. M2 firmware: needs the FIFOs (POP, PUSH), nothing else.
 ;
-; Pins: SCL = BIDIR0, SDA = BIDIR1, both open drain (OD_MASK bits 0 and 1,
-; set here with a read-modify-write so other threads' bits survive). Writing
-; 1 releases a line and 0 pulls it low; the board supplies the pull-ups.
+; Pins: SCL = BIDIR0, SDA = BIDIR1, both open drain (their OD_MASK bits, set
+; here with a read-modify-write so other threads' bits survive). Writing 1
+; releases a line and 0 pulls it low; the board supplies the pull-ups. Both
+; move to any other BIDIR pins with the assembler's --pin SCL=<pin> and
+; --pin SDA=<pin>: the mask is written with pin() (firmware/README.md, "Pmod
+; builds").
 ;
 ; Host command format (FIFO space, thread 0): one word per operation.
 ;     bits 7:0   the byte to write (ignored for READ and NOBYTE)
@@ -78,9 +81,11 @@
         .equ    PRE = 10                ; SCL low before a START or STOP lets it go
         .equ    BUF = 10                ; bus free after a STOP
         .equ    STRETCH = 255           ; clock-stretch timeout, in ticks
+        .equ    ODM = (1 << pin(SCL)) | (1 << pin(SDA))   ; their OD_MASK bits
 
 start:  CSRR    r0, OD_MASK
-        ORI     r0, 3                   ; SCL and SDA open drain
+        LDI     r1, ODM
+        OR      r0, r0, r1              ; SCL and SDA open drain
         CSRW    OD_MASK, r0
         SETP    SCL, 1                  ; release both lines: the bus idles high
         SETP    SDA, 1

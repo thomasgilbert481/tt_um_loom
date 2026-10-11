@@ -9,9 +9,10 @@ quarter of the 512-word memory and on its own pins:
     thread 2  i2c_master    SCL = BIDIR0, SDA = BIDIR1        TICK_INT 8
     thread 3  ws2812        DOUT = OUT4                       its own tick
 
-Each program is the file in ``firmware/`` with only its ``.thread`` line and
-its pins changed (the SPI master's output group, ``OUTGRP``, moves with its
-pins). Every run loads the same image, queues the same data and writes the
+Each program is the file in ``firmware/`` with only its ``.thread`` line
+changed and its pins moved by the assembler's ``pins=`` overrides (the SPI
+master derives its output group from its pins). Every run loads the same
+image, queues the same data and writes the
 same ticks through the host port, then starts threads with one ``RUN``
 write; only that write's mask differs. So everything up to ``RUN`` is the
 same transaction sequence, and a protocol's pin edges in the run where all
@@ -35,18 +36,12 @@ ISA = load()
 FIRMWARE = REPO / "firmware"
 IMEM = 512                                   # the macro build: quarters of 128 words
 
-#: (protocol, program, thread, source substitutions, host tick or None)
+#: (protocol, program, thread, pin overrides, host tick or None)
 LAYOUT = (
-    ("uart", "uart_tx_fifo", 0, (), (128, 0)),
-    ("spi", "spi_master", 1, (
-        (".pins   MOSI = OUT0, SCK = OUT1, CS_N = OUT2, MISO = IN0",
-         ".pins   MOSI = OUT1, SCK = OUT2, CS_N = OUT3, MISO = IN0"),
-        (".csr    OUTGRP, 16 | (3 << 5)", ".csr    OUTGRP, 17 | (3 << 5)"),
-    ), (64, 0)),
-    ("i2c", "i2c_master", 2, (), (8, 0)),
-    ("ws2812", "ws2812", 3, (
-        (".pins   DOUT = OUT0", ".pins   DOUT = OUT4"),
-    ), None),
+    ("uart", "uart_tx_fifo", 0, {}, (128, 0)),
+    ("spi", "spi_master", 1, {"MOSI": "OUT1", "SCK": "OUT2", "CS_N": "OUT3"}, (64, 0)),
+    ("i2c", "i2c_master", 2, {}, (8, 0)),
+    ("ws2812", "ws2812", 3, {"DOUT": "OUT4"}, None),
 )
 PINS = {"uart": ("OUT0",), "spi": ("OUT1", "OUT2", "OUT3"),
         "i2c": ("BIDIR0", "BIDIR1"), "ws2812": ("OUT4",)}
@@ -62,19 +57,19 @@ LED = [0x12, 0x34, 0x56]                                 # one LED, G R B
 RUN_CLOCKS = 12000           # the WS2812 frame latches last, about 7,000 after RUN
 
 
-def program(source, thread, substitutions):
+def program(source, thread, pins):
     text = (FIRMWARE / (source + ".loom")).read_text(encoding="utf-8")
-    for old, new in ((".thread 0", ".thread %d" % thread),) + tuple(substitutions):
-        assert text.count(old) == 1, "%s: %r is not in the source once" % (source, old)
-        text = text.replace(old, new)
-    return assemble_text(text, source + ".loom", isa=ISA, imem_words=IMEM, strict=True)
+    assert text.count(".thread 0") == 1, "%s: '.thread 0' is not in the source once" % source
+    text = text.replace(".thread 0", ".thread %d" % thread)
+    return assemble_text(text, source + ".loom", isa=ISA, imem_words=IMEM, strict=True,
+                         pins=pins)
 
 
 def image():
     """The four programs, each at its own thread's quarter, as one image."""
     words = {}
-    for _, source, thread, subs, _ in LAYOUT:
-        prog = program(source, thread, subs)
+    for _, source, thread, pins, _ in LAYOUT:
+        prog = program(source, thread, pins)
         assert prog.errors == [], prog.errors
         base, size = thread * IMEM // 4, IMEM // 4
         assert all(base <= a < base + size for a in prog.words), \

@@ -1,6 +1,7 @@
 ; uart_tx_fifo.loom
 ; 8N1 UART transmitter on OUT0, fed by the host through INQ[0]. M2 firmware:
-; needs the FIFOs (POP), nothing else.
+; needs the FIFOs (POP), nothing else. TX moves to any output or BIDIR pin
+; with the assembler's --pin TX=<pin> (firmware/README.md, "Pmod builds").
 ;
 ; Host command format (FIFO space, thread 0): one word per byte.
 ;     bits 7:0   the byte to send (LSB first on the wire)
@@ -37,6 +38,7 @@
         .tick   24                      ; the fastest rate the schedule is proved for
 
 start:  SETP    TX, 1                   ; the line idles high
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
         JMP     idle
 
 stop:   LDI     r1, 8                   ; the next byte's bit count, ahead of time

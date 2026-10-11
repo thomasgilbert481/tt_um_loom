@@ -153,7 +153,8 @@ class Program:
 
 class _Assembler:
     def __init__(self, isa: Isa, filename: str,
-                 imem_words: "Optional[int]" = None):
+                 imem_words: "Optional[int]" = None,
+                 pins: "Optional[Dict[str, object]]" = None):
         self.isa = isa
         self.filename = filename
         self.threads = int(isa.meta["threads"])
@@ -182,6 +183,13 @@ class _Assembler:
         self.labels: Dict[str, int] = {}
         self.equs: Dict[str, int] = {}
         self.pin_aliases: Dict[str, int] = {}
+        #: ``pins=`` (the command line's ``--pin NAME=PIN``): an alias the
+        #: source's ``.pins`` defines, moved to another pin without editing
+        #: the source (D-035). Each must name an alias the source defines.
+        self.pin_overrides: Dict[str, int] = {
+            name.upper(): self.override_value(name, value)
+            for name, value in (pins or {}).items()}
+        self.pin_overrides_used = set()
         self.words: Dict[int, int] = {}
         self.owner: Dict[int, Tuple[int, int]] = {}
         self.diagnostics: List[Diagnostic] = []
@@ -223,11 +231,48 @@ class _Assembler:
             return self.labels[name]
         raise UnresolvedSymbol(name)
 
+    def resolve_pin(self, name: str) -> int:
+        """``pin(NAME)`` in an expression: a ``.pins`` alias (as moved by any
+        override) or an isa.yaml pin name."""
+        key = name.upper()
+        if key in self.pin_aliases:
+            return self.pin_aliases[key]
+        if key in self.pins:
+            return self.pins[key]
+        raise ExprError("pin(%s): no such pin (a .pins alias must be defined "
+                        "before it is used)" % name)
+
+    def override_value(self, name: str, value: object) -> int:
+        """The pin index a ``pins=`` override gives: an isa.yaml pin name or a
+        number. Raises ValueError, which the command line reports."""
+        if isinstance(value, int):
+            index = value
+        else:
+            text = str(value).strip()
+            if text.upper() in self.pins:
+                index = self.pins[text.upper()]
+            else:
+                try:
+                    index = int(text, 0)
+                except ValueError:
+                    raise ValueError("--pin %s=%s: isa.yaml has no pin called %s"
+                                     % (name, text, text)) from None
+        if index not in self.isa.pins:
+            raise ValueError("--pin %s=%s: pin index %d is not a pad" % (name, value, index))
+        return index
+
+    def check_pin_overrides(self) -> None:
+        """An override for an alias the source never defined is a mistake."""
+        for key in sorted(set(self.pin_overrides) - self.pin_overrides_used):
+            self.diagnostics.append(Diagnostic(
+                ERROR, SYMBOL, self.filename, 0,
+                "--pin %s: the source's .pins defines no alias %s to move" % (key, key)))
+
     def eval_tokens(self, tokens: Sequence[Token], what: str) -> int:
         if not tokens:
             raise _Bad("missing %s" % what)
         try:
-            return evaluate(list(tokens), self.resolve)
+            return evaluate(list(tokens), self.resolve, self.resolve_pin)
         except UnresolvedSymbol as exc:
             raise _Bad(exc.message, exc.token or tokens[0], SYMBOL) from None
         except ExprError as exc:
@@ -422,6 +467,9 @@ class _Assembler:
             name_token, value_tokens = self.split_assignment(group, ".pins")
             value = self.pin_value(value_tokens)
             key = name_token.text.upper()
+            if key in self.pin_overrides:              # moved by pins= / --pin
+                value = self.pin_overrides[key]
+                self.pin_overrides_used.add(key)
             if key in self.pins:
                 raise _Bad("'%s' is a pin name in isa.yaml and cannot be "
                            "redefined" % name_token.text, name_token, SYMBOL)
@@ -803,15 +851,17 @@ class _Assembler:
 def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" = None,
                   strict: bool = False, deadline_check: bool = True,
                   imem_words: "Optional[int]" = None,
-                  sound_setd: bool = dl.SOUND_SETD_DEFAULT) -> Program:
+                  sound_setd: bool = dl.SOUND_SETD_DEFAULT,
+                  pins: "Optional[Dict[str, object]]" = None) -> Program:
     """Assemble source text. See :func:`assemble` for the argument meanings."""
     from .listing import build_listing
 
     isa = isa if isa is not None else load()
     stmts, diagnostics = parse_source(text, filename)
-    asm = _Assembler(isa, filename, imem_words)
+    asm = _Assembler(isa, filename, imem_words, pins)
     asm.diagnostics.extend(diagnostics)
     asm.pass1(stmts)
+    asm.check_pin_overrides()
     # Pass 2 always runs: statements that failed to size emit nothing, so every
     # operand error in the file is reported alongside the layout errors.
     asm.pass2(stmts)
@@ -826,18 +876,20 @@ def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" =
 def assemble_file(path, *, isa: "Optional[Isa]" = None, strict: bool = False,
                   deadline_check: bool = True,
                   imem_words: "Optional[int]" = None,
-                  sound_setd: bool = dl.SOUND_SETD_DEFAULT) -> Program:
+                  sound_setd: bool = dl.SOUND_SETD_DEFAULT,
+                  pins: "Optional[Dict[str, object]]" = None) -> Program:
     path = pathlib.Path(path)
     text = path.read_text(encoding="utf-8")
     return assemble_text(text, str(path).replace(os.sep, "/"), isa=isa,
                          strict=strict, deadline_check=deadline_check,
-                         imem_words=imem_words, sound_setd=sound_setd)
+                         imem_words=imem_words, sound_setd=sound_setd, pins=pins)
 
 
 def assemble(text_or_path, *, filename: "Optional[str]" = None,
              isa: "Optional[Isa]" = None, strict: bool = False,
              deadline_check: bool = True,
-             imem_words: "Optional[int]" = None) -> Program:
+             imem_words: "Optional[int]" = None,
+             pins: "Optional[Dict[str, object]]" = None) -> Program:
     """Assemble a file or a block of source text.
 
     A :class:`pathlib.Path` is always read from disk. A ``str`` is treated as
@@ -847,9 +899,15 @@ def assemble(text_or_path, *, filename: "Optional[str]" = None,
     ``imem_words`` is the instruction-memory size the program is laid out for:
     thread ``t``'s section starts at ``t * (imem_words / 4)`` (D-017). It
     defaults to 1024 and overrides a ``.imem`` in the source.
+
+    ``pins`` moves pins the source's ``.pins`` names, ``{"SCL": "BIDIR2"}``
+    for example: the command line's ``--pin SCL=BIDIR2`` (D-035). Each name
+    must be an alias the source defines; the value is an isa.yaml pin name or
+    an index. A program re-pins correctly only if everything that depends on
+    its pins is written with ``pin(NAME)``.
     """
     kwargs = dict(isa=isa, strict=strict, deadline_check=deadline_check,
-                  imem_words=imem_words)
+                  imem_words=imem_words, pins=pins)
     if isinstance(text_or_path, pathlib.Path):
         return assemble_file(text_or_path, **kwargs)
     text = str(text_or_path)

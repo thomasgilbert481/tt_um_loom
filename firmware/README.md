@@ -39,11 +39,11 @@ the M2 convention for the rate.
 
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
-| `uart_tx_fifo.loom` | TX = OUT0 | 26 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
+| `uart_tx_fifo.loom` | TX = OUT0 | 27 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
 | `uart_rx.loom` | RX = IN0 | 47 | 8 clocks per tick, 8 ticks per bit | 20 clocks | 64 clocks/bit (781 kbaud); 115200 baud (TICK 54 + 64/256); +-3 % sender error |
-| `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 72 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
+| `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 84 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
 | `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 80 | none: the master's SCK times it, no deadline pairs | no deadline pairs; MISO 28 to 35 clocks after each sampling edge | 390 kHz SCK (128 clocks, TICK 32 for the silence timeout), modes 0 to 3 |
-| `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 120 | 6 clocks per tick, 16 ticks per SCL period | 0 clocks | 100 kHz standard mode (TICK 31 + 64/256) and 390.6 kHz fast mode (TICK 7, r5 = 1), UM10204 table 10 measured at both; most tests at TICK 8 (347 kHz) |
+| `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 121 | 6 clocks per tick, 16 ticks per SCL period | 0 clocks | 100 kHz standard mode (TICK 31 + 64/256) and 390.6 kHz fast mode (TICK 7, r5 = 1), UM10204 table 10 measured at both; most tests at TICK 8 (347 kHz) |
 | `ws2812.loom` | DOUT = OUT0 | 52 | 1 clock per tick (set by the program) | 4 clocks (two `.bounded` POPs) | the WS2812B waveform at 50 MHz: T0H 20, T1H 40, period 64 clocks |
 | `ps2_host.loom` | CLK = IN0, DATA = IN1 | 45 | 64 clocks per tick (set by the program), timeouts only | no deadline pairs | 10 kHz and 16.67 kHz device clock |
 | `jtag_master.loom` | TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0 | 43 | 32 clocks per half TCK period | 0 clocks | TICK 32: 781 kHz TCK |
@@ -182,6 +182,36 @@ transmitter rate at 763 baud.
 Every error is under 0.01 %. The examples elsewhere use 434 + 8/256 for
 115200 baud, 1/256 of a clock slower: both are far inside a UART's
 tolerance.
+
+## Pmod builds
+
+A program keeps its pins in its `.pins` line, and the assembler's
+`--pin NAME=PIN` moves them without editing the source
+(`tools/loomasm/README.md`, section 2). Tiny Tapeout's recommended pinouts
+(<https://tinytapeout.com/specs/pinouts/>) put the common peripherals on
+fixed pins; these builds put the programs there, and
+`tools/tests/test_fw_pmod.py` runs each one on both backends (its `PMODS` is
+this table). Every command starts
+`python -m tools.loomasm --strict firmware/<program>.loom`:
+
+| Build | Program and pins | Where |
+|---|---|---|
+| UART on the demo board's own USB-UART link | `uart_tx_fifo --pin TX=OUT4`, `uart_rx --pin RX=IN3` | the design's TX on `uo_out[4]`, RX on `ui_in[3]` |
+| UART on the UART Pmod's top row | `uart_tx_fifo --pin TX=BIDIR1`, `uart_rx --pin RX=BIDIR2` | TXD `uio[1]`, RXD `uio[2]` |
+| I2C on the I2C Pmod's top row | `i2c_master --pin SCL=BIDIR2 --pin SDA=BIDIR3` | SCL `uio[2]`, SDA `uio[3]` |
+| SPI on the SPI Pmod's top row, which is also how the QSPI Pmod wires its flash | `spi_master --pin CS_N=BIDIR0 --pin MOSI=BIDIR1 --pin MISO=BIDIR2 --pin SCK=BIDIR3` | CS `uio[0]`, MOSI `uio[1]`, MISO `uio[2]`, SCK `uio[3]`; the test reads a flash's JEDEC ID |
+
+`uart_tx_fifo` as shipped (TX on `uo_out[0]`) already matches the pinouts
+page's other UART link pair; its receiver is `uart_rx --pin RX=IN1`. TXD and
+RXD are named as the pinouts page names them; swap the two for a Pmod named
+from its own side. A program re-pins correctly only when everything it
+derives from its pins is written with `pin()`, so that moves too: the
+`OD_MASK` bits of `i2c_master`, the `OUT` group and bit positions of
+`spi_master` (its three outputs must lie within six consecutive pins), and
+the `OEP` that drives an output that lands on a BIDIR pin (`uart_tx_fifo`,
+`spi_master`). Those three were changed for that on 2026-10-11 (D-035);
+`uart_rx` needed nothing. The other programs have not been checked for
+constants that depend on their pins, so check before moving them.
 
 ## spi_master.loom: full-duplex SPI master
 

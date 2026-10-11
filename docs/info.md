@@ -115,5 +115,8 @@ protocol programs, as wanted:
 - A logic analyser to watch it all.
 
 Each program sets its pins in its source; `firmware/README.md` lists them.
-Tiny Tapeout's recommended Pmod pinouts are at
-<https://tinytapeout.com/specs/pinouts/>.
+The assembler's `--pin NAME=PIN` moves them without editing the source, and
+`firmware/README.md` ("Pmod builds") gives the options that put the UART,
+I2C and SPI programs on Tiny Tapeout's recommended Pmod pinouts
+(<https://tinytapeout.com/specs/pinouts/>) and on the demo board's own
+USB-UART link.
