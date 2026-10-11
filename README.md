@@ -124,6 +124,8 @@ python -m tools.loomhost --model firmware/uart_tx_fifo.loom --uart-rx OUT0:32 \
   hardware; `docs/VERIFICATION_REPORT.md` section 2 says what stands in for
   a bench.
 - The slow corner closes at about 43 MHz, not 50 MHz.
+- The I/O pads and Tiny Tapeout's multiplexer sit outside the hardened
+  tile, so no simulation here includes their delays.
 - The bit engine has no autonomous mode (D-032): every bit costs its thread
   at least one instruction slot. The fastest rate a shipped program is
   tested at is 2.083 Mbit/s, the Manchester loopback's.

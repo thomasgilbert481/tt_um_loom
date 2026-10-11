@@ -469,6 +469,13 @@ that attribute after boot gives the live map; v2.0.4's `GPIOMapTT04` has the sam
 `machine.Pin(40)` can be made. The firmware's `PIOClock` (state machine 0) is used only for project
 clocks below 3 Hz; above that `clock_project_PWM` uses PWM on GP16 (`demoboard.py`).
 
+**The v3 board is the ETR board** (checked 2026-10-11). The firmware's
+`ttboard/boot/demoboard_detect.py` calls demo board v3 "ETR" and says SDK support is limited to
+RP2350-based boards from that release on. Tiny Tapeout's page for it,
+<https://tinytapeout.com/specs/pcb-etr/> ("PCB - ETR (TT09+)"), describes an RP2350 with Pmod
+headers, USB-C for power and data and the MicroPython SDK in flash, but gives no pin table:
+`GPIOMapTTDBv3` above is the map.
+
 ### PMODs
 
 <https://tinytapeout.com/specs/pinouts/>: there are input-only (`ui_in`), output-only (`uo_out`) and
@@ -816,6 +823,23 @@ published cmos5l SRAM result that passes the Tiny Tapeout precheck.
 - A mock of the relevant OpenDB calls in Python's Tcl 8.6 (`tkinter`) ran the real
   `pdn_cfg.tcl` offline before each push; it caught the geometry but not PDN-0234,
   which lives in C++ (run 6).
+
+### An independent recipe, 2026-09-29
+
+Ken Pettit's walkthrough <https://kdp1965.github.io/ihp-um-janestreet-prism/ihp_sram_macro.html>
+(written from his design on 2026-09-29, read here 2026-10-11) puts two
+`RM_IHPSG13_1P_512x32_c2_bm_bist` in an 8x4 cmos5l tile. It agrees with this recipe on the
+points that matter: the macro is powered Metal4 on Metal4 by tile stripes landed in its power
+columns (his pitch 44.96 um = 4 x 11.24, ours 67.44 = 6 x 11.24; he adds stripes over more
+columns with a custom LibreLane step); `PDN_MACRO_CONNECTIONS` hooks `VDD!` and `VDDARRAY!` to
+the power net; `A_DLY` is tied to 1 and the BIST port off (here: `src/loom_imem_macro.v`); and
+Magic's abstract extraction reports illegal overlaps where stripes cross the LEF's Metal4 bar,
+waived because the GDS has no metal there (his 22, ours 10 to 12). It differs in that he turns
+Magic DRC off and relies on KLayout DRC (here Magic DRC runs and is not an error, item 4 of
+the recipe above), blocks Metal2 to Metal4 routing over the macros with a 2 um halo, and places antenna
+diodes at the macro inputs with a custom step. His warning that an unfed macro still passes
+DRC and LVS is covered here by the PDN wrapper, which fails the step unless every macro supply
+carries a stripe.
 
 ## 12. The macro in the 6x4 core: gate-level simulation and sign-off readings, 2026-09-19
 

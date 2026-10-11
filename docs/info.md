@@ -60,7 +60,10 @@ design closes at about 43 MHz.
 ## How to test
 
 After reset all four threads are halted: nothing runs until the host loads
-a program and starts a thread.
+a program and starts a thread. Load the programs after every power-up and
+every time Loom is selected again on the demo board: the SRAM does not keep
+them while another design is selected. The demo-board helper selects and
+resets Loom at the start of every session.
 
 1. **The host.** `tools/loomhost` in the repository talks to Loom through
    the host port. `--ttboard PORT` drives it through the demo board's
@@ -94,8 +97,23 @@ every instruction), `docs/HOST_PROTOCOL.md` and
 
 ## External hardware
 
-The SPI host: the demo board's RP2040, or a Pico. For the protocol programs,
-as wanted: a USB-UART adapter, an SPI device or master, I2C pull-ups, a
-WS2812 strip, a PS/2 keyboard, a JTAG or SWD target, a CAN transceiver
-(TXD on OUT0, RXD on IN0), for USB low speed the D+ and D- lines with a
-1.5 kOhm pull-up on D-, and a logic analyser to watch it all.
+The SPI host: the demo board's microcontroller (the RP2040, or the RP2350B
+on the v3 board, which Tiny Tapeout's firmware calls ETR), or a Pico. The
+demo board's I/O is 3.3 V, so anything else goes on a Pmod. For the
+protocol programs, as wanted:
+
+- UART: a 3.3 V USB-UART adapter.
+- SPI: a 3.3 V SPI device or master.
+- I2C: pull-ups to 3.3 V on SCL and SDA.
+- WS2812: a strip, with a 3.3 V to 5 V buffer on the data line (the LEDs
+  want at least 0.7 of their 5 V supply on DIN).
+- PS/2: a keyboard, with its 5 V clock and data lines brought down to 3.3 V.
+- JTAG and SWD: a 3.3 V target.
+- CAN: a 3.3 V CAN transceiver (TXD on OUT0, RXD on IN0).
+- USB low speed: the D+ and D- lines, with a 1.5 kOhm pull-up from D- to
+  3.3 V.
+- A logic analyser to watch it all.
+
+Each program sets its pins in its source; `firmware/README.md` lists them.
+Tiny Tapeout's recommended Pmod pinouts are at
+<https://tinytapeout.com/specs/pinouts/>.

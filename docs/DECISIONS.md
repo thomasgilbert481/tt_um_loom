@@ -773,6 +773,15 @@ Consequences: D-030's fallback clause is replaced by the order above; PLAN
 M4's freeze item and M5's release item carry it. The M3 review is
 `docs/reviews/m3-review.md`. It was not independent: Thomas asked for it in
 the directing session, which also wrote its brief.
+Amended 2026-10-11: Tiny Tapeout's local hardening guide
+(<https://tinytapeout.com/guides/local-hardening/>) runs the same
+`tt_tool.py --harden` flow in Docker, off GitHub and its six-hour job
+limit, and the organisers told entrants on 2026-10-09 that this is the
+route for a design that hits the limit. It keeps the design unchanged, so
+it becomes the second step: re-run once, then harden locally, and only then
+take D-031 out. 8x4, the old second step, is already taken (D-034). Not yet
+tried here: the guide covers sky130, gf180 and ihp-sg13g2 but not cmos5l,
+and leaves out precheck and submission.
 
 ## D-034 2026-09-28 Opus 5.5 (M3 review), proposed; adopted 2026-10-06 by Thomas: 8x4
 

@@ -403,8 +403,9 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 
 - [ ] 2026-11-08: RTL freeze (D-030). Final `gds` run by hand on the freeze
       commit; if it does not finish inside six hours, re-run it once, then
-      move to 8x4 if the organisers have confirmed it, and only then take
-      D-031 out (D-033, which replaced "the last slice comes out"). Record
+      run the same flow locally (Tiny Tapeout's local hardening guide), and
+      only then take D-031 out (D-033 as amended 2026-10-11; its old second
+      step, 8x4, is taken). Record
       the action and tools commits the run used. After the freeze, RTL changes only for a bug found
       by verification, each with a re-hardening. Measured 2026-09-28 (run
       36366875261, the unchanged design again): the flow is deterministic,
@@ -509,6 +510,12 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       `info.yaml`); the branch run 36427897067 already passed every job at
       8x4 with the macro and stripe keys unchanged. Its datasheet numbers
       (clock at the slow corner) and AREA's current row change with it.
+- [ ] When Tiny Tapeout publishes its 8x4 template for cmos5l: compare the
+      tools' 8x4 tile with d66cf17, the version runs 36427897067 and
+      37547764383 used (still the latest on 2026-10-11). If anything
+      changed, Thomas starts a hardening of main before the freeze, so the
+      freeze run holds no surprise. The design passes at 6x4 too (run
+      37475045879), so a 6x4 limit is met either way.
 - [ ] Firmware freeze 2026-12-01.
 
 ### M5: documentation and submission package (by 2026-12-20)
@@ -887,3 +894,17 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   moves MISO only after the fall. Not run on a real board. Next: the
   2026-11-08 freeze run as planned; README final pass and M5 demo
   material; a first run on a v3 board when one is available.
+- 2026-10-11, Opus 5.5: the organisers' update to entrants of 2026-10-09,
+  checked against the design. The prize board is Tiny Tapeout's ETR board,
+  which their firmware names demo board v3: the RP2350B board the host
+  transfer already targets. The tools' 8x4 tile is unchanged since
+  d66cf17, the version both 8x4 runs used; an M4 item now watches for the
+  8x4 template. D-033 amended: local hardening comes before taking D-031
+  out. The datasheet says what each program needs on a Pmod (3.3 V I/O,
+  level shifting for WS2812 data and PS/2) and that the programs must be
+  loaded again after Loom is selected again. Ken Pettit's independent
+  cmos5l SRAM walkthrough agrees with D-021's recipe where it matters,
+  `A_DLY` tied to 1 and every macro supply fed included (facts section
+  11). Next: proposals for Thomas (new firmware for protocols Loom was
+  not designed for, SPI slave modes 1 and 2, builds for Tiny Tapeout's
+  Pmod pinouts); the freeze run on 2026-11-08 as planned.
