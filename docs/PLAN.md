@@ -516,6 +516,18 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       changed, Thomas starts a hardening of main before the freeze, so the
       freeze run holds no surprise. The design passes at 6x4 too (run
       37475045879), so a 6x4 limit is met either way.
+- [ ] D-035, protocols Loom was not designed for, each to the shipped
+      programs' bar (`--strict`, a reference model from the specification,
+      L3 on both backends, a PHY-GL-SDF scenario, a README row, a header
+      saying when it was written and what hardware it reuses): 1-Wire
+      master and device; LIN master and auto-baud slave; NEC infrared
+      transmitter and receiver; HDLC transmitter and receiver. Then, as
+      time allows, DShot600, DMX512 and Wiegand. Started 2026-10-11, one
+      agent per protocol in its own worktree.
+- [ ] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
+      I2C master at exactly 100 and 400 kHz, checked against UM10204's
+      timing; a UART baud-rate table; builds of the UART, SPI and I2C
+      programs for Tiny Tapeout's recommended Pmod pinouts.
 - [ ] Firmware freeze 2026-12-01.
 
 ### M5: documentation and submission package (by 2026-12-20)

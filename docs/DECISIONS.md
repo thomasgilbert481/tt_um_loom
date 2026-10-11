@@ -820,3 +820,46 @@ six hours); slack typical +5.49, fast +10.64, slow -3.05 ns on 24
 endpoints, so the datasheet's slow-corner clock is about 43 MHz. 8x4
 stays.
 
+
+## D-035 2026-10-11 Opus 5.5, delegated by Thomas: firmware for protocols Loom was not designed for, and the common-settings gaps
+
+Decision: before the firmware freeze (2026-12-01), and with no change to
+`src/`, write firmware for protocols that were never design targets:
+
+1. 1-Wire, master and device (a DS18B20-style emulation): one open-drain
+   pin, microsecond time slots, presence detection, the ROM search, CRC-8 on
+   the CRC unit.
+2. LIN, master and a slave that measures the master's sync field and sets
+   its own tick from it (auto-baud), with the protected identifier and the
+   enhanced checksum.
+3. NEC infrared: a transmitter that makes the 38 kHz carrier itself with the
+   deadline latch on a fractional tick, and a receiver for a demodulated
+   input.
+4. HDLC framing (ISO/IEC 13239), transmitter and receiver: NRZI from the
+   encoder built for USB, the FCS-16 on the CRC unit, and the zero-bit
+   insertion, which the stuffing hardware does not know, done by firmware.
+
+Then, as time allows, short ones: DShot600, DMX512, Wiegand. And close the
+gaps against common settings: the SPI slave in modes 1 and 2, the I2C master
+at exactly 100 and 400 kHz against UM10204's timing, a UART baud-rate table,
+and builds of the UART, SPI and I2C programs for Tiny Tapeout's recommended
+Pmod pinouts.
+
+Why: the organisers' guidance to entrants (2026-10-09) puts flexibility
+first: support for protocols the chip was not designed for. Every shipped
+program was a target while the hardware was being designed (the blog's list
+plus WS2812 and the EEPROM), so none of them answers that directly. Programs
+written after the hardware was complete (D-032) do, the more so when they
+reuse hardware built for something else (USB's NRZI, the CRC unit, the
+deadline latch) and firmware covers what the hardware lacks. Each new
+program meets the shipped ones' bar: `--strict` with every deadline pair
+proved, a reference model written from the protocol's specification, L3
+tests on the model and the RTL, a PHY-GL-SDF scenario on the freeze netlist,
+a firmware README row, and a header that says when it was written and which
+hardware it reuses.
+Rejected: 10BASE-T (20 M half-bits per second is beyond the manual mode,
+D-029); any hardware change (D-030, D-032); protocols picked for the count
+rather than for a different physical layer or coding.
+Consequences: four firmware agents in worktrees and the director on the
+gaps and the integration; L3 grows, with slow scenarios marked `model_only`
+as before; the firmware freeze date is unchanged.
