@@ -527,7 +527,17 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
 - [ ] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
       I2C master at exactly 100 and 400 kHz, checked against UM10204's
       timing; a UART baud-rate table; builds of the UART, SPI and I2C
-      programs for Tiny Tapeout's recommended Pmod pinouts.
+      programs for Tiny Tapeout's recommended Pmod pinouts. Done
+      2026-10-11: the SPI slave in all four modes (a falling-edge copy of
+      its loop, picked with r5 = 1; BUGS 12 found on the way); the I2C
+      master meets every UM10204 table 10 bound at 100 kHz in standard mode
+      and at 390.6 kHz in fast mode (r5 = 1), measured on the pins on both
+      backends (BUGS 13; 400 kHz itself needs a 125-clock period, which
+      the 4-clock slot grid cannot give); the UART rate table, from
+      `tools.loomhost.rates.tick`, swept on the model from 9600 baud to
+      1 Mbaud (transmitter) and 460800 baud (receiver). Left: the Pmod
+      builds. The PHY-GL-SDF scenarios of the changed programs are re-run
+      with the D-035 programs at the end.
 - [ ] Firmware freeze 2026-12-01.
 
 ### M5: documentation and submission package (by 2026-12-20)

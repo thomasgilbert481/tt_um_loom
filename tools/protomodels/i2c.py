@@ -341,3 +341,108 @@ class I2cMaster(Model):
                 self.scl_rel = 0
                 yield q
                 self.sda_rel = 1
+
+
+#: UM10204 (rev. 7, 2021) table 10, the characteristics of SCL and SDA a
+#: master has to meet, in nanoseconds (``f_scl_max`` in hertz): minimums,
+#: except ``t_vd_dat``, a maximum. Standard mode and fast mode.
+UM10204 = {
+    "standard": {"f_scl_max": 100_000, "t_low": 4700, "t_high": 4000,
+                 "t_su_sta": 4700, "t_hd_sta": 4000, "t_su_sto": 4000,
+                 "t_buf": 4700, "t_su_dat": 250, "t_hd_dat": 0, "t_vd_dat": 3450},
+    "fast": {"f_scl_max": 400_000, "t_low": 1300, "t_high": 600,
+             "t_su_sta": 600, "t_hd_sta": 600, "t_su_sto": 600,
+             "t_buf": 1300, "t_su_dat": 100, "t_hd_dat": 0, "t_vd_dat": 900},
+}
+
+
+class I2cTiming(Model):
+    """Every SCL and SDA edge, and the UM10204 table 10 quantities they give.
+
+    Written from the table, not from any firmware: :meth:`measure` returns,
+    in clocks, every SCL period (rise to rise) and every instance of each
+    quantity the table bounds. SDA changing while SCL is high is a START
+    (falling) or a STOP (rising); while SCL is low it is data. Data edges
+    count for the set-up and hold of data whoever drives them, so a check
+    of the master alone should look at a transaction whose data the master
+    drives, or accept the device's edges as they come.
+    """
+
+    def __init__(self, scl: PinSpec, sda: PinSpec) -> None:
+        self.scl, self.sda = pad_of(scl), pad_of(sda)
+        self.prev = (1, 1)
+        self.edges: List[Tuple[int, str, int]] = []
+
+    def observe(self, lines: Lines) -> None:
+        now = (lines.get(self.scl), lines.get(self.sda))
+        if now[0] != self.prev[0]:
+            self.edges.append((lines.cycle, "scl", now[0]))
+        if now[1] != self.prev[1]:
+            self.edges.append((lines.cycle, "sda", now[1]))
+        self.prev = now
+
+    def measure(self) -> dict:
+        out = {k: [] for k in ("period", "t_low", "t_high", "t_su_sta", "t_hd_sta",
+                               "t_su_sto", "t_buf", "t_su_dat", "t_hd_dat", "t_vd_dat")}
+        scl = 1
+        rise = fall = start = stop = data = None
+        first_data_in_low = True
+        prev_rise = None
+        for cycle, line, value in self.edges:
+            if line == "scl" and value:                       # SCL rises
+                if fall is not None:
+                    out["t_low"].append(cycle - fall)
+                if prev_rise is not None:
+                    out["period"].append(cycle - prev_rise)
+                if data is not None:
+                    out["t_su_dat"].append(cycle - data)
+                prev_rise = rise = cycle
+                data = None
+                scl = 1
+            elif line == "scl":                               # SCL falls
+                if rise is not None:
+                    out["t_high"].append(cycle - rise)
+                if start is not None and (rise is None or start >= rise):
+                    out["t_hd_sta"].append(cycle - start)
+                fall = cycle
+                first_data_in_low = True
+                scl = 0
+            elif scl and not value:                           # START
+                if rise is not None:
+                    out["t_su_sta"].append(cycle - rise)
+                if stop is not None:
+                    out["t_buf"].append(cycle - stop)
+                start, stop = cycle, None
+            elif scl:                                         # STOP
+                if rise is not None:
+                    out["t_su_sto"].append(cycle - rise)
+                stop, start = cycle, None
+            else:                                             # data, SCL low
+                if fall is not None and first_data_in_low:
+                    out["t_hd_dat"].append(cycle - fall)
+                    out["t_vd_dat"].append(cycle - fall)
+                    first_data_in_low = False
+                data = cycle
+        return out
+
+    def violations(self, mode: str, clock_hz: float, *, master: bool = True) -> List[str]:
+        """Each table 10 bound the measured edges break, as text (none: []).
+
+        With ``master`` (the default) the data valid time is not checked: by
+        the table's note 4 its maximum holds only where SCL's LOW period is
+        not stretched, and a master holds SCL low until its own data has
+        set up, which ``t_su_dat`` checks. A device answering on the
+        master's clock has to meet it: pass ``master=False``.
+        """
+        table, ns = UM10204[mode], 1e9 / clock_hz
+        got = self.measure()
+        bad = []
+        if got["period"] and clock_hz / min(got["period"]) > table["f_scl_max"]:
+            bad.append("f_scl %.0f Hz > %d" % (clock_hz / min(got["period"]), table["f_scl_max"]))
+        for key in ("t_low", "t_high", "t_su_sta", "t_hd_sta", "t_su_sto", "t_buf",
+                    "t_su_dat", "t_hd_dat"):
+            if got[key] and min(got[key]) * ns < table[key]:
+                bad.append("%s %.0f ns < %d" % (key, min(got[key]) * ns, table[key]))
+        if not master and got["t_vd_dat"] and max(got["t_vd_dat"]) * ns > table["t_vd_dat"]:
+            bad.append("t_vd_dat %.0f ns > %d" % (max(got["t_vd_dat"]) * ns, table["t_vd_dat"]))
+        return bad

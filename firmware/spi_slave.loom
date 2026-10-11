@@ -1,6 +1,6 @@
 ; spi_slave.loom
-; SPI slave, modes 0 and 3 (both sample on the rising edge), MSB first. M2
-; firmware: needs the FIFOs (POP, PUSH, WAITB), nothing else.
+; SPI slave, modes 0 to 3, MSB first. M2 firmware: needs the FIFOs (POP,
+; PUSH, WAITB), nothing else.
 ;
 ; Pins: SCK = IN1, MOSI = IN2, CS_n = IN3, MISO = OUT0.
 ;
@@ -14,9 +14,16 @@
 ; full is dropped (the host is not keeping up); nothing else is lost.
 ;
 ; Modes: in mode 0 (CPOL 0, CPHA 0) and in mode 3 (CPOL 1, CPHA 1) the
-; master samples MOSI and MISO on the rising edge of SCK, so one loop serves
-; both; this program never looks at the idle level or at the falling edge.
-; Modes 1 and 2 sample on the falling edge and are not supported.
+; master samples MOSI and MISO on the rising edge of SCK; in modes 1 and 2 it
+; samples on the falling edge. Which edge is the only thing the slave needs
+; to know: it never looks at the idle level, and its first bit is on MISO
+; before the first edge of either kind. The host picks the edge before RUN
+; by writing r5: 0, the reset value, for the rising edge (modes 0 and 3), 1
+; for the falling edge (modes 1 and 2). The program is two copies of one
+; loop, one per edge (a WAITE's edge is part of the instruction), chosen
+; once at start, so modes 1 and 2 have exactly the timing of modes 0 and 3
+; with the edges swapped. The falling-edge copy was added on 2026-10-11
+; (D-035); the rising-edge copy is unchanged.
 ;
 ; Rate: the slave follows the master's SCK and keeps no schedule of its own.
 ; It writes MISO six slots after the X cycle in which it sees the sampling
@@ -42,9 +49,15 @@
 ; Selection: while CS_n is high the slave watches INQ and pre-loads the next
 ; response byte as soon as one is queued, so its first bit is on MISO before
 ; the master may raise SCK two slots after CS_n falls. A host that queues
-; nothing before the transaction starts gets IDLE for that byte. MISO keeps
-; the last bit it drove while deselected (a Tiny Tapeout output pad cannot
-; be let go).
+; nothing before the transaction starts gets IDLE for that byte. A word that
+; lands in INQ while the slave is deselected has its first bit on MISO, and
+; the slave waiting for the first sampling edge, at most 21 slots later (the
+; rest of the poll loop, `load`, and the way back to the WAITE). A word that
+; lands later than 21 slots before the master's first sampling edge has its
+; first bit out in time but that edge missed, so the whole transaction comes
+; out one bit late: queue the response first, then let the master select
+; (BUGS 12). MISO keeps the last bit it drove while deselected (a Tiny
+; Tapeout output pad cannot be let go).
 ;
 ; If SCK stops inside a byte for TMO ticks the slave looks at CS_n: a master
 ; that still selects us is only pausing, and the wait is resumed; a master
@@ -57,7 +70,8 @@
 ; the host is loaded and none of it has gone out yet", so that a byte
 ; pre-loaded at the end of one transaction is not thrown away by the next
 ; pre-load and a filler byte is replaced as soon as the host queues one;
-; r7 .csr scratch.
+; r5 the sampling edge, set by the host (0 rising, 1 falling); r7 .csr
+; scratch.
 
         .thread 0
         .pins   SCK = IN1, MOSI = IN2, CS_N = IN3, MISO = OUT0
@@ -68,6 +82,8 @@
 start:  .csr    OUTGRP, 16 | (1 << 5)   ; OUT drives MISO (OUT0) alone; clobbers r7
         LDI     r4, 0
         OUT     r4                      ; MISO low until the first byte is loaded
+        TEST    r5, r5
+        BNZ     fidle                   ; r5 = 1: modes 1 and 2, the falling-edge copy
 
 idle:   WAITP   CS_N, 1                 ; deselected (a partial byte is dropped)
         TEST    r6, r6
@@ -104,6 +120,43 @@ drop:   JP      CS_N, 0, byte           ; still selected: on to the next byte
 
 quiet:  JP      CS_N, 0, bit            ; only a pause: keep waiting for the edge
         JMP     idle                    ; deselected mid-byte: start again
+
+; Modes 1 and 2 (r5 = 1): the same loop slot for slot, sampling on the
+; falling edge. Only the WAITE's edge and the labels differ from the copy
+; above; `load` is shared, and returns into `fbit` as it returns into `bit`.
+fidle:  WAITP   CS_N, 1
+        TEST    r6, r6
+        BNZ     farmed
+fpoll:  SETD    0
+        WAITB   INQ_NE, T
+        BT      fnobyte
+        CALL    load
+farmed: WAITP   CS_N, 0
+        JMP     fbit
+fnobyte: JP     CS_N, 1, fpoll
+        JMP     fbyte
+
+fbyte:  CALL    load
+fbit:   SETD    TMO
+        WAITE   SCK, FALL, T            ; modes 1 and 2 sample here
+        BT      fquiet
+        SHLI    r2, 1
+        JP      MOSI, 0, fm0
+        ORI     r2, 1
+fm0:    SHRI    r0, 1
+        LDI     r6, 0
+        OUT     r0
+        DJNZ    r1, fbit
+
+        SETD    0
+        WAITB   OUTQ_NF, T
+        BT      fdrop
+        PUSH    r2
+fdrop:  JP      CS_N, 0, fbyte
+        JMP     fidle
+
+fquiet: JP      CS_N, 0, fbit
+        JMP     fidle
 
 ; The next byte to send, reversed so that a SHRI feeds MISO, with its first
 ; bit already on the pin. Never blocks: the WAITB is timed and its deadline

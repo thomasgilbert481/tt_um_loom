@@ -18,9 +18,10 @@ import pytest
 from tools.loomasm import assemble_file
 from tools.loomisa import REPO, load
 from tools.protomodels.bench import Model, pad_of
-from tools.protomodels.i2c import I2cEeprom, I2cMonitor
+from tools.protomodels.i2c import I2cEeprom, I2cMonitor, I2cTiming
 
 ISA = load()
+CLOCK_HZ = 50e6                                          # the datasheet's clock
 TICK = 8
 Q, LOW = 4, 8                                            # as in the program
 SLOT = 4
@@ -139,6 +140,48 @@ def test_scl_phases_follow_the_tick_schedule(backend):
     highs = scl.high[1:]
     assert all((2 * Q - 1) * TICK - SLOT <= t <= 2 * Q * TICK + 3 * SLOT
                for t in highs), highs
+
+
+@pytest.mark.parametrize("mode, tick_int, tick_frac", [
+    ("standard", 31, 64),                # 100.0 kHz at 50 MHz
+    ("fast", 7, 0),                      # 390.6 kHz: shortest period 128 clocks
+])
+def test_um10204_table_10_holds_at_the_datasheet_rates(backend, mode, tick_int, tick_frac):
+    """Every UM10204 table 10 bound a master has to meet, measured on the
+    pins by ``I2cTiming``, at the datasheet's settings: standard mode at
+    100 kHz, and fast mode (r5 = 1) at 390.6 kHz, the fastest rate at or
+    under 400 kHz that the 4-clock slot grid gives at 50 MHz. Writes, a
+    random read with a repeated START and a bare START/STOP, so that every
+    quantity the table bounds occurs. BUGS 13: START and STOP set-up and
+    hold were a quarter period, 2.5 us at 100 kHz against the table's 4.0
+    and 4.7 us, and the even 8/8 split could not give fast mode's 1.3 us low
+    time near 400 kHz.
+    """
+    bench = backend.bench(pullups=0b11)
+    bench.add(I2cEeprom("BIDIR0", "BIDIR1", memory=MEMORY))
+    mon = bench.add(I2cMonitor("BIDIR0", "BIDIR1"))
+    timing = bench.add(I2cTiming("BIDIR0", "BIDIR1"))
+    program = assemble_file(REPO / "firmware" / "i2c_master.loom", isa=ISA, strict=True)
+    loom = backend.loom(bench, isa=ISA)
+    loom.load(program)
+    loom.write_csr(0, "TICK_INT", tick_int)
+    loom.write_csr(0, "TICK_FRAC", tick_frac)
+    if mode == "fast":
+        loom.write_reg(0, "r5", 1)
+    loom.run(0)
+    loom.push(0, [START | 0xA0, 0x10, 0x11, STOP | 0x22])
+    assert loom.pop(0, 4) == [0xA0, 0x10, 0x11, 0x22]
+    loom.push(0, [START | 0xA0, 0x10, START | 0xA1, READ, READ | NACK | STOP])
+    assert loom.pop(0, 5) == [0xA0, 0x10, 0xA1, 0x11, R_NACK | 0x22]
+    loom.push(0, [START | 0xA0, NOBYTE | STOP])
+    assert loom.pop(0, 1) == [0xA0]
+    assert bench.run_until(lambda: mon.kinds().count("stop") == 3, 200000, every=64)
+    bench.step(16 * tick_int)
+    assert timing.violations(mode, CLOCK_HZ) == []
+    got = timing.measure()
+    assert CLOCK_HZ / min(got["period"]) >= (99_000 if mode == "standard" else 390_000)
+    assert all(got[k] for k in ("t_su_sta", "t_hd_sta", "t_su_sto", "t_buf", "t_su_dat"))
+    assert bench.contention_free() and loom.badop() == 0
 
 
 def test_a_stuck_scl_times_out_and_the_bus_is_released(backend):

@@ -94,8 +94,8 @@ Three things set it apart from a PIO or PRU clone:
 | Program | What | Tested at (50 MHz clock) |
 |---|---|---|
 | `uart_tx_fifo`, `uart_rx` | 8N1 UART | 115200 baud; 1.5625 Mbaud (TX), 781 kbaud (RX) |
-| `spi_master`, `spi_slave` | SPI master (modes 0 to 3, MSB or LSB first), SPI slave (modes 0 and 3) | 781 kHz SCK (master), 390 kHz (slave) |
-| `i2c_master` | I2C master: NACK, clock stretching, stuck-SCL timeout | 390 kHz SCL |
+| `spi_master`, `spi_slave` | SPI master and slave, modes 0 to 3 (master MSB or LSB first) | 781 kHz SCK (master), 390 kHz (slave) |
+| `i2c_master` | I2C master: standard and fast mode, NACK, clock stretching, stuck-SCL timeout; every UM10204 table 10 bound measured on the pins | 100 kHz and 390.6 kHz SCL |
 | `i2c_slave_eeprom` | a 24C02-style I2C EEPROM, 256 bytes | 100 and 400 kHz SCL |
 | `ws2812` | WS2812B LED driver | the datasheet waveform |
 | `ps2_host` | PS/2 host | 10 and 16.67 kHz device clock |

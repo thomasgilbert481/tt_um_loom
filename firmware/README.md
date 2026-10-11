@@ -42,8 +42,8 @@ the M2 convention for the rate.
 | `uart_tx_fifo.loom` | TX = OUT0 | 26 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
 | `uart_rx.loom` | RX = IN0 | 47 | 8 clocks per tick, 8 ticks per bit | 20 clocks | 64 clocks/bit (781 kbaud); 115200 baud (TICK 54 + 64/256); +-3 % sender error |
 | `spi_master.loom` | MOSI = OUT0, SCK = OUT1, CS_n = OUT2, MISO = IN0 | 72 | 28 clocks per half SCK period | 0 clocks | TICK 32: 781 kHz SCK, modes 0-3, MSB and LSB first |
-| `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 48 | none: the master's SCK times it, no deadline pairs | no deadline pairs; MISO 28 to 35 clocks after each sampling edge | 390 kHz SCK (128 clocks, TICK 32 for the silence timeout), modes 0 and 3 |
-| `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 105 | 5 clocks per tick, 16 ticks per SCL period | 0 clocks | TICK 8: 390 kHz SCL; 100 kHz is TICK 31 + 64/256 |
+| `spi_slave.loom` | MISO = OUT0, SCK = IN1, MOSI = IN2, CS_n = IN3 | 80 | none: the master's SCK times it, no deadline pairs | no deadline pairs; MISO 28 to 35 clocks after each sampling edge | 390 kHz SCK (128 clocks, TICK 32 for the silence timeout), modes 0 to 3 |
+| `i2c_master.loom` | SCL = BIDIR0, SDA = BIDIR1 (open drain) | 120 | 6 clocks per tick, 16 ticks per SCL period | 0 clocks | 100 kHz standard mode (TICK 31 + 64/256) and 390.6 kHz fast mode (TICK 7, r5 = 1), UM10204 table 10 measured at both; most tests at TICK 8 (347 kHz) |
 | `ws2812.loom` | DOUT = OUT0 | 52 | 1 clock per tick (set by the program) | 4 clocks (two `.bounded` POPs) | the WS2812B waveform at 50 MHz: T0H 20, T1H 40, period 64 clocks |
 | `ps2_host.loom` | CLK = IN0, DATA = IN1 | 45 | 64 clocks per tick (set by the program), timeouts only | no deadline pairs | 10 kHz and 16.67 kHz device clock |
 | `jtag_master.loom` | TCK = OUT0, TMS = OUT1, TDI = OUT2, TDO = IN0 | 43 | 32 clocks per half TCK period | 0 clocks | TICK 32: 781 kHz TCK |
@@ -148,6 +148,41 @@ claim the barrel pipeline makes (SEMANTICS 2, ISO-1).
   115200 baud; at 64 clocks per bit, -2 % .. +4 % back to back, +-3 % with an
   idle bit between frames.
 
+## UART rates at 50 MHz
+
+`uart_tx_fifo` takes one tick per bit and `uart_rx` eight, so the tick is
+50 MHz / baud and 50 MHz / (8 x baud) clocks. `tools.loomhost.rates.tick`
+gives the nearest setting (TICK_FRAC resolves 1/256 of a clock); the error
+is the mean bit-rate error that rounding leaves. The transmitter's edges
+are within one slot (4 clocks) of the ideal grid at every rate, and both
+programs move bytes correctly at every rate from 9600 baud up
+(`test_uart_tx_at_the_common_rates_edges_within_one_slot` and
+`test_uart_rx_at_the_common_rates`, on the model). The limits are the
+programs' proved ticks: 24 clocks for the transmitter (2.08 Mbaud) and 8
+for the receiver (781 kbaud); TICK_INT is 16 bits, which puts the slowest
+transmitter rate at 763 baud.
+
+| Baud | `uart_tx_fifo` TICK_INT + TICK_FRAC/256 | `uart_rx` TICK_INT + TICK_FRAC/256 |
+|---|---|---|
+| 1200 | 41666 + 171 | 5208 + 85 |
+| 2400 | 20833 + 85 | 2604 + 43 |
+| 4800 | 10416 + 171 | 1302 + 21 |
+| 9600 | 5208 + 85 | 651 + 11 |
+| 19200 | 2604 + 43 | 325 + 133 |
+| 31250 (MIDI) | 1600 + 0 | 200 + 0 |
+| 38400 | 1302 + 21 | 162 + 195 |
+| 57600 | 868 + 14 | 108 + 130 |
+| 115200 | 434 + 7 | 54 + 65 |
+| 230400 | 217 + 4 | 27 + 32 |
+| 250000 (DMX512) | 200 + 0 | 25 + 0 |
+| 460800 | 108 + 130 | 13 + 144 |
+| 921600 | 54 + 65 | too fast |
+| 1000000 | 50 + 0 | too fast |
+
+Every error is under 0.01 %. The examples elsewhere use 434 + 8/256 for
+115200 baud, 1/256 of a clock slower: both are far inside a UART's
+tolerance.
+
 ## spi_master.loom: full-duplex SPI master
 
 - **Host command** (push to thread 0): one word per byte.
@@ -190,9 +225,23 @@ claim the barrel pipeline makes (SEMANTICS 2, ISO-1).
   27 slots after the X cycle that saw a byte's last one, so bytes back to back
   need an SCK period of about 110 clocks or more (tested at 128). A master
   that pauses between bytes can clock the bits themselves faster.
-- **Modes 0 and 3**: both sample MOSI and MISO on the rising edge, so one
-  loop serves both and the idle level and the falling edge are never looked
-  at. Modes 1 and 2 sample on the falling edge and are not supported.
+- **Modes**: modes 0 and 3 sample MOSI and MISO on the rising edge, modes 1
+  and 2 on the falling edge, and the edge is all the slave needs to know (it
+  never looks at the idle level, and its first bit is on MISO before the
+  first edge of either kind). The host picks it before `RUN` by writing r5:
+  0, the reset value, for the rising edge, 1 for the falling edge
+  (`reg 0 r5 1` in `tools.loomhost`). A `WAITE`'s edge is part of the
+  instruction, so the program holds two copies of its loop and picks one at
+  start: modes 1 and 2 have the timing of modes 0 and 3 with the edges
+  swapped. Modes 1 and 2 were added on 2026-10-11 (D-035).
+- **Queue first, then select**: a word that lands in `INQ` while the slave
+  is deselected has its first bit on MISO, and the slave waiting for the
+  first sampling edge, at most 21 slots later. A word that lands later than
+  that before the master's first sampling edge has its first bit out in
+  time but that edge missed, and the whole transaction comes out one bit
+  late (BUGS 12). The tests start the master 21 slots minus half an SCK
+  period after the push, and one test checks every phase of the poll loop
+  at that lead.
 - Each bit is one `WAITE SCK, RISE` (the master samples there), then MOSI is
   sampled and the next MISO bit is written six slots after the X cycle that
   saw the edge (seven after a 1 bit): 28 to 35 clocks after the edge, long
@@ -226,14 +275,31 @@ claim the barrel pipeline makes (SEMANTICS 2, ISO-1).
   as seen on SDA (the data read, or the echo of the byte written); bit 15 NACK
   (the ACK slot was high); bit 14 TIMEOUT (SCL stayed low more than 255 ticks
   after release: the operation was abandoned and both lines released).
-- **Rate**: 16 ticks per SCL period (4 per quarter), `TICK_INT` = clocks per
-  SCL period / 16.
+- **Rate and mode**: 16 ticks per SCL period. In standard mode (r5 = 0, the
+  reset value) a bit is 8 ticks low and 8 high; in fast mode (r5 = 1,
+  `reg 0 r5 1`) 10 low and 6 high, because fast mode's minimum low time
+  (1.3 us) is over half its period. At 50 MHz, 100 kHz standard mode is
+  TICK 31 + 64/256, and fast mode's fastest rate at or under 400 kHz is
+  TICK 7: 390.6 kHz, since every SCL edge falls in one of the thread's slots
+  and the period is a whole number of slots (128 clocks; 124 would be
+  403 kHz).
+- **UM10204 table 10**: at both settings every bound a master has to meet
+  holds, measured on the pins by `tools.protomodels.i2c.I2cTiming`, written
+  from the table: f_SCL, t_LOW, t_HIGH, t_SU;STA, t_HD;STA, t_SU;STO, t_BUF,
+  t_SU;DAT and t_HD;DAT (t_VD;DAT is reported but, by the table's note 4,
+  binds a master only where it does not stretch its own low phase, which
+  t_SU;DAT covers). START and STOP use the same tick counts in both modes:
+  10 ticks of SCL low before SCL is let go, a set-up of 9 ticks from the
+  re-anchor, a hold of 8, and 10 ticks of bus free time after a STOP.
+  (Before 2026-10-11 the set-up and hold were a quarter period, 2.5 us at
+  100 kHz where the table asks 4.0 to 4.7 us: BUGS 13.)
 - SCL and SDA are open drain through `OD_MASK` (set with a read-modify-write).
   After releasing SCL the program waits for it with a timed `WAITP SCL, 1, T`
   (clock stretching, timeout 255 ticks), then re-anchors with `SETD 0`, so
   whatever a slave did to the low phase the high phase that follows is a full
-  one: 8 ticks less up to one tick, plus a few slots of pin latency. Measured
-  at TICK 8: low 68 clocks inside a byte (8 ticks and one slot), high 76.
+  one: 8 ticks (6 in fast mode) less up to one tick, plus a few slots of pin
+  latency. Measured at TICK 8 in standard mode: low 68 clocks inside a byte
+  (8 ticks and one slot), high 76.
 
 ## ws2812.loom: WS2812B / NeoPixel strip driver
 

@@ -19,8 +19,8 @@ PROGRAMS = {
     "uart_tx_fifo": (24, 26),
     "uart_rx": (8, 47),
     "spi_master": (28, 72),
-    "spi_slave": (32, 48),
-    "i2c_master": (5, 105),
+    "spi_slave": (32, 80),
+    "i2c_master": (6, 120),
 }
 #: Programs with no deadline pair at all, by design: spi_slave follows the
 #: master's SCK and keeps no schedule of its own (tools finding T-1).

@@ -27,13 +27,30 @@
 ;                was released; the operation was abandoned, both lines are
 ;                released, and the next command is taken
 ;
-; Bit rate: 16 ticks per SCL period (Q = 4 ticks per quarter). The host sets
-; TICK_INT/TICK_FRAC before RUN, through the debug space:
-;     50 MHz, 100 kHz SCL:  TICK_INT 31, TICK_FRAC 64 (31.25 clocks per tick)
-;     tests (tools/tests/test_fw_i2c.py): TICK_INT 8, 128 clocks per SCL period
-; The schedule is proved for ticks of 5 clocks or more (.tick below).
+; Bit rate and timing mode: 16 ticks per SCL period. The host sets
+; TICK_INT/TICK_FRAC, and the timing mode in r5, before RUN, through the
+; debug space:
+;     standard mode (r5 = 0, the reset value): a bit is 8 ticks low, 8 high.
+;         50 MHz, 100 kHz: TICK_INT 31, TICK_FRAC 64 (31.25 clocks per tick)
+;     fast mode (r5 = 1): 10 ticks low, 6 high, because fast mode's minimum
+;         low time (1.3 us) is over half its period.
+;         50 MHz, 390.6 kHz: TICK_INT 7, TICK_FRAC 0. Every SCL edge is
+;         written in one of the thread's slots, so periods are whole slots;
+;         the shortest here is 128 clocks, and 124 would be 403 kHz.
+;     tests (tools/tests/test_fw_i2c.py): TICK_INT 8, standard mode (347 kHz)
+; At the two datasheet settings every bound of UM10204 table 10 that a
+; master has to meet holds, measured on the pins
+; (test_um10204_table_10_holds_at_the_datasheet_rates). The schedule is
+; proved for ticks of 6 clocks or more (.tick below).
 ;
-; Timing of one bit: SCL is pulled low at a deadline; SDA changes a few slots
+; (Changed 2026-10-11, D-035, BUGS 13: START and STOP set-up and hold were
+; one quarter period, 2.5 us at 100 kHz where the table asks 4.0 to 4.7 us,
+; and the even split could not give fast mode's low time near 400 kHz. The
+; mode test in sclk costs two slots of the low phase, which moved the proved
+; tick from 5 to 6 clocks.)
+;
+; Timing of one bit (standard mode; fast mode is the same with 10 and 3 for
+; LOW and Q): SCL is pulled low at a deadline; SDA changes a few slots
 ; later (after SCL is low); LOW ticks after the fall SCL is released; WAITP
 ; waits for the line to be high (a slave may hold it low: clock stretching,
 ; up to STRETCH ticks); the schedule is re-anchored on the rise with SETD 0;
@@ -44,15 +61,22 @@
 ; one tick plus the pin latency of the WAITP: 68 and 76 clocks at TICK 8.
 ; Between two host commands the low phase is longer by the command decoding.
 ;
-; Registers: r0 transmit shifter, r1 bit count, r3 bits sampled from SDA
-; (the byte in bits 8:1, the ACK slot in bit 0 after nine clocks), r5
-; scratch, r7 the command word.
+; Registers: r0 transmit shifter, r1 bit count, r2 scratch, r3 bits sampled
+; from SDA (the byte in bits 8:1, the ACK slot in bit 0 after nine clocks),
+; r5 the timing mode, set by the host (0 standard, 1 fast), r7 the command
+; word.
 
         .thread 0
         .pins   SCL = BIDIR0, SDA = BIDIR1
-        .tick   5                       ; the shortest tick the schedule is proved for
-        .equ    Q = 4                   ; ticks per quarter SCL period
-        .equ    LOW = 2 * Q             ; SCL low phase
+        .tick   6                       ; the shortest tick the schedule is proved for
+        .equ    Q = 4                   ; standard mode: ticks per quarter SCL period
+        .equ    LOW = 2 * Q             ; standard mode: SCL low phase of a bit
+        .equ    QF = 3                  ; fast mode: half the high phase of a bit
+        .equ    LOWF = 10               ; fast mode: SCL low phase of a bit
+        .equ    SUP = 9                 ; START and STOP set-up, from the re-anchor
+        .equ    HOLD = 8                ; START hold
+        .equ    PRE = 10                ; SCL low before a START or STOP lets it go
+        .equ    BUF = 10                ; bus free after a STOP
         .equ    STRETCH = 255           ; clock-stretch timeout, in ticks
 
 start:  CSRR    r0, OD_MASK
@@ -99,9 +123,15 @@ stuck:  SETP    SCL, 1
 ; ---------------------------------------------------------------------------
 ; sclk: one SCL pulse. On entry SCL is low (it fell at the last deadline) and
 ; SDA is already set. Shifts the SDA level seen mid-high into r3 bit 0 and
-; returns with SCL low again, at a deadline.
+; returns with SCL low again, at a deadline. The two copies differ only in
+; how the 16 ticks of a bit are split: 8 low and 8 high in standard mode,
+; 10 low and 6 high in fast mode (r5 = 1), whose minimum low time is over
+; half its period. The test and branch sit inside the low phase, before its
+; deadline.
 ; ---------------------------------------------------------------------------
-sclk:   WAITD   LOW                     ; end of the low phase
+sclk:   TEST    r5, r5
+        BNZ     sclkf                   ; fast mode
+        WAITD   LOW                     ; end of the low phase
         SETD    STRETCH                 ; timeout for the stretch wait
         SETP    SCL, 1                  ; release SCL
         WAITP   SCL, 1, T               ; wait until SCL is really high
@@ -112,6 +142,20 @@ sclk:   WAITD   LOW                     ; end of the low phase
         JP      SDA, 0, sk0
         ORI     r3, 1                   ; sample SDA
 sk0:    WAITD   Q                       ; end of the high phase
+        SETP    SCL, 0
+        RET
+
+sclkf:  WAITD   LOWF
+        SETD    STRETCH
+        SETP    SCL, 1
+        WAITP   SCL, 1, T
+        BT      stuck
+        SETD    0
+        WAITD   QF
+        SHLI    r3, 1
+        JP      SDA, 0, skf0
+        ORI     r3, 1
+skf0:   WAITD   QF
         SETP    SCL, 0
         RET
 
@@ -138,8 +182,8 @@ rbyte:  SETD    0
         LDI     r1, 8
 rb1:    CALL    sclk
         DJNZ    r1, rb1
-        MOV     r5, r7
-        SHLI    r5, 5                   ; C = bit 11: NACK
+        MOV     r2, r7
+        SHLI    r2, 5                   ; C = bit 11: NACK
         BC      rb_nack
         SETP    SDA, 0                  ; ACK
         JMP     rb_ack
@@ -155,19 +199,25 @@ rb_ack: CALL    sclk
 ; The SETD 0 before the RETs of wbyte and rbyte cuts those loops. It costs
 ; nothing: SCL is low, and every operation starts by re-anchoring anyway.
 
+; START and STOP use the same tick counts in both modes, chosen to meet
+; UM10204 table 10 in each: a whole low phase (PRE) before SCL is let go,
+; set-up SUP ticks from the re-anchor (one more than the 8 the table needs,
+; for the tick the re-anchor can lose), hold HOLD ticks, and BUF ticks of
+; bus free time after a STOP.
+
 ; i2c_start: START, or a repeated START when SCL is low.
 i2c_start:
         SETD    0
         SETP    SDA, 1                  ; SDA high first (SCL may be low)
-        WAITD   Q
+        WAITD   PRE                     ; SCL low long enough (a repeated START)
         SETD    STRETCH
         SETP    SCL, 1
         WAITP   SCL, 1, T
         BT      stuck
         SETD    0
-        WAITD   Q                       ; set-up: both lines high
+        WAITD   SUP                     ; set-up (tSU;STA): both lines high
         SETP    SDA, 0                  ; START: SDA falls while SCL is high
-        WAITD   Q                       ; hold
+        WAITD   HOLD                    ; hold (tHD;STA)
         SETP    SCL, 0
         RET
 
@@ -175,13 +225,13 @@ i2c_start:
 i2c_stop:
         SETD    0
         SETP    SDA, 0                  ; SCL is low: SDA low first
-        WAITD   Q
+        WAITD   PRE
         SETD    STRETCH
         SETP    SCL, 1
         WAITP   SCL, 1, T
         BT      stuck
         SETD    0
-        WAITD   Q                       ; set-up
+        WAITD   SUP                     ; set-up (tSU;STO)
         SETP    SDA, 1                  ; STOP: SDA rises while SCL is high
-        WAITD   LOW                     ; bus free before the next START
+        WAITD   BUF                     ; bus free (tBUF) before the next START
         RET

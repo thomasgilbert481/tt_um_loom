@@ -26,12 +26,14 @@ on both because it is the one that measures fractional-tick edge placement.
 import pytest
 
 from tools.loomasm import assemble_file
+from tools.loomhost.rates import tick
 from tools.loomisa import REPO, load
 from tools.protomodels.uart import UartRx, UartTx
 from tools.tests.fw_backend import model_only
 
 ISA = load()
 FIRMWARE = REPO / "firmware"
+CLOCK_HZ = 50e6                                            # the datasheet's clock
 SLOT = 4
 
 
@@ -206,3 +208,36 @@ def test_uart_rx_ignores_a_glitch_and_a_break_is_one_error(backend):
     bench.step(3000)
     words = loom.pop_available(0)
     assert words == [0x100]                                # one framing error, byte 0
+
+
+# ------------------------------------------------------------- common rates
+# The table in firmware/README.md: every common rate the two programs reach
+# at 50 MHz, with the tick tools.loomhost.rates.tick gives. Model only: at
+# 9600 baud two bytes are 100 k cycles of line time.
+@model_only("a run per common rate down to 9600 baud, 100 k cycles of line time at the slowest")
+@pytest.mark.parametrize("baud", [9600, 19200, 38400, 57600, 115200, 230400, 460800,
+                                  921600, 1000000])
+def test_uart_tx_at_the_common_rates_edges_within_one_slot(backend, baud):
+    tick_int, tick_frac = tick(CLOCK_HZ, baud)
+    bits = tick_int + tick_frac / 256
+    bench = backend.bench()
+    rx = bench.add(UartRx("OUT0", bits))
+    loom, _ = boot(backend, bench, "uart_tx_fifo", tick_int, tick_frac)
+    loom.push(0, b"U\x00")
+    assert bench.run_until(lambda: len(rx.frames) == 2, int(30 * bits) + 4000, every=256)
+    assert rx.data == b"U\x00" and not rx.errors
+    offsets = [off for f in rx.frames for _, off in rx.edge_offsets(f)]
+    assert max(abs(o) for o in offsets) < SLOT             # SEMANTICS 2: one slot
+
+
+@model_only("a run per common rate down to 9600 baud, 100 k cycles of line time at the slowest")
+@pytest.mark.parametrize("baud", [9600, 19200, 38400, 57600, 115200, 230400, 460800])
+def test_uart_rx_at_the_common_rates(backend, baud):
+    tick_int, tick_frac = tick(CLOCK_HZ, baud, 8)
+    bits = CLOCK_HZ / baud
+    bench, tx, loom, _ = rx_bench(backend, tick_int, tick_frac, bits)
+    tx.send(b"\x55\xa3")
+    assert bench.run_until(lambda: not tx.busy, int(25 * bits) + 1000, every=256)
+    bench.step(200)
+    assert loom.pop(0, 2) == [0x55, 0xA3]
+    assert loom.pop_available(0) == [] and loom.badop() == 0

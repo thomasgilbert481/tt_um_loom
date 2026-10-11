@@ -10,13 +10,18 @@ them on the golden model over ``ModelTransport``, ``test/test_fw.py`` runs
 the same bodies on the RTL over ``SimTransport`` and the real SPI host pads.
 Error cases: an empty INQ (the slave sends its idle byte), a full OUTQ (the
 byte is dropped) and a transaction cut off in the middle of a byte (the
-slave drops the partial byte and resynchronises).
+slave drops the partial byte and resynchronises). All four SPI modes: the
+host sets r5 = 1 before RUN for modes 1 and 2, which sample on the falling
+edge (D-035).
 """
+
+import pytest
 
 from tools.loomasm import assemble_file
 from tools.loomisa import REPO, load
 from tools.protomodels.bench import Drive, Model, pad_of
 from tools.protomodels.spi import SpiMaster
+from tools.tests.fw_backend import model_only
 
 ISA = load()
 PINS = ("IN1", "IN2", "OUT0", "IN3")                     # SCK, MOSI, MISO, CS_n
@@ -30,6 +35,13 @@ TMO = 16
 #: Cycles that guarantee the slave has noticed a deselect and gone back to
 #: watching INQ: the timeout plus a byte's worth of slack.
 RESYNC = TMO * TICK + PERIOD
+#: Slots from a word landing in INQ (deselected) to the slave waiting for the
+#: first sampling edge with its first bit on MISO: the program's bound
+#: (BUGS 12). The master's first sampling edge comes HALF after CS_n falls in
+#: modes 0 and 2, so a host has to finish queueing LEAD cycles before
+#: selecting.
+READY = 21
+LEAD = READY * SLOT - HALF
 
 
 def setup(backend, mode=0):
@@ -41,13 +53,21 @@ def setup(backend, mode=0):
     loom = backend.loom(bench, isa=ISA)
     loom.load(program)
     loom.write_csr(0, "TICK_INT", TICK)
+    if mode in (1, 2):
+        loom.write_reg(0, "r5", 1)     # sample on the falling edge
     loom.run(0)
     bench.step(16 * SLOT)          # let it reach the deselected state and watch INQ
     return bench, master, loom
 
 
 def transfer(bench, master, data):
-    """Clock ``data`` out of the master and return what came back on MISO."""
+    """Clock ``data`` out of the master and return what came back on MISO.
+
+    The master selects LEAD cycles after the call, as a host that queued the
+    response first and then let the master go would (BUGS 12: before that
+    rule the tests selected one cycle after the push and passed on a lucky
+    phase)."""
+    bench.step(LEAD)
     master.transfer(bytes(data))
     assert bench.run_until(lambda: not master.busy, 40000, every=64)
     bench.step(SLOT * 8)
@@ -55,18 +75,20 @@ def transfer(bench, master, data):
 
 
 class Miso(Model):
-    """Every SCK rise and every MISO change, by cycle."""
+    """Every SCK rise and fall and every MISO change, by cycle."""
 
     def __init__(self):
         self.sck, self.miso = pad_of("IN1"), pad_of("OUT0")
         self.prev = None
-        self.rises, self.changes = [], []
+        self.rises, self.falls, self.changes = [], [], []
 
     def observe(self, lines):
         now = (lines.get(self.sck), lines.get(self.miso))
         if self.prev is not None:
             if now[0] and not self.prev[0]:
                 self.rises.append(lines.cycle)
+            if self.prev[0] and not now[0]:
+                self.falls.append(lines.cycle)
             if now[1] != self.prev[1]:
                 self.changes.append(lines.cycle)
         self.prev = now
@@ -128,12 +150,17 @@ def test_an_empty_queue_sends_the_idle_byte(backend):
     assert loom.pop(0, 2) == [0x55, 0xAA]
 
 
-def test_mode_3_is_the_same_loop(backend):
-    """CPOL 1, CPHA 1: the master samples on the rising edge as in mode 0."""
-    bench, master, loom = setup(backend, mode=3)
+@pytest.mark.parametrize("mode", [1, 2, 3])
+def test_every_other_mode_exchanges_bytes(backend, mode):
+    """Mode 3 samples on the rising edge as mode 0 does; modes 1 and 2 on the
+    falling edge, the copy of the loop the host picks with r5 = 1. Each
+    exchange is two bytes back to back with a queued pair, so both the first
+    bit (on MISO before any edge) and the byte-to-byte path are covered."""
+    bench, master, loom = setup(backend, mode=mode)
     loom.push(0, [0x12, 0x34])
     assert transfer(bench, master, b"\xde\xad") == bytes([0x12, 0x34])
     assert loom.pop(0, 2) == [0xDE, 0xAD]
+    assert bench.contention_free() and loom.badop() == 0
 
 
 def test_a_queued_byte_replaces_the_idle_byte_before_the_next_transaction(backend):
@@ -148,7 +175,8 @@ def test_a_queued_byte_replaces_the_idle_byte_before_the_next_transaction(backen
     assert loom.pop(0, 2) == [0x03, 0x04]
 
 
-def test_miso_changes_once_per_bit_soon_after_the_sampling_edge(backend):
+@pytest.mark.parametrize("mode", [0, 2])
+def test_miso_changes_once_per_bit_soon_after_the_sampling_edge(backend, mode):
     """What the master needs of MISO, measured on the pads.
 
     0xAA alternates, so every one of the seven intervals between sampling
@@ -158,18 +186,47 @@ def test_miso_changes_once_per_bit_soon_after_the_sampling_edge(backend):
     three more after the edge, and the pin follows two clocks after the
     write. So the change is after the edge and long before the next one. No
     deadline times it: the first version changed MISO one tick after the
-    edge, which after an edge cannot be proved (tools finding T-1).
+    edge, which after an edge cannot be proved (tools finding T-1). Mode 2
+    samples on the falling edge, through the other copy of the loop, and
+    must show the same numbers against its falling edges.
     """
-    bench, master, loom = setup(backend)
+    bench, master, loom = setup(backend, mode=mode)
     watch = bench.add(Miso())
     loom.push(0, [0xAA])
     assert transfer(bench, master, bytes([0xA5])) == bytes([0xAA])  # MOSI: 1s and 0s
-    assert len(watch.rises) == 8
-    for rise, nxt in zip(watch.rises, watch.rises[1:]):
-        inside = [c for c in watch.changes if rise < c < nxt]
-        assert len(inside) == 1, (rise, inside)
-        assert 6 * SLOT + 4 <= inside[0] - rise <= 7 * SLOT + 7
+    edges = watch.rises if mode == 0 else watch.falls
+    assert len(edges) == 8
+    for edge, nxt in zip(edges, edges[1:]):
+        inside = [c for c in watch.changes if edge < c < nxt]
+        assert len(inside) == 1, (edge, inside)
+        assert 6 * SLOT + 4 <= inside[0] - edge <= 7 * SLOT + 7
         assert nxt - inside[0] >= 2 * TICK                     # half a period of setup
+
+
+@model_only("sixteen setups, one per clock phase of the poll loop; the RTL "
+            "runs the same cycle-exact program (L3 lockstep co-simulation)")
+@pytest.mark.parametrize("mode", [0, 2])
+def test_a_byte_queued_at_the_stated_lead_is_on_time_at_every_phase(backend, mode):
+    """BUGS 12: the program's bound, at every phase of the poll loop.
+
+    One byte queued while deselected, the master selecting LEAD cycles after
+    the push returns, so its first sampling edge is READY slots after: the
+    master reads that byte, whatever the slave was doing when it landed.
+    Modes 0 and 2 are the tight ones (their first sampling edge is the
+    leading edge, HALF after CS_n falls); before BUGS 12 one phase in four
+    came out one bit late with the master selecting one cycle after the
+    push.
+    """
+    for phase in range(4 * SLOT):
+        bench, master, loom = setup(backend, mode=mode)
+        bench.step(phase)
+        loom.push(0, [0xAA])
+        bench.step(LEAD)
+        master.transfer(bytes([0xA5]))
+        assert bench.run_until(lambda: not master.busy, 40000, every=64)
+        bench.step(SLOT * 8)
+        assert master.results[-1] == bytes([0xAA]), phase
+        assert loom.pop(0, 1) == [0xA5], phase
 
 
 def test_a_byte_is_dropped_when_outq_is_full(backend):
