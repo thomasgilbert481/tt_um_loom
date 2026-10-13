@@ -1,0 +1,250 @@
+; ir_nec_rx.loom
+; NEC infrared receiver on IN0, for the output of a demodulating receiver
+; module (a TSOP38238 or alike: low while a 38 kHz burst is present),
+; delivering frames, repeat codes and errors to the host through OUTQ[0].
+;
+; Written on 2026-10-11, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; infrared. The program measures every mark and space with the timed waits
+; (`WAITP ... T` against a `SETD` deadline, SEMANTICS 6.4), built for the
+; timeouts of PS/2 and I2C clock stretching, and restarts its tick generator
+; on every edge it accepts (a `CSRW TICK_INT` clears ACC, SEMANTICS 4), the
+; hard synchronisation built for the UART, CAN and Manchester receivers. What
+; the firmware does that no hardware does: pulse-distance decoding, the
+; windows below, the glitch filter, the inverse checks and the repeat codes.
+; It needs the FIFOs (PUSH) and nothing else: no bit engine, no latch.
+;
+; Pin: RX = IN0, idle high (the module's output; it has its own pull-up).
+;
+; Result format (FIFO space read, thread 0). Bits 15:14 give the kind:
+;   frame:  two words.
+;           word 1  bits 7:0 the command; bit 8 EXT; bits 15:14 = 01
+;           word 2  the address: bits 7:0, and bits 15:8 as received. EXT = 0
+;                   when bits 15:8 are the inverse of bits 7:0 (standard NEC);
+;                   EXT = 1 when they are not: extended NEC, a 16-bit address.
+;   repeat: one word, 0x8000: a repeat code (the last key is still held).
+;   error:  one word, bits 15:14 = 11. Bits 13:8 n, the data bits received
+;           whole before it (0..32); bit 4 in a repeat code's burst; bit 3 in
+;           the leader; bit 2 a space (0: a mark); bits 1:0 the fault: 1 out
+;           of its window (too short, or between two windows), 2 too long (a
+;           timeout: the line stopped changing), 3 the command's inverse is
+;           wrong (n = 32).
+; A report is never split: the program blocks on a full OUTQ, which a host
+; must empty within about 40 ms (the gap before the next leader can start).
+; Nothing is read from INQ.
+;
+; Tick (set by the host before RUN, the M2 convention): one tick is 1/16 of
+; the NEC unit, 35.15625 us.
+;   50 MHz: TICK_INT 1757, TICK_FRAC 208 (1757.8125 clocks, exact).
+;   1.824 MHz (the RTL tests): TICK_INT 64, TICK_FRAC 32 (64.125, exact).
+; TICK_INT must be 64 or more (the glitch filter and the restart latency,
+; below, are fractions of a tick). The program reads TICK_INT once at start.
+;
+; Windows. Each mark and space is accepted within +-25 % of its nominal
+; length plus 4 ticks (140.6 us). The 4 ticks are for the receiver module: a
+; TSOP's output pulse is the burst length -5/f0 .. +5/f0 (+-132 us at
+; 38 kHz; Vishay TSOP382.., TSOP384.. datasheet, document 82491 rev. 2.1,
+; figure 1 note 3), which alone is +-23 % of a
+; 562.5 us burst and shortens the space after it by as much. In ticks:
+;   leader mark      9 ms      256 t   188 .. 324   (6.61 .. 11.39 ms)
+;   leader space     4.5 ms    128 t    92 .. 164   (3.23 .. 5.77 ms)
+;   repeat space     2.25 ms    64 t    44 .. 84    (1.55 .. 2.95 ms)
+;   mark             562.5 us   16 t     8 .. 24    (281 .. 844 us)
+;   space, a 0       562.5 us   16 t     8 .. 24
+;   space, a 1       1687.5 us  48 t    32 .. 64    (1.125 .. 2.25 ms)
+; A mark is a data bit's burst, the final burst or the repeat code's burst.
+; On an idle line a low pulse shorter than a leader is noise and is ignored
+; silently; every other violation ends the frame with an error word, and
+; the receiver then waits for the line to be idle (high) again.
+;
+; Glitch filter. An edge counts only if the new level is still there 2 ticks
+; (70.3 us) later: a pulse of either level shorter than that is ignored and
+; the wait it interrupted goes on, against the same deadline. The filter is
+; a delay of TICK_INT / 2 slots, so it scales with the tick. A confirmed edge
+; restarts the tick grid, so each window is measured from the edge that
+; opened it plus the filter's 2 ticks, which the deadlines already take off
+; (W = window - 2). Pulses longer than the filter but outside their window
+; are errors.
+;
+; Repeat codes are reported as they come; the receiver does not check that
+; one follows a frame or keep the last command: the host has both.
+;
+; How a pulse is measured: at the edge that opened it the grid restarts and
+; `SETD W1` sets the first window edge; `whigh`/`wlow` wait for the pulse's
+; end against it (T = 0: the end came first, T = 1: the deadline did), then
+; `SETD W2 - W1` sets the next, and so on: one deadline per window edge. A
+; timed-out wait completes on its tick and the next `SETD` follows a few
+; slots later in the same tick, so the chain does not drift (except after a
+; glitch whose filter delay runs past a deadline: the next deadline is then
+; set from the end of the filter, up to 2 ticks late). There is no
+; `WAITD` in the program, so the deadline checker has no pair to prove (as
+; for ps2_host.loom); `.tick` records the shortest tick the header allows.
+;
+; Measurement error. A waiting `WAITP` sees an edge 2 to 5 clocks after it
+; (synchroniser and slot grid), but an edge that comes just after a window
+; deadline, while the program moves to the next wait (BT, RET, BT, SETD,
+; CALL), is seen up to 6 slots (24 clocks) later. Both ends of a pulse are
+; seen that way, so a pulse is measured to within about 30 clocks: 0.6 us at
+; 50 MHz, 16 us (0.4 tick) on the 1.824 MHz board of the RTL tests.
+;
+; Registers: r0 the item being measured (error bits 4:2), then the result;
+; r1 = 0x8000; r2 the first 16 data bits (address half); r3 the last 16
+; (command half); r4 data bits left; r5 the glitch-filter delay in slots;
+; r6 = TICK_INT for the restarts; r7 the delay counter and scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   64                      ; TICK_INT 64 or more (header)
+        .equ    G     = 2               ; glitch filter, ticks
+        .equ    LMMIN = 188 - G         ; leader mark window, minus the filter
+        .equ    LMMAX = 324 - G
+        .equ    RSMIN = 44 - G          ; repeat space
+        .equ    RSMAX = 84 - G
+        .equ    LSMIN = 92 - G          ; leader space
+        .equ    LSMAX = 164 - G
+        .equ    MMIN  = 8 - G           ; a one-unit mark or space
+        .equ    MMAX  = 24 - G
+        .equ    S1MIN = 32 - G          ; the space of a 1
+        .equ    S1MAX = 64 - G
+        .equ    I_REP  = 16             ; item bits of an error word
+        .equ    I_LEAD = 8
+        .equ    I_SPACE = 4
+        .equ    E_WIN  = 1              ; fault bits
+        .equ    E_LONG = 2
+        .equ    E_INV  = 3
+
+start:  CSRR    r6, TICK_INT            ; P, kept for the restarts
+        MOV     r5, r6
+        SHRI    r5, 1                   ; P / 2 slots = 2 ticks: the glitch filter,
+        SUBI    r5, 4                   ; less the 4 other slots of wlow / whigh
+        LDI     r1, 0
+        LDIH    r1, 0x80                ; r1 = 0x8000
+
+; Hunt for a leader: an idle (high) line first, then a confirmed mark.
+hunt:   WAITP   RX, 1
+h2:     SETD    255                     ; re-armed every 255 ticks
+        CALL    wlow
+        BT      h2                      ; no mark yet
+        LDI     r4, 32                  ; no data bit yet: n = 0 in an error
+        LDI     r0, I_LEAD
+        SETD    LMMIN                   ; the leader mark, 188 .. 324 ticks
+        CALL    whigh
+        BNT     hunt                    ; too short for a leader: noise, ignored
+        SETD    LMMAX - LMMIN
+        CALL    whigh
+        BT      elong                   ; too long
+
+; The leader space: 44 .. 84 ticks is a repeat code, 92 .. 164 a frame.
+        ORI     r0, I_SPACE
+        SETD    RSMIN
+        CALL    wlow
+        BNT     ewin                    ; too short
+        SETD    RSMAX - RSMIN
+        CALL    wlow
+        BNT     rep                     ; a repeat code
+        SETD    LSMIN - RSMAX
+        CALL    wlow
+        BNT     ewin                    ; between the two windows
+        SETD    LSMAX - LSMIN
+        CALL    wlow
+        BT      elong                   ; too long
+        LDI     r0, 0                   ; a frame: 32 data bits follow
+        JMP     mark
+rep:    LDI     r0, I_REP               ; a repeat code: one burst follows
+        LDI     r4, 0
+
+; A mark, 8 .. 24 ticks: a data bit's burst, the final burst or the repeat
+; code's. Entered at its confirmed start; r4 = data bits left (0: the last).
+mark:   ANDI    r0, I_REP               ; a mark (bits 3:2 clear)
+        SETD    MMIN
+        CALL    whigh
+        BNT     ewin                    ; too short
+        SETD    MMAX - MMIN
+        CALL    whigh
+        BT      elong                   ; too long
+        TEST    r4, r4
+        BZ      done                    ; that was the last burst
+
+; A space: 8 .. 24 ticks is a 0, 32 .. 64 a 1. The bits arrive least
+; significant first and enter r3 at bit 15.
+        ORI     r0, I_SPACE
+        SETD    MMIN
+        CALL    wlow
+        BNT     ewin                    ; too short
+        SETD    MMAX - MMIN
+        CALL    wlow
+        BNT     zero                    ; a 0
+        SETD    S1MIN - MMAX
+        CALL    wlow
+        BNT     ewin                    ; between the 0 and 1 windows
+        SETD    S1MAX - S1MIN
+        CALL    wlow
+        BT      elong                   ; too long: the frame stopped
+        SHRI    r3, 1
+        OR      r3, r3, r1              ; a 1
+        JMP     next
+zero:   SHRI    r3, 1
+next:   DEC     r4
+        CMPI    r4, 16
+        BNZ     mark
+        MOV     r2, r3                  ; the first 16 bits are whole
+        JMP     mark
+
+; The last burst has ended: report. r0 = I_REP for a repeat code, else 0.
+done:   TEST    r0, r0
+        BZ      frame
+        PUSH    r1                      ; 0x8000: a repeat code
+        JMP     hunt
+frame:  MOV     r7, r3                  ; the command half: ~command, command
+        SWAP    r7, r7
+        XOR     r7, r7, r3
+        NOT     r7, r7                  ; zero when bits 15:8 invert bits 7:0
+        BNZ     einv
+        MOV     r7, r2                  ; the same test on the address half
+        SWAP    r7, r7
+        XOR     r7, r7, r2
+        NOT     r7, r7                  ; Z: standard NEC
+        MOV     r0, r3
+        LDIH    r0, 0x40                ; a frame, the command in 7:0
+        BZ      std
+        LDIH    r0, 0x41                ; EXT: a 16-bit address
+std:    PUSH    r0                      ; blocks while OUTQ is full
+        PUSH    r2
+        JMP     hunt
+
+; Errors: r0 holds the item; n = 32 - r4 data bits were received whole.
+einv:   ORI     r0, E_INV
+        JMP     err
+ewin:   ORI     r0, E_WIN
+        JMP     err
+elong:  ORI     r0, E_LONG
+err:    LDIH    r0, 0xC0
+        LDI     r7, 32
+        SUB     r7, r7, r4
+        SHLI    r7, 8
+        OR      r0, r0, r7
+        PUSH    r0
+        JMP     hunt                    ; which waits for an idle line first
+
+; wlow / whigh: wait until RX is low / high or TD is reached, through the
+; glitch filter. T = 1: TD came first. T = 0: the new level held for r5
+; slots (2 ticks). A level that does not hold is a glitch, and the wait goes
+; on against the same TD.
+; A confirmed edge restarts the tick grid (CSRW TICK_INT clears ACC): its
+; X cycle is 4 + r5 slots = 2P clocks after the WAITP that saw the edge, so
+; the grid starts exactly 2 ticks (plus 2 clocks) after that X cycle.
+wlow:   WAITP   RX, 0, T
+        BT      wlr
+        MOV     r7, r5
+wld:    DJNZ    r7, wld
+        JP      RX, 1, wlow             ; high again: a glitch
+        CSRW    TICK_INT, r6            ; the next window starts here
+wlr:    RET
+whigh:  WAITP   RX, 1, T
+        BT      whr
+        MOV     r7, r5
+whd:    DJNZ    r7, whd
+        JP      RX, 0, whigh            ; low again: a glitch
+        CSRW    TICK_INT, r6
+whr:    RET

@@ -37,6 +37,10 @@ a Manchester transmitter on thread 0 and a receiver on thread 1 at the rate
 the bit engine's manual mode reaches, with slice A's encoder (6.9.1) and
 the M2 convention for the rate.
 
+The rows after it are the D-035 programs, written after the hardware was
+complete for protocols Loom was not designed for (see the section of that
+name below). Each keeps the M2 convention for the rate.
+
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
 | `uart_tx_fifo.loom` | TX = OUT0 | 27 | 24 clocks per bit | 4 clocks | 32 clocks/bit (1.5625 Mbaud at 50 MHz); 115200 baud (TICK 434 + 8/256) |
@@ -52,9 +56,11 @@ the M2 convention for the rate.
 | `can_loopback.loom` | TX = OUT0, RX = IN0 | 79 (thread 0) + 140 (thread 1) | thread 0: 100 clocks per bit; thread 1: 12 clocks per tick, 8 ticks per bit | 28 clocks (thread 0), 4 clocks (thread 1) | 500 kbit/s (TICK 100; thread 1 TICK 12 + 128/256) and 125 kbit/s (TICK 400; TICK 50) |
 | `usb_ls_device.loom` | D+ = BIDIR0, D- = BIDIR1 (push-pull while sending; 1.5 kOhm pull-up on D-) | 511 of 512 (all four quarters, slices A and B) | 33 clocks per tick, one tick per bit (set by the program: 33 + 85/256) | 1 clock | USB low speed, 1.5 Mbit/s at 50 MHz; host at +-0.25 %; 2-bit host gaps |
 | `manchester_loopback.loom` | TX = OUT0, RX = IN0 | 60 (thread 0) + 113 (thread 1) | 12 clocks per tick, one tick per half-bit, both threads | 0 clocks (both threads) | 2.083 Mbit/s (TICK 12) and 1 Mbit/s (TICK 25), wire loopback; a sender at +-0.1 % (TICK 12) and +-0.2 % (TICK 25) |
+| `ir_nec_tx.loom` | LED = OUT0 (high = on, through a transistor) | 71 | 16 clocks per tick, a third of a carrier period (host-set) | 8 clocks (two `.bounded` POPs, in an interval with 28) | 38 kHz carrier at 50 MHz (TICK 438 + 153/256: 37,999.9 Hz) and at a 1.824 MHz clock (TICK 16); duty 1/3 |
+| `ir_nec_rx.loom` | RX = IN0 (a receiver module's output, low = carrier) | 112 | 64 clocks per tick, 1/16 of the NEC unit (host-set); timeouts only | no deadline pairs; pulses measured to about 30 clocks | NEC at 50 MHz (TICK 1757 + 208/256) and at 1.824 MHz (TICK 64 + 32/256); every mark and space +-25 % + 140 us; glitches under 70 us ignored |
 
 Every program assembles with `--strict` and no diagnostic at all: each
-deadline pair is proved, apart from the three intervals declared `.bounded`
+deadline pair is proved, apart from the five intervals declared `.bounded`
 below, and none is unbounded (the M2 five in
 `tools/tests/test_fw_build.py`, the M3 and M4 programs in their own test
 modules). Each fits in thread 0's quarter of the 512-word memory of D-020,
@@ -64,7 +70,8 @@ except three of the M3 programs: `i2c_slave_eeprom`'s data fills thread 3's quar
 `usb_ls_device` needs the whole memory for itself (a thread-0-only
 program: the other three threads must not be started with it loaded).
 `manchester_loopback`'s two threads each stay in their own quarter (60
-words from 0x000, 113 from 0x080).
+words from 0x000, 113 from 0x080), and so do the two NEC infrared
+programs run together (71 words from 0x000, 112 from 0x080).
 
 `ws2812` gets there with two `.bounded` declarations
 (`tools/loomasm/README.md` sections 4 and 7). Its byte fetch needs a `POP`
@@ -82,7 +89,10 @@ history.
 word queued behind the stop bit, guarded by a `WAITB INQ_NE, T` two slots
 earlier (a `BT` between them leaves for the idle path when nothing is
 queued), on an interval of 5 slots against the 24-clock budget of its
-proved `.tick`.
+proved `.tick`. `ir_nec_tx` has the fourth and fifth, the ws2812 idiom
+again: the two `POP`s of the next frame or repeat word, each guarded by a
+`WAITB INQ_NE, T` right after a deadline, on an interval of 25 slots
+against 8 ticks of at least 16 clocks.
 
 ```
 python -m tools.loomasm firmware/uart_rx.loom --strict --listing
@@ -616,12 +626,129 @@ constants that depend on their pins, so check before moving them.
   resynchronisation on data edges, and any medium access: thread 0 sends
   whenever the host asks.
 
+## The D-035 programs: protocols Loom was not designed for
+
+The programs below were written after the hardware was complete (D-032),
+for protocols nothing in Loom was built for (D-035). Each says what
+hardware it reuses and what that hardware was built for. Their open
+questions and the decisions taken are in
+`docs/spec-questions/firmware-d035.md`.
+
+## ir_nec_tx.loom: NEC infrared transmitter
+
+NEC is the remote-control code of most TVs. Loom has no PWM, no carrier
+generator and no pulse-width capture. The transmitter makes the 38 kHz
+carrier itself: every carrier edge is a deadline-latched pin write
+(`SETP pin, v, D`, SEMANTICS 6.10, D-016), built so that WS2812 pulses land
+on the exact clock, on a fractional tick (`TICK_FRAC`, SEMANTICS 4), built
+for UART rates such as 115200 baud. The NEC burst/space envelope is a count
+of those ticks.
+
+- **Host command** (push to thread 0): a frame is two words: bits 7:0 the
+  command and bit 8 EXT, then the address. Standard NEC (EXT = 0) sends
+  address bits 7:0 and their inverse; extended NEC (EXT = 1) sends bits
+  15:0, low byte first, with no inverse. The command is always followed by
+  its inverse. A repeat is one word with bit 15 set.
+- **Results**: none.
+- **Rate**: TICK = a third of a carrier period, set by the host
+  (TICK = f_clk / 114 kHz): 438 + 153/256 at 50 MHz (37,999.90 Hz,
+  -2.7 ppm), 16 at a 1.824 MHz clock. The schedule is proved for 16 clocks
+  or more.
+- **The carrier**: each cycle is `SETP LED, 1, D; WAITD 2; SETP LED, 0, D;
+  WAITD 1`, so every edge lands on the exact clock edge of its tick
+  (SEMANTICS 6.10 rule 1). At 50 MHz a high lasts 438 or 439 clocks and a
+  period 1315 or 1316: every edge is within one clock (20 ns) of the ideal
+  grid. Duty 1/3: a receiver module filters the carrier's fundamental,
+  which at 1/3 duty is sin(60 deg) = 87 % of a square wave's, for two
+  thirds of the mean LED current.
+- **The envelope**: the NEC unit (562.5 us = 64.125 ticks) is taken as 64
+  ticks, 561.4 us, 0.19 % short, so every time is an exact tick count: a
+  one-unit burst is 22 cycles, the 9 ms leader 342 cycles (1024 ticks), the
+  spaces 64, 192, 256 and 512 ticks, start to start 12288 ticks =
+  107.79 ms. Measured on the pin, every burst and space is 0.19 % short of
+  nominal (the tests allow 0.5 %).
+- **Repeats**: a frame or repeat that starts at S is followed by the next
+  at S + 192 units (107.79 ms) if a word is queued 10 ticks (88 us at
+  50 MHz) before that time: a repeat word sends a repeat code there, a
+  frame sends that frame there. The test is `WAITB INQ_NE, T` right after a
+  deadline (the ws2812 idiom), and the two `POP`s it guards carry
+  `.bounded` declarations (25 slots against 8 ticks of 16 clocks: 28 clocks
+  of slack). The worst slack, 8 clocks, is the carrier loop. With INQ empty
+  at that moment the chain ends and the next command starts as soon as it
+  arrives. A repeat word taken outside a chain is dropped: a repeat code
+  with no frame before it would be wrong on the wire.
+- **Not done**: other IR protocols (RC5, Sony SIRC). The thread is busy for
+  the whole frame: each carrier edge costs it two slots, and the rest of
+  its time is idle rather than free for other work.
+
+## ir_nec_rx.loom: NEC infrared receiver
+
+The receiver measures every mark and space of a receiver module's output
+with the timed waits (`WAITP ... T` against `SETD` deadlines, SEMANTICS
+6.4), built for the PS/2 and I2C timeouts, and restarts its tick generator
+on every edge it accepts (a `CSRW TICK_INT` clears ACC, SEMANTICS 4), the
+hard synchronisation built for the UART, CAN and Manchester receivers.
+
+- **Input**: RX = IN0, the output of a demodulating receiver module (a
+  TSOP38238 or alike: low while it sees a 38 kHz burst), idle high.
+- **Results** (pop thread 0), bits 15:14 the kind: a frame is two words,
+  bits 7:0 the command and bit 8 EXT, then the address (bits 15:8 as
+  received: the inverse for standard NEC; EXT says they were not, extended
+  NEC); a repeat code is 0x8000; an error is one word, 0xC000 | n << 8 |
+  item | fault, n the data bits received whole, item bit 4 a repeat code's
+  burst, bit 3 the leader, bit 2 a space, fault 1 out of window, 2 too
+  long (a timeout), 3 the command's inverse. A report is never split; the
+  program blocks on a full OUTQ, so a host pops within about 40 ms.
+- **Rate**: TICK = 1/16 of the NEC unit, 35.156 us, set by the host: 1757 +
+  208/256 at 50 MHz, 64 + 32/256 at 1.824 MHz (both exact); 64 clocks or
+  more. The program reads TICK_INT once at start for the glitch filter.
+- **Windows**: each mark and space within +-25 % of nominal plus 4 ticks
+  (140.6 us) for the receiver module's output-pulse error (the header gives
+  the datasheet figure). Leader 188 .. 324 ticks (6.61 .. 11.39 ms), its
+  space 92 .. 164 (3.23 .. 5.77 ms) for a frame or 44 .. 84 (1.55 ..
+  2.95 ms) for a repeat code, a mark 8 .. 24 (281 .. 844 us), the space of
+  a 0 8 .. 24 and of a 1 32 .. 64 (1.125 .. 2.25 ms). On an idle line a low
+  pulse shorter than a leader is ignored silently; every other violation
+  is one error word, and the receiver waits for an idle line again.
+- **How**: at each accepted edge the program restarts its tick grid, then
+  walks the window edges with `SETD` and a timed `WAITP` per edge:
+  completing before a deadline puts the pulse in the window below it,
+  timing out moves to the next. No `WAITD` and no deadline pair: like
+  `ps2_host`, everything is a timeout.
+- **Glitch filter**: an edge counts only if the new level is still there 2
+  ticks (70.3 us) later, a delay that scales with the tick; a shorter pulse
+  of either level is ignored and the interrupted wait goes on against the
+  same deadline.
+- **Measurement error**: an edge that comes while the program moves from
+  one wait to the next is seen up to 24 clocks late, so a pulse is measured
+  to within about 30 clocks: 0.6 us at 50 MHz, 0.4 tick at 1.824 MHz.
+- **Not done**: no check that a repeat code follows a frame within 108 ms,
+  no remembered command (the host has both); other IR protocols.
+
+Both programs fit a quarter of the memory and run together: the
+transmitter on thread 0 (0x000..0x046), the receiver moved to thread 1
+(0x080..0x0EF) by changing its `.thread` line.
+
+**Tests.** `tools/tests/test_fw_ir_nec.py`, with `tools.protomodels.ir_nec`
+(an encoder and decoder, a carrier analyser that rebuilds the carrier and
+the envelope from the LED pin's edges, a receiver-module model between the
+two programs' pins, and a source of demodulated frames with timing
+variations, glitches and faults). On the RTL (the default set, all on a
+board clocked at 1.824 MHz, where the waveform in microseconds is the same
+in 27 times fewer clocks than at 50 MHz): a frame and its repeat code from
+thread 0 through the receiver-module model to thread 1, glitches of both
+levels, and the two PHY-GL-SDF candidates (the transmitter's leader and
+four bits, the receiver's repeat code), 627,600 clocks. On the model only,
+with the reason in each mark: the 50 MHz carrier and a 50 MHz receive, the
+chain rules, the tolerance edges of every window, thirteen faults, and the
+two programs together at the receiver module's timing limits.
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks

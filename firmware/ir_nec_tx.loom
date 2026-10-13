@@ -1,0 +1,184 @@
+; ir_nec_tx.loom
+; NEC infrared transmitter on OUT0, fed by the host through INQ[0].
+;
+; Written on 2026-10-11, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; infrared: there is no PWM and no carrier generator. The program makes the
+; 38 kHz carrier itself with two pieces of hardware built for other jobs:
+; the deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016),
+; built so that WS2812 pulses land on the exact clock, and the fractional
+; tick divider (TICK_FRAC, SEMANTICS 4), built for UART rates such as
+; 115200 baud. Every carrier edge is a staged write that lands on the exact
+; clock edge of its tick, and the NEC burst/space envelope is a count of
+; those ticks. What the firmware does that no hardware does: the carrier,
+; the envelope, the NEC frame with its inverted bytes, and the 108 ms repeat
+; grid. It needs the FIFOs (POP, WAITB INQ_NE) and the latch, nothing else.
+;
+; Pin: LED = OUT0, push-pull, high = LED on, through a transistor (a pad
+; cannot drive an IR LED's 50..100 mA itself). Idle low: the LED is off.
+;
+; Host command format (FIFO space, thread 0):
+;   frame:  word 1  bits 7:0 the command byte; bit 8 EXT; bit 15 = 0
+;           word 2  the address. Standard NEC (EXT = 0): bits 7:0, and the
+;                   program sends its inverse as the second byte (bits 15:8
+;                   ignored). Extended NEC (EXT = 1): bits 15:0 as given,
+;                   low byte first, no inverse.
+;   repeat: one word with bit 15 set (the other bits are ignored).
+; The command byte is always followed by its inverse. Bits 14:9 of word 1
+; are ignored. Nothing is ever pushed to OUTQ.
+;
+; Wire format (NEC): a 9 ms burst, 4.5 ms of space, then 32 bits least
+; significant first (address, inverted address or the address high byte,
+; command, inverted command), each bit a 562.5 us burst followed by 562.5 us
+; (0) or 1687.5 us (1) of space, then a final 562.5 us burst. A repeat code is
+; a 9 ms burst, 2.25 ms of space and a 562.5 us burst.
+;
+; Repeats and the 108 ms grid. A frame or repeat that starts at S is followed
+; by the next one at S + 192 units (107.79 ms, below) exactly, if a word is in
+; INQ LEAD ticks (88 us at 50 MHz) before that time: a repeat word sends a
+; repeat code there, a frame (both words) sends that frame there. With INQ
+; empty at that moment the chain ends and the program waits for the next
+; command, which then starts at once (after that slot). A repeat word taken outside
+; a chain is dropped: the key was released, and a repeat code with no frame
+; before it would be wrong on the wire. So a host holding a key pushes the
+; frame, then one repeat word per 108 ms, each before its slot; it may queue
+; up to four words ahead. A frame whose address word is not queued yet when
+; its slot comes starts as soon as the address word arrives instead.
+;
+; Tick (set by the host before RUN, the M2 convention: the clock is the
+; board's): one tick is a third of a carrier period, TICK = f_clk / 114 kHz.
+;   50 MHz: TICK_INT 438, TICK_FRAC 153: 438.59765625 clocks (ideal
+;     438.5965). Carrier period 3 ticks = 1315.79 clocks: 37,999.90 Hz, an
+;     error of -2.7 ppm. Ticks fall on clock edges, so the high time is 438
+;     or 439 clocks and the period 1315 or 1316: every edge is within one
+;     clock (20 ns, 0.08 % of a period) of the ideal grid.
+;   1.824 MHz (the RTL tests): TICK_INT 16, TICK_FRAC 0: exactly 38 kHz.
+; The deadline schedule is proved for ticks of 16 clocks or more (.tick).
+;
+; Duty 1/3: high for one tick, low for two. A TSOP-style receiver filters
+; the carrier's fundamental, which for a 1/3 duty is sin(60 deg) = 87 % of a
+; square wave's, at two thirds of the square wave's mean LED current and
+; heat. A 1/3 duty costs nothing here (two edges per three ticks).
+;
+; Envelope. A burst of n carrier cycles lasts 3n - 2 ticks from its first
+; rise to its last fall; the space runs from that fall to the next rise. The
+; NEC unit (562.5 us = 64.125 ticks at 38 kHz) is taken as 64 ticks, 561.4 us,
+; 0.19 % short, so every time is exact in ticks:
+;   1 unit burst   22 cycles   64 ticks    561.4 us
+;   leader burst  342 cycles 1024 ticks   8.982 ms (16 units)
+;   space 0 / 1 / repeat / leader: 64 / 192 / 256 / 512 ticks
+;   start to start: 192 units = 12288 ticks = 107.79 ms
+; All are 0.19 % short of nominal, against the tolerances of +-10 % and more
+; that NEC receivers apply.
+;
+; Timing. Each edge is `SETP LED, v, D` and the WAITD that lands it, so it
+; changes the pad on the exact clock edge of its tick (SEMANTICS 6.10 rule
+; 1), whatever the code between the deadlines does. The burst loop is a
+; subroutine: SETP 1 D, WAITD 2 (the rise), SETP 0 D, WAITD 1 (the fall),
+; DJNZ. Spaces are WAITDs with nothing staged; each is two ticks short
+; because the burst loop's WAITD 2 lands the next rise.
+;
+; Registers: r0 command word, r1 the address word then the cycle count, r2
+; the 16 bits on the wire now (address half, then command half), r3 the
+; command half, r4 data bits left, r5 units left to the next start, r6
+; 0x00FF, r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   LED = OUT0
+        .tick   16                      ; the shortest tick the schedule is proved for
+        .equ    U     = 64              ; ticks per NEC unit (561.4 us)
+        .equ    CYC   = 22              ; carrier cycles in a one-unit burst
+        .equ    LCYC  = 342             ; carrier cycles in the 9 ms leader
+        .equ    START = 192             ; units from one start to the next (108 ms)
+        .equ    FUNITS = 25             ; leader (16 + 8) and final burst (1)
+        .equ    RUNITS = 21             ; repeat code: 16 + 4 + 1
+        .equ    LEAD  = 10              ; ticks between the INQ test and a start
+
+start:  SETP    LED, 0                  ; LED off
+        LDI     r6, 0xFF
+
+; Idle: no chain. Wait for a command; drop a repeat word.
+idle:   POP     r0                      ; blocks while INQ is empty
+        ADD     r7, r0, r0              ; C = bit 15: REPEAT
+        BC      idle                    ; no frame before it: dropped
+late:   POP     r1                      ; the address word (blocks until queued)
+        SETD    LEAD                    ; re-anchor after the unbounded POPs
+
+; A frame. Entered with TD LEAD ticks before the start (from idle, or from
+; the chain at gap below); the leader's first rise lands on that start.
+frame:  AND     r3, r0, r6              ; the command byte
+        NOT     r7, r3
+        SHLI    r7, 8
+        OR      r3, r3, r7              ; wire bits 16..31: command, ~command
+        MOV     r2, r1                  ; EXT: the 16-bit address as given
+        SHRI    r0, 9                   ; C = bit 8: EXT
+        BC      fext
+        AND     r2, r1, r6              ; standard: the address byte
+        NOT     r7, r2
+        SHLI    r7, 8
+        OR      r2, r2, r7              ; wire bits 0..15: address, ~address
+fext:   LDI     r5, START - FUNITS      ; units left, before the data bits
+        LDI     r4, 32                  ; data bits
+        MOV16   r1, LCYC
+        WAITD   LEAD - 2                ; the burst loop's WAITD 2 lands the start
+        CALL    burst                   ; 9 ms leader
+        WAITD   255
+        WAITD   255                     ; 4.5 ms space (the last 2 ticks in burst)
+
+; 32 data bits, least significant first: a one-unit burst, then one unit of
+; space for a 0 or three for a 1. r4 counts the bits left, this one included.
+bits:   LDI     r1, CYC
+        CALL    burst                   ; the bit's burst; back at its last fall
+        CMPI    r4, 16
+        BNZ     same
+        MOV     r2, r3                  ; bits 16..31: the command half
+same:   SHRI    r2, 1                   ; C = this bit
+        BC      one
+        SUBI    r5, 2                   ; a 0 is two units long
+        WAITD   U - 2                   ; one unit of space
+        DJNZ    r4, bits
+        JMP     last
+one:    SUBI    r5, 4                   ; a 1 is four units long
+        WAITD   3 * U - 2               ; three units of space
+        DJNZ    r4, bits
+last:   LDI     r1, CYC
+        CALL    burst                   ; the final burst
+        JMP     gap
+
+; The carrier: r1 cycles, each a rise, one tick high, two ticks low. Entered
+; with TD two ticks before the first rise; returns with TD at the last fall.
+burst:  SETP    LED, 1, D
+        WAITD   2                       ; the rise lands here
+        SETP    LED, 0, D
+        WAITD   1                       ; the fall, one tick later
+        DJNZ    r1, burst
+        RET
+
+; The gap to the next start, S + 108 ms. Entered at the last fall of a frame
+; or repeat code with r5 = the units left (39 or more), TD at that fall.
+gap:    DEC     r5                      ; the last unit is waited below
+gl:     WAITD   U
+        DJNZ    r5, gl
+        WAITD   U - LEAD                ; LEAD ticks before the next start
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      idle                    ; nothing queued: the chain ends
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0
+        ADD     r7, r0, r0              ; C = bit 15: REPEAT
+        BC      rep
+        WAITB   INQ_NE, T               ; the address word queued as well?
+        BT      late                    ; not yet: the frame starts when it comes
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r1
+        JMP     frame                   ; its leader lands on the start
+
+; A repeat code on the start: 9 ms burst, 2.25 ms space, one-unit burst.
+rep:    LDI     r5, START - RUNITS
+        MOV16   r1, LCYC
+        WAITD   LEAD - 2
+        CALL    burst                   ; 9 ms
+        WAITD   4 * U - 2               ; 2.25 ms
+        LDI     r1, CYC
+        CALL    burst                   ; 562.5 us
+        JMP     gap
