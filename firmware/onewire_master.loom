@@ -1,0 +1,316 @@
+; onewire_master.loom
+; A standard-speed 1-Wire master: reset and presence, byte writes and reads
+; with a running CRC-8, and the whole SEARCH ROM of Maxim application note
+; 187 in firmware, every ROM ID reported to the host with its CRC checked.
+;
+; Written on 2026-10-11, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). 1-Wire carries both directions
+; on one wire and the master times every bit slot. The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the master only ever
+;     pulls the line low or lets it go, and the board's pull-up (4.7 kOhm
+;     typical) makes the high level;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every edge the master makes lands on the
+;     exact clock of its deadline, so each low time is exact to 20 ns;
+;   - the bit engine's SHI and CRC unit (SEMANTICS 6.9), built for the
+;     serial protocols and used so far for CAN's CRC15 and USB's CRC16:
+;     here they carry Maxim's CRC-8, x^8 + x^5 + x^4 + 1, which no hardware
+;     in Loom was meant for. CRC_POLY = 0x31 left-aligned; the bits enter in
+;     wire order (LSB first), so the register holds the bit-reversed Maxim
+;     CRC and a whole ROM ID (or scratchpad) leaves it at 0 exactly when its
+;     last byte is the CRC of the bytes before it.
+; What the firmware does that no hardware does: the time slots themselves
+; (each bit is a low pulse whose length is the bit), presence detection, the
+; reset, and the ROM search's decision per bit (AN187).
+;
+; Pin: OW = BIDIR0, open drain (OD_MASK bit 0, set with a read-modify-write
+; so other threads' bits survive). Nothing drives the line high.
+;
+; Memory: 157 words, 124 in thread 0's quarter (0x000) and the three slot
+; subroutines, 33 words, at 0x100 in thread 2's: start thread 0 only, or
+; with onewire_device.loom (thread 1, 0x080) for the two together.
+;
+; Host command format (FIFO space, thread 0): one word per operation.
+;     bits 15:8  1 RESET:  reset pulse, then presence detect. One result.
+;                2 WRITE:  write the byte in bits 7:0, LSB first. No result.
+;                3 READ:   read one byte. One result.
+;                4 SEARCH: SEARCH ROM (0xF0) over the whole bus, AN187.
+;                Any other value is ignored.
+; Results (FIFO space read, thread 0):
+;   RESET   bit 0 PRESENCE: a device held the line low 70 us after release;
+;           bit 1 SHORT: the line was still low at the end of the reset
+;           sequence (480 us after release, when every device has let go).
+;   READ    bits 7:0 the byte; bits 15:8 the CRC-8 (Maxim's, as AN27 and
+;           the DS18B20 datasheet define it) of the bytes read since the last
+;           RESET or WRITE, this one included. After a DS18B20's nine
+;           scratchpad bytes, or a READ ROM's eight, the field is 0 exactly
+;           when the CRC byte matched.
+;   SEARCH  for each device, in AN187's order: a status word, then the 64-bit
+;           ROM ID as four words, bits 15:0 first (the family code is bits
+;           7:0 of the first word, the CRC bits 15:8 of the last). Status
+;           bits 7:0: the CRC-8 the CRC unit computed over all 64 bits,
+;           which is 0 exactly when the ID's CRC byte is right; anything
+;           else is a CRC error, and the four words follow anyway. Bit 15 is
+;           0. After the last device, an end
+;           marker: bit 15 END, with bit 1 NO PRESENCE, bit 2 SHORT (as for
+;           RESET) or bit 3 NO DEVICE (a bit position where the bit and its
+;           complement both read 1: nobody answered) if the search stopped
+;           on a fault. A CRC error ends the search after that ID, as AN187
+;           does (it restarts on a bad CRC): on a noisy or shorted bus a
+;           search that went on could branch without end.
+; Example, a DS18B20 scratchpad: 0x0100 (RESET, result 0x0001), 0x02CC
+; (SKIP ROM), 0x02BE (READ SCRATCHPAD), nine 0x0300 (READ); the ninth
+; result is 0x00nn when the scratchpad's CRC is right.
+;
+; Rate: the program sets its own tick, TICK_INT = 50, one tick per
+; microsecond at 50 MHz, and the host must not. Application note 126 fixes
+; the standard-speed slot timing in microseconds, so nothing here is the
+; host's choice, as for ws2812 and ps2_host; and `.csr TICK_INT, 50` both
+; sets the divider and declares the tick to the deadline checker, so the
+; schedule is proved at exactly the rate it runs. On a board clocked at
+; another frequency change US to the clocks per microsecond and reassemble:
+; the deadline checker proves the schedule down to US = 10 (10 MHz), and the
+; tests run the long scenarios on that build to save simulation time.
+;
+; Timing, AN126 table 2 at standard speed, in ticks of 1 us from a slot's
+; falling edge F (every edge latched, so exact):
+;     write 1   low A = 6, high until the slot ends: F+6 release, F+70 next
+;     write 0   low C = 60, recovery D = 10
+;     read      low A = 6, sample E = 8 after release (F+14, see below),
+;               then to the end of the 70 us slot
+;     reset     G = 0, low H = 480, presence sampled I = 70 after release,
+;               J = 410 more before the next slot
+; One subroutine, wbit, makes every slot: the fall, the level at F+6 (the
+; release for a 1 or a read, nothing for a 0), the sample at F+14 by SHI
+; (into SR and the CRC: the device's bit in a read slot, the master's own
+; bit in a write slot), and the release at F+60. The next slot's fall is
+; REC = 10 ticks after that release.
+; The sample point is the one place the program leaves AN126. AN126's E = 9
+; samples exactly 15 us after the fall, the end of the time a DS18B20
+; guarantees its 0 (tRDV). Loom's sample is the SHI one slot after the
+; WAITD, which completes 0 to 3 clocks after its tick, and reads the pad
+; through the two-flop synchroniser (SEMANTICS 2 and 3): the line as it was
+; 2 to 5 clocks after the tick. At E = 9 that is up to 0.1 us past the
+; guarantee, so the program uses E = 8: the line at 14.04 to 14.10 us,
+; inside the window, with 8 us after the release for the pull-up
+; (QUESTIONS.md item 1).
+; A staged write lands on the thread's next deadline, whichever instruction
+; set it (SEMANTICS 6.10), so the re-anchors after POP and PUSH are SETD 0:
+; that deadline is already reached, and the fall staged next lands on the
+; WAITD REC that follows. The first version used SETD 1, whose deadline
+; one tick away caught the staged fall 10 ticks early: its reset pulse
+; measured 490 us.
+; Between commands the slots simply wait (1-Wire has no maximum recovery
+; time); the search pushes its reports between passes, where the bus idles.
+;
+; Registers. Commands: r0 the byte shifter, r6 the opcode, r7 the command
+; word and scratch. Search (AN187's names): r0..r3 the ROM ID, the word being
+; searched in r0 (the previous pass's bits, consumed one per bit), the new
+; words rotating in at r3; r4 LastDiscrepancy; r5 last_zero; r6
+; id_bit_number (1..64); r7 scratch. r7 is also the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    OWPIN = 0               ; BIDIR0
+        .pins   OW = OWPIN
+        .equ    OWBIT = 1 << OWPIN      ; its bit in OD_MASK
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    A = 6                   ; AN126 standard speed, in us
+        .equ    C = 60
+        .equ    E = 8                   ; AN126 says 9; see the header
+        .equ    H = 480
+        .equ    I = 70
+        .equ    J = 410
+        .equ    REC = 10                ; D: recovery before the next fall
+        .equ    OP_RESET = 1
+        .equ    OP_WRITE = 2
+        .equ    OP_READ = 3
+        .equ    OP_SEARCH = 4
+        .equ    CRC_EN = 1 << 9         ; BE_CFG: DIR = 0 (LSB first), CRC on
+        .equ    MAXIM8 = 0x31 << 8      ; x^8 + x^5 + x^4 + 1, left-aligned
+
+start:  .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        CSRW    CRC_INIT, r7            ; Maxim: the CRC starts at 0
+        LDIH    r7, hi8(MAXIM8)
+        CSRW    CRC_POLY, r7
+        LDIH    r7, hi8(CRC_EN)
+        CSRW    BE_CFG, r7
+        LDI     r7, OWPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples OW
+        LDI     r7, (1 << 5) | OWPIN
+        CSRW    INGRP, r7               ; IN reads OW into bit 0
+        CSRR    r7, OD_MASK
+        ORI     r7, OWBIT
+        CSRW    OD_MASK, r7             ; OW open drain
+        SETP    OW, 1                   ; released: the pull-up holds it high
+
+cmd:    POP     r7                      ; the next command (blocks)
+        SETD    0                       ; re-anchor after the unbounded POP (0: see below)
+        MOV     r6, r7
+        SHRI    r6, 8                   ; the opcode (bits 15:11 are zero)
+        CMPI    r6, OP_RESET
+        BZ      c_reset
+        CMPI    r6, OP_WRITE
+        BZ      c_write
+        CMPI    r6, OP_READ
+        BZ      c_read
+        CMPI    r6, OP_SEARCH
+        BZ      search
+        JMP     cmd                     ; not a command: ignored
+
+c_reset: CALL   reset
+        PUSH    r7
+        JMP     cmd
+
+c_read: LDI     r7, 0xFF                ; a read slot is a write-1 slot
+c_write: MOV    r0, r7                  ; the byte in 7:0
+        LDI     r7, 8
+        CSRW    CNT, r7
+x_bit:  SHRI    r0, 1                   ; C = the next bit, LSB first
+        CALL    wbit
+        BNZ     x_bit                   ; Z: SHI counted the eighth bit
+        CMPI    r6, OP_READ
+        BZ      x_read
+        CRCI                            ; reads after a write start a new CRC
+        JMP     cmd
+x_read: STSR    r7
+        SHRI    r7, 8                   ; the byte, from SR[15:8]
+        STCRC   r6                      ; the reversed Maxim CRC in 15:8, 0 in 7:0
+        REV     r6, r6                  ; Maxim's CRC in 7:0
+        SWAP    r6, r6                  ; ... in 15:8
+        OR      r7, r7, r6
+        PUSH    r7
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; SEARCH ROM, AN187. One pass per device: reset, 0xF0, then for each of the
+; 64 bits two read slots (the bit, its complement) and a write slot (the
+; direction). LastDiscrepancy (r4) carries the tree position between passes.
+; ---------------------------------------------------------------------------
+search: LDI     r4, 0                   ; LastDiscrepancy: none yet
+s_pass: CALL    reset                   ; r7 = {SHORT, PRESENCE}
+        CMPI    r7, 1
+        BNZ     s_bus                   ; nobody there, or a short
+        LDI     r6, 0xF0                ; SEARCH ROM
+        LDI     r7, 8
+        CSRW    CNT, r7
+s_f0:   SHRI    r6, 1
+        CALL    wbit
+        BNZ     s_f0
+        CRCI                            ; the ID's CRC starts here
+        LDI     r7, 16
+        CSRW    CNT, r7                 ; SHI counts the bits of one word
+        LDI     r5, 0                   ; last_zero
+        LDI     r6, 1                   ; id_bit_number
+
+s_bit:  CALL    rbit                    ; id_bit
+        CMPI    r7, 1
+        BZ      s_id1
+        CALL    rbit                    ; cmp_id_bit
+        CMPI    r7, 1
+        BZ      s_d0                    ; 0 1: every device left has a 0 here
+        CMP     r6, r4                  ; 0 0: a discrepancy. Z: n == LastDisc.,
+        BZ      s_d1                    ;   C: n >= LastDisc.
+        BC      s_new0                  ; n > LastDiscrepancy: take 0
+        SHRI    r0, 1                   ; n < LastDiscrepancy: as last time;
+        BC      s_w                     ;   C = that bit (1: direction 1)
+        MOV     r5, r6                  ; a 0 taken: last_zero = n (C stays 0)
+        JMP     s_w
+s_id1:  CALL    rbit                    ; cmp_id_bit
+        CMPI    r7, 1
+        BZ      s_none                  ; 1 1: no device answered
+s_d1:   SHRI    r0, 1                   ; consume the previous pass's bit
+        CMP     r0, r0                  ; C = 1: direction 1
+        JMP     s_w
+s_new0: MOV     r5, r6                  ; last_zero = n
+s_d0:   SHRI    r0, 1
+        TEST    r0, r0                  ; C = 0: direction 0
+s_w:    CALL    wbit                    ; write the direction: SHI records it in
+        BNZ     s_next                  ;   SR and the CRC; Z: 16 bits in SR
+        STSR    r7                      ; a word of the new ID
+        MOV     r0, r1
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r7
+        CMPI    r6, 63                  ; C: this was bit 64
+        BC      s_done
+        LDI     r7, 16
+        CSRW    CNT, r7
+s_next: ADDI    r6, 1
+        JMP     s_bit
+
+s_done: MOV     r4, r5                  ; LastDiscrepancy = last_zero
+        STCRC   r7                      ; the residue, bit-reversed, in 15:8
+        REV     r7, r7                  ; status: Maxim's CRC of all 64 bits
+        PUSH    r7                      ; status, then the ID (blocks while
+        PUSH    r0                      ;   OUTQ is full: the bus just idles)
+        PUSH    r1
+        PUSH    r2
+        PUSH    r3
+        SETD    0                       ; re-anchor after the unbounded PUSHes
+        CMPI    r7, 0
+        BNZ     s_end                   ; a CRC error ends the search (AN187)
+        CMPI    r4, 0
+        BNZ     s_pass                  ; a 0 was taken somewhere: more devices
+s_end:  LDI     r7, 0
+s_mark: LDIH    r7, 0x80                ; END
+        PUSH    r7
+        JMP     cmd
+s_none: LDI     r7, 8                   ; NO DEVICE
+        JMP     s_mark
+s_bus:  XORI    r7, 1                   ; {SHORT, NO PRESENCE} ...
+        SHLI    r7, 1                   ; ... in bits 2:1
+        JMP     s_mark
+
+; ---------------------------------------------------------------------------
+; The three slot subroutines live in thread 2's quarter (the main loop and
+; the search fill thread 0's): thread 2 must not be started with this image.
+; CALL takes an absolute address, so nothing else changes.
+; ---------------------------------------------------------------------------
+        .org    0x100
+
+; wbit: one time slot. C = the bit to send (1 for a read slot). The fall is
+; REC ticks after the last deadline; returns at the release, F+60, with the
+; bus level at F+14 shifted into SR[15] and the CRC and Z = (CNT == 0).
+; ---------------------------------------------------------------------------
+wbit:   SETP    OW, 0, D                ; stage the fall
+        WAITD   REC                     ; F: the fall lands
+        BNC     w_low
+        SETP    OW, 1, D                ; a 1: release at F+6 (A)
+w_low:  WAITD   A                       ; a 0 stays low (nothing staged)
+        WAITD   E                       ; F+14
+        SHI                             ; sample
+w_end:  SETP    OW, 1, D                ; stage the release
+        WAITD   C - A - E               ; F+60: a 0's low phase ends (C)
+        RET
+
+; rbit: a read slot like wbit's, sampled into r7 (0 or 1) instead of SR.
+; No flag changes, so a caller's C survives it.
+rbit:   SETP    OW, 0, D
+        WAITD   REC
+        SETP    OW, 1, D
+        WAITD   A
+        WAITD   E
+        IN      r7                      ; the bus level at F+14
+        JMP     w_end                   ; to F+60, the same grid as wbit
+
+; reset: the reset pulse and the presence sample. Returns r7 = {SHORT,
+; PRESENCE} at H + I + J after the fall, with a fresh CRC. Clobbers r6.
+reset:  SETP    OW, 0, D
+        WAITD   REC                     ; F: the fall lands
+        WAITD   H / 2
+        SETP    OW, 1, D                ; stage the release for the next deadline
+        WAITD   H / 2                   ; F+480: released (H)
+        WAITD   I                       ; presence sample point
+        IN      r7                      ; 0: a device answered
+        WAITD   J / 2
+        WAITD   J / 2                   ; every device has let go by now
+        IN      r6                      ; 0: the line is held low, a short
+        XORI    r7, 1                   ; bit 0 PRESENCE
+        XORI    r6, 1
+        SHLI    r6, 1
+        OR      r7, r7, r6              ; bit 1 SHORT
+        CRCI
+        RET

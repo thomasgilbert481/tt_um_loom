@@ -77,3 +77,65 @@ quotes no TSOP figure.
 The worktree's `.git` file holds a Windows path that git in WSL cannot
 follow. **Decision:** expected there; it passes in main (checked by
 `scripts/check_all.sh quick` at integration).
+
+## 1-Wire (`onewire_master.loom`, `onewire_device.loom`), integrated 2026-10-25
+
+### 1. The master's read sample at E = 8, not AN126's 9
+
+AN126 samples 15 us after the fall, exactly where the DS18B20's tRDV
+guarantee ends. Loom sees the line 2 to 5 clocks after the deadline (the
+instruction after `WAITD`, then the synchroniser), so E = 9 would be up to
+0.1 us late against a part that holds its 0 for exactly the guaranteed
+time, and the model DS18B20 does.
+
+**Decision:** E = 8 accepted (14.04 to 14.10 us after the fall). A master
+must sample before tRDV ends; AN126's value is a recommendation, and the
+datasheet's window is the requirement. The program is described as AN126
+timing with this one stated departure (its header and `firmware/README.md`).
+
+### 2. A bad ROM CRC ends the search after that ID
+
+**Decision:** accepted. The ID is reported with the residue the CRC unit
+computed, then the END marker; a host that wants the rest of the bus
+searches again. A search that went on over bad bits could branch without
+end. Recorded in the master's header.
+
+### 3. Write-0 low of 60 us, the DS18B20's tLOW0 minimum
+
+**Decision:** kept. Every edge is deadline-latched, so the low is 60.00 us
+to the clock and never less; AN126 uses the same value.
+
+### 4. The device calls a 240 us low a reset
+
+**Decision:** accepted. It lies between the longest slot (120 us) and the
+shortest reset (480 us) with margin both ways. Recorded in the device's
+header.
+
+### 5. WRITE SCRATCHPAD keeps the whole configuration byte
+
+**Decision:** accepted and documented as a difference from a DS18B20 (which
+keeps bits 6:5): the device's scratchpad belongs to the host.
+
+### 6. Both programs use thread 2's quarter for their slot subroutines
+
+The master is 157 words and the device 149 plus 8 of data; neither fits
+128. **Decision:** accepted. They load and run together on threads 0 and 1,
+thread 3's quarter stays free, and thread 2 must not be started with either
+loaded. The headers and `firmware/README.md` say so.
+
+### 7. The device's report is a blocking PUSH
+
+**Decision:** accepted, as for `ir_nec_rx`: the host has four words of room
+(two WRITE SCRATCHPADs), and a pop on the SPI port takes about 200 clocks.
+
+### 8. Not done: overdrive, strong pull-up, ALARM SEARCH, CONVERT T, COPY, RECALL
+
+**Decision:** out of scope for D-035 and listed under "Weaker than" in each
+section.
+
+### 9. RTL speed and the time-scaled build
+
+**Decision:** accepted. The RTL default set is the four real-rate scenarios
+(resets, presence pulses, both READ ROMs); the searches and scratchpads run
+on the model, also on a build with `US = 10`, which the deadline checker
+proves at that tick.

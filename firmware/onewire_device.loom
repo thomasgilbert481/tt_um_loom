@@ -1,0 +1,287 @@
+; onewire_device.loom
+; Loom as a DS18B20-style 1-Wire device: the presence pulse, the ROM
+; commands READ ROM, MATCH ROM, SKIP ROM and SEARCH ROM, and the function
+; commands READ SCRATCHPAD (nine bytes, the last the CRC-8 the program
+; computes on the CRC unit) and WRITE SCRATCHPAD (three bytes, passed to
+; the host).
+;
+; Written on 2026-10-11, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). A device answers inside a few
+; microseconds of the master's falling edge on a wire it shares. The
+; program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C;
+;   - WAITP on that pin for the master's lows, and the timed waits: TD
+;     anchored on each fall times the sample, the hold of a 0 and the
+;     presence pulse, and a WAITP with a timeout tells a reset from a slot;
+;   - the bit engine's SHO and SHI with BE_PINS on that one pin (SEMANTICS
+;     6.9), built for the serial protocols: SHO answers a read slot (open
+;     drain: a 0 pulls the line, a 1 leaves it) and SHI takes a write slot;
+;   - the CRC unit, built for CAN and USB, running Maxim's CRC-8 (x^8 + x^5
+;     + x^4 + 1, CRC_POLY 0x31 left-aligned) over the scratchpad bytes as
+;     they go out, so the ninth byte is computed, never stored;
+;   - LD and ST (slice B, SEMANTICS 6.11): the ROM ID and the scratchpad
+;     live in eight words of the instruction memory.
+; What the firmware does that no hardware does: the slot protocol, reset
+; detection, the presence pulse, the ROM and function command decoding and
+; the search's bit, complement and compare.
+;
+; Pin: OW = BIDIR1, open drain (OD_MASK bit 1, read-modify-write). With
+; onewire_master.loom on BIDIR0 (thread 0) the bench joins the two pins as
+; one bus: two Loom threads never share a pin (a pin's output register
+; holds whichever thread wrote last).
+;
+; Host words (FIFO space, thread 1).
+;   INQ, once at start: the ROM ID as four words, bits 15:0 first (the family
+;     code, 0x28 for a DS18B20, in bits 7:0 of the first, the CRC in bits
+;     15:8 of the last; the program sends what it is given), then the
+;     scratchpad bytes 0..7 as four words, byte 2k in bits 7:0 and byte
+;     2k+1 in bits 15:8 of word k. The device stays off the bus until all
+;     eight have arrived. They are stored at DATA (the last eight words of
+;     thread 1's quarter), where the host may also rewrite them while the
+;     thread is halted (say, a new temperature in word DATA + 4).
+;   OUTQ, after each WRITE SCRATCHPAD: two words, {TL, TH} (TH in bits 7:0)
+;     and the configuration byte in bits 7:0. The same three bytes are kept
+;     as scratchpad bytes 2, 3 and 4 (the configuration as written; a real
+;     DS18B20 keeps only its bits 6:5). The PUSH blocks while OUTQ is full,
+;     and a blocked device misses the master's slots: the host pops them.
+;
+; Rate: the program sets its own tick, TICK_INT = 50 (1 us at 50 MHz), as
+; the master does: the DS18B20 datasheet fixes the windows in microseconds.
+; Another board clock: change US (the checker proves it down to 10).
+;
+; Timing, DS18B20 datasheet, from the moment the device sees the line low
+; (L, within a few slots of the master's fall F; every time is in ticks of
+; 1 us from a SETD 0 at L, so up to one tick less):
+;     write slot   sampled by SHI at L + SAMPLE = 30 (window 15..60)
+;     read slot    a 0 driven by SHO one slot after L, released at L + HOLD
+;                  = 30 (valid until 15, released before the 60 us slot ends)
+;     reset        a low still there at L + RSTDET = 240 (a slot is at most
+;                  120 us low, a reset at least 480): wait for the rise,
+;                  then PDW = 30 high and PDL = 120 low (15..60, 60..240)
+; Each slot starts with WAITP OW, 0 rather than WAITE: a low that began
+; while the device was still deciding what to do with the last byte is
+; caught as long as it lasts, and every slot ends with WAITP OW, 1, so the
+; low of the next one is never confused with the last.
+; Memory: the main loop fills thread 1's quarter up to DATA; the five slot
+; subroutines sit at SUBS in thread 2's quarter, after onewire_master.loom's
+; (0x100..0x120), so the two load together. Start thread 1 only, or threads
+; 0 and 1 with the master.
+;
+; Registers: r0 a ROM or scratchpad word, r1 word count, r2 data pointer, r3
+; r4 the WRITE SCRATCHPAD bytes, r5 search bit count, r6 the search bit or a
+; command value, r7 scratch and the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    OWPIN = 1               ; BIDIR1
+        .pins   OW = OWPIN
+        .equ    OWBIT = 1 << OWPIN
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    SAMPLE = 30             ; in us, after the line is seen low
+        .equ    HOLD = SAMPLE           ; equal, so the two slots share a tail
+        .equ    RSTDET = 240
+        .equ    PDW = 30
+        .equ    PDL = 120
+        .equ    CRC_EN = 1 << 9         ; BE_CFG: DIR = 0 (LSB first), CRC on
+        .equ    MAXIM8 = 0x31 << 8      ; x^8 + x^5 + x^4 + 1, left-aligned
+        .equ    DATA = 0x0F8            ; ROM ID (4 words), then the scratchpad (4)
+        .equ    ROM = DATA
+        .equ    SPAD = DATA + 4
+        .equ    SUBS = 0x140            ; the slot subroutines, thread 2's quarter
+        .equ    READ_ROM = 0x33
+        .equ    MATCH_ROM = 0x55
+        .equ    SKIP_ROM = 0xCC
+        .equ    SEARCH_ROM = 0xF0
+        .equ    READ_SPAD = 0xBE
+        .equ    WRITE_SPAD = 0x4E
+
+start:  .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        CSRW    CRC_INIT, r7            ; Maxim: the CRC starts at 0
+        LDIH    r7, hi8(MAXIM8)
+        CSRW    CRC_POLY, r7
+        LDIH    r7, hi8(CRC_EN)
+        CSRW    BE_CFG, r7
+        LDI     r7, (OWPIN << 5) | OWPIN
+        CSRW    BE_PINS, r7             ; SHO drives OW, SHI samples it
+        CSRR    r7, OD_MASK
+        ORI     r7, OWBIT
+        CSRW    OD_MASK, r7             ; OW open drain
+        SETP    OW, 1                   ; let go of the line
+        LDI     r2, DATA
+        LDI     r1, 8
+load:   POP     r0                      ; the ROM ID and the scratchpad
+        ST      r0, r2, 0
+        ADDI    r2, 1
+        DJNZ    r1, load
+
+; idle: follow the slots without answering, until a reset pulse.
+idle:   CALL    rxbit
+        JMP     idle
+
+; A reset pulse (rxbit and txbit come here when the line stays low): the
+; presence pulse after its end, then a ROM command.
+reset:  WAITP   OW, 1                   ; the end of the reset pulse
+        SETD    0                       ; anchored on the rise
+        SETP    OW, 0, D
+        WAITD   PDW                     ; the presence pulse starts ...
+        SETP    OW, 1, D
+        WAITD   PDL                     ; ... and ends
+        WAITP   OW, 1                   ; other devices' presence pulses too
+        LDI     r7, 8
+        CALL    rxn                     ; the ROM command
+        STSR    r7
+        SHRI    r7, 8
+        LDI     r6, READ_ROM
+        CMP     r7, r6
+        BZ      readrom
+        LDI     r6, MATCH_ROM
+        CMP     r7, r6
+        BZ      match
+        LDI     r6, SKIP_ROM
+        CMP     r7, r6
+        BZ      func
+        LDI     r6, SEARCH_ROM
+        CMP     r7, r6
+        BNZ     idle                    ; any other: silent until the next reset
+
+; SEARCH ROM: each of the 64 bits, then its complement, then the master's
+; choice; a choice that is not this device's bit drops it out.
+search: LDI     r2, ROM
+        LDI     r1, 4
+s_word: LD      r0, r2, 0
+        LDI     r5, 16
+s_bit:  MOV     r6, r0
+        ANDI    r6, 1                   ; the bit
+        SHRI    r0, 1
+        LDI     r7, 2
+        SUB     r7, r7, r6              ; SR = {complement, bit}: 2 - bit
+        LDSR    r7
+        CALL    txbit                   ; the bit
+        CALL    txbit                   ; its complement
+        CALL    rxbit                   ; the master's choice, in SR[15]
+        STSR    r7
+        SHRI    r7, 15
+        CMP     r7, r6
+        BNZ     idle                    ; not this device's branch
+        DJNZ    r5, s_bit
+        ADDI    r2, 1
+        DJNZ    r1, s_word
+        JMP     idle                    ; found: the master resets next
+
+; READ ROM: the 64 bits, then a function command (a bus with one device).
+readrom: LDI    r2, ROM
+        CALL    sendw
+        JMP     func
+
+; MATCH ROM: 64 bits from the master, compared a word at a time; another
+; ID leaves the device silent until the next reset.
+match:  LDI     r2, ROM
+        LDI     r1, 4
+m_word: LDI     r7, 16
+        CALL    rxn
+        STSR    r7
+        LD      r0, r2, 0
+        CMP     r7, r0
+        BNZ     idle
+        ADDI    r2, 1
+        DJNZ    r1, m_word
+
+; The function command.
+func:   LDI     r7, 8
+        CALL    rxn
+        STSR    r7
+        SHRI    r7, 8
+        LDI     r6, READ_SPAD
+        CMP     r7, r6
+        BZ      rdspad
+        LDI     r6, WRITE_SPAD
+        CMP     r7, r6
+        BNZ     idle
+
+; WRITE SCRATCHPAD: TH, TL, configuration, to the host and into bytes 2..4.
+        LDI     r7, 16
+        CALL    rxn
+        STSR    r3                      ; {TL, TH}
+        LDI     r7, 8
+        CALL    rxn
+        STSR    r4
+        SHRI    r4, 8                   ; the configuration
+        PUSH    r3
+        PUSH    r4
+        LDI     r2, SPAD
+        ST      r3, r2, 1               ; bytes 2 and 3
+        LD      r0, r2, 2
+        SHRI    r0, 8
+        SHLI    r0, 8
+        OR      r0, r0, r4
+        ST      r0, r2, 2               ; byte 4, byte 5 kept
+        JMP     idle
+
+; READ SCRATCHPAD: bytes 0..7 through the CRC unit, then its CRC as byte 8.
+; A master that wants fewer stops reading; after nine the line stays high.
+rdspad: CRCI
+        LDI     r2, SPAD
+        CALL    sendw
+        STCRC   r7                      ; Maxim's CRC, bit-reversed, in 15:8
+        REV     r7, r7                  ; in 7:0, in the order it is sent
+        LDSR    r7
+        LDI     r7, 8
+        CALL    txn
+        JMP     idle
+
+; The ROM ID and the scratchpad (the host's words go here at start).
+        .org    DATA
+        .word   0, 0, 0, 0, 0, 0, 0, 0
+
+; ---------------------------------------------------------------------------
+; The slot subroutines, in thread 2's quarter (see Memory above).
+; ---------------------------------------------------------------------------
+        .org    SUBS
+
+; sendw: four words from r2 on, LSB first, through SHO (and the CRC).
+sendw:  LDI     r1, 4
+sw_w:   LD      r0, r2, 0
+        LDSR    r0
+        LDI     r7, 16
+        CSRW    CNT, r7
+sw_b:   CALL    txbit
+        BNZ     sw_b
+        ADDI    r2, 1
+        DJNZ    r1, sw_w
+        RET
+
+; rxn, txn: r7 slots of rxbit or txbit (CNT counts them).
+rxn:    CSRW    CNT, r7
+rx_b:   CALL    rxbit
+        BNZ     rx_b
+        RET
+txn:    CSRW    CNT, r7
+tx_b:   CALL    txbit
+        BNZ     tx_b
+        RET
+
+; rxbit: one write slot of the master's: the line at L + SAMPLE into SR[15]
+; (and the CRC). Z = (CNT == 0) on return.
+rxbit:  WAITP   OW, 0                   ; L: the master's fall, seen
+        SETD    0
+        WAITD   SAMPLE
+        SHI
+        JMP     b_end
+
+; txbit: one read slot of the master's: SR[0] on the line from L to
+; L + HOLD (SHO: a 0 pulls the line low, a 1 leaves it). Z as for rxbit.
+txbit:  WAITP   OW, 0                   ; L
+        SHO                             ; a 0 holds the line low from here
+        SETD    0
+        SETP    OW, 1, D                ; let it go ...
+        WAITD   HOLD                    ; ... at L + HOLD
+
+; Both: the slot ends when the line rises; still low at L + RSTDET, it was
+; a reset pulse.
+b_end:  SETD    RSTDET - SAMPLE
+        WAITP   OW, 1, T
+        BNT     b_ret
+        JMP     reset                   ; (BT cannot reach it from here)
+b_ret:  RET

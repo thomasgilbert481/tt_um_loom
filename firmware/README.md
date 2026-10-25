@@ -39,7 +39,9 @@ the M2 convention for the rate.
 
 The rows after it are the D-035 programs, written after the hardware was
 complete for protocols Loom was not designed for (see the section of that
-name below). Each keeps the M2 convention for the rate.
+name below). Each keeps the M2 convention for the rate, except where the
+protocol fixes its slots in microseconds: the 1-Wire programs then set
+their own tick, as `ws2812` and `ps2_host` do.
 
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
@@ -58,6 +60,8 @@ name below). Each keeps the M2 convention for the rate.
 | `manchester_loopback.loom` | TX = OUT0, RX = IN0 | 60 (thread 0) + 113 (thread 1) | 12 clocks per tick, one tick per half-bit, both threads | 0 clocks (both threads) | 2.083 Mbit/s (TICK 12) and 1 Mbit/s (TICK 25), wire loopback; a sender at +-0.1 % (TICK 12) and +-0.2 % (TICK 25) |
 | `ir_nec_tx.loom` | LED = OUT0 (high = on, through a transistor) | 71 | 16 clocks per tick, a third of a carrier period (host-set) | 8 clocks (two `.bounded` POPs, in an interval with 28) | 38 kHz carrier at 50 MHz (TICK 438 + 153/256: 37,999.9 Hz) and at a 1.824 MHz clock (TICK 16); duty 1/3 |
 | `ir_nec_rx.loom` | RX = IN0 (a receiver module's output, low = carrier) | 112 | 64 clocks per tick, 1/16 of the NEC unit (host-set); timeouts only | no deadline pairs; pulses measured to about 30 clocks | NEC at 50 MHz (TICK 1757 + 208/256) and at 1.824 MHz (TICK 64 + 32/256); every mark and space +-25 % + 140 us; glitches under 70 us ignored |
+| `onewire_master.loom` | OW = BIDIR0 (open drain, board pull-up) | 157: 124 at 0x000, 33 at 0x100 (thread 2's quarter) | 50 clocks per tick, 1 us (set by the program); also proved at 10 | 288 clocks (12 at a tick of 10) | 1-Wire standard speed at 50 MHz, AN126's slots to the clock (read sample E = 8, see its section); searches and scratchpads also on a build with a 10-clock tick |
+| `onewire_device.loom` | OW = BIDIR1 (open drain) | 157: 116 at 0x080, 8 of data at 0x0F8, 33 at 0x140 (thread 2's quarter) | 50 clocks per tick, 1 us (set by the program); also proved at 10 | 1446 clocks (286 at 10) | standard speed against an AN126 master and one at the datasheet's limits (write-1 low 14 us, read low 1 us sampled at 15 us); MATCH, search, scratchpad also on the 10-clock build |
 
 Every program assembles with `--strict` and no diagnostic at all: each
 deadline pair is proved, apart from the five intervals declared `.bounded`
@@ -743,12 +747,156 @@ with the reason in each mark: the 50 MHz carrier and a 50 MHz receive, the
 chain rules, the tolerance edges of every window, thirteen faults, and the
 two programs together at the receiver module's timing limits.
 
+## onewire_master.loom: 1-Wire master with the ROM search
+
+- **Written** 2026-10-11, after the hardware was complete (D-032), as a
+  protocol Loom was not designed for (D-035). Hardware reused: the
+  open-drain BIDIR pin (built for I2C), the deadline-latched `SETP ... D`
+  (built for clock-exact edges, WS2812), `SHI` and the CRC unit (built for CAN
+  and USB), here Maxim's CRC-8 with `CRC_POLY = 0x31 << 8`. What only the
+  firmware does: the time slots, the reset and presence detection, and
+  application note 187's search.
+- **Pin**: OW = BIDIR0, open drain (`OD_MASK` bit 0, read-modify-write);
+  the board's pull-up (4.7 kOhm typical) makes the high level.
+- **Host command** (push to thread 0): one word per operation, bits 15:8
+  the operation, bits 7:0 the byte for WRITE.
+  - `0x0100` RESET: the reset pulse and presence detect. Result: bit 0
+    PRESENCE, bit 1 SHORT (the line still low 480 us after the release).
+  - `0x02bb` WRITE byte `bb`, LSB first. No result.
+  - `0x0300` READ a byte. Result: bits 7:0 the byte, bits 15:8 the CRC-8
+    of the bytes read since the last RESET or WRITE, this one included:
+    after a DS18B20's nine scratchpad bytes or a READ ROM's eight it is 0
+    exactly when the CRC byte matched.
+  - `0x0400` SEARCH: SEARCH ROM over the whole bus. Results, per device in
+    AN187's order: a status word (bits 7:0 the CRC-8 the CRC unit computed
+    over all 64 bits: 0 for a good ID; bit 15 clear), then the ID as four
+    words, bits 15:0 first (family code in 7:0 of the first). Then an end
+    marker: bit 15 END, plus bit 1 NO PRESENCE, bit 2 SHORT or bit 3 NO
+    DEVICE (bit and complement both 1) when the search stopped on a fault.
+    A CRC error ends the search after that ID (AN187 restarts on one; a
+    search that went on over a faulty line could branch without end).
+  - Example, a DS18B20 scratchpad: `0x0100` (0x0001 back), `0x02CC`,
+    `0x02BE`, nine `0x0300`; the ninth result is `0x00nn`.
+- **Rate**: fixed by AN126, so the program writes `TICK_INT = 50` itself (1
+  us at 50 MHz); **the host must not**. Another board clock: change `US`.
+- **Timing**: AN126 table 2, standard speed, every edge deadline-latched
+  and so exact to the clock: write 1 low 6 us, write 0 low 60 us, slots
+  70 us apart inside a byte (recovery 10 us after a write 0, 64 after a
+  write 1), reset low 480 us, presence sampled 70 us after the release and
+  the next slot at least 490 us after it (J = 410 plus the 10 us
+  recovery; 519 in the READ ROM test, where the host sends the next
+  command). One subroutine makes every slot: fall, level at 6 us
+  (released for a 1 or a read), sample by `SHI` (into SR and the CRC),
+  release at 60 us. The one
+  departure from AN126 is the read sample: E = 8, not 9. AN126's sample
+  at 15.0 us is where the DS18B20's guarantee (tRDV) ends, and Loom's
+  sample sees the line 2 to 5 clocks after its deadline (one slot after
+  the `WAITD`, through the synchroniser), so E = 9 would be up to 0.1 us
+  late; at E = 8 it is 14.04 to 14.10 us after the fall.
+- **The search**: AN187's algorithm with the ID in r0..r3 (the word being
+  searched in r0, the previous pass's bit consumed from its bottom while
+  the new bit enters SR through the direction slot's `SHI`), LastDiscrepancy
+  in r4, last_zero in r5, the bit number in r6. Each bit is two read slots
+  and a write slot, 210 us; a pass is about 15 ms. The CRC unit sees exactly
+  the 64 direction bits, so its residue is the ID's CRC check.
+- **The first version** re-anchored with `SETD 1` after `POP`: a staged
+  write lands on the thread's next deadline whatever set it (SEMANTICS
+  6.10), and the slot's fall, staged before that tick, landed on it ten
+  ticks early (a 490 us reset pulse). `SETD 0` sets a deadline that is
+  already reached, so the fall lands on the `WAITD` meant for it.
+- **Weaker than a dedicated master** (DS2482 and the like): no overdrive,
+  no strong pull-up for parasite-powered parts, no active pull-up for long
+  lines, a fixed 1 us grid (the read sample is 14 us, not adjustable), and
+  a host that must pop the search reports (the search waits while OUTQ is
+  full; the line idles high meanwhile).
+
+## onewire_device.loom: a DS18B20-style 1-Wire device
+
+- **Written** 2026-10-11, after the hardware was complete (D-032), as a
+  protocol Loom was not designed for (D-035). Hardware reused: the
+  open-drain BIDIR pin (I2C), `WAITP` and the timed waits, `SHO`/`SHI` with
+  `BE_PINS` pointing both ways at the one pin (built for the serial
+  protocols), the CRC unit (CAN, USB) for the scratchpad's CRC-8, and
+  `LD`/`ST` (slice B, built for the EEPROM) for the ID and the scratchpad.
+  What only the firmware does: the slot protocol, reset detection, the
+  presence pulse, the ROM and function commands and the search's bit,
+  complement and compare.
+- **Pin**: OW = BIDIR1, open drain. With `onewire_master.loom` on BIDIR0
+  (thread 0) the board joins the two pins into one line: two threads never
+  share a pin.
+- **Host words** (thread 1): at start, the ID as four words, bits 15:0
+  first (family code 0x28 in 7:0 of the first; sent as given, a corrupt CRC
+  included), then scratchpad bytes 0..7 as four words, byte 2k in bits 7:0.
+  They are stored at 0x0F8..0x0FF, where the host may rewrite them while the
+  thread is halted. The device stays off the line until all eight are in.
+  After each WRITE SCRATCHPAD it pushes `{TL, TH}` (TH in 7:0) and the
+  configuration byte, and keeps the three bytes as scratchpad bytes 2..4.
+- **Commands**: READ ROM, MATCH ROM (silent until the next reset for
+  another ID), SKIP ROM, SEARCH ROM (the bit, its complement, then the
+  master's choice; a different choice drops the device out); then READ
+  SCRATCHPAD (bytes 0..7 through `SHO` with the CRC unit on, then the CRC
+  as byte 8; after it the line stays high) and WRITE SCRATCHPAD. Any other
+  command: silent until the next reset.
+- **Rate**: fixed by the datasheet, the program writes `TICK_INT = 50`
+  itself; the host must not.
+- **Timing**, from L, the moment the device sees the line low (a few slots
+  after the master's fall F; times in 1 us ticks from a `SETD 0` at L, so
+  up to one tick short): write slots sampled by `SHI` at L + 30 (window
+  15..60); in a read slot a 0 driven by `SHO` one slot after L and
+  released at L + 30 (measured against the AN126 master: 0.16 us and 29.28
+  us after F, against 15 us valid and 60 us released); a low still there at
+  L + 240 is a reset (slots are at most 120 us, resets at least 480), and
+  the presence pulse follows its rise after 30 us and lasts 120 (measured
+  29.28 us high, 120.0 us low, against 15..60 and 60..240). Every slot starts with `WAITP OW, 0`, not `WAITE`, so a low that
+  began while the device was busy between bytes is still caught while it
+  lasts, and ends with `WAITP OW, 1, T`, whose timeout is the reset test.
+- **Weaker than a DS18B20**: no temperature conversion (CONVERT T is
+  ignored: the host supplies the scratchpad), no ALARM SEARCH, COPY or
+  RECALL, no parasite power; the configuration byte is kept as written
+  (a DS18B20 keeps bits 6:5 only); and the report to the host is a blocking
+  `PUSH`, so with OUTQ full the device misses the master's slots.
+
+**Tests.** `tools/tests/test_fw_onewire.py` with `tools.protomodels.onewire`: a
+`OneWireBus` (the wired AND of the chip's open-drain pads, joined when there
+are two, with the bench pull-up), `Ds18b20` devices (each with its own ID
+and scratchpad, written from the datasheet: it samples each write slot at
+both ends of the 15..60 us window and records a bit that differs, and holds
+a read 0 for exactly the guaranteed 15 us, so a late master sample reads a
+1) and `OneWireMaster` (AN126's delays, AN187's search; it measures the
+presence pulse and watches every bit a device drives). Every low pulse the
+chip's master makes is held to AN126 to the clock and to the datasheet's
+windows; every 0 the device sends is measured from the master's fall. The
+golden model is built with `FIFO`, `BE`, `SETPD` (and `DMEM` for the
+device) and the 512-word memory. 1-Wire at standard speed is slow for a
+simulator (a reset is 48000 clocks, a byte 28000, a search pass 750000;
+the golden model runs these programs at about 16000 clocks a second and
+Icarus at about 6400), so:
+
+- at the real rate run the resets and presence pulses, both READ ROMs, the
+  master's search faults (no presence, nobody answering, a shorted line:
+  the read slots of the search, at the real rate) and the device against a
+  master at the edges of the datasheet's windows. The RTL set is four of
+  them: `test_master_reset_and_presence`, `test_master_read_rom_of_one_device`,
+  `test_device_presence_pulse`, `test_device_presence_and_read_rom`, about
+  17.8 million ns of simulation (2 min 20 s on an idle laptop);
+- the searches (1, 2, 3 and 8 devices, and a corrupt ROM CRC), the
+  scratchpad scenarios of both programs and the two programs together run
+  on a time-scaled build: the same source with `US = 10` instead of 50, so
+  every interval is the same number of ticks and one fifth as many clocks
+  (the deadline checker proves both programs at that tick), against models
+  clocked at 10 MHz. They test the protocol and the search order; the
+  timing to the clock is the real-rate scenarios' job.
+
+`test_model_*` check the reference models against each other with no chip
+(`OneWireBus.run_alone`): the catalogue CRC-8/MAXIM check value, and the
+reference master's AN187 search over five reference devices.
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py`, `test_fw_ir_nec.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks
