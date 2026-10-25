@@ -936,3 +936,19 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   11). Next: proposals for Thomas (new firmware for protocols Loom was
   not designed for, SPI slave modes 1 and 2, builds for Tiny Tapeout's
   Pmod pinouts); the freeze run on 2026-11-08 as planned.
+- 2026-10-24 to 2026-10-25 (nightly D-035 run), Opus 5.5: the NEC infrared
+  programs had been integrated on 2026-10-12 (7daa439). Tonight the 1-Wire,
+  LIN and HDLC agents finished their last steps (the green checks and
+  summaries; no source changes). Integrated, each verified in main:
+  1-Wire master and DS18B20-style device (fd74668: --strict clean, model
+  24 passed, RTL 4 of 4, check_all quick 1,784 tool tests) and LIN master
+  and auto-baud slave (d38284c: model 30 passed, RTL 6 of 6, check_all
+  quick 1,814). Director decisions in `docs/spec-questions/firmware-d035.md`;
+  the LIN model's figures are marked as not yet checked against the LIN
+  2.2A text. The laptop slept from about 00:20 to 06:14, so HDLC, finished
+  and reviewed (decisions drafted in the director's scratch), was not
+  integrated. Next: integrate HDLC (`tt_um_loom_fw6_hdlc`, branch
+  `fw6-hdlc`); then the README section on the D-035 protocols, the
+  info.md program list and the recounts, and PHY-GL-SDF on the 8x4
+  netlist of run 37547764383 for the new programs' candidates and the
+  changed i2c_master, spi_master, spi_slave and uart_tx_fifo.
