@@ -1,0 +1,347 @@
+; lin_slave.loom
+; A LIN slave (LIN 2.2A, ISO 17987) that does not know the bus rate: it
+; measures the master's bit time on every sync byte, sets its own tick from
+; it, and publishes or subscribes according to a table from the host. For a
+; transceiver such as the TJA1021: TX to its TXD (1 = recessive), RX from
+; its RXD, the bus level.
+;
+; Written on 2026-10-11, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Loom has no baud-rate
+; detector: the slave times the bus with timed waits and NOW, and writes
+; its own TICK_INT, the divider built so that the host could pick a rate,
+; from what it measured: clock recovery in firmware. It needs the M2 core
+; and LD/ST of slice B (SEMANTICS 6.11, built for the I2C EEPROM's array),
+; which here holds the table.
+;
+; Pins: TX = OUT0, RX = IN0.
+;
+; Host command (INQ[0]), once, before the first header: c (0 .. 8), then c
+; entries, each a header word {N - 1 in 15:13, PUB in 12, ID in 5:0} and,
+; for PUB (the slave sends the response), the N data bytes, one per word in
+; 7:0 (N = 1 .. 8). The slave works out each published frame's checksum,
+; enhanced (over the PID and the data) except for 0x3C and 0x3D (classic).
+; The table is fixed from then on.
+;
+; Result (OUTQ[0]), for every header with a good sync byte whose
+; identifier is in the table, or whose PID parity is wrong:
+;     word 1, status: bits 7:0 the PID as received; bits 11:8 n, the
+;             bytes received (data and checksum) of a subscribed frame;
+;             bit 12 published; bit 13 checksum error (a subscribed
+;             frame's checksum was wrong); bit 14 parity error (the frame
+;             was ignored)
+;     word 2, the bit time measured on this frame's sync byte, in clocks
+;     then n words, one byte each in 7:0
+; Headers for other identifiers are ignored. The report goes out between
+; frames and waits for room in OUTQ: pop it before the next break is half
+; over, or the slave misses that header.
+;
+; Rate: any from 763 bit/s up (LIN's 1 to 20 kbit/s included); the program
+; writes TICK_INT and TICK_FRAC itself, and the host must not.
+;
+; Break and sync. On a tick of 32 clocks the slave times every falling
+; edge and the rise after it, so it knows every low run and every
+; falling-to-falling interval. A low run D followed by five falling edges
+; e1 .. e5 is a header when the intervals are a sync byte's (2 bits each:
+; the first, i1, and the other three within i1/8 of it, e1's low run half
+; of i1 within i1/8) and D is at least 11 of those bits (2 D >= 11 i1). The
+; check goes edge by edge, and the first one that fails makes the low run
+; just timed the new candidate, so a break that starts while a false
+; candidate is checked is not lost. Data cannot pass: a byte's longest low
+; run is 9 bits, and the intervals after it are at least 2 bits.
+;
+; Clock recovery. e5 - e1 is 8 bit times, n ticks of 32 clocks, so half a
+; bit is 32 n / 16 = 2 n clocks: TICK_INT = 2 n, TICK_FRAC = 0, a shift and
+; a CSRW. Error: each edge is read as NOW in the slot after the wait that
+; saw it, 6 to 9 clocks after the pad changed and rounded down to the
+; tick, so 32 n is within 35 clocks of the true 8 bit times and the
+; half-bit within 35/16 = 2.2 clocks: 0.18 % at 20 kbit/s, 0.08 % at 9600
+; bit/s, 0.01 % at 1 kbit/s, against the 2 % (F_TOL_SYNC) a synchronised
+; slave may be off. Every byte received restarts the grid on its start
+; edge (a TICK_INT write clears the accumulator, SEMANTICS 4) and is
+; sampled at the half-bit ticks (measured: 14 to 21 clocks after mid-bit);
+; every byte sent starts on a tick and its edges keep that grid, so a
+; byte's last edge is off by at most 20 x 2.2 = 44 clocks plus the 4-clock
+; slot grid.
+;
+; Limits. A break longer than 0x7FFF ticks (21 bit times at 1 kbit/s) is
+; not seen (its low run is saturated and the edge after it waited for
+; again). The slave does not read back its own bits (no bit error), and
+; has no sleep, wake-up or diagnostic transport layer.
+;
+; Memory: 218 words from the thread's reset vector, so 90 of them run into
+; the next quarter (that thread must not be started), and the table in
+; 80 words at 0x180..0x1CF, which the image does not load (the program
+; writes all of it before reading any). Beside lin_master on thread 0,
+; this program runs as thread 1 (0x080..0x159), and threads 2 and 3 must
+; not be started. The deadline pairs, all in the byte code that runs on
+; the measured half-bit tick, are proved for 32 clocks (the .csr below):
+; at LIN rates that tick is 1250 clocks or more.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .equ    MTICK = 32              ; the measuring tick, clocks
+        .equ    TABLE = 0x180           ; eight entries of ten words
+        .equ    ENT = 10
+        .equ    NENT = 8
+        .equ    EMPTY = 63              ; the identifier of an unused entry
+
+start:  SETP    TX, 1                   ; recessive
+
+; ------------------------------------------------------------- the table
+; INQ: c, then c entries (c <= 8): a header {N - 1 in 15:13, PUB in 12,
+; ID in 5:0}, and for PUB the N data bytes, one per word in 7:0. Entry i
+; is TABLE + 10 i: the header, then for PUB the data and the checksum,
+; worked out here (enhanced, or classic for 0x3C and 0x3D). The other
+; entries get identifier 63, which no header asks for.
+        POP     r2                      ; c
+        MOV16   r4, TABLE
+        LDI     r5, NENT
+load:   LDI     r0, EMPTY
+        TEST    r2, r2
+        BZ      lst
+        DEC     r2
+        POP     r0                      ; a header
+lst:    ST      r0, r4, 0
+        SHRI    r0, 13                  ; C = PUB
+        BNC     lnext
+        LD      r7, r4, 0
+        ANDI    r7, 63
+        CALL    mkpid
+        MOV     r3, r7                  ; enhanced: the sum starts at the PID
+        ANDI    r7, 0x3E
+        CMPI    r7, 0x3C
+        BNZ     lenh
+        LDI     r3, 0                   ; 0x3C, 0x3D: classic
+lenh:   LD      r1, r4, 0
+        SHRI    r1, 13
+        INC     r1                      ; N
+        MOV     r7, r4
+ldat:   INC     r7
+        POP     r0
+        SHLI    r0, 8
+        SHRI    r0, 8                   ; the byte alone
+        ST      r0, r7, 0
+        CALL    addb
+        DJNZ    r1, ldat
+        LDI     r0, 255
+        SUB     r0, r0, r3              ; the checksum: the inverted sum
+        INC     r7
+        ST      r0, r7, 0
+lnext:  ADDI    r4, ENT
+        DJNZ    r5, load
+
+; --------------------------------------------------- break and sync hunt
+; On a tick of 32 clocks, every falling edge F and the rise after it are
+; timed. A candidate break (a low run D) is followed by the sync byte's
+; falling edges e1 .. e5, which must come 2 bits apart (i1, the first
+; interval, and each one after within i1/8 of it), with e1's start bit
+; half of i1 (within i1/8) and 2 D >= 11 i1 (a break of 11 bits or more).
+; Any check that fails makes the low run just timed the new candidate and
+; this falling edge its e1, so a break that arrives while a false
+; candidate is being checked is not lost. Each wait times out 0x7FFF ticks
+; after the last falling edge, so no interval wraps the 16-bit NOW.
+; Registers: r1 D, r2 e1, r3 the last falling edge, r4 i1, r5 the sync's
+; falling edges so far, r6 the low run after r3, r7 the interval.
+hunt:   .csr    TICK_INT, MTICK         ; also restarts the grid
+        .csr    TICK_FRAC, 0
+quiet:  LDI     r1, 0                   ; no candidate: the first check fails
+        LDI     r5, 1
+        WAITP   RX, 0                   ; a falling edge, however long it takes
+        CSRR    r3, NOW
+        MOV     r2, r3
+edge:   MOV16   r0, 0x7FFF
+        ADD     r0, r0, r3
+        CSRW    TD, r0                  ; the time-out of both waits below
+        WAITP   RX, 1, T                ; the rise after r3
+        CSRR    r6, NOW
+        SUB     r6, r6, r3              ; the low run (0x7FFF if it timed out)
+        WAITP   RX, 1
+        WAITP   RX, 0, T                ; the next falling edge
+        BT      quiet                   ; the bus went quiet
+        CSRR    r0, NOW
+        SUB     r7, r0, r3              ; the interval
+        MOV     r3, r0
+        CMPI    r5, 1
+        BNZ     more
+        MOV     r4, r7                  ; e2: i1
+        MOV     r0, r4
+        SHRI    r0, 12
+        BNZ     again                   ; 4096 ticks or more: below 763 bit/s
+        MOV     r0, r6
+        SHLI    r0, 1
+        SUB     r0, r0, r4              ; 2 L - i1, shifted by i1/8 so that
+        MOV     r7, r4                  ; |2 L - i1| <= i1/8 is one unsigned
+        SHRI    r7, 3                   ; compare with i1/4
+        ADD     r0, r0, r7
+        SHLI    r7, 1
+        CMP     r7, r0
+        BNC     again                   ; e1 does not start a start bit
+        MOV     r0, r4
+        SHLI    r0, 2
+        ADD     r0, r0, r4
+        SHLI    r0, 1
+        ADD     r0, r0, r4              ; 11 i1
+        SHLI    r1, 1                   ; 2 D
+        CMP     r1, r0
+        BNC     again                   ; no break of 11 bits before it
+        LDI     r5, 2
+        JMP     edge
+more:   SUB     r7, r7, r4              ; e3 .. e5: |I - i1| <= i1/8
+        MOV     r0, r4
+        SHRI    r0, 3
+        ADD     r7, r7, r0
+        SHLI    r0, 1
+        CMP     r0, r7
+        BNC     again
+        INC     r5
+        CMPI    r5, 5
+        BNZ     edge
+        JMP     found
+again:  MOV     r1, r6                  ; the low run just timed
+        MOV     r2, r3                  ; and this falling edge
+        LDI     r5, 1
+        JMP     edge
+
+; ------------------------------------------------------------- the frame
+; e5 - e1 = 8 bit times = n ticks of 32 clocks, so a half-bit is
+; 32 n / 16 = 2 n clocks: the slave's tick from here to the frame's end.
+found:  SUB     r6, r3, r2              ; n
+        SHLI    r6, 1                   ; 2 n: half a bit, in clocks
+        CSRW    TICK_INT, r6
+        WAITP   RX, 1                   ; e5 starts bit 7 (a 0): its stop bit
+        CALL    rxbyte                  ; the PID
+        BT      hunt                    ; it never came
+        MOV     r5, r0                  ; the PID as received
+        MOV     r7, r0
+        ANDI    r7, 63
+        CALL    mkpid
+        CMP     r7, r5
+        BNZ     perr                    ; parity error: the frame is ignored
+        ANDI    r7, 63
+        MOV16   r4, TABLE
+        LDI     r2, NENT
+find:   LD      r1, r4, 0
+        ANDI    r1, 63
+        CMP     r1, r7
+        BZ      hit
+        ADDI    r4, ENT
+        DJNZ    r2, find
+        JMP     hunt                    ; not in the table: not for us
+hit:    LD      r1, r4, 0
+        SHRI    r1, 13                  ; C = PUB, r1 = N - 1
+        BNC     sub
+; Publish: the entry's N data bytes and checksum, a bit every 2 ticks,
+; starting a bit after this point (the response space: 0.5 to 1 bit).
+        ADDI    r1, 2                   ; N + 1 bytes
+        SETD    0
+pbyte:  INC     r4
+        LD      r0, r4, 0
+        LDIH    r0, 1                   ; bit 8: the stop bit
+        SHLI    r0, 1                   ; bit 0: the start bit
+        LDI     r2, 10
+pbit:   SHRI    r0, 1
+        WAITD   2
+        BC      p1
+        SETP    TX, 0
+        JMP     pn
+p1:     SETP    TX, 1
+pn:     DJNZ    r2, pbit
+        DJNZ    r1, pbyte
+        LDI     r2, 0x10                ; the status: published
+        MOV     r7, r4                  ; no data words
+        JMP     rep
+; Subscribe: N data bytes and the checksum into the entry; the sum over
+; the PID (enhanced) or not (classic), the data and the checksum is 0xFF
+; exactly when the checksum is right.
+sub:    ADDI    r1, 2                   ; N + 1 bytes
+        MOV     r3, r5                  ; enhanced: from the PID
+        MOV     r0, r5
+        ANDI    r0, 0x3E
+        CMPI    r0, 0x3C
+        BNZ     senh
+        LDI     r3, 0                   ; 0x3C, 0x3D: classic
+senh:   MOV     r7, r4
+sbyte:  CALL    rxbyte
+        BT      sdone                   ; the master stopped: incomplete
+        INC     r7
+        ST      r0, r7, 0
+        CALL    addb
+        DJNZ    r1, sbyte
+sdone:  SUB     r2, r7, r4              ; n, the bytes received
+        TEST    r1, r1
+        BNZ     rep                     ; incomplete: no checksum to judge
+        INC     r3
+        SHRI    r3, 8                   ; 1 when the sum was 0xFF
+        BNZ     rep
+        ORI     r2, 0x20                ; checksum error
+        JMP     rep
+perr:   LDI     r2, 0x40                ; parity error
+        MOV     r7, r4
+
+; ------------------------------------------------------------- the report
+; OUTQ: the status {flags and n in 15:8, the PID as received in 7:0}, the
+; bit time measured, then the n bytes received, one per word. The pushes
+; wait for room: the bus is between frames here.
+rep:    SWAP    r2, r2
+        OR      r0, r2, r5
+        PUSH    r0
+        MOV     r0, r6
+        SHLI    r0, 1                   ; the bit time: 4 n clocks
+        PUSH    r0
+rdata:  CMP     r4, r7
+        BZ      rdone
+        INC     r4
+        LD      r0, r4, 0
+        PUSH    r0
+        JMP     rdata
+rdone:  JMP     hunt
+
+; ------------------------------------------------------------ subroutines
+; rxbyte: the next byte, sampled from its own start edge on a half-bit
+; tick of r6 clocks: T = 1 if no start bit came within 255 ticks. Returns
+; r0 = the byte at the middle of its stop bit (not checked); r2 clobbered.
+rxbyte: SETD    255
+        WAITP   RX, 0, T
+        BT      rxret
+        CSRW    TICK_INT, r6            ; the grid restarts on the edge
+        SETD    0
+        WAITD   1                       ; the middle of the start bit
+        JP      RX, 1, rxbyte           ; recessive again: a glitch
+        LDI     r2, 8
+rxbit:  WAITD   2                       ; the middle of the next bit
+        SHLI    r0, 1                   ; MSB first here, reversed below
+        JP      RX, 0, rx0
+        INC     r0
+rx0:    DJNZ    r2, rxbit
+        REV     r0, r0
+        SHRI    r0, 8                   ; LSB first: the byte in 7:0
+        WAITD   2                       ; the middle of the stop bit
+rxret:  RET
+
+; mkpid: r7 = the protected identifier of the identifier in r7 (bits 5:0,
+; the rest 0): P0 = ID0^ID1^ID2^ID4, P1 = ~(ID1^ID3^ID4^ID5). r0, r1
+; clobbered.
+mkpid:  LDI     r1, 0x40
+        MOV     r0, r7
+        ANDI    r0, 0x17
+        PAR     r0, r0
+        BNC     mk1
+        OR      r7, r7, r1
+mk1:    SHLI    r1, 1
+        MOV     r0, r7
+        ANDI    r0, 0x3A
+        PAR     r0, r0
+        BC      mk2
+        OR      r7, r7, r1
+mk2:    RET
+
+; addb: r3 += r0 as LIN sums: eight bits, a carry out of bit 7 added back
+; into bit 0 (r0 a byte, r3 below 256 before and after). r0 clobbered.
+addb:   ADD     r3, r3, r0
+        MOV     r0, r3
+        SHRI    r0, 8
+        ADD     r3, r3, r0
+        SHLI    r3, 8
+        SHRI    r3, 8
+        RET

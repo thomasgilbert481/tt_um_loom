@@ -1,0 +1,238 @@
+; lin_master.loom
+; A LIN master (LIN 2.2A, ISO 17987-2 and -3) for a transceiver such as the
+; TJA1021: TX drives the transceiver's TXD (1 = recessive), RX reads its
+; RXD, the bus level, so every bit the master sends comes back on RX.
+;
+; Written on 2026-10-11, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, the FIFOs) and LD/ST of slice B (SEMANTICS 6.11), which was
+; built to hold the I2C EEPROM's array and USB's descriptors and here holds
+; the frame as it goes on the bus. No hardware knows LIN: the break, the
+; protected identifier's parity bits, the checksum with its end-around
+; carry, the read-back bit check, the response timeout and the sampling of
+; a slave's bytes are all firmware.
+;
+; Pins: TX = OUT0, RX = IN0.
+;
+; Host command (INQ[0]): one word per frame, then, for a frame the master
+; publishes, N words of data.
+;     bits 5:0   the frame identifier, 0..63 (bits 11:6 are ignored)
+;     bit 12     PUB: the master sends the response itself; otherwise it
+;                reads a slave's response
+;     bits 15:13 N - 1: N = 1..8 data bytes
+;     data       one byte per word in bits 7:0 (bits 15:8 ignored)
+; The checksum is enhanced (over the PID and the data) except for the
+; diagnostic frames 0x3C and 0x3D, which use the classic one (the data).
+;
+; Result (OUTQ[0]): per frame a status word, then n words, one byte each in
+; bits 7:0: the bytes on the bus after the PID, data then checksum (what
+; the master sent, or what the slave sent).
+;     bits 7:4   n: N + 1 for a whole response, fewer when a slave's
+;                response stopped early (0: no response at all)
+;     bit 0      checksum error: the slave's checksum is wrong
+;     bit 1      no response: a slave's byte did not start in time for
+;                the response to end within TResponse_max
+;     bit 2      bit error: RX differed from TX at the middle of a bit the
+;                master sent
+;     bit 3      framing error: a stop bit of the slave's response was
+;                dominant
+;
+; Frame: a break of 208 to 209 ticks (13 bits and at most a sixteenth
+; more), a delimiter of one bit, the sync byte 0x55, the PID, then the
+; response. Bytes are 8N1, LSB first. The master's bytes go back to back,
+; each edge two slots after its tick. A slave's bytes are sampled from
+; their own start edges, 7/16 to 1/2 of a bit into each bit plus the
+; latency (measured at 256 clocks a bit: 7 to 11 clocks after mid-bit), so
+; a slave within the +-2 % of a synchronised node is read correctly
+; however late its response starts.
+;
+; Rate: sixteen ticks a bit; the host writes TICK_INT and TICK_FRAC before
+; RUN (the M2 convention). At 50 MHz:
+;     19200 bit/s: TICK_INT 162, TICK_FRAC 195  (162.76 clocks)
+;     10417 bit/s: TICK_INT 300                 (10416.7 bit/s)
+;      9600 bit/s: TICK_INT 325, TICK_FRAC 133  (325.52 clocks)
+; The deadline pairs are proved for ticks of 10 clocks or more (.tick
+; below, 7 would do); 10 is also the fastest tick at which the 18 slots
+; after a stop-bit sample reach the next start-bit wait before a slave's
+; next byte can start. LIN's 20 kbit/s is 156 clocks a tick.
+;
+; Memory: 128 words of code, all of thread 0's quarter, and an 11-word frame
+; buffer at the top of thread 3's quarter (0x1F5..0x1FF): threads 1 and 2
+; may run other programs, thread 3 must not.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .tick   10                      ; the fastest tick supported (header)
+        .equ    CKERR = 1               ; result flags, in r5 and in the status
+        .equ    NORESP = 2
+        .equ    BITERR = 4
+        .equ    FRAMING = 8
+        .equ    BUF = 512 - 11          ; the frame buffer, at the top of memory
+
+; Registers: r0 byte, r1 bytes to send or a bit count, r2 PID, a
+; bit count or the start-bit deadline, r3 the command, r4 the checksum
+; sum, r5 flags, r6 N or the bytes still to come, r7 a pointer into BUF.
+
+start:  SETP    TX, 1                   ; recessive
+
+; ------------------------------------------------------------ the command
+next:   POP     r3
+        LDI     r5, 0                   ; no flags yet
+        MOV     r6, r3
+        SHRI    r6, 13
+        INC     r6                      ; N
+        MOV     r2, r3
+        ANDI    r2, 63                  ; the identifier
+; The protected identifier: P0 = ID0^ID1^ID2^ID4 in bit 6 and
+; P1 = ~(ID1^ID3^ID4^ID5) in bit 7 (PAR: C = the parity of its operand).
+        LDI     r1, 0x40
+        MOV     r0, r2
+        ANDI    r0, 0x17                ; ID0, ID1, ID2, ID4
+        PAR     r0, r0
+        BNC     pa
+        OR      r2, r2, r1              ; P0
+pa:     SHLI    r1, 1
+        MOV     r0, r2
+        ANDI    r0, 0x3A                ; ID1, ID3, ID4, ID5
+        PAR     r0, r0
+        BC      pb
+        OR      r2, r2, r1              ; P1: the PID
+pb:     MOV16   r7, BUF + 1
+        ST      r2, r7, 0
+; The checksum sum starts with the PID (enhanced), except for the
+; diagnostic frames 0x3C and 0x3D (classic: the data alone).
+        MOV     r4, r2
+        ANDI    r2, 0x3E
+        CMPI    r2, 0x3C
+        BNZ     enh
+        LDI     r4, 0
+enh:    LDI     r1, 2                   ; bytes to send: sync, PID
+        MOV     r0, r3
+        SHRI    r0, 13                  ; C = PUB (bit 12)
+        BNC     hdr
+
+; PUB: the N data bytes into BUF after the PID with their sum, then the
+; checksum, the inverted sum. r6 counts down to 0, which marks PUB below.
+        MOV     r1, r6
+        ADDI    r1, 3                   ; bytes to send: N + 3
+popl:   INC     r7
+        POP     r0
+        SHLI    r0, 8
+        SHRI    r0, 8                   ; the byte alone
+        ST      r0, r7, 0
+        CALL    addb
+        DJNZ    r6, popl
+        LDI     r0, 255
+        SUB     r0, r0, r4              ; the inverted sum, bits 7:0 only
+        INC     r7
+        ST      r0, r7, 0               ; the checksum
+
+; --------------------------------------------- the header and the sending
+; Sixteen ticks a bit. Break: at least 208 ticks, 13 bits (the SETD's own
+; tick is partly gone, so it lasts 208 to 209); delimiter: 16 ticks. Then
+; the r1 bytes of BUF, each bit starting two slots after its tick and read
+; back from RX at its middle (a mismatch is a bit error).
+hdr:    SETP    TX, 0                   ; break
+        SETD    208
+        WAITD   1
+        SETP    TX, 1                   ; break delimiter
+        MOV16   r7, BUF
+        WAITD   8
+txbyte: LD      r0, r7, 0
+        LDIH    r0, 1                   ; bit 8: the stop bit; 15:9 clear
+        SHLI    r0, 1                   ; bit 0: the start bit
+        LDI     r2, 10
+txbit:  SHRI    r0, 1                   ; C = this bit
+        WAITD   8                       ; the bit starts
+        BC      tx1
+        SETP    TX, 0
+        WAITD   8                       ; its middle
+        JP      RX, 0, txok
+        JMP     txerr
+tx1:    SETP    TX, 1
+        WAITD   8
+        JP      RX, 1, txok
+txerr:  ORI     r5, BITERR
+txok:   DJNZ    r2, txbit
+        INC     r7
+        DJNZ    r1, txbyte
+        TEST    r6, r6
+        BZ      report                  ; PUB (r6 = 0): the frame is complete
+
+; ------------------------------------------------ a slave's response
+; TResponse_max = 1.4 x 10 (N + 1) bits = 224 (N + 1) ticks from the end
+; of the PID's stop bit, 8 ticks after this point. Byte j (0 .. N) must
+; start by 64 (N + 1) + 160 j + 8 ticks from here, or it and the bytes
+; after it, 160 ticks each, cannot end in time. Each byte is sampled from
+; its start edge: SETD 0 there takes the tick just gone, so the samples
+; fall 7/16 to 1/2 of a bit after each bit starts.
+        INC     r6                      ; N + 1 bytes to come
+        MOV     r2, r6
+        SHLI    r2, 6
+        ADDI    r2, 8
+        CSRR    r0, NOW
+        ADD     r2, r2, r0              ; byte 0's start-bit deadline
+rxbyte: CSRW    TD, r2
+        WAITP   RX, 0, T                ; a start bit, or the deadline
+        BT      noresp
+        SETD    0
+        WAITD   8                       ; the middle of the start bit
+        JP      RX, 1, rxbyte           ; recessive again: a glitch
+        LDI     r1, 8
+rxbit:  WAITD   16                      ; the middle of the next bit
+        SHLI    r0, 1                   ; MSB first here, reversed below
+        JP      RX, 0, rx0
+        INC     r0
+rx0:    DJNZ    r1, rxbit
+        REV     r0, r0
+        SHRI    r0, 8                   ; LSB first: the byte in 7:0
+        WAITD   16                      ; the middle of the stop bit
+        JP      RX, 1, rxok
+        ORI     r5, FRAMING
+rxok:   ST      r0, r7, 0
+        CALL    addb
+        INC     r7
+        ADDI    r2, 63
+        ADDI    r2, 63
+        ADDI    r2, 34                  ; the next byte's deadline: 160 on
+        DJNZ    r6, rxbyte
+        NOT     r0, r4                  ; the sum over the data and the
+        SHLI    r0, 8                   ; checksum is 0xFF exactly when
+        BZ      report                  ; the checksum is right
+        XORI    r5, CKERR | NORESP      ; with the XOR below: CKERR alone
+noresp: XORI    r5, NORESP              ; (both bits were clear)
+
+; ------------------------------------------------------------- the report
+; n = the bytes on the bus after the PID: N + 1 for a whole response or
+; the master's own (the data and the checksum), fewer if the slave stopped.
+report: MOV16   r0, BUF + 2
+        SUB     r1, r7, r0              ; n
+        MOV     r6, r7                  ; the end
+        MOV     r7, r0
+        SHLI    r1, 4
+        OR      r0, r1, r5              ; the status: n in 7:4, flags in 3:0
+        PUSH    r0
+rword:  CMP     r7, r6
+        BZ      next
+        LD      r0, r7, 0
+        PUSH    r0                      ; the bytes, one to a word
+        INC     r7
+        JMP     rword
+
+; addb: r4 += r0 as LIN sums, an eight-bit sum whose carry out of bit 7 is
+; added back into bit 0 (r0 is a byte, r4 below 256 before and after).
+addb:   ADD     r4, r4, r0              ; at most 510
+        MOV     r0, r4
+        SHRI    r0, 8                   ; the carry
+        ADD     r4, r4, r0
+        SHLI    r4, 8
+        SHRI    r4, 8
+        RET
+
+; The frame as it goes on the bus, one byte per word: sync, PID, N data
+; bytes and the checksum. It is data, in thread 3's quarter, which no
+; thread of this program runs from; the image loads the sync byte.
+        .org    BUF
+        .word   0x55
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0

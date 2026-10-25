@@ -139,3 +139,64 @@ section.
 (resets, presence pulses, both READ ROMs); the searches and scratchpads run
 on the model, also on a build with `US = 10`, which the deadline checker
 proves at that tick.
+
+## LIN (`lin_master.loom`, `lin_slave.loom`), integrated 2026-10-25
+
+### 1. The specification's figures, taken from memory of LIN 2.2A
+
+The agent had no copy of LIN 2.2A or ISO 17987 and listed the figures it
+used in `tools/protomodels/lin.py`'s docstring: break at least 13 bits,
+delimiter at least 1, slave break threshold 11 bits, sync 0x55, the PID
+parity equations, the inverted eight-bit sum with end-around carry
+(classic for 0x3C and 0x3D, enhanced otherwise), TResponse_Maximum =
+1.4 x 10 (N + 1) bit times, and clock tolerances of 0.5, 14 and 2 per cent.
+The checksum example of the specification (PID 0x4A, data 0x55 0x93 0xE5,
+checksum 0xE6) is a test.
+
+**Decision:** the director has not checked these against a copy of the
+document either. A search on 2026-10-25 found vendor pages (Microchip, ST)
+that agree with the 2 per cent between synchronised nodes and the 11-bit
+break threshold, but give 15 per cent, not 14, for an unsynchronised
+slave's clock. So, as for the TSOP figures of the NEC receiver:
+`firmware/README.md` states what was tested (a master 14 per cent slow and
+fast, a slave 2 per cent off, the checksum example) and does not quote the
+tolerance symbols as the specification's values; the model's docstring
+keeps the list marked as the agent's reading, to be checked against LIN
+2.2A before anything outward-facing quotes it.
+
+### 2. One sample per bit, after the edge plus a measured offset
+
+**Decision:** accepted. Both programs sample inside 7/16 to 9/16 of a bit
+(measured), the window a UART-style LIN receiver uses; no majority vote.
+Recorded in both headers.
+
+### 3. The response timeout is judged per byte
+
+The master reports "no response" as soon as byte j has not started in time
+for the response to end within TResponse_Maximum. **Decision:** accepted;
+it is the same test as checking the end of the checksum, made earlier.
+
+### 4. A header for an identifier not in the table is ignored silently
+
+**Decision:** accepted. A bad PID parity is reported with the PID as
+received, as the brief asks; a frame for another node is not this node's
+business.
+
+### 5. The slave's report blocks when OUTQ is full
+
+A subscribed frame's report is up to 11 words and the FIFO holds 4.
+**Decision:** accepted, as for `ir_nec_rx` and `onewire_device`: never
+lose report words, and the host's duty (pop before the next break is half
+over) is in the header and the README.
+
+### 6. Memory
+
+The master is 128 words of code (thread 0's quarter) and an 11-word frame
+buffer at 0x1F5; the slave is 218 words (0x080..0x159) and an 80-word table
+at 0x180. **Decision:** accepted. They load and run together on threads 0
+and 1; threads 2 and 3 must not be started. Both headers say so.
+
+### 7. `test_rekey_from_a_git_revision_runs` in the agent worktree
+
+As NEC infrared item 7: expected there, and it passed in main at
+integration.

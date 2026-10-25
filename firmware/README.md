@@ -41,7 +41,8 @@ The rows after it are the D-035 programs, written after the hardware was
 complete for protocols Loom was not designed for (see the section of that
 name below). Each keeps the M2 convention for the rate, except where the
 protocol fixes its slots in microseconds: the 1-Wire programs then set
-their own tick, as `ws2812` and `ps2_host` do.
+their own tick, as `ws2812` and `ps2_host` do; and `lin_slave` sets its
+own from the bit rate it measures on every sync byte.
 
 | Program | Pins | Words | `.tick` (proved) | Worst slack | Rates tested |
 |---|---|---|---|---|---|
@@ -62,6 +63,8 @@ their own tick, as `ws2812` and `ps2_host` do.
 | `ir_nec_rx.loom` | RX = IN0 (a receiver module's output, low = carrier) | 112 | 64 clocks per tick, 1/16 of the NEC unit (host-set); timeouts only | no deadline pairs; pulses measured to about 30 clocks | NEC at 50 MHz (TICK 1757 + 208/256) and at 1.824 MHz (TICK 64 + 32/256); every mark and space +-25 % + 140 us; glitches under 70 us ignored |
 | `onewire_master.loom` | OW = BIDIR0 (open drain, board pull-up) | 157: 124 at 0x000, 33 at 0x100 (thread 2's quarter) | 50 clocks per tick, 1 us (set by the program); also proved at 10 | 288 clocks (12 at a tick of 10) | 1-Wire standard speed at 50 MHz, AN126's slots to the clock (read sample E = 8, see its section); searches and scratchpads also on a build with a 10-clock tick |
 | `onewire_device.loom` | OW = BIDIR1 (open drain) | 157: 116 at 0x080, 8 of data at 0x0F8, 33 at 0x140 (thread 2's quarter) | 50 clocks per tick, 1 us (set by the program); also proved at 10 | 1446 clocks (286 at 10) | standard speed against an AN126 master and one at the datasheet's limits (write-1 low 14 us, read low 1 us sampled at 15 us); MATCH, search, scratchpad also on the 10-clock build |
+| `lin_master.loom` | TX = OUT0 (to a LIN transceiver's TXD), RX = IN0 (its RXD) | 128, and an 11-word frame buffer at 0x1F5 | 10 clocks per tick, 16 ticks per bit (the deadline pairs alone would allow 7) | 28 clocks | 19200, 10417 and 9600 bit/s (TICK 162 + 195/256, 300, 325 + 133/256); 195 kbit/s (TICK 16) and 100 kbit/s (TICK 31 + 64/256) as test rates; a slave 2 % off |
+| `lin_slave.loom` | TX = OUT0, RX = IN0 (thread 0); OUT1, IN1 beside the master | 218 (runs 90 words into the next quarter), and an 80-word table at 0x180 | 32 clocks (set by the program; the half-bit tick it measures is 1250 clocks or more at LIN rates) | 4 clocks | a master at 19200, 10417 and 9600 bit/s, each 14 % slow, exact and 14 % fast; 100 kbit/s as the test rate |
 
 Every program assembles with `--strict` and no diagnostic at all: each
 deadline pair is proved, apart from the five intervals declared `.bounded`
@@ -891,12 +894,133 @@ Icarus at about 6400), so:
 (`OneWireBus.run_alone`): the catalogue CRC-8/MAXIM check value, and the
 reference master's AN187 search over five reference devices.
 
+## lin_master.loom: LIN master
+
+- **Written** 2026-10-11, after the hardware was complete (D-032), as a
+  protocol Loom was not designed for (D-035): LIN, the single-wire bus of
+  car body electronics. Hardware reused: the M2 core (pins, deadlines, the
+  FIFOs) and `LD`/`ST` of slice B, built for the I2C EEPROM's array and
+  USB's descriptors, here the frame as it goes on the bus. No hardware
+  knows LIN: the break, the PID parity, the checksum's end-around carry,
+  the read-back bit check and the response timeout are firmware.
+- **What it does**: a LIN 2.2A / ISO 17987 master for a transceiver such as
+  the TJA1021 (TX = OUT0 to its TXD, RX = IN0 from its RXD). Per frame: a
+  break of 13 bits (208 to 209 ticks of a sixteenth of a bit), a one-bit
+  delimiter, the sync byte 0x55, the protected identifier (P0 and P1
+  worked out with `PAR`), then either its own response (1 to 8 data bytes
+  and the checksum) or a slave's response, read and checked. Every bit it
+  sends is read back from RX at its middle; a mismatch is a bit error.
+- **Host command** (push to thread 0): `{N - 1 in 15:13, PUB in 12, ID in
+  5:0}`, then for PUB the N data bytes, one per word in 7:0.
+- **Result** (pop thread 0): a status word, then n words of one byte each:
+  the bytes on the bus after the PID (data, then checksum), what the
+  master sent or what the slave sent. Status: bits 7:4 n (N + 1 for a whole
+  response, 0 for none), bit 0 checksum error, bit 1 no response, bit 2 bit
+  error, bit 3 framing error.
+- **Checksum**: enhanced (the PID and the data) except for the diagnostic
+  frames 0x3C and 0x3D (classic), worked out with `ADD` and the carry folded
+  back by hand; a response is checked by summing the data and the checksum,
+  which must give 0xFF.
+- **Rate**: sixteen ticks a bit, set by the host (M2 convention): 19200
+  bit/s is TICK 162 + 195/256, 10417 is TICK 300, 9600 is TICK 325 +
+  133/256.
+- **Reading a slave**: every byte is sampled from its own start edge (`SETD
+  0` on the edge, then `WAITD 8` and `WAITD 16`), 7/16 to 1/2 of a bit into
+  each bit plus the latency (measured at 256 clocks a bit: 7 to 11 clocks
+  after mid-bit), so a slave within the 2 % a synchronised node may be off is
+  read whole, however late it starts (tested at +-2 %). The response
+  deadline is TResponse_max = 1.4 x 10 (N + 1) bit times: byte j must start
+  by 4 (N + 1) + 10 j bit times after the header, or the response cannot
+  end in time; a late or missing byte gives "no response" and the bytes
+  that did come.
+- **Memory**: 128 words, all of thread 0's quarter, and the frame (sync,
+  PID, data, checksum, one byte per word) in 11 words at 0x1F5..0x1FF, the
+  top of thread 3's quarter, through `LD`/`ST`: threads 1 and 2 may run
+  other programs (the LIN slave on thread 1, say), thread 3 must not.
+- **Not done**: schedule tables (the host sends each frame), sleep and
+  wake-up, the diagnostic transport layer, collision handling of
+  event-triggered frames.
+
+## lin_slave.loom: LIN slave with automatic bit rate
+
+- **Written** 2026-10-11, after the hardware was complete (D-032), as a
+  protocol Loom was not designed for (D-035). Loom has no baud-rate
+  detector: the slave times the bus with timed waits and `NOW` and writes
+  its own `TICK_INT`, the divider built so that the host could pick a
+  rate, from what it measured: clock recovery in firmware. `LD`/`ST` of
+  slice B (built for the I2C EEPROM) hold its table.
+- **What it does**: a LIN slave that does not know the bus rate. It finds
+  each break, measures the master's bit time on the sync byte that follows
+  and writes its own `TICK_INT` from it, checks the protected identifier's
+  parity, and publishes or subscribes according to a table the host gives
+  at start. Pins TX = OUT0, RX = IN0 (OUT1, IN1 beside the master).
+- **Host command** (push to thread 0, once, before the first header): c
+  (0 .. 8), then c entries: a header `{N - 1 in 15:13, PUB in 12, ID in
+  5:0}` and, for PUB, the N data bytes one per word. The slave works out
+  each checksum (enhanced, or classic for 0x3C and 0x3D) and keeps the
+  table, eight entries of ten words, at 0x180..0x1CF through `LD`/`ST`.
+- **Result** (pop thread 0): per header with a good sync whose identifier
+  is in the table, or whose PID parity is wrong: a status (bits 7:0 the
+  PID as received, 11:8 n, bit 12 published, bit 13 checksum error, bit 14
+  parity error, the frame ignored), the bit time measured in clocks, then
+  the n bytes received of a subscribed frame (data and checksum). The
+  report waits for room in OUTQ between frames.
+- **Rate**: any from 763 bit/s up; tested against a master at 9600, 10417
+  and 19200 bit/s with its clock 14 % slow, exact and 14 % fast, and at 100
+  kbit/s. The program writes `TICK_INT` and `TICK_FRAC`; the host must not.
+- **Finding the break**: on a 32-clock tick the slave times every falling
+  edge and the rise after it. A low run D followed by five falling edges
+  e1 .. e5 is a header when the four intervals are a sync byte's (2 bits
+  each, the first one i1, the others within i1/8 of it, e1's low run half
+  of i1) and 2 D >= 11 i1: a break of at least 11 of the bits the sync
+  measures, whatever the rate. The checks run edge by edge and the first
+  that fails makes the low run just timed the new candidate, so a break
+  that starts while a false candidate is checked is not lost. Data cannot
+  pass: no byte has a low run longer than 9 bits.
+- **Clock recovery**: e5 - e1 is 8 bit times, n ticks of 32 clocks, so a
+  half-bit is 2 n clocks: `TICK_INT = 2 n`, `TICK_FRAC = 0`. Each edge is
+  read 6 to 9 clocks after the pad changed and rounded down to the tick, so
+  32 n is within 35 clocks of the true 8 bit times: the half-bit within
+  2.2 clocks, 0.18 % at 20 kbit/s and 0.08 % at 9600 bit/s against the 2 %
+  a synchronised slave may be off (F_TOL_SYNC as the model reads LIN 2.2A;
+  see the spec questions, LIN 1). Measured: the reported bit
+  time within 0.2 % of the master's in every test.
+- **Bytes**: each byte received restarts the tick grid on its start edge
+  (a `TICK_INT` write clears the accumulator, SEMANTICS 4) and is sampled
+  on the half-bit ticks: measured 14 to 21 clocks after the middle of each
+  bit, at 19200 bit/s and at 100 kbit/s. Each byte sent keeps the grid of
+  its start bit, every edge two slots after its tick.
+- **Weaker than a peripheral**: a LIN controller with a baud-rate detector
+  times the sync with its full clock; here the slot grid and the 32-clock
+  tick bound the error to 35 clocks, still eleven times inside the
+  tolerance at 20 kbit/s. The slave cannot change its published data while
+  it runs (the table is given once), does not read back its own bits, and
+  a break longer than 0x7FFF ticks (21 bit times at 1 kbit/s) is not seen.
+- **Memory**: 218 words, 90 of them in the next quarter (beside the master:
+  0x080..0x159), and the 80-word table. With `lin_master` on thread 0:
+  threads 2 and 3 must not be started.
+
+**Tests.** `tools/tests/test_fw_lin.py` runs both programs against
+`tools.protomodels.lin`: `LinBus` (the wired AND of the chip's TX pins and
+the model nodes, seen by the chip's RX pins one clock later),
+`LinMasterNode` (a master with its own clock, a settable break and
+delimiter, a spoiled parity or checksum on request), `LinSlaveNode` (a
+slave with a table, a spoiled checksum or silence on request) and
+`LinSniffer`; every node decodes each byte with its edges, so the tests
+measure the chip's pins against the specification. It builds the model
+with `FIFO` and `DMEM` and the 512-word memory. On the RTL it runs six
+scenarios (the two programs together on one bus, the master's own frame,
+no response, a slave's checksum error, a bit error, and the slave
+ignoring a bad parity); the other 24 are `model_only`, each with its
+reason: the LIN-rate cases (150,000 to 600,000 clocks a frame) and those
+whose code paths the six already cover.
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks
