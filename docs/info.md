@@ -45,14 +45,18 @@ timing exact and checkable before it runs.
   BIDIR0..BIDIR7 (`uio[7:0]`), each bidirectional pin with its own
   open-drain mode.
 
-Thirteen protocol programs come with the design (besides two small UART
+Twenty protocol programs come with the design (besides two small UART
 demos from the first milestone), each with a test whose bodies run both on
 the golden model and on the RTL through the real SPI pads: UART transmit
 and receive, SPI master and slave, I2C master, a 24C02-style I2C EEPROM,
 WS2812, PS/2 host, JTAG (IDCODE read), SWD (DPIDR read), a CAN 2.0A node, a
 USB low-speed HID mouse (enumeration and an interrupt IN endpoint) and a
-Manchester loopback. `firmware/README.md` in the repository lists their
-pins, sizes and rates.
+Manchester loopback. Seven more were written after the hardware was
+complete, for protocols Loom was not designed for: an NEC infrared
+transmitter and receiver, a 1-Wire master with the ROM search and a
+DS18B20-style device, a LIN master and an auto-baud LIN slave, and an HDLC
+transmitter and receiver. `firmware/README.md` in the repository lists
+their pins, sizes and rates.
 
 Clock: 50 MHz at the typical corner. At the slow corner (1.08 V, 125 C) the
 design closes at about 43 MHz.
@@ -112,6 +116,11 @@ protocol programs, as wanted:
 - CAN: a 3.3 V CAN transceiver (TXD on OUT0, RXD on IN0).
 - USB low speed: the D+ and D- lines, with a 1.5 kOhm pull-up from D- to
   3.3 V.
+- NEC infrared: an IR LED through a transistor on OUT0, and a 38 kHz
+  demodulating receiver module (3.3 V) on IN0.
+- 1-Wire: a 4.7 kOhm pull-up to 3.3 V on the line.
+- LIN: a LIN transceiver (TXD on OUT0, RXD on IN0).
+- HDLC: OUT0 wired to IN0 for the loopback, or an NRZI sender at 3.3 V.
 - A logic analyser to watch it all.
 
 Each program sets its pins in its source; `firmware/README.md` lists them.

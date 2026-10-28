@@ -516,14 +516,18 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       changed, Thomas starts a hardening of main before the freeze, so the
       freeze run holds no surprise. The design passes at 6x4 too (run
       37475045879), so a 6x4 limit is met either way.
-- [ ] D-035, protocols Loom was not designed for, each to the shipped
+- [x] D-035, protocols Loom was not designed for, each to the shipped
       programs' bar (`--strict`, a reference model from the specification,
       L3 on both backends, a PHY-GL-SDF scenario, a README row, a header
       saying when it was written and what hardware it reuses): 1-Wire
       master and device; LIN master and auto-baud slave; NEC infrared
       transmitter and receiver; HDLC transmitter and receiver. Then, as
       time allows, DShot600, DMX512 and Wiegand. Started 2026-10-11, one
-      agent per protocol in its own worktree.
+      agent per protocol in its own worktree. Done 2026-10-27: all four
+      integrated (7daa439, fd74668, d38284c, 2c09f1a), the README section
+      on them, PHY-GL-SDF 11 of 11 with the changed common programs
+      (VERIFICATION L5). DShot600, DMX512 and Wiegand were not started;
+      whether to write them before the firmware freeze is Thomas's call.
 - [x] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
       I2C master at exactly 100 and 400 kHz, checked against UM10204's
       timing; a UART baud-rate table; builds of the UART, SPI and I2C
@@ -952,3 +956,18 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   info.md program list and the recounts, and PHY-GL-SDF on the 8x4
   netlist of run 37547764383 for the new programs' candidates and the
   changed i2c_master, spi_master, spi_slave and uart_tx_fifo.
+- 2026-10-27 to 2026-10-28 (nightly D-035 run), Opus 5.5: HDLC
+  integrated (2c09f1a: --strict clean, 279 words; model 16 passed; RTL 6
+  of 6; check_all quick all passed, 1,830 tool tests with
+  test_mutate_rekey; decisions in `docs/spec-questions/firmware-d035.md`,
+  the shared-flag limit also in the header); worktree and branch removed.
+  CI on it: test 243 of 243 (run 40627932146). README section on the
+  protocols written after the hardware was complete, docs/info.md's
+  program list and Pmod notes, the recounts (215 scenarios on the model,
+  126 on the RTL; 243 cocotb; 1,830 tool tests). PHY-GL-SDF on the 8x4
+  netlist of run 37547764383, typical-corner cell delays: 11 of 11 (each
+  D-035 program's scenario, the LIN slave through the master-and-slave
+  test because its own candidate is model only, and one each of
+  i2c_master, spi_master, spi_slave and uart_tx_fifo). The D-035 protocol
+  item is checked; DShot600, DMX512 and Wiegand were not started. Next:
+  Thomas decides on those three; the freeze run on 2026-11-08 as planned.

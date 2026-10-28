@@ -75,13 +75,16 @@ miss". The state on 2026-09-22 is:]
   so every built feature is exercised; 553 coverage bins, 33 empty with a
   recorded reason each; four of five hand-written mutants killed at the first
   seed.
-- L3 protocol: 109 scenarios on the model and 95 on the RTL across
-  thirteen programs, one of them four programs at once, one per thread,
+- L3 protocol: 215 scenarios on the model and 126 on the RTL across
+  twenty programs (seven of them, D-035, written after the hardware was
+  complete for protocols Loom was not designed for), one of them four
+  programs at once, one per thread,
   whose pin edges each fall on the same clock as when that program runs
-  alone (`test_fw_four_at_once`: ISO-1 on the pins; the 14 left out of the routine RTL run are slow cases, each
+  alone (`test_fw_four_at_once`: ISO-1 on the pins; the 89 left out of the routine RTL run are slow cases, each
   marked with the reason: 115200-baud UART reception, most of the SPI mode
   sweep, the longest PS/2 frames, the USB host at +-0.25 per cent of the bit
-  rate, the 257-byte EEPROM read; all 14 pass on the RTL in a separate run,
+  rate, the 257-byte EEPROM read, and the long cases of the later programs;
+  the 14 there were before D-035 all pass on the RTL in a separate run,
   last repeated on 2026-09-26 after the T-1 firmware fixes), with
   no divergence between the sides, including error cases
   (framing error, NACK, clock stretching, CAN CRC, stuff and form errors and
@@ -112,7 +115,9 @@ miss". The state on 2026-09-22 is:]
   109 on the last full hardening (run 37547764383, the BUGS 11 fix at 8x4;
   the one test of the flop-memory build is skipped there). With that run's
   typical-corner cell delays (PHY-GL-SDF), one firmware scenario per
-  protocol and the four-at-once demo, 14 of 14, passed on the netlist.
+  protocol and the four-at-once demo, 14 of 14, passed on the netlist;
+  on 2026-10-27, 11 of 11 more: each D-035 program and each program the
+  common-settings gaps changed.
 - L7 mutation: the M2 pass, 823 mutants, 99.7 per cent killed with 44
   documented equivalents set aside (`tools/mutate/equivalents.json` gives
   each its reason). The freeze-time run on d1ea0ac (2026-09-29, D-033): 911
@@ -251,3 +256,4 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
   section 6 and the L5 line describe the fix's hardening, 37475045879.
 - 2026-10-07: section 6 and the L5 line describe the 8x4 hardening,
   37547764383, and the L5 line the SDF subset on its netlist.
+- 2026-10-27: the L3 and L5 lines follow D-035 (seven programs, the recounts, PHY-GL-SDF 11 of 11).

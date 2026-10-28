@@ -26,11 +26,11 @@ the reasons for each choice.
 |---|---|---|
 | Hardened in CI, 8x4 tiles | 31,268 standard cells and one 512x16 IHP SRAM macro, 41.1 % utilisation; DRC, LVS and antenna clean; Tiny Tapeout precheck passes; gate-level tests 109 of 109; detailed routing 2 h 52 min, the build job 4 h 04 min of GitHub's six hours | `docs/AREA.md`, run 37547764383 |
 | Clock | 50 MHz with +5.49 ns of setup slack at the typical corner (the flow's sign-off corner); about 43 MHz at the slow corner (1.08 V, 125 C) | `docs/AREA.md` |
-| Protocols | thirteen firmware programs, each tested on the golden model and on the RTL through the real SPI pads with the same test bodies: 109 scenarios on the model, 95 of them on the RTL in every CI run and the other 14 (slow cases) in a separate run. One runs four of the programs at once, one per thread, and checks that every pin edge of each lands on the same clock as when it runs alone | `firmware/README.md`, `test/test_fw.py` |
+| Protocols | twenty firmware programs, thirteen written with the hardware and seven after it was complete for protocols Loom was not designed for (NEC infrared, 1-Wire, LIN, HDLC), each tested on the golden model and on the RTL through the real SPI pads with the same test bodies: 215 scenarios on the model, 126 of them on the RTL in every CI run and the other 89 (slow cases, each with its reason) on the model only. One runs four of the programs at once, one per thread, and checks that every pin edge of each lands on the same clock as when it runs alone | `firmware/README.md`, `test/test_fw.py` |
 | RTL against an independent golden model | lockstep co-simulation compared on every clock cycle, on constrained-random programs with the host port driven during the run, in every CI run | `test/test_cosim.py` |
 | Formal (SymbiYosys) | properties of the scheduler, FIFOs, timer, pins, SPI port, decoder and wait rule, proved for every depth (PDR or k-induction) apart from one bound checked to depth 40; thread isolation (a thread's state does not depend on what the other three run) proved for each of the four threads on a two-copy miter. Four properties were false as first worded; each is a recorded finding, one of them a real bug | `formal/README.md` |
 | Mutation testing | the freeze-time run: 911 one-line faults in the RTL, 99.9 % killed with 60 documented equivalents set aside, after it found eleven holes in the tests (closed) and one real bug (BUGS 11, fixed) | `docs/VERIFICATION.md` L7 |
-| Test counts | 212 cocotb tests on the RTL, most of them through the pins; 1,692 Python tests on the tools and the golden model | `test/`, `tools/tests/` |
+| Test counts | 243 cocotb tests on the RTL, most of them through the pins (CI run 40627932146); 1,830 Python tests on the tools and the golden model | `test/`, `tools/tests/` |
 | IHP SRAM macro on cmos5l | the 512x16 macro hardens and passes all nine precheck checks and the gate-level test; as far as we know the first published cmos5l SRAM result that passes the Tiny Tapeout precheck; the recipe is written up | `docs/tt_cmos5l_facts.md` section 11 |
 
 `docs/VERIFICATION_REPORT.md` puts the evidence together, with what each
@@ -116,6 +116,60 @@ python -m tools.loomhost --model firmware/uart_tx_fifo.loom --uart-rx OUT0:32 \
 ```
 
 `docs/info.md` (the Tiny Tapeout datasheet page) shows the same on the chip.
+
+## Protocols written after the hardware was complete
+
+The test of a protocol emulator is the protocol nobody planned for. After
+the hardware was complete (D-032) four protocols that nothing in Loom was
+built for were written as firmware only, with no RTL change (D-035): each
+by one agent in its own worktree, all four started at 11:11 EDT on
+2026-10-11, then reviewed and integrated by the director. Each meets the
+shipped programs' bar: `--strict` assembly (every deadline proved), a
+reference model written from the specification rather than from the
+firmware, the same test bodies on the golden model and on the RTL through
+the SPI pads, a timing-annotated gate-level scenario (PHY-GL-SDF) and a
+header saying what hardware it reuses.
+
+| Protocols | Programs (words) | Rates tested | Scenarios: model, RTL | Hours to green |
+|---|---|---|---|---|
+| NEC infrared | `ir_nec_tx` (71), `ir_nec_rx` (112) | 38 kHz carrier and NEC frames at 50 MHz; RTL on a 1.824 MHz board, the same waveform in microseconds | 13, 4 | 1.9 |
+| 1-Wire | `onewire_master` (157), `onewire_device` (157) | standard speed, 1 us tick, AN126 slots; also a 10-clock tick | 20, 4 | 1.7 |
+| LIN | `lin_master` (128), `lin_slave` (218) | 9600, 10417 and 19200 bit/s; a master 14 % off for the auto-baud slave | 30, 6 | 2.0 |
+| HDLC | `hdlc_loopback` (279, two threads) | 64 and 329 kbit/s NRZI; a sender up to 3 % off | 14, 6 | 2.0 |
+
+Hours to green run from the session start to the first run green on both
+backends (`PROGRESS.md` timestamps); the summaries, recounts and some
+re-runs took later sessions after the account's session limit cut the
+agents off.
+
+- **NEC infrared.** Loom has no PWM, carrier generator or pulse capture.
+  The transmitter makes the 38 kHz carrier from deadline-latched pin
+  writes (`SETP ... D`, built for clock-exact WS2812 pulses) on a
+  fractional tick (built for UART rates). The receiver measures each mark
+  and space with timed waits (built for the PS/2 and I2C timeouts) and
+  re-phases its tick on every edge, the hard synchronisation built for the
+  UART, CAN and Manchester receivers.
+- **1-Wire.** One open-drain wire with timed slots, a reset and presence
+  pulse and a binary-tree ROM search. The master and a DS18B20-style
+  device reuse the open-drain BIDIR pin (built for I2C), `SETP ... D`,
+  the shift register and the CRC unit (built for CAN and USB, here
+  Maxim's CRC-8) and `LD`/`ST` (built for the EEPROM). The slots, the
+  presence detection and application note 187's search are firmware.
+- **LIN.** The car-body bus: a 13-bit break, a sync byte and a checksum
+  with an end-around carry. The master reads back every bit it sends. The
+  slave does not know the bus rate: it measures the sync byte with timed
+  waits and `NOW` and writes its own `TICK_INT`, a divider built so the
+  host could pick a rate, so the clock recovery is firmware.
+- **HDLC.** Bit-stuffed frames with an FCS-16. It reuses the bit
+  engine's NRZI encoder and decoder (built for USB), the CRC unit for the
+  FCS and `LD`/`ST` for the frame buffers. HDLC stuffs a 0 after five 1s,
+  a rule the stuffing hardware does not know (it knows USB's and CAN's),
+  so the firmware inserts and removes the stuff bits and finds flags and
+  aborts.
+
+`firmware/README.md` has each program's pins, host words, proved ticks and
+what it does not do; `docs/spec-questions/firmware-d035.md` has the open
+questions and the decisions taken.
 
 ## Limitations
 
