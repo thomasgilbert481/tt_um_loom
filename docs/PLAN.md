@@ -526,8 +526,15 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       agent per protocol in its own worktree. Done 2026-10-27: all four
       integrated (7daa439, fd74668, d38284c, 2c09f1a), the README section
       on them, PHY-GL-SDF 16 of 16 with the changed common programs
-      (VERIFICATION L5). DShot600, DMX512 and Wiegand were not started;
-      whether to write them before the firmware freeze is Thomas's call.
+      (VERIFICATION L5). DShot600, DMX512 and Wiegand were not started
+      then; they are the next item.
+- [ ] D-035, second batch, to the same bar: a DShot600 transmitter (and
+      bidirectional telemetry if it fits); a DMX512 controller and fixture
+      (ANSI E1.11); a Wiegand reader and panel. Thomas asked for them on
+      2026-10-28; one agent per protocol in its own worktree
+      (`tt_um_loom_fw7_{dshot,dmx,wieg}`, from acf8487), run by the nightly
+      task, then integrated with the README section, the recounts and
+      PHY-GL-SDF as the first batch was. Before the firmware freeze.
 - [x] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
       I2C master at exactly 100 and 400 kHz, checked against UM10204's
       timing; a UART baud-rate table; builds of the UART, SPI and I2C
@@ -973,3 +980,10 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   stuff bits). The D-035 protocol
   item is checked; DShot600, DMX512 and Wiegand were not started. Next:
   Thomas decides on those three; the freeze run on 2026-11-08 as planned.
+- 2026-10-28, Opus 5.5: Thomas chose to go on with DShot600, DMX512 and
+  Wiegand. A new PLAN M4 item; briefs and shared rules in
+  `.loom_agent_scratch/fw7_*` (the first batch's lessons added: writes of
+  at most about 120 lines, background jobs instead of setsid, the time
+  window, cited sources); worktrees `tt_um_loom_fw7_{dshot,dmx,wieg}` on
+  branches `fw7-*` from acf8487. No agent started in the day. Next: the
+  nightly task runs the three agents and integrates them.
