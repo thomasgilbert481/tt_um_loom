@@ -200,3 +200,55 @@ and 1; threads 2 and 3 must not be started. Both headers say so.
 
 As NEC infrared item 7: expected there, and it passed in main at
 integration.
+
+
+## HDLC (`hdlc_loopback.loom`), integrated 2026-10-27
+
+### 1. No shared flags on receive
+
+ISO/IEC 13239 lets one flag close a frame and open the next. The
+transmitter never shares; the receiver needs a whole flag after a frame,
+because its report path (about 49 words, not timed) runs before it hunts
+for the next flag, and does not fit thread 1's 3-tick budget.
+
+**Decision:** accepted for D-035 as a stated limit, not bought with a
+slower rate. Every sender that idles with flags (the transmitter here, PPP
+and AX.25 in practice) sends at least one flag between frames; a sender
+that shares a single flag loses the frame after it. Recorded in the
+program header and under "Weaker than" in `firmware/README.md`.
+
+### 2. Idle state: flags
+
+**Decision:** accepted. The transmitter idles with flags; the receiver
+accepts flags or marks (tested with marks at 64 kbit/s).
+
+### 3. Frames shorter than 32 bits are dropped without a report
+
+**Decision:** accepted, as ISO/IEC 13239 discards them; reporting them
+would make every pair of idle flags a report.
+
+### 4. Maximum frame: 127 octets to send, 256 with the FCS to receive
+
+**Decision:** accepted. The standard sets no maximum; TOO_LONG is reported
+once and the receiver hunts for the next flag.
+
+### 5. A frame that is not a whole number of octets is NOT_OCTETS, no data
+
+**Decision:** accepted. Octet-oriented hosts (RFC 1662, AX.25) discard such
+frames.
+
+### 6. Abort: eight 1s sent, seven 1s recognised
+
+**Decision:** accepted; the standard needs seven or more.
+
+### 7. Bits 14:7 of the transmit command are ignored
+
+**Decision:** accepted and documented: the length is bits 6:0, so a host
+that sets more gets n mod 128.
+
+### 8. One program, two threads
+
+**Decision:** accepted. The transmitter (thread 0, 127 words) and receiver
+(thread 1, 103 words and a 49-word report block at 0x148) share one file
+so the wire loopback and its tests build from one source; buffers at 0x100
+(TX) and 0x180 (RX), so threads 2 and 3 must not be started.

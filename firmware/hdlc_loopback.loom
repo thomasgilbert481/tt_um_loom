@@ -1,0 +1,410 @@
+; hdlc_loopback.loom
+; An HDLC transmitter (thread 0) and receiver (thread 1), framing as ISO/IEC
+; 13239 defines it. Written on 2026-10-11, after the hardware was complete
+; (D-032), as a protocol Loom was not designed for (D-035).
+;
+; Hardware reused, and what it was built for:
+;   - the bit engine's NRZI encoder and decoder (SEMANTICS 6.9.1, ENC = 1),
+;     built for USB: 0 = a transition, the convention SDLC and AX.25 use;
+;   - the CRC unit (6.9), built for USB's CRC16, CAN's CRC15 and CRC-8; here
+;     the FCS-16, x^16 + x^12 + x^5 + 1 (CRC_POLY 0x1021, CRC_INIT 0xFFFF);
+;   - LD/ST (6.11), built for the EEPROM and USB programs: the frame buffers;
+;   - the tick restart on a TICK_INT write (4), used by CAN and USB to
+;     re-phase a receiver: here on every transition of the line.
+; What the firmware does that no hardware does: zero-bit insertion and
+; deletion. The stuffing hardware knows USB's rule (a 0 after six 1s) and
+; CAN's (the opposite bit after five equal bits); HDLC's is a 0 after five
+; 1s, so the engine runs with STUFF = 0 and the firmware counts the 1s,
+; sends and removes the stuff bits, and finds flags and aborts.
+;
+; Pins: TX = OUT0 (push-pull NRZI line), RX = IN0. Wire OUT0 to IN0 for the
+; loopback, or let any HDLC/NRZI sender of the same rate drive IN0.
+;
+; Frame (ISO/IEC 13239): flag 0x7E, address, control, 0 to N information
+; octets, FCS-16, flag. Every octet least significant bit first. FCS: the
+; register preset to all ones, the bits in transmission order, the ones
+; complement sent, the x^15 coefficient first (RFC 1662's fcs16 in its
+; reflected form is the same thing). A good frame leaves 0x1D0F in the
+; receiver's register (0xF0B8 reflected). Between the opening flag and the
+; closing flag a 0 follows every five 1s. Line: NRZI, a 0 toggles the line.
+; Idle: flags back to back (not marks). Abort: eight 1s, then flags again.
+;
+; Host words.
+;   INQ[0]:  a command {ABORT (bit 15), n (bits 6:0)}, n = 0..127 information
+;            octets (N = 127: the 128-word transmit buffer; bits 14:7 are
+;            ignored), then {control in 15:8,
+;            address in 7:0}, then (n + 1) / 2 words of information, first
+;            octet in 7:0 (an odd last octet in 7:0, 15:8 ignored). ABORT
+;            sends the frame up to the end of its information and then eight
+;            1s instead of the FCS and the closing flag.
+;            Thread 0 collects a frame into its buffer while it sends idle
+;            flags, and starts it two flags after its last word is in (an
+;            idle flag, then the opening flag), so a slow host delays a frame
+;            but never breaks it. An idle flag always separates a closing
+;            flag from the next opening flag.
+;   OUTQ[1]: per frame a status word, then (m + 1) / 2 words of octets, first
+;            in 7:0 (an odd last octet in 7:0, 15:8 = 0).
+;   Status:  bits 8:0 m, the octets delivered (address, control,
+;            information; the FCS is not delivered); bit 15 bad FCS (the
+;            octets are still delivered); bit 14 abort; bit 13 too long (more
+;            than 256 octets between the flags, FCS included); bit 12 not a
+;            whole number of octets. m = 0 with bits 14, 13 and 12. All four
+;            clear: a good frame. Fewer than 32 bits between two flags (the
+;            idle flags themselves) is no frame and gives no report, as
+;            ISO/IEC 13239 has it. A report is pushed after the closing flag;
+;            thread 1 receives nothing until it is out, so the host pops each
+;            report before the next frame ends. No shared flags on receive:
+;            after a report thread 1 hunts for a whole new flag, so a sender
+;            that closes one frame and opens the next with one flag loses the
+;            frame after it (decided in docs/spec-questions/firmware-d035.md,
+;            HDLC 1, with the other open questions).
+;
+; Memory: thread 0's code in 0x000.., thread 1's in 0x080.., the transmit
+; buffer at 0x100 and the receive buffer at 0x180 (128 words each, written
+; with ST before any LD reads them). Start threads 0 and 1 only.
+;
+; Rate: the host writes TICK_INT of both threads before RUN (the M2
+; convention). Thread 0 ticks once a bit, thread 1 eight times a bit:
+;   64 kbit/s: thread 0 TICK_INT 781 + 64/256; thread 1 TICK_INT 97 + 168/256
+; The .tick lines give the fastest rate the deadline checker proves for each
+; thread (see the README for the loopback rate, which thread 1 sets).
+;
+; Transmit, thread 0. One tick per bit, and every bit is one pass of
+;     txb: WAITD 1; SHO; then the run of 1s counted from C (SHRI of r0, a
+;     copy of SR, before the WAITD), and the word and frame counts.
+; The engine sends with ENC = NRZI, STUFF = 0 and CRC_EN, LSB first. After
+; the fifth 1 in a row the next tick sends a stuff 0 by hand: SETP of the
+; complement of the line level (read with JP before the WAITD, so the edge
+; is one slot after its tick like an SHO edge), then a CSRW BE_CFG with INV
+; equal to the new level. That write clears LVL (6.9.1), and with INV set
+; so, LVL = 0 is the line as it now stands: the encoder goes on from there.
+; The stuff bit never passes through SR or SHO, so it is never in the CRC,
+; and it costs nothing in the CRC: four slots of the stuff bit's own tick
+; (SETP, CSRW, a branch, and the count of the bit before).
+; The FCS: after the last data bit, STCRC, NOT, REV (the x^15 coefficient
+; first, as SR is LSB first) into SR, and sixteen more bits through the
+; same loop, stuffing included. Then the closing flag, which is the first
+; idle flag. An aborted frame (ABORT) sends eight 1s instead of the FCS,
+; raw, and then idle flags.
+; Idle: raw flags (no stuffing). While it sends them, thread 0 takes the
+; next command and its words from INQ, one word per bit, each POP guarded
+; by a WAITB INQ_NE, T that completed by condition; a frame whose words are
+; all in goes out after two more flags: one idle flag, which gives a
+; receiver a whole flag to report the frame before, and the opening flag,
+; with the frame's set-up spread over the bits of the two.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   TX = OUT0, RX = IN0
+        .equ    CFG = (1 << 3) | (1 << 9)       ; ENC NRZI, DIR LSB first, CRC_EN
+        .equ    CFGI = CFG | (1 << 7)           ; the same with INV
+        .equ    POLY = 0x1021           ; FCS-16, x^16 + x^12 + x^5 + 1 (all 16 bits)
+        .equ    GOOD = 0x1D0F           ; the register after a good frame and its FCS
+        .equ    FLAG = 0x7E
+        .equ    ONES = 0xFF             ; the abort: eight 1s
+        .equ    TXBUF = 0x100
+        .equ    RXBUF = 0x180
+
+; ---------------------------------------------------------------- transmit
+        .thread 0
+        .tick   64                      ; 781 kbit/s: the fastest proved
+        SETP    TX, 0                   ; the line starts low ...
+        .csr    BE_PINS, 16             ; out = OUT0
+        .csr    CRC_POLY, POLY
+        .csr    CRC_INIT, 0xFFFF
+        MOV16   r5, CFG
+        MOV16   r6, CFGI
+        CSRW    BE_CFG, r5              ; ... and LVL = 0, INV = 0 is the low line
+        LDI     r1, FLAG                ; the next raw octet
+        SETD    1
+
+; Idle A: flags, and a command taken if one is waiting.
+ia:     LDSR    r1                      ; FLAG, or ONES once after an abort
+        LDI     r1, FLAG
+        LDI     r4, 8
+        MOV16   r2, TXBUF               ; where B will put the frame
+al:     WAITD   1
+        SHO                             ; raw: idle octets are not stuffed
+        WAITB   INQ_NE, T               ; TD has passed: a test, not a wait
+        BT      an
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only thread 0 pops INQ[0]"
+        POP     r0                      ; the command, kept for the opening flag
+        MOV     r3, r0
+        SHLI    r3, 9
+        SHRI    r3, 9                   ; n
+        ADDI    r3, 3
+        SHRI    r3, 1                   ; words to come: 1 + (n + 1) / 2
+        DJNZ    r4, bl
+        JMP     ib
+an:     DJNZ    r4, al
+        JMP     ia
+
+; Idle B: flags, and the frame's words into TXBUF, one per bit.
+ib:     LDSR    r1
+        LDI     r1, FLAG
+        LDI     r4, 8
+bl:     WAITD   1
+        SHO
+        WAITB   INQ_NE, T
+        BT      bn
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only thread 0 pops INQ[0]"
+        POP     r7
+        ST      r7, r2, 0
+        INC     r2
+        DJNZ    r3, bn
+        DJNZ    r4, cl                  ; all in: finish this octet, then open
+        JMP     open
+bn:     DJNZ    r4, bl
+        JMP     ib
+cl:     WAITD   1
+        SHO
+        DJNZ    r4, cl
+
+; Two more flags, the second the opening flag, with the frame set up between
+; their bits. r0 is the command. The extra flag gives the receiver of the
+; frame before (thread 1 here) a whole flag to push its report and hunt.
+open:   MOV16   r1, (FLAG << 8) | FLAG
+        LDSR    r1
+        LDI     r1, 14                  ; flag bits 1 to 14 in the loop below
+        MOV     r4, r0
+        WAITD   1                       ; flag bit 0
+        SHO
+        SHLI    r4, 9
+        SHRI    r4, 6                   ; 8n
+        ADDI    r4, 16                  ; bits: address, control, information
+        MOV     r7, r0
+        SHRI    r7, 13                  ; ABORT (bit 15) to T (FLAGS bit 2)
+        CSRW    FLAGS, r7               ; T = ABORT; the frame loop never touches T
+        LDI     r7, 2                   ; ends to come: the data's, the FCS's
+        LDI     r3, 16                  ; the CNT reload
+        MOV16   r2, TXBUF
+        LD      r0, r2, 0               ; address (7:0), control (15:8)
+        INC     r2
+fo:     WAITD   1                       ; flag bits 1 to 14
+        SHO
+        DJNZ    r1, fo
+        WAITD   1                       ; bit 15, the last of the opening flag
+        SHO
+        CRCI                            ; the FCS covers what follows the flag
+        LDSR    r0
+        CSRW    CNT, r3
+        SHRI    r0, 1                   ; C = the first bit
+        LDI     r1, 5                   ; five 1s before a stuff bit
+        JMP     txb
+
+; The FCS (or the abort), entered right after the last data bit's SHO.
+fcs:    BT      abort
+        STCRC   r0
+        NOT     r0, r0                  ; sent complemented ...
+        REV     r0, r0                  ; ... the x^15 coefficient first
+        LDSR    r0
+        CSRW    CNT, r3
+        LDI     r4, 16
+        SHRI    r0, 1                   ; and on into txb
+
+; Every bit of address, control, information and FCS.
+txb:    WAITD   1
+        SHO                             ; the bit; Z = (CNT == 0): the word is out
+        BC      t1                      ; C = this bit (the SHRI of the copy before)
+        LDI     r1, 5                   ; a 0: five more 1s before a stuff bit
+tn:     BZ      wend
+        SHRI    r0, 1                   ; C = the next bit
+        DJNZ    r4, txb                 ; bits left in the data, or in the FCS
+end:    DJNZ    r7, fcs                 ; the data are out: the FCS, or the abort
+close:  LDI     r1, FLAG                ; the FCS is out: the closing flag is
+        JMP     ia                      ; the first idle flag
+abort:  LDI     r1, ONES                ; eight 1s instead of the FCS
+        JMP     ia
+wend:   DJNZ    r4, wl                  ; the word is out: bits left?
+        DJNZ    r7, fcs
+        JMP     close
+wl:     LD      r0, r2, 0               ; the next word
+        INC     r2
+        LDSR    r0
+        CSRW    CNT, r3
+        SHRI    r0, 1
+        JMP     txb
+t1:     DJNZ    r1, tn                  ; a 1: fewer than five so far
+        LDI     r1, 5                   ; the fifth: a stuff bit next
+        JP      TX, 1, th               ; the level the stuff bit leaves
+        WAITD   1
+        SETP    TX, 1                   ; the stuff 0: the line rises ...
+        CSRW    BE_CFG, r6              ; ... and LVL = 0 is now the high line
+ts:     BZ      wend                    ; then on with the bit before it
+        SHRI    r0, 1
+        DJNZ    r4, txb
+        DJNZ    r7, fcs
+        JMP     close
+th:     WAITD   1
+        SETP    TX, 0                   ; the line falls ...
+        CSRW    BE_CFG, r5              ; ... and LVL = 0 is the low line
+        JMP     ts
+
+; ----------------------------------------------------------------- receive
+; Receive, thread 1. Eight ticks per bit, and the tick is re-phased on every
+; transition of the line, that is on every 0 (NRZI): the edge is looked for
+; in a window from 3 to 7 ticks after the last sample (WAITE RX, ANY, T), and
+; when it comes the program rewrites TICK_INT (SEMANTICS 4: ACC <= 0) and
+; samples 3 ticks later, about mid-bit once the detection latency is added;
+; when it does not, the bit is a 1 and is sampled 8 ticks after the last.
+; HDLC puts a transition at least every seventh bit (the stuff bit after five
+; 1s; a flag's six 1s), so the receiver's clock only has to hold for seven
+; bits. SHI does the NRZI decoding (s = 1 when the line has not moved) and
+; the CRC; the firmware counts the 1s. After five 1s the next window decides:
+; an edge is a stuff 0, which is not shifted in (never in SR, CNT or the
+; CRC): the program reads the line level at its sample point and writes
+; BE_CFG with INV equal to it, which puts LVL back in step with the line
+; (the write clears LVL, 6.9.1). No edge is a sixth 1; then an edge ends a
+; flag and no edge is an abort (seven 1s).
+; The CRC is copied (STCRC) before every 0 is shifted in, so at a flag the
+; copy is the register before the flag's first bit: a good frame left 0x1D0F
+; there. Each 16 data bits are a word, stored with ST from RXBUF on.
+; Until the first flag, and after an abort or a report, a hunt loop with no
+; stores looks for the next flag (0, six 1s, 0) on the same window timing.
+
+        .thread 1
+        .tick   19                      ; 329 kbit/s: the fastest proved
+        .csr    BE_PINS, 8 << 5         ; in = IN0
+        .csr    CRC_POLY, POLY
+        .csr    CRC_INIT, 0xFFFF
+        .csr    BE_CFG, CFG
+        MOV16   r5, CFG                 ; for the BE_CFG writes after a stuff 0
+        LDI     r6, 16                  ; the CNT reload
+        CSRR    r3, TICK_INT            ; the host's divider, rewritten on every edge
+
+; Hunt: nothing is a frame until a flag.
+hunt:   WAITE   RX, ANY                 ; the line moves: a 0
+hz:     CSRW    TICK_INT, r3            ; re-phase on it
+        SETD    2
+        LDI     r0, 6                   ; six 1s, then a 0, end a flag
+        WAITD   1                       ; (the 0's sample point)
+hw:     WAITD   3                       ; the window opens
+        SETD    4                       ; ... and closes 7 ticks after the sample
+        WAITE   RX, ANY, T
+        BNT     hz                      ; an edge: another 0
+        SETD    0                       ; none: a 1, sampled 8 ticks after the last
+        WAITD   1
+        DJNZ    r0, hw
+        WAITD   3                       ; six 1s: an edge now ends a flag
+        SETD    4
+        WAITE   RX, ANY, T
+        BT      hunt                    ; a seventh 1: no flag, the line idles
+        CSRW    TICK_INT, r3            ; the flag's last 0
+        SETD    2
+        LDI     r0, 5                   ; five 1s before a stuff bit
+        WAITD   1
+        SHI                             ; LVL follows the line
+        JMP     fnew                    ; a frame may start
+
+; A frame: every bit, from the window.
+rw:     WAITD   3                       ; the window opens
+        SETD    4
+        WAITE   RX, ANY, T
+        BT      one                     ; no edge: a 1
+        CSRW    TICK_INT, r3            ; an edge: a 0; re-phase on it
+        SETD    2
+        STCRC   r2                      ; the CRC before this 0
+        LDI     r0, 5                   ; five 1s before a stuff bit
+        WAITD   1                       ; the sample point
+        SHI
+        BNZ     rw                      ; no word complete
+        INC     r0                      ; (6: the DJNZ below makes it 5 again)
+wst:    STSR    r7                      ; a word: two octets, the first in 7:0
+        ST      r7, r1, 0
+        INC     r1
+        CSRW    CNT, r6
+        DJNZ    r4, wok
+        JMP     rlong                   ; the buffer is full: too long
+wok:    DJNZ    r0, rw
+        JMP     r5w
+one:    SETD    0                       ; re-anchor after the timed wait
+        WAITD   1                       ; the sample point, 8 ticks after the last
+        SHI
+        BZ      wst
+        DJNZ    r0, rw                  ; fewer than five 1s
+r5w:    WAITD   3                       ; five 1s: a stuff 0 is due
+        SETD    4
+        WAITE   RX, ANY, T
+        BT      r6w                     ; no edge: a sixth 1
+        CSRW    TICK_INT, r3            ; the stuff 0: re-phase on it as well
+        SETD    2
+        LDI     r0, 5
+        WAITD   1                       ; its sample point: which level?
+        JP      RX, 1, sth
+        CSRW    BE_CFG, r5              ; low: LVL = 0 is the low line again
+        JMP     rw
+sth:    MOV16   r7, CFGI
+        CSRW    BE_CFG, r7              ; high: INV, so LVL = 0 is the high line
+        JMP     rw
+r6w:    SETD    0
+        WAITD   1                       ; (the sixth 1: not data, not shifted in)
+        WAITD   3
+        SETD    4
+        WAITE   RX, ANY, T
+        BT      rabort                  ; a seventh 1
+        CSRW    TICK_INT, r3            ; the flag's last 0
+        SETD    2
+        LDI     r0, 5
+        WAITD   1
+        SHI                             ; LVL follows the line
+        MOV     r7, r4                  ; words left: 128 - words stored
+        INC     r7
+        SHRI    r7, 7                   ; Z = two words or more (r4 <= 126)
+        BZ      frame                   ; else no frame: under 32 bits
+fnew:   MOV16   r1, RXBUF               ; a new frame
+        LDI     r4, 128                 ; words the buffer holds
+        CRCI
+        CSRW    CNT, r6
+        JMP     rw
+rabort: MOV16   r0, 0x4000              ; ABORT, m = 0
+        PUSH    r0
+        JMP     hunt
+
+; The report, after a flag that ended a frame of two words or more, or when
+; the buffer overflows. Not timed: thread 1 hunts for the next flag once the
+; report is out. It lives after the transmit buffer (TXBUF + 65 words at
+; most), in the free words before RXBUF.
+        .org    0x148
+rlong:  MOV16   r0, 0x2000              ; TOO_LONG, m = 0: the rest of the
+        BRA     rnone                   ; frame is skipped by the hunt
+frame:  CSRR    r7, CNT                 ; with the flag's seven bits in, an octet
+        ANDI    r7, 7                   ; boundary before it left CNT at 9 or 1
+        CMPI    r7, 1
+        MOV16   r0, 0x1000              ; NOT_OCTETS, m = 0
+        BNZ     rnone
+        LDI     r0, 0                   ; the status
+        MOV16   r7, GOOD
+        CMP     r2, r7                  ; the CRC before the flag
+        BZ      rfcs
+        MOV16   r0, 0x8000              ; BAD_FCS
+rfcs:   LDI     r7, 128
+        SUB     r4, r7, r4              ; k, the words stored
+        ADD     r4, r4, r4              ; 2k octets ...
+        CSRR    r7, CNT
+        CMPI    r7, 1
+        BNZ     reven
+        STSR    r7                      ; ... and one more, in SR bits 8:1
+        SHLI    r7, 7
+        SHRI    r7, 8
+        ST      r7, r1, 0
+        INC     r4
+reven:  SUBI    r4, 2                   ; m: the FCS is not delivered
+        OR      r0, r0, r4
+        PUSH    r0                      ; the status
+        MOV16   r1, RXBUF
+        MOV     r2, r4
+        ADDI    r2, 1
+        SHRI    r2, 1                   ; (m + 1) / 2 words
+rpl:    LD      r7, r1, 0
+        INC     r1
+        DEC     r2
+        BZ      rlast
+        PUSH    r7
+        JMP     rpl
+rlast:  ANDI    r4, 1                   ; m odd: 15:8 of the last word is the
+        BZ      rl2                     ; FCS's first octet, cleared
+        SHLI    r7, 8
+        SHRI    r7, 8
+rl2:    PUSH    r7
+        JMP     hunt
+rnone:  PUSH    r0
+        JMP     hunt

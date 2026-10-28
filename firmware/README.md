@@ -65,6 +65,7 @@ own from the bit rate it measures on every sync byte.
 | `onewire_device.loom` | OW = BIDIR1 (open drain) | 157: 116 at 0x080, 8 of data at 0x0F8, 33 at 0x140 (thread 2's quarter) | 50 clocks per tick, 1 us (set by the program); also proved at 10 | 1446 clocks (286 at 10) | standard speed against an AN126 master and one at the datasheet's limits (write-1 low 14 us, read low 1 us sampled at 15 us); MATCH, search, scratchpad also on the 10-clock build |
 | `lin_master.loom` | TX = OUT0 (to a LIN transceiver's TXD), RX = IN0 (its RXD) | 128, and an 11-word frame buffer at 0x1F5 | 10 clocks per tick, 16 ticks per bit (the deadline pairs alone would allow 7) | 28 clocks | 19200, 10417 and 9600 bit/s (TICK 162 + 195/256, 300, 325 + 133/256); 195 kbit/s (TICK 16) and 100 kbit/s (TICK 31 + 64/256) as test rates; a slave 2 % off |
 | `lin_slave.loom` | TX = OUT0, RX = IN0 (thread 0); OUT1, IN1 beside the master | 218 (runs 90 words into the next quarter), and an 80-word table at 0x180 | 32 clocks (set by the program; the half-bit tick it measures is 1250 clocks or more at LIN rates) | 4 clocks | a master at 19200, 10417 and 9600 bit/s, each 14 % slow, exact and 14 % fast; 100 kbit/s as the test rate |
+| `hdlc_loopback.loom` | TX = OUT0, RX = IN0 | 127 (thread 0) + 152 (thread 1: 103, and a 49-word report block at 0x148); buffers 0x100 (TX) and 0x180 (RX) | thread 0: 64 clocks per bit (781 kbit/s); thread 1: 19 clocks per tick, 8 ticks per bit (329 kbit/s) | 0 clocks (both threads) | 329 kbit/s wire loopback (thread 0 TICK 152, thread 1 TICK 19) and 64 kbit/s (TICK 781 + 64/256; TICK 97 + 168/256); a sender at +1 % (RTL), +1.5 % and -3 % (329 kbit/s) and +-2.5 % (64 kbit/s) |
 
 Every program assembles with `--strict` and no diagnostic at all: each
 deadline pair is proved, apart from the five intervals declared `.bounded`
@@ -1015,12 +1016,163 @@ ignoring a bad parity); the other 24 are `model_only`, each with its
 reason: the LIN-rate cases (150,000 to 600,000 clocks a frame) and those
 whose code paths the six already cover.
 
+## hdlc_loopback.loom: HDLC transmitter and receiver
+
+Written on 2026-10-11, after the hardware was complete (D-032), as a
+protocol Loom was not designed for (D-035). Nothing in Loom was built for
+HDLC. The program reuses four things built for other protocols:
+
+- the bit engine's NRZI encoder and decoder (SEMANTICS 6.9.1, `ENC = 1`),
+  built for USB, where 0 is a transition, the same convention SDLC and
+  AX.25 use;
+- the CRC unit (6.9), built for USB's CRC16, CAN's CRC15 and CRC-8, here
+  carrying the FCS-16 (`CRC_POLY 0x1021`, `CRC_INIT 0xFFFF`);
+- `LD`/`ST` (6.11), built for the EEPROM and USB programs, here holding the
+  frame buffers;
+- the tick restart on a `TICK_INT` write (SEMANTICS 4), which CAN and USB
+  use to re-phase a receiver, here applied on every line transition.
+
+The firmware does one thing no hardware does: zero-bit insertion and
+deletion. The engine's stuffing hardware knows USB's rule (a 0 after six 1s)
+and CAN's (the opposite bit after five equal bits). HDLC inserts a 0 after
+five 1s, so the engine runs with `STUFF = 0` and the firmware counts the 1s,
+sends and removes the stuff bits, and finds flags and aborts.
+
+- **Pins**: TX = OUT0 (push-pull, NRZI line), RX = IN0. For the loopback,
+  wire OUT0 to IN0, or let any HDLC/NRZI sender at the same rate drive IN0.
+  Thread 0 sends and thread 1 receives every frame on RX. Start threads 0
+  and 1 only, because the buffers occupy the other two quarters.
+- **One program, two threads**: the transmitter and receiver share the
+  constants, the memory map and the rate set-up, and each needs one thread.
+  Splitting them would gain nothing, and 279 words fit with room to spare.
+  Thread 0's code takes 0x000-0x07E. Thread 1's code takes 0x080-0x0E6,
+  plus a 49-word report block at 0x148-0x178, which the report path does
+  not need to fit inside thread 1's quarter. The block sits in free words
+  between the TX buffer (0x100, at most 65 words) and the RX buffer (0x180,
+  128 words).
+- **Frame** (ISO/IEC 13239): flag 0x7E, address, control, 0 to N
+  information octets, FCS-16, flag. Every octet goes least significant bit
+  first. FCS-16 is x^16 + x^12 + x^5 + 1 with the register preset to all
+  ones, fed the bits in transmission order; the ones complement is sent,
+  x^15 coefficient first. This is RFC 1662's `fcs16` in non-reflected
+  form: in engine terms it is the MSB-first serial CRC (6.9) fed in line
+  order, with the result sent as `REV(~CRC)` because SR is LSB first. A
+  good frame leaves 0x1D0F in the receiver's register (0xF0B8 reflected).
+  Between the opening and closing flags, every five 1s are followed by a 0.
+  The line is NRZI: a 0 toggles it.
+- **Idle and abort**: the transmitter idles with flags back to back, not
+  marks. An abort is eight 1s followed by flags. The receiver also accepts
+  a sender that idles with marks (a still line): its hunt finds each
+  opening flag.
+- **Host command** (push to thread 0): a word `{ABORT bit 15, n bits 6:0}`
+  with n = 0..127 information octets (N = 127, set by the 128-word TX
+  buffer; bits 14:7 are ignored). Next comes `{control 15:8, address 7:0}`, then (n + 1) / 2 words
+  of information with the first octet in 7:0. `ABORT` sends the frame up to
+  the end of its information, then eight 1s instead of the FCS and closing
+  flag. Thread 0 collects a frame into its buffer while it sends idle flags,
+  one word per bit, each `POP` guarded by a `WAITB INQ_NE, T` that
+  completed on its condition (the two `.bounded` declarations). The frame
+  starts two flags after its last word is in: one idle flag, then the
+  opening flag. A slow host therefore delays a frame but never breaks it.
+- **Result** (pop thread 1): per frame, a status word, then (m + 1) / 2
+  words of octets, first octet in 7:0 (an odd last octet has 15:8 = 0).
+  Status bits 8:0 hold m, the octets delivered (address, control,
+  information; the FCS is not delivered). Bit 15 is bad FCS (the octets are
+  still delivered), bit 14 abort, bit 13 too long (more than 256 octets
+  between the flags, FCS included, reported as soon as the buffer is full),
+  and bit 12 not a whole number of octets. With bits 14, 13 or 12, m = 0.
+  All four clear means a good frame. Fewer than 32 bits between two flags
+  (the idle flags themselves) is not a frame and gives no report, as ISO/IEC
+  13239 has it. Thread 1 pushes a report after the closing flag and hunts
+  for the next flag once the report is out, so the host must pop each
+  report before the next frame ends.
+- **Rate**: the host writes `TICK_INT` of both threads before `RUN` (the M2
+  convention). Thread 0 ticks once per bit and thread 1 eight times per bit.
+  At 64 kbit/s that is thread 0 TICK 781 + 64/256 and thread 1 TICK
+  97 + 168/256. The checker proves thread 0 at 64 clocks per bit
+  (781 kbit/s) and thread 1 at 19 clocks per tick (152 clocks per bit,
+  329 kbit/s). The receiver sets the loopback rate, so 329 kbit/s (thread 0
+  TICK 152, thread 1 TICK 19) is the fastest tested.
+- **Stuff bits stay out of the CRC by construction.** A stuff 0 is a line
+  transition that never passes through `SHO`/`SHI`, so it never enters SR,
+  `CNT` or the CRC, and nothing has to be saved or restored. The transmitter
+  reads the line level with `JP` before the tick, then after the tick does
+  `SETP` of its complement (the edge comes one slot after the tick, like an
+  `SHO` edge). It then writes `CSRW BE_CFG` with `INV` equal to the new
+  level: the write clears `LVL` (6.9.1), and with `INV` set this way,
+  `LVL = 0` is the line as it now stands, so the encoder continues from
+  there. The receiver sees the stuff 0 as an edge in its window after five
+  1s. It does not shift that bit in; it reads the level at the sample point
+  and writes `BE_CFG` with `INV` equal to it, which puts the decoder's
+  `LVL` back in step with the line. The cost is four slots of the stuff
+  bit's own tick on the transmit side (`SETP`, `CSRW`, a branch and the
+  count of the bit before) and one `BE_CFG` write on the receive side, with
+  both `BE_CFG` values held in registers. The CRC itself costs nothing.
+- **Why 64 and 19 clocks**: thread 0's per-bit loop (`WAITD 1; SHO;` the
+  ones count from a copy of SR in C, and the frame's bit counter) is six
+  slots. Its worst interval is 16 slots (64 clocks, 0 slack): the bit after
+  a word boundary that also ends the data and enters the FCS (`STCRC`,
+  `NOT`, `REV`, `LDSR`, `CNT` reload) or the abort. Thread 1 has three
+  ticks between a sample and the next window. Its longest path (a 0 that
+  completes a word: `STCRC`, `SHI`, `ST`, the pointer and the overflow test)
+  is 12 slots, 48 clocks against a budget of 57 at TICK 19. The 0-slack
+  pairs on thread 1 are the `SETD 0; WAITD 1` of a 1 bit, which the checker
+  proves with one slot against one tick. The real constraint there is that
+  `SETD` lands within the timeout's tick, which needs T >= 12 clocks.
+- **Transmit timing** (measured on OUT0 in loopback, golden model): at TICK
+  152 every edge is exactly on the 152-clock grid. At 64 kbit/s every edge
+  is within -3..0 clocks of the 781.25-clock grid, as SEMANTICS 2 allows for
+  a fractional tick. The reference model decodes every frame Loom sends,
+  with each stuff bit where ISO/IEC 13239 puts it.
+- **Receive timing and clock recovery**: thread 1 re-phases on every
+  transition of the line, which in NRZI means every 0. It looks for the
+  edge in a window from 3 to 7 ticks after the last sample
+  (`WAITE RX, ANY, T`). When the edge comes, it rewrites `TICK_INT`
+  (`ACC <= 0`) and samples 3 ticks later; with the detection latency that is
+  about mid-bit. When no edge comes, the bit is a 1, sampled 8 ticks after
+  the last. HDLC guarantees a transition at least every seventh bit (the
+  stuff bit after five 1s, or a flag's six 1s), so the recovered clock only
+  has to hold for seven bits. Measured samples fall at 47 % of the bit at
+  329 kbit/s and 39-40 % at 64 kbit/s. Tolerance to a sender's clock
+  offset, measured on the golden model with random and stuff-heavy frames:
+  -4 % to +1.75 % at 329 kbit/s (fails at -5 % and +2 %), and -3 % to +3 %
+  at 64 kbit/s (fails at +-4 %). The tests run inside those limits: +1 % on
+  the RTL, +1.5 % and -3 % at 329 kbit/s, and +-2.5 % at 64 kbit/s on the
+  model. The asymmetry at 329 kbit/s (the fast side is tighter) was
+  measured, not analysed; the cause is not established here.
+- **Not done, and weaker than a dedicated HDLC controller**:
+  - One frame in flight each way, and no shared flags. The transmitter
+    always puts an idle flag between a closing flag and the next opening
+    flag. After a report the receiver hunts for a whole new flag, so a
+    sender that uses one flag to close a frame and open the next (which
+    ISO/IEC 13239 permits) loses the frame after it (not tested). The host must
+    also pop each report before the next frame ends.
+  - N = 127 information octets to send; the receiver takes up to 256
+    octets (FCS included) before reporting too long.
+  - FCS-16 only (no FCS-32), no address recognition (every frame is
+    reported), and no frames that are not a whole number of octets
+    (reported as such, with no data).
+  - Asynchronous clock recovery from NRZI transitions only. There is no
+    separate receive clock pin as a synchronous serial port would have.
+    329 kbit/s is far below the rates of a hardware HDLC controller.
+  - Bits 14:7 of the transmit command are ignored, not checked.
+- **PHY-GL-SDF candidate**: `test_loopback_fcs_check_vector`. It is one
+  frame, "123456789" (address '1', control '2', information "3456789"),
+  through the wire loopback at 329 kbit/s: 1.41 ms, about 70 k clocks. It
+  exercises the NRZI encoder and decoder, the FCS on the CRC unit and the
+  per-edge `TICK_INT` re-phase, and checks RFC 1662's check value 0x906E on
+  the line. It has no stuff bit (no run of 1s is longer than three). If the
+  gate-level run can afford about 147 k clocks,
+  `test_loopback_short_and_stuff_heavy_frames` adds the stuff-bit path
+  (`SETP` and the `BE_CFG` write) on both sides.
+
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks
