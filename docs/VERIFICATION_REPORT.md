@@ -116,7 +116,7 @@ miss". The state on 2026-09-22 is:]
   the one test of the flop-memory build is skipped there). With that run's
   typical-corner cell delays (PHY-GL-SDF), one firmware scenario per
   protocol and the four-at-once demo, 14 of 14, passed on the netlist;
-  on 2026-10-27, 11 of 11 more: each D-035 program and each program the
+  on 2026-10-27, 16 of 16 more: each D-035 program, and each program the
   common-settings gaps changed.
 - L7 mutation: the M2 pass, 823 mutants, 99.7 per cent killed with 44
   documented equivalents set aside (`tools/mutate/equivalents.json` gives
@@ -256,4 +256,4 @@ bash scripts/harden_report.sh <run id>       # reads a CI hardening
   section 6 and the L5 line describe the fix's hardening, 37475045879.
 - 2026-10-07: section 6 and the L5 line describe the 8x4 hardening,
   37547764383, and the L5 line the SDF subset on its netlist.
-- 2026-10-27: the L3 and L5 lines follow D-035 (seven programs, the recounts, PHY-GL-SDF 11 of 11).
+- 2026-10-27: the L3 and L5 lines follow D-035 (seven programs, the recounts, PHY-GL-SDF 16 of 16).

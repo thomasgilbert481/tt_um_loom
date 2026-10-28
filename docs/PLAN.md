@@ -525,7 +525,7 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       time allows, DShot600, DMX512 and Wiegand. Started 2026-10-11, one
       agent per protocol in its own worktree. Done 2026-10-27: all four
       integrated (7daa439, fd74668, d38284c, 2c09f1a), the README section
-      on them, PHY-GL-SDF 11 of 11 with the changed common programs
+      on them, PHY-GL-SDF 16 of 16 with the changed common programs
       (VERIFICATION L5). DShot600, DMX512 and Wiegand were not started;
       whether to write them before the firmware freeze is Thomas's call.
 - [x] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
@@ -965,9 +965,11 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   protocols written after the hardware was complete, docs/info.md's
   program list and Pmod notes, the recounts (215 scenarios on the model,
   126 on the RTL; 243 cocotb; 1,830 tool tests). PHY-GL-SDF on the 8x4
-  netlist of run 37547764383, typical-corner cell delays: 11 of 11 (each
+  netlist of run 37547764383, typical-corner cell delays: 16 of 16 (each
   D-035 program's scenario, the LIN slave through the master-and-slave
   test because its own candidate is model only, and one each of
-  i2c_master, spi_master, spi_slave and uart_tx_fifo). The D-035 protocol
+  i2c_master, spi_master, spi_slave and uart_tx_fifo, then the gaps'
+  new paths: I2C table 10 in both modes, SPI slave modes 1 and 2, HDLC
+  stuff bits). The D-035 protocol
   item is checked; DShot600, DMX512 and Wiegand were not started. Next:
   Thomas decides on those three; the freeze run on 2026-11-08 as planned.

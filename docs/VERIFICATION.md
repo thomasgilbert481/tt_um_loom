@@ -280,6 +280,10 @@ property that only reaches bounded depth is listed as bounded, not proven.
   each program the common-settings gaps changed (`i2c_master`,
   `spi_master`, `spi_slave`, `uart_tx_fifo`): 11 of 11 passed, 15.8 ms
   simulated, 33 minutes in four parallel groups and 26 for the LIN pair.
+  Then 5 of 5 more on the paths the gaps added: `i2c_master` at UM10204
+  table 10 in standard (TICK 31 + 64/256) and fast mode (TICK 7),
+  `spi_slave` in modes 1 and 2, and `hdlc_loopback`'s stuff bits
+  (`test_loopback_short_and_stuff_heavy_frames`); 16 of 16 in all.
 - PHY-PRECHECK: TT precheck clean on every push to main.
 
 ### L6: FPGA and bench
