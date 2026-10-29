@@ -1,0 +1,264 @@
+; dshot_bidir.loom
+; Bidirectional DShot600 on BIDIR0: the inverted throttle frame, then the
+; line turned around to receive the ESC's eRPM telemetry, decoded, to OUTQ[0].
+; DShot300 is the same program with another tick.
+;
+; Written on 2026-10-28, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The transmit side is
+; dshot_tx.loom inverted (its header has the frame, the tick table and the
+; repeat stream); read that first. The receive side reuses two more pieces
+; of hardware built for other jobs. The bit engine's NRZI decoder (SEMANTICS
+; 6.9.1, built for USB) undoes the telemetry's line code: GCR's 20 bits go
+; out as 21 line bits in which a 1 is a level change (Betaflight
+; decodeTelemetryPacket; brushlesswhoop "eRPM Transmission"), and USB's NRZI
+; is the same code with the sense of the bit inverted, so each `SHI` puts
+; the complement of a GCR bit into SR. The instruction memory read as data
+; (LD, SEMANTICS 6.11, built for device emulation) holds the 5b/4b table.
+; What the firmware does that no hardware does: the inversion, the inverted
+; checksum, the turnaround, the reply window, the mid-bit sampling grid at
+; 5/4 of the bit rate, the 5b/4b decode, the telemetry checksum, and keeping
+; the frame grid exact across all of it.
+;
+; Wire (sources in tools/protomodels/dshot.py). The FC's frame is DShot
+; inverted: the line idles high and each bit is a low pulse of 7 or 14
+; twentieths of a period; the checksum is inverted (Betaflight
+; prepareDshotPacket: csum = ~csum when telemetry is on). After the frame
+; the FC releases the line (the pull-up holds it high) and the ESC answers
+; about 30 us later (Betaflight DSHOT_TELEMETRY_DEADTIME_US 30 + 5;
+; brushlesswhoop "30 us"): 21 bits at 5/4 of the bit rate (750 kbit/s for
+; DShot600), the first one always a 0, so the reply starts with a fall.
+; The 20 GCR bits that follow are four 5-bit codes, MSB first, each one
+; nibble of a 16-bit word eeem mmmm mmmm cccc whose four nibbles XOR to
+; 0xF (Betaflight's check; the ESC's checksum is inverted too).
+;
+; Timing. One tick is 1/20 of a frame bit, as in dshot_tx.loom, so a reply
+; bit is exactly 16 ticks (20 * 4/5). The reply's first fall is found by a
+; timed WAITP (level, not edge, so it cannot be missed between slots) in a
+; window of 36 bit periods from the release (60 us at DShot600, 120 us at
+; DShot300; TD is set with CSRW, since SETD reaches only 255 ticks).
+; A `SETD FIRST` there starts the sampling grid, and each line bit is
+; sampled 16 ticks after the last, the first FIRST + 16 = 22 ticks after
+; that SETD: with the detection's latency (about 10 clocks) the first
+; sample is about 1.5 reply bits after the fall at DShot600 (the ideal),
+; 1.4 at DShot300. The tick grid is deliberately not restarted at
+; the fall (the uart_rx idiom): that would move the frame grid by up to a
+; tick, and the up-to-one-tick phase it would remove is 1/16 of a reply bit.
+; Every transmit edge is deadline-latched, as in dshot_tx.loom.
+;
+; Sampling, not edge timing. Betaflight times the reply's edges and
+; rounds each run to whole bits; this receiver samples in the middle of
+; each bit on its own clock, as a UART does, so the ESC's clock error
+; accumulates over 20 bits. Measured on the model in 0.5 % steps
+; (2026-10-28), the reply decodes with the ESC's clock off by -1.5 % to
+; +2.5 % at DShot600 (50 MHz), -2.5 % to +2 % at DShot300; the test
+; module runs -1 % and +2 %. A dedicated decoder would resynchronise on
+; every edge, as Betaflight's does; this one does not.
+;
+; Output (OUTQ[0], one word per frame sent, in order):
+;   bits 11:0: the telemetry value eeem mmmm mmmm,
+;       Betaflight's rawValue: the period is m << e microseconds, or for an
+;       Extended DShot Telemetry frame (bit 8 = 0 with e odd) a type and a
+;       value; the host decodes it, as the FC does.
+;   0x8001 no reply in the window, 0x8002 a 5-bit code that is not GCR,
+;   0x8003 a telemetry checksum that does not XOR to 0xF.
+; With OUTQ full the word is dropped (the stream must not stall).
+;
+; Frame grid. The frame grid is kept across the reply exactly: TD at the end
+; of the 16th bit period is saved, the reply is received on its own
+; deadlines, then TD is put back and the gap loop catches up to the grid
+; (each WAITD on a deadline already passed completes at once). If the reply
+; is still running PREP bits before the next start, the grid slips: the
+; next frame starts PREPT ticks after the program is ready instead. The
+; program is ready again PREP bits before a start when I is at least
+; 16 + (the reply's delay + 17 bits of reply) + PREP: 54 bit periods
+; (90 us) for a reply 30 us after the frame at DShot600, 55 when no reply
+; comes and the window runs out, 72 for a reply that starts at the very
+; end of the window. 8 kHz (I = 75) and slower, the usual bidirectional
+; rates, never slip.
+;
+; Words. 154 words: the 23-word GCR table sits right after the reset
+; vector, so that LD's 5-bit offset reaches it with no base register (the
+; receive loop has two slots to spare). The program is longer than thread
+; 0's quarter: it runs to 0x099, 26 words into thread 1's quarter, so thread
+; 1 must not be started with this image (the listing says so); threads 2
+; and 3 are free.
+;
+; Host interface: as dshot_tx.loom (frame word, interval word; IMIN is 20
+; here, the fetch taking PREP = 3 bits), plus the
+; output above. Registers: r0 frame / received word, r1 bit counter, r2
+; packet to repeat, r3 saved grid then gap counter, r4 interval, r5 word /
+; quintet counter, r6 scratch, r7 the `.csr` scratch, then the bad-code flag.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   DLINE = BIDIR0
+        .tick   4                       ; the shortest tick the schedule is proved for
+        .equ    BIT  = 20               ; ticks per frame bit (MOTOR_BITLENGTH)
+        .equ    T0H  = 7                ; low pulse of a 0 (MOTOR_BIT_0)
+        .equ    T1H  = 14               ; low pulse of a 1 (MOTOR_BIT_1)
+        .equ    T0L  = BIT - T0H        ; 13
+        .equ    T1L  = BIT - T1H        ; 6
+        .equ    PREP = 3                ; bits before a start spent fetching
+        .equ    IMIN = 16 + 1 + PREP    ; 20: the shortest interval
+        .equ    PREPT = PREP * BIT      ; 60 ticks
+        .equ    RBIT = BIT * 4 / 5      ; 16 ticks per reply bit (5/4 rate)
+        .equ    FIRST = 6               ; first sample: FIRST + RBIT after the fall
+        .equ    WIN  = 36 * BIT         ; reply window, 720 ticks from the release
+        .equ    CFG  = 0x0A             ; BE_CFG: DIR = 1 (MSB first), ENC = NRZI
+        .equ    LATE = 8                ; ticks past a fetch deadline that slip the grid
+
+        JMP     start                   ; the reset vector
+; GCR 5b/4b, indexed by s = ~code & 31 (what SHI's NRZI decode gives): the
+; nibble, or 0x10 for a code GCR does not use (Betaflight's decode[32]).
+; s = 0..22 is code 31..9; s >= 23 (codes 0..8) is never GCR.
+gcr:    .word   0x10, 0xC, 0x4, 0x10, 0x1, 0x8, 0x0, 0x10   ; codes 1F..18
+        .word   0x7, 0x6, 0x5, 0x10, 0x3, 0x2, 0x10, 0x10   ; codes 17..10
+        .word   0xF, 0xE, 0xD, 0x10, 0xB, 0xA, 0x9          ; codes 0F..09
+
+start:  SETP    DLINE, 1                ; the inverted line idles high,
+        OEP     DLINE, 0                ;   released: the pull-up holds it
+        .csr    BE_PINS, pin(DLINE) << 5 ; SHI samples DLINE
+        LDI     r4, 0                   ; I = 0: one-shot until told otherwise
+        LDI     r2, 0
+
+; Idle: as dshot_tx.loom.
+idle:   POP     r5                      ; blocks while INQ is empty
+        SETD    0                       ; re-anchor after the unbounded POP
+        ADD     r6, r5, r5              ; C = bit 15, r6 = bits 14:0 << 1
+        BNC     newf                    ; a frame word
+        SHRI    r6, 1                   ; I, Z = (I == 0)
+        MOV     r4, r6
+        BZ      idle
+        CMPI    r4, IMIN
+        BC      idle
+        LDI     r4, IMIN
+        JMP     idle
+
+; The fetch point of a stream: TD is PREP bits before the next start and
+; has just been reached, unless the reply ran late: then the grid slips.
+fetch:  CSRR    r6, NOW
+        CSRR    r5, TD
+        SUB     r6, r6, r5              ; ticks past the deadline (mod 2^16)
+        CMPI    r6, LATE                ; C = (late by LATE ticks or more)
+        BNC     prep
+        SETD    0                       ; slip: the next start is PREPT from now
+prep:   WAITB   INQ_NE, T               ; a word? (a test, not a wait)
+        BT      again                   ; INQ empty: repeat the last frame
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r5                      ; one slot: it cannot stall
+        ADD     r6, r5, r5              ; C = bit 15
+        BNC     newf                    ; a frame word: send it at this start
+        SHRI    r6, 1                   ; an interval word
+        MOV     r4, r6
+        BZ      idle                    ; I = 0: the stream stops here
+        CMPI    r4, IMIN
+        BC      again
+        LDI     r4, IMIN
+again:  MOV     r5, r2                  ; the packet to repeat
+
+; A frame from the packet in r5 bits 11:0, as dshot_tx.loom, with the
+; checksum inverted.
+newf:   SHLI    r5, 4                   ; packet << 4: bits 15:12 drop out
+        MOV     r0, r5                  ; the frame, checksum still 0
+        SHRI    r5, 4                   ; v = the 12-bit packet
+        MOV     r2, r5                  ; keep it for a repeat,
+        SHRI    r2, 1                   ;   with the telemetry bit cleared
+        SHLI    r2, 1
+        MOV     r6, r5                  ; v ^ v >> 4 ^ v >> 8, as dshot_tx
+        SHRI    r6, 4
+        XOR     r6, r6, r5
+        SHRI    r6, 4
+        XOR     r6, r6, r5
+        ANDI    r6, 15
+        XORI    r6, 15                  ; inverted: bidirectional DShot
+        OR      r0, r0, r6              ; the 16-bit frame
+        LDI     r1, 16
+        OEP     DLINE, 1                ; drive the line (high, as it idles)
+        SETP    DLINE, 0, D             ; stage the first bit's fall
+        WAITD   PREPT                   ; it lands on the frame start
+
+; bit is entered at the fall that starts a bit (it has just landed): r0
+; holds the bits not yet sent, r1 how many are left, this one included. The
+; fall at each period boundary does not depend on the bit, so the bit's
+; value is looked at only after it.
+bit:    SETP    DLINE, 1, D             ; stage the end of the low pulse
+        SHLI    r0, 1                   ; C = this bit
+        BC      one
+        WAITD   T0H                     ; 7 ticks low; the rise lands here
+        DJNZ    r1, zn                  ; more bits in the frame?
+        WAITD   T0L                     ; no: the end of the last period
+        JMP     rx
+zn:     SETP    DLINE, 0, D             ; stage the next fall
+        WAITD   T0L                     ; it lands on the period boundary
+        JMP     bit
+one:    WAITD   T1H                     ; 14 ticks low
+        DJNZ    r1, on
+        WAITD   T1L
+        JMP     rx
+on:     SETP    DLINE, 0, D
+        WAITD   T1L                     ; 6 ticks high
+        JMP     bit
+
+; ------------------------------------------------------------ the reply
+; TD is the end of the frame's 16th bit period, S + 16 bits.
+rx:     OEP     DLINE, 0                ; release: the ESC answers on this line
+        CSRR    r3, TD                  ; keep the frame grid
+        .csr    BE_CFG, CFG             ; also LVL = 0: the reply's first bit
+        CSRR    r6, NOW                 ; the reply window: TD = NOW + WIN,
+        MOV16   r5, WIN                 ;   longer than SETD's 255 ticks
+        ADD     r6, r6, r5
+        CSRW    TD, r6
+        WAITP   DLINE, 0, T             ; the first fall, or the window closes
+        BT      norep
+        SETD    FIRST                   ; the sampling grid starts at the fall
+        LDI     r5, 4                   ; four 5-bit codes
+        LDI     r7, 0                   ; bit 4: a code that is not GCR
+rxq:    LDI     r1, 5
+rxb:    WAITD   RBIT                    ; the middle of the next line bit
+        SHI                             ; SR <= SR << 1 | ~(GCR bit)
+        DJNZ    r1, rxb
+        STSR    r6
+        ANDI    r6, 31                  ; s = ~code, the last five bits
+        CMPI    r6, 23                  ; codes 0..8 are not GCR
+        BC      nogcr
+        LD      r6, r6, gcr             ; the nibble, or 0x10
+rxn:    OR      r7, r7, r6              ; collect bit 4; keep sampling to the
+        SHLI    r0, 4                   ;   end, so the line is the ESC's
+        OR      r0, r0, r6              ;   until its reply is over
+        DJNZ    r5, rxq
+        ANDI    r7, 16
+        BNZ     badc                    ; a code was not GCR
+        MOV     r6, r0                  ; the four nibbles must XOR to 0xF:
+        SHRI    r6, 8
+        XOR     r6, r6, r0              ;   bytes
+        MOV     r1, r6
+        SHRI    r1, 4
+        XOR     r6, r6, r1              ;   nibbles
+        ANDI    r6, 15
+        CMPI    r6, 15
+        BNZ     badsum
+        SHRI    r0, 4                   ; eeem mmmm mmmm
+        JMP     report
+nogcr:  LDI     r6, 16                  ; flag it, and go on sampling
+        JMP     rxn
+norep:  LDI     r0, 1                   ; 0x8001: no reply
+        JMP     err
+badc:   LDI     r0, 2                   ; 0x8002: not a GCR code
+        JMP     err
+badsum: LDI     r0, 3                   ; 0x8003: bad checksum
+err:    LDIH    r0, 0x80
+report: WAITB   OUTQ_NF, T              ; room? (a test, not a wait)
+        BT      rxdone                  ; OUTQ full: dropped
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ (SEMANTICS 6.7)"
+        PUSH    r0
+rxdone: SETD    0                       ; an anchor; TD is put back next
+        CSRW    TD, r3                  ; back on the frame grid, S + 16 bits
+
+; ------------------------------------------------------------ the gap
+; As dshot_tx.loom. After a reply the WAITDs catch up to the grid at once.
+gap:    OR      r3, r4, r4              ; r3 = I, Z = (I == 0)
+        BZ      idle
+        SUBI    r3, 16 + PREP           ; I >= IMIN, so r3 >= 1
+glp:    WAITD   BIT
+        DJNZ    r3, glp
+        JMP     fetch                   ; TD = S + (I - PREP) bits

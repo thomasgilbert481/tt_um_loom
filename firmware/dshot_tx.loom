@@ -1,0 +1,165 @@
+; dshot_tx.loom
+; DShot600 transmitter (drone ESC throttle) on OUT0, fed by the host through
+; INQ[0]. DShot300 and DShot150 are the same program with another tick.
+;
+; Written on 2026-10-28, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; DShot. The program uses two pieces of hardware built for other jobs: the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016), built
+; so that WS2812 pulses land on the exact clock, and the fractional tick
+; divider (TICK_FRAC, SEMANTICS 4), built for UART rates. What the firmware
+; does that no hardware does: the pulse-width bit coding, the 4-bit checksum,
+; the frame, and the steady repeat stream an ESC needs to stay armed. It
+; needs the FIFOs (POP, WAITB INQ_NE) and the latch, nothing else.
+;
+; Wire format (no formal standard; sources as in tools/protomodels/dshot.py).
+; A frame is 16 bits, MSB first: an 11-bit value (0 disarm, 1..47 special
+; commands, 48..2047 throttle), the telemetry-request bit, and a 4-bit
+; checksum, the XOR of the three nibbles above it (Betaflight
+; src/main/drivers/dshot.c, prepareDshotPacket). Each bit is one fixed
+; period that starts with a rise; the fall comes 7/20 of a period later for
+; a 0 and 14/20 for a 1 (Betaflight dshot_dpwm.h: MOTOR_BIT_0 7, MOTOR_BIT_1
+; 14, MOTOR_BITLENGTH 20). The line idles low between frames.
+;
+; Tick (set by the host before RUN, the M2 convention: the clock is the
+; board's): one tick is 1/20 of a bit, TICK = f_clk / (20 * bit rate):
+;   50 MHz, DShot600: TICK_INT 4,  TICK_FRAC 43:  4.16797 clocks (ideal 4.16667)
+;   50 MHz, DShot300: TICK_INT 8,  TICK_FRAC 85:  8.33203 clocks (ideal 8.33333)
+;   50 MHz, DShot150: TICK_INT 16, TICK_FRAC 171: 16.66797 clocks (ideal 16.66667)
+;   48 MHz: TICK_INT 4, 8, 16, TICK_FRAC 0: exact (80, 160, 320 clocks a bit).
+; At 50 MHz the bit is 83.36 clocks (DShot600 at 599.8 kbit/s, -0.03 %), and
+; since ticks fall on clock edges every edge is within one clock (20 ns) of
+; the ideal grid of that tick. The schedule is proved for ticks of 4 clocks
+; or more (.tick 4), so it holds for all three rates on any clock from
+; 48 MHz up, DShot1200 excepted (2 clocks a tick at 48 MHz).
+;
+; Timing. Every edge is `SETP DOUT, v, D` and the WAITD that lands it, so it
+; changes the pad on the exact clock edge of its tick (SEMANTICS 6.10 rule
+; 1), whatever the code between the deadlines does: the high time is exactly
+; 7 or 14 ticks and the period exactly 20, on the tick grid. The tightest
+; interval is the rise -> fall of a 0 bit, 5 slots in 7 ticks (28 clocks at
+; the shortest tick); the low phase of a 1 bit is 3 slots in 6 ticks.
+;
+; Host command format (FIFO space, thread 0). Nothing is pushed to OUTQ.
+;   frame word,    bit 15 = 0: bits 11:0 the packet, value << 1 | telemetry,
+;                  as Betaflight packs it (value 0..2047 in bits 11:1, the
+;                  telemetry request in bit 0); bits 14:12 are ignored. The
+;                  program adds the checksum.
+;   interval word, bit 15 = 1: bits 14:0 the frame interval I, in bit
+;                  periods from one frame's first rise to the next one's
+;                  (I = 600 is 1 kHz at DShot600). I = 0, the reset value,
+;                  is one-shot: each frame word sends one frame. A non-zero
+;                  I below IMIN = 19 is taken as 19 (16 bits, a gap of at
+;                  least one bit, two bits to fetch the next word).
+; Repeat stream: with I > 0, after each frame the program keeps the frame
+; grid exactly (frame n starts n * I bits after the first) and, two bits
+; before each start, takes at most one word from INQ: a frame word is sent
+; at that start; an interval word changes I (0 stops the stream, the line
+; stays low) and the last frame is repeated; with INQ empty the last frame
+; is repeated. A repeated frame has the telemetry bit cleared and its
+; checksum recomputed, as Betaflight does (it requests telemetry once per
+; request). So a host sends `0x8000 | I` once and then frame words at its
+; own pace; the ESC sees a steady stream whatever the host's latency. A
+; frame word taken while idle starts its frame about 40 ticks later.
+;
+; Registers: r0 the frame being shifted out, r1 bits left in it, r2 the
+; packet to repeat (telemetry bit cleared), r3 the gap counter, r4 the
+; interval I, r5 the word / packet, r6 scratch, r7 the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   DOUT = OUT0
+        .tick   4                       ; the shortest tick the schedule is proved for
+        .equ    BIT  = 20               ; ticks per bit (MOTOR_BITLENGTH)
+        .equ    T0H  = 7                ; high time of a 0 (MOTOR_BIT_0)
+        .equ    T1H  = 14               ; high time of a 1 (MOTOR_BIT_1)
+        .equ    T0L  = BIT - T0H        ; 13
+        .equ    T1L  = BIT - T1H        ; 6
+        .equ    PREP = 2                ; bits before a start spent fetching
+        .equ    IMIN = 16 + 1 + PREP    ; 19: the shortest interval
+        .equ    PREPT = PREP * BIT      ; 40 ticks
+
+start:  SETP    DOUT, 0                 ; the line idles low
+        LDI     r4, 0                   ; I = 0: one-shot until told otherwise
+        LDI     r2, 0
+
+; Idle: no stream. Wait for a word; an interval word is taken and the
+; program waits again, a frame word is sent at once.
+idle:   POP     r5                      ; blocks while INQ is empty
+        SETD    0                       ; re-anchor after the unbounded POP
+        ADD     r6, r5, r5              ; C = bit 15, r6 = bits 14:0 << 1
+        BNC     newf                    ; a frame word
+        SHRI    r6, 1                   ; I, Z = (I == 0)
+        MOV     r4, r6                  ; MOV leaves Z alone
+        BZ      idle                    ; I = 0: one-shot
+        CMPI    r4, IMIN                ; C = (I >= IMIN)
+        BC      idle
+        LDI     r4, IMIN                ; too short: the shortest
+        JMP     idle
+
+; The fetch point of a stream: TD is the deadline PREP bits before the next
+; start and has just been reached. At most one word is taken.
+prep:   WAITB   INQ_NE, T               ; a word? (a test, not a wait)
+        BT      again                   ; INQ empty: repeat the last frame
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r5                      ; one slot: it cannot stall
+        ADD     r6, r5, r5              ; C = bit 15
+        BNC     newf                    ; a frame word: send it at this start
+        SHRI    r6, 1                   ; an interval word: I, Z = (I == 0)
+        MOV     r4, r6
+        BZ      idle                    ; I = 0: the stream stops here
+        CMPI    r4, IMIN
+        BC      again
+        LDI     r4, IMIN
+again:  MOV     r5, r2                  ; the packet to repeat
+
+; A frame from the packet in r5 bits 11:0 (bits 15:12 ignored). TD is the
+; deadline the first rise lands PREPT ticks after.
+newf:   SHLI    r5, 4                   ; packet << 4: bits 15:12 drop out
+        MOV     r0, r5                  ; the frame, checksum still 0
+        SHRI    r5, 4                   ; v = the 12-bit packet
+        MOV     r2, r5                  ; keep it for a repeat,
+        SHRI    r2, 1                   ;   with the telemetry bit cleared
+        SHLI    r2, 1
+        MOV     r6, r5                  ; csum = v ^ v >> 4 ^ v >> 8:
+        SHRI    r6, 4                   ;   v >> 4
+        XOR     r6, r6, r5              ;   v ^ v >> 4
+        SHRI    r6, 4                   ;   v >> 4 ^ v >> 8
+        XOR     r6, r6, r5              ;   v ^ v >> 4 ^ v >> 8
+        ANDI    r6, 15                  ; the low nibble is the checksum
+        OR      r0, r0, r6              ; the 16-bit frame
+        LDI     r1, 16
+        SETP    DOUT, 1, D              ; stage the first rise
+        WAITD   PREPT                   ; it lands on the frame start
+
+; bit is entered at the rise that starts a bit (it has just landed): r0
+; holds the bits not yet sent, r1 how many are left, this one included. The
+; rise at each period boundary does not depend on the bit, so the bit's
+; value is looked at only after it.
+bit:    SETP    DOUT, 0, D              ; stage the fall
+        SHLI    r0, 1                   ; C = this bit
+        BC      one
+        WAITD   T0H                     ; 7 ticks high; the fall lands here
+        DJNZ    r1, zn                  ; more bits in the frame?
+        WAITD   T0L                     ; no: the end of the last period
+        JMP     gap
+zn:     SETP    DOUT, 1, D              ; stage the next rise
+        WAITD   T0L                     ; it lands on the period boundary
+        JMP     bit
+one:    WAITD   T1H                     ; 14 ticks high
+        DJNZ    r1, on
+        WAITD   T1L                     ; the end of the last period
+        JMP     gap
+on:     SETP    DOUT, 1, D
+        WAITD   T1L                     ; 6 ticks low
+        JMP     bit
+
+; ------------------------------------------------------------ the gap
+; TD is the end of the frame's 16th bit period, S + 16 bits. One-shot: go
+; idle. Stream: wait I - 16 - PREP bits on the grid, then fetch.
+gap:    OR      r3, r4, r4              ; r3 = I, Z = (I == 0)
+        BZ      idle
+        SUBI    r3, 16 + PREP           ; I >= IMIN, so r3 >= 1
+glp:    WAITD   BIT                     ; one bit period of low line
+        DJNZ    r3, glp
+        JMP     prep                    ; TD = S + (I - PREP) bits

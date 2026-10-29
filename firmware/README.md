@@ -70,9 +70,11 @@ own from the bit rate it measures on every sync byte.
 | `wiegand_panel.loom` | D0 = IN0, D1 = IN1 | 109 | 16 clocks per tick (host-set; suggested 250, 5 us); timeouts only | no deadline pairs; falls seen 2 to 26 clocks late (a 6-slot poll) | SIA AC-01's windows at 5 MHz (TICK 25): pulses 20 to 100 us, 200 us intervals with +-2 us jitter; 20 ms intervals at 50 MHz (TICK 250, 25 ms timeout); glitches under 2 ticks (10 us) ignored |
 | `dmx_controller.loom` | TX = OUT0 (to an RS-485 driver's DI) | 60 | 200 clocks per tick, one tick per bit (the pairs also hold from 64) | 132 clocks (one `.bounded` POP) | 250 kbit/s (TICK 200) at 50 MHz, every field against E1.11's transmit column; 512-slot packets; a late host |
 | `dmx_fixture.loom` | RX = IN0 (from an RS-485 receiver's RO) | 127, and the window in 2 words at 0x0FE | 25 clocks per tick, 8 ticks per bit | 71 clocks (three `.bounded` PUSHes) | 250 kbit/s (TICK 25); a sender at 3.92 and 4.08 us a bit (+-2 %), break 88 us, MAB 8 us, marks 0 to 1 ms; short breaks (84, 60 us), MAB 6 us, framing errors |
+| `dshot_tx.loom` | DOUT = OUT0 (to the ESC's signal input) | 65 | 4 clocks per tick, 1/20 of a bit (host-set) | 8 clocks, the rise to the fall of a 0 bit (the `.bounded` POP is in an interval with 40) | DShot600, 300 and 150 at 50 MHz (TICK 4 + 43/256, 8 + 85/256, 16 + 171/256) and DShot600 and 300 at 48 MHz (TICK 4, 8: exact); repeat stream at 19, 30 and 40 bits |
+| `dshot_bidir.loom` | DLINE = BIDIR0 (push-pull while sending, released for the reply; board pull-up) | 154 (runs 26 words into thread 1's quarter, to 0x099), with a 23-word GCR table at 0x001 | 4 clocks per tick, 1/20 of a frame bit, 16 per reply bit (host-set) | 8 clocks, the reply loop and the 0 bit (`.bounded` POP and PUSH, neither in a tight interval) | bidirectional DShot600 at 50 and 48 MHz and DShot300 at 50 MHz; replies 20 to 40 us after the frame (5 to 58 us decode); ESC clock -1 % and +2 % (-1.5 % to +2.5 % decode at DShot600) |
 
 Every program assembles with `--strict` and no diagnostic at all: each
-deadline pair is proved, apart from the nine intervals declared `.bounded`
+deadline pair is proved, apart from the twelve intervals declared `.bounded`
 below, and none is unbounded (the M2 five in
 `tools/tests/test_fw_build.py`, the M3 and M4 programs in their own test
 modules). Each fits in thread 0's quarter of the 512-word memory of D-020,
@@ -110,6 +112,10 @@ slot, guarded by a `WAITB INQ_NE, T` just before it. `dmx_fixture` has
 the seventh to ninth, the receive side of it: three `PUSH`es, each
 guarded by a `WAITB OUTQ_NF, T` just before it (only the host takes words
 out of OUTQ, so the space cannot go).
+`dshot_tx` has the tenth and `dshot_bidir` the eleventh and twelfth,
+the same two idioms: a `POP` of the next frame word and a `PUSH` of the
+telemetry result, each guarded by a `WAITB` just before it that completed
+with T = 0, and only this thread pops INQ or pushes OUTQ.
 
 The two Wiegand programs run together, reader on thread 0 (0x000, 107 words) and panel on
 thread 1 (0x080, 109 words), each in its own quarter.
@@ -119,6 +125,21 @@ the host sets each one's tick. The reader's width and interval are whole
 ticks, so its tick is the resolution; the panel's tick scales its glitch
 threshold (2 ticks), its stuck-line limit (255 ticks) and its inter-frame
 timeout (5000 ticks by default, or a word the host pushes before RUN).
+
+`dshot_tx` fits thread 0's quarter (0x000..0x040). `dshot_bidir` does not:
+thread 1 must not be started with its image (the listing says so). So
+`dshot_tx` leaves threads 1 to 3 free and `dshot_bidir` threads 2 and 3,
+for other programs moved to those quarters.
+
+**The tick is the host's** (the M2 convention): TICK = f_clk / (20 x bit
+rate). At 50 MHz no DShot rate is a whole number of clocks a bit (83.33 at
+DShot600), so the fractional tick does the work: 4 + 43/256 clocks
+(4.16797, the bit 83.36 clocks, 599.8 kbit/s, -0.03 %). Ticks fall on clock
+edges, so measured on the pin a 0's high is 29 or 30 clocks (ideal 29.17),
+a 1's 58 or 59 (58.35), the period 83 or 84 (83.36), and every edge is
+within one clock of the ideal tick grid with exactly 7, 14 and 20 ticks
+between them. On a 48 MHz board the tick is a whole 4 clocks and every
+pulse is exactly 28 or 56 clocks and every period exactly 80.
 
 ```
 python -m tools.loomasm firmware/uart_rx.loom --strict --listing
@@ -1369,12 +1390,170 @@ checked to the clock, about 30,000 clocks).
 - `dmx_fixture`: `test_fixture_keeps_its_window_and_reports_each_packet`
   (one five-slot packet and the next break, 1.44 ms, 72,000 clocks).
 
+## DShot: dshot_tx.loom and dshot_bidir.loom
+
+Two programs written on 2026-10-28, after the hardware was complete (D-032),
+for a protocol Loom was not designed for (D-035): DShot, the digital
+throttle protocol flight controllers use to command drone motor ESCs. DShot
+has no formal standard; every figure comes from a named source (Betaflight's
+`dshot_dpwm.h`, `dshot.c` and `decodeTelemetryPacket`, Bluejay's
+`DShot.asm`, and brushlesswhoop's "DSHOT - the missing Handbook"), cited in
+`tools/protomodels/dshot.py`. Nothing in Loom was built for DShot: there is
+no PWM, no pulse-width encoder and no GCR decoder.
+
+- The **transmitter** (`dshot_tx`) makes every pulse with the
+  deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016),
+  built so that WS2812 pulses land on the exact clock, on a fractional tick
+  (`TICK_FRAC`, SEMANTICS 4), built for UART rates. A bit is 20 ticks, high
+  for 7 (a 0) or 14 (a 1), Betaflight's own `MOTOR_BIT_0/1` and
+  `MOTOR_BITLENGTH`, so every edge is an exact tick count apart.
+- The **bidirectional** version (`dshot_bidir`) inverts the line and the
+  checksum, releases the line after the frame and receives the ESC's eRPM
+  telemetry with two more pieces of hardware built for other jobs: the bit
+  engine's NRZI decoder (SEMANTICS 6.9.1, built for USB), which undoes the
+  telemetry's line code (GCR's "a 1 is a level change" is USB's NRZI with
+  the sense of the bit inverted), and the instruction memory read as data
+  (`LD`, SEMANTICS 6.11, built for device emulation) for the 5b/4b table.
+- What the firmware does that no hardware does: the pulse-width coding,
+  the 4-bit checksum (inverted for bidirectional), the frame, the steady
+  repeat stream an ESC needs to stay armed, the turnaround and reply
+  window, mid-bit sampling at 5/4 of the bit rate, the 5b/4b decode, the
+  telemetry checksum, and an exact frame grid kept across the reply.
+
+## dshot_tx.loom: DShot600 / 300 / 150 transmitter
+
+- **Host command** (push to thread 0):
+  - a **frame word**, bit 15 = 0: bits 11:0 the packet `value << 1 |
+    telemetry`, as Betaflight packs it (value 0 disarm, 1 to 47 special
+    commands, 48 to 2047 throttle; bits 14:12 ignored). The program adds the
+    checksum (`(v ^ v >> 4 ^ v >> 8) & 0xF`, Betaflight `prepareDshotPacket`).
+  - an **interval word**, bit 15 = 1: bits 14:0 the frame interval I in bit
+    periods, first rise to first rise (600 is 1 kHz at DShot600). I = 0, the
+    reset value, is one-shot; a non-zero I below 19 is taken as 19 (16
+    bits, at least one idle bit, two bits to fetch the next word, so the
+    idle line between frames is at least three bits, against Betaflight's
+    two).
+- **Results**: none.
+- **The repeat stream.** An ESC disarms without a steady stream, and a
+  host's latency should not decide when frames go out. With I > 0 the
+  program keeps an exact frame grid (frame n starts n x I bits after the
+  first, to the tick) and, two bits before each start, takes at most one
+  word from INQ: a frame word goes out at that start, an interval word
+  changes I (0 stops the stream with the line low) and the last frame is
+  repeated, an empty INQ repeats the last frame. A repeated frame has the
+  telemetry bit cleared and its checksum recomputed, as Betaflight sends a
+  telemetry request once. So the host sends `0x8000 | I` once and then
+  frame words at its own pace. The INQ test is `WAITB INQ_NE, T` right
+  after a deadline (the ws2812 idiom), so the `POP` it guards carries a
+  `.bounded` declaration.
+- **The edges.** Each bit starts with `SETP DOUT, 0, D` staged and lands
+  its rise and fall with the next two `WAITD`s. The rise at a period
+  boundary does not depend on the bit, so the program looks at the bit's
+  value only after the rise has landed (`SHLI` into C), which makes the
+  bit loop 18 words and its tightest interval the rise to the fall of a 0
+  bit: 5 slots in 7 ticks (28 clocks at the 4-clock tick the schedule is
+  proved for).
+- **Rates.** DShot300 and DShot150 are the same program with the tick
+  doubled and quadrupled. DShot1200 is not claimed: its tick would be about
+  2 clocks.
+- **Tests** (`tools/tests/test_fw_dshot.py`): frames across the range
+  (0, 1, 47, 48, 1046 with and without telemetry, 1500, 2047) one-shot at
+  48 and 50 MHz; the 40-bit stream with a frame replaced mid-stream and
+  the stop (48 MHz on the RTL, 50 MHz on the model only); the 19-bit
+  floor; DShot300 and DShot150 at 50 MHz and DShot300 at 48 MHz. All on
+  the RTL as well, except where noted. `DshotRx` checks every
+  high time and period against the windows (in bits: T0H 0.30 to 0.425,
+  T1H 0.65 to 0.80, period 0.95 to 1.05, the span of Betaflight's and the
+  handbook's nominals widened by one Betaflight timer unit; no source gives
+  a tolerance, see the model), the 16 bits, Bluejay's frame-length
+  criterion, the checksum and the two-bit idle gap; the test then checks
+  every edge against the tick grid (exact at 48 MHz, within one clock at
+  50 MHz) and the frame starts I bits apart to the tick.
+- **PHY-GL-SDF candidate**: `test_tx_one_shot_frames_across_the_range`
+  at 48 MHz (`board_600_48MHz`): eight frames, 37 k clocks with the
+  program load (7.6 s of RTL), every edge exact
+  to the clock, so a timing-annotated netlist that moves an edge by one
+  clock fails it.
+
+## dshot_bidir.loom: bidirectional DShot with eRPM telemetry
+
+- **Host command**: as `dshot_tx` (frame word, interval word), except
+  that the shortest interval is 20 bits: the fetch takes three bits here.
+- **Results** (pop thread 0), one word per frame sent, in order: bits 11:0
+  the telemetry value `eeem mmmm mmmm` (Betaflight's raw value: the eRPM
+  period is `m << e` us, or an Extended DShot Telemetry type and value),
+  or `0x8001` no reply in the window, `0x8002` a 5-bit code that is not
+  GCR, `0x8003` a checksum whose four nibbles do not XOR to 0xF. With OUTQ
+  full the word is dropped (`WAITB OUTQ_NF, T` guards a `.bounded` PUSH),
+  so the stream never stalls on a slow host.
+- **The frame** is `dshot_tx`'s inverted: the line idles high, each bit is
+  a low pulse of 7 or 14 ticks, and the checksum is inverted (Betaflight
+  `prepareDshotPacket` with telemetry on). The program drives BIDIR0
+  push-pull only for the frame (`OEP DLINE, 1` just before the first
+  fall) and releases it at the end of the 16th bit period; the board's
+  pull-up holds it high between.
+- **The reply** (Betaflight `decodeTelemetryPacket`, the handbook's "eRPM
+  Transmission"): about 30 us after the frame the ESC drives 21 line bits
+  at 5/4 of the bit rate, the first always a 0, each later one toggling the
+  level for a GCR 1. One tick is 1/20 of a frame bit, so a reply bit is
+  exactly 16 ticks. The first fall is found with `WAITP DLINE, 0, T` (a
+  level, so it cannot fall between two slots) against a 36-bit window
+  (60 us at DShot600; `CSRW TD`, since `SETD` reaches only 255 ticks); a
+  `SETD` there starts the sampling grid and each bit is sampled 16 ticks
+  after the last, the first about 1.5 reply bits after the fall. `SHI`
+  with `BE_CFG.ENC = NRZI` decodes the line code: USB's NRZI gives
+  `s = (level == previous level)`, the complement of the GCR bit, and the
+  `BE_CFG` write before each reply sets the previous level to the reply's
+  leading 0. Every fifth bit the last five bits of SR index the 5b/4b
+  table: `LD r6, r6, gcr`, with the table at 0x001..0x017 right after the
+  reset vector so that LD's 5-bit offset reaches it without a base
+  register, and the complement folded into the table's order. A code that
+  is not GCR is flagged and sampling goes on to the end of the reply, so
+  the next frame never lands on the ESC's bits. Then the four nibbles must
+  XOR to 0xF, and the value is pushed. The reply loop is 14 slots in a
+  16-tick bit (64 clocks at the 4-clock tick): two slots of slack.
+- **The frame grid** is kept across the reply: TD at the end of the 16th
+  bit is saved with `CSRR`, the reply runs on its own deadlines, then
+  `CSRW TD` puts it back and the gap loop's `WAITD`s on deadlines already
+  passed complete at once, catching up to the grid. Two bits before a start
+  the program checks that it is on time (`NOW - TD` below 8 ticks); if a
+  reply ran into that point the grid slips instead of the frame breaking.
+  It never slips for I of 72 bits or more, 54 when the replies come 30 us
+  after the frame; 8 kHz at DShot600 is I = 75.
+- **Weaker than a dedicated receiver**: the reply is sampled mid-bit on the
+  program's own clock, as a UART does, while Betaflight times every edge.
+  The ESC's clock error therefore accumulates over 20 bits: measured on the
+  model in 0.5 % steps, the reply decodes with the ESC off by -1.5 % to
+  +2.5 % at DShot600 (50 MHz) and -2.5 % to +2 % at DShot300, and the
+  window takes replies 5 to 58 us after the frame. No source gives an ESC's
+  clock accuracy (`QUESTIONS.md` item 5). Edge resynchronisation would need
+  more than the two spare slots of a DShot600 reply bit.
+- **Words**: 154, so the program runs 26 words into thread 1's quarter
+  (to 0x099). The first-draft budget had the table, the receive loop and
+  the transmit loop of `dshot_tx` in one quarter; it came to 150, with no
+  feature that could go without weakening the protocol, and a split over
+  two threads would have needed the host to set the tick of both.
+- **Tests**: five telemetry values (stopped 0xFFF, eRPM periods with
+  exponents 0 to 3, an EDT temperature frame) at DShot600 on 48 and 50 MHz
+  boards (50 MHz on the RTL, 48 MHz on the model only) and three at
+  DShot300; a bad checksum, a non-GCR code below the
+  table (0x00) and inside it (0x1C), and a missing reply, each reported and
+  followed by a good reply; a 100-bit stream whose frames stay exactly 100
+  bits apart across the replies, with one word per frame (48 MHz on the
+  RTL, 50 MHz on the model only); and (model only)
+  reply delays of 20 and 40 us and ESC clocks at -1 % and +2 %. `DshotEsc`
+  decodes the FC's frames with the same checked decoder, and the bench
+  records any cycle where the line is driven both ways (none).
+- **PHY-GL-SDF candidate**: `test_bidir_reply_errors` with `bad_code=0`:
+  five frames on a 48 MHz board (exact edges), the turnaround, four
+  replies and a timeout: 68 k clocks with the program load, 14 s of RTL.
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py`, `test_fw_wiegand.py`, `test_fw_dmx.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py`, `test_fw_wiegand.py`, `test_fw_dmx.py`, `test_fw_dshot.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks

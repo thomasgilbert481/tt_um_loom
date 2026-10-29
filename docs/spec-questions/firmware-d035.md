@@ -344,3 +344,70 @@ status says so; the receiver never stalls. A host reading a large window
 must keep up with 44 us per slot. The window settings sit at 0x0FE..0x0FF,
 the top of thread 1's quarter, so a program on thread 1 must leave them
 (`dmx_controller` does).
+
+## DShot (`dshot_tx.loom`, `dshot_bidir.loom`), integrated 2026-10-29
+
+DShot has no formal standard. The sources are Betaflight (master 81e82a6),
+Bluejay (0368d11) and the brushlesswhoop "DSHOT - the missing Handbook",
+read on 2026-10-28 and cited in `tools/protomodels/dshot.py`.
+
+### 1. High times and the model's windows
+
+Betaflight drives a 0 high for 7/20 of a bit and a 1 for 14/20; the
+handbook's table says 3/8 and 3/4. No source gives a tolerance.
+
+**Decision:** accepted. The programs drive Betaflight's 7/14/20, the
+transmitter that ESC firmware is tested against. The model's windows span both
+nominals widened by 1/20 bit each way; they are the model's own and
+narrow on purpose, and a wider ESC-side tolerance would need no firmware
+change.
+
+### 2. Telemetry checksum inverted
+
+The handbook says the reply's checksum is sent uninverted; Betaflight and
+Bluejay both use it inverted.
+
+**Decision:** inverted, as the two codebases agree. A reply whose nibbles
+do not XOR to 0xF is reported as 0x8003.
+
+### 3. Bluejay's frame-length criterion
+
+**Decision:** accepted as unchecked. The programs' frames are 15.35 to 15.7
+bit periods, inside the model's 12 to 24 and either reading of Bluejay's
+threshold.
+
+### 4. Reply window of 36 bit periods
+
+No source gives the earliest or latest reply ("about 30 us", Betaflight's
+30 + 5 us dead time).
+
+**Decision:** accepted: 60 us at DShot600. Replies 5 to 58 us after the
+frame decode on the model.
+
+### 5. ESC clock accuracy
+
+The receiver samples mid-bit on its own clock, so it tolerates -1.5 % to
++2.5 % at DShot600 (model, 0.5 % steps). No source gives the ESC's reply
+rate accuracy.
+
+**Decision:** accepted as a stated limit (both README sections). Edge
+resynchronisation would need slots the 16-slot reply bit does not have (2
+slots of slack). Checking against an EFM8BB2 oscillator figure is left for
+a real-hardware demo.
+
+### 6. Telemetry bit cleared on repeated frames
+
+**Decision:** accepted, as Betaflight does. A host that wants it on every
+frame pushes each frame word.
+
+### 7. DShot150 bidirectional and DShot1200
+
+**Decision:** bidirectional DShot is tested at DShot600 and 300 only (the
+handbook says 300 and up). DShot1200 is not claimed: its tick would be
+about 2.08 clocks at 50 MHz, below the 4-clock tick the schedules are
+proved for.
+
+### 8. `dshot_bidir` runs into thread 1's quarter
+
+**Decision:** accepted. 154 words, to 0x099; thread 1 must not be started
+with that image (program header and the table).
