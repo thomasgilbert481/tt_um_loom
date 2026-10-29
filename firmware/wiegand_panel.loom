@@ -1,0 +1,217 @@
+; wiegand_panel.loom
+; A Wiegand panel (the receiver of an access-control door controller):
+; counts the bits of a frame of any length on D0 and D1, ends the frame when
+; the lines have been quiet for the inter-frame timeout, ignores glitches,
+; reports both lines low at once, checks the parities of a 26-bit frame, and
+; pushes a status word and the bits to the host for every frame.
+;
+; Written on 2026-10-28, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; Wiegand: there is no pulse counter on two pins and no inter-frame timeout
+; in hardware. The program uses:
+;   - the timed waits (WAITP ... T against a SETD deadline, SEMANTICS 6.4),
+;     built for the timeouts of PS/2 and I2C clock stretching: they measure
+;     the glitch threshold and catch a line held low;
+;   - the tick restart (a CSRW TICK_INT clears ACC, SEMANTICS 4), built for
+;     the UART, CAN and Manchester receivers to hard-synchronise on a start
+;     bit: here every fall restarts the grid, so the glitch threshold is
+;     measured from the fall and not from a tick boundary;
+;   - NOW (CSRR), compared in firmware against a deadline 16 bits wide,
+;     for the inter-frame timeout, which is longer than SETD's 255 ticks.
+; What the firmware does that no hardware does: watching two lines at once
+; (a poll loop of 6 slots: no single wait instruction watches two pins), the
+; bit count, the frame end, the glitch and both-low checks, and the parity.
+; Weaker than a dedicated peripheral: the two lines are polled, so a fall is
+; seen 2 to 26 clocks after it reaches the pad, and both lines low at once
+; is checked at the fall, at the glitch threshold and at the release of
+; each pulse, not continuously (an overlap that starts and ends between
+; those three points is missed).
+;
+; Pins: D0 = IN0, D1 = IN1, inputs, idle high (the panel's pull-ups). The
+; program never drives them.
+;
+; Memory: 109 words from 0x000, thread 0's quarter (.imem 512). Moved to
+; thread 1 (0x080) it runs beside wiegand_reader.loom on thread 0.
+;
+; Host set-up (FIFO space, thread 0), optional, pushed before RUN: one word,
+; the inter-frame timeout END in ticks, 1 to 32767 (default 5000). The
+; program reads INQ once, at start, and never again.
+;
+; Results (FIFO space read, thread 0): per frame, a status word
+;     bits 7:0   N, the bits received (pulses accepted), modulo 256
+;     bit 8      P26: N = 26, so the parities were checked
+;     bit 9      PERR: N = 26 and a parity is wrong (the even one over bits
+;                1 to 13 or the odd one over bits 14 to 26)
+;     bit 10     GLITCH: at least one pulse shorter than G was ignored
+;     bit 11     BOTH: both lines were low at once; that pulse was not counted
+;     bit 12     LONG: a pulse lasted 255 ticks or more; the frame ended there
+;     bit 13     OVER: N > 48; only the last 48 bits follow
+;     bits 15:14 zero
+; then the bits, ceil(min(N, 48) / 16) words, the frame as one number, most
+; significant word first and right-aligned (a 37-bit frame is bits 36:32,
+; 31:16, 15:0), exactly the layout wiegand_reader.loom takes. A frame of
+; glitches only gives a status word with N = 0 and GLITCH. OUTQ holds four
+; words, one frame of 48 bits or fewer: a host must read each frame before
+; the next one ends, or the program blocks in PUSH and misses pulses.
+;
+; Tick (set by the host before RUN, the M2 convention). The glitch threshold
+; is G = 2 ticks, the stuck-line limit 255 ticks and the timeout END ticks.
+; The suggested tick is 5 us, TICK_INT 250 at 50 MHz: G is then 10 us (SIA
+; AC-01's narrowest pulse is 20 us), the stuck limit 1.275 ms and END 25 ms,
+; longer than the widest interval SIA AC-01 allows (20 ms). TICK_INT must be
+; 16 or more, so that the fall-to-threshold latency below stays under a
+; tick. There is no WAITD in the program: every interval is a timeout, so
+; the deadline checker has no pair to prove (as for ps2_host.loom and
+; ir_nec_rx.loom); `.tick` records the shortest tick the header allows.
+;
+; Timing of one pulse, from the poll that sees the fall (2 to 26 clocks
+; after the pad, the synchroniser and the 6-slot loop):
+;     restart the tick grid; check the other line
+;     SETD G, WAITP Dx, 1, T     released first: a glitch, ignored
+;     check the other line
+;     SETD 255, WAITP Dx, 1, T   still low at 255 ticks: LONG, frame ends
+;     check the other line; shift the bit in; END ticks from now is the
+;     frame's end unless another fall comes first
+;
+; Registers: r0, r1, r2 the last 48 bits (the newest in r2 bit 0); r3 N;
+; r4 scratch; r5 the error flags (bits 2:0: LONG, BOTH, GLITCH) and scratch;
+; r6 the frame-end deadline (NOW + END); r7 END.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   D0 = IN0, D1 = IN1
+        .tick   16                      ; TICK_INT 16 or more (header)
+        .equ    G = 2                   ; glitch threshold, ticks
+        .equ    LMAX = 255              ; a pulse this long: the line is stuck
+        .equ    F_GLITCH = 1            ; r5 flags, bits 10.. of the status
+        .equ    F_BOTH = 2
+        .equ    F_LONG = 4
+        .equ    NBUF = 48               ; bits kept
+
+start:  LDI     r7, lo8(5000)           ; END: 25 ms at a 5 us tick
+        LDIH    r7, hi8(5000)
+        SETD    0                       ; TD reached: the WAITB below is a test
+        WAITB   INQ_NE, T
+        BT      fresh                   ; nothing pushed: the default
+        POP     r7                      ; END from the host (it is there)
+
+; A new frame: wait for idle lines, then for the first fall (untimed).
+fresh:  WAITP   D0, 1
+        WAITP   D1, 1
+        LDI     r0, 0
+        LDI     r1, 0
+        LDI     r2, 0
+        LDI     r3, 0
+        LDI     r5, 0
+hunt:   JP      D0, 0, f0
+        JP      D1, 0, f1
+        JMP     hunt
+
+; Between pulses: the next fall, or END ticks of quiet ends the frame.
+poll:   JP      D0, 0, f0
+        JP      D1, 0, f1
+        CSRR    r4, NOW
+        SUB     r4, r4, r6              ; NOW - deadline
+        SHLI    r4, 1                   ; C = bit 15: negative, not reached
+        BC      poll
+        JMP     fend
+
+; A fall on D0: a 0, if it is a pulse.
+f0:     CSRR    r4, TICK_INT
+        CSRW    TICK_INT, r4            ; restart the grid at the fall
+        JP      D1, 0, both
+        SETD    G
+        WAITP   D0, 1, T
+        BNT     glitch                  ; released within G ticks
+        JP      D1, 0, both
+        SETD    LMAX
+        WAITP   D0, 1, T
+        BT      long
+        JP      D1, 0, both
+        LDI     r4, 0
+        JMP     shift
+
+; Both lines low: the pulse is not counted. Wait for both to be released,
+; each within the stuck limit, and go on with the frame. (Here, between
+; the two pulse paths, so that every JP of both can reach it.)
+both:   ORI     r5, F_BOTH
+        SETD    LMAX
+        WAITP   D0, 1, T
+        BT      long
+        SETD    LMAX
+        WAITP   D1, 1, T
+        BT      long
+        JMP     again
+
+; A fall on D1: a 1.
+f1:     CSRR    r4, TICK_INT
+        CSRW    TICK_INT, r4
+        JP      D0, 0, both
+        SETD    G
+        WAITP   D1, 1, T
+        BNT     glitch
+        JP      D0, 0, both
+        SETD    LMAX
+        WAITP   D1, 1, T
+        BT      long
+        JP      D0, 0, both
+        LDI     r4, 1
+
+; Shift the bit in r4 into r0:r1:r2 at r2 bit 0, count it, set the frame end.
+shift:  SHLI    r0, 1
+        SHLI    r1, 1
+        BNC     s1
+        ORI     r0, 1
+s1:     SHLI    r2, 1
+        BNC     s2
+        ORI     r1, 1
+s2:     OR      r2, r2, r4
+        INC     r3
+again:  CSRR    r6, NOW
+        ADD     r6, r6, r7              ; the frame ends at NOW + END
+        JMP     poll
+
+glitch: ORI     r5, F_GLITCH            ; the line is high again: go on
+        JMP     again
+
+long:   ORI     r5, F_LONG              ; the frame ends here
+
+; The frame is over: the status word, then the bits.
+fend:   MOV     r4, r3
+        LDIH    r4, 0                   ; N, modulo 256
+        SHLI    r5, 10                  ; the flags to bits 12:10
+        OR      r4, r4, r5
+        LDI     r5, 0
+        CMPI    r3, NBUF + 1
+        BNC     f_n                     ; 48 bits or fewer
+        LDIH    r5, 0x20                ; OVER
+        OR      r4, r4, r5
+f_n:    CMPI    r3, 26
+        BNZ     f_push
+        LDIH    r5, 0x01                ; P26
+        OR      r4, r4, r5
+        MOV     r5, r1                  ; frame bits 25:16 ...
+        SHLI    r5, 3
+        MOV     r6, r2
+        SHRI    r6, 13                  ; ... and 15:13: bits 1 to 13
+        OR      r5, r5, r6
+        PAR     r5, r5                  ; C = their XOR: 0 for even parity
+        BC      f_bad
+        MOV     r5, r2
+        SHLI    r5, 3                   ; frame bits 12:0: bits 14 to 26
+        PAR     r5, r5                  ; C = 1 for odd parity
+        BC      f_push
+f_bad:  LDI     r5, 0
+        LDIH    r5, 0x02                ; PERR
+        OR      r4, r4, r5
+f_push: PUSH    r4                      ; blocks while OUTQ is full
+        TEST    r3, r3
+        BZ      fresh                   ; glitches only: no bits
+        CMPI    r3, 33
+        BNC     f_2                     ; 32 bits or fewer
+        PUSH    r0
+f_2:    CMPI    r3, 17
+        BNC     f_1                     ; 16 bits or fewer
+        PUSH    r1
+f_1:    PUSH    r2
+        JMP     fresh

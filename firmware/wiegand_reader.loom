@@ -1,0 +1,214 @@
+; wiegand_reader.loom
+; A Wiegand reader (the transmitter of an access-control card reader): sends
+; frames of 1 to 48 bits on D0 and D1, with the pulse width and the pulse
+; interval set by the host, and computes the two parities of the common
+; 26-bit format itself.
+;
+; Written on 2026-10-28, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; Wiegand: there is no pulse generator on two pins. The program uses:
+;   - two open-drain BIDIR pins (OD_MASK), built for I2C: a reader's D0 and
+;     D1 are open collector, so the program only pulls a line low or lets
+;     it go, and the panel's pull-ups make the high level;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every fall and every release lands on the
+;     exact clock of its deadline, so each pulse width and each interval is
+;     exact to the clock, whatever the code between them does;
+;   - the deadline schedule (WAITD), so the pulse width and the interval,
+;     which the host chooses at run time, are counted in ticks by a WAITD 1
+;     loop that the deadline checker proves at the declared tick.
+; What the firmware does that no hardware does: the choice of line per bit,
+; the pulse and interval timing, the frame layout and the 26-bit parities.
+; A dedicated peripheral would take its timing from registers in any unit;
+; here the width and the interval are whole ticks, so the host picks the
+; tick as the resolution (5 us below).
+;
+; Pins: D0 = BIDIR0, D1 = BIDIR1, open drain (OD_MASK bits 0 and 1, set with
+; a read-modify-write so other threads' bits survive). Idle: both released.
+; A 0 is a low pulse on D0, a 1 a low pulse on D1, never both at once
+; (SIA AC-01; tools/protomodels/wiegand.py gives the windows and sources).
+;
+; Memory: 107 words from 0x000, thread 0's quarter (.imem 512). With
+; wiegand_panel.loom moved to thread 1 (0x080) the two fit together.
+;
+; Host command format (FIFO space, thread 0). Bits 15:13 give the kind,
+; bits 12:0 the value v:
+;   0 FRAME   v = N, the bit count, 1 to 48; then ceil(N / 16) data words,
+;             the frame as one N-bit number, most significant word first
+;             and right-aligned (a 37-bit frame is bits 36:32, 31:16, 15:0).
+;             The bits go out MSB first. N = 0 or N > 48: the header is
+;             dropped and nothing is sent (the data words that follow would
+;             then be read as commands: the host must not do that).
+;   1 CARD26  then two words: the 8-bit facility code (bits 7:0) and the
+;             16-bit card number. The program sends the 26-bit frame
+;             P(even) FC CARD P(odd): the even parity over the first 12 data
+;             bits, the odd parity over the last 12.
+;   2 WIDTH   v = the pulse width PW in ticks, 1 or more (reset value 10).
+;   3 PERIOD  v = the pulse interval IV in ticks, fall to fall, more than PW
+;             (reset value 200). The host keeps PW < IV.
+;   4 GAP     hold both lines idle for v ticks before the next command:
+;             what a panel needs to see the end of a frame. Queue one after
+;             each frame unless the host itself waits between frames.
+;   5..7      ignored.
+; Results: none; nothing is pushed to OUTQ.
+;
+; Tick (set by the host before RUN, the M2 convention): the resolution of
+; the width and the interval. The suggested tick is 5 us, TICK_INT 250 at
+; 50 MHz: then the reset values are a 50 us pulse every 1 ms, and SIA AC-01's
+; windows (pulse width 20 to 100 us, interval 200 us to 20 ms) are PW 4 to
+; 20 and IV 40 to 4000. The deadline checker proves the schedule for any
+; tick of TICKMIN clocks or more (.tick below); the RTL tests run at that
+; tick with PW 2 and IV 6 (see tools/tests/test_fw_wiegand.py).
+;
+; Timing. Every edge is a staged SETP ... D that lands on a deadline:
+;     fall F       on the WAITD 1 that ends the interval before it
+;     release      F + PW: PW - 1 ticks of WAITD 1 loop, then the release
+;                  staged and one more WAITD 1
+;     next fall    F + IV: IV - PW - 1 ticks of loop after the release,
+;                  then the fall staged and one more WAITD 1
+; Nothing is staged while the loop runs, so the latch always fires on the
+; deadline right after the stage (SEMANTICS 6.10 rule 1). A frame starts
+; with an anchor (SETD 1, WAITD 1) and then a full interval before its first
+; fall, so its first pulse is timed like every other one. Between commands
+; the program blocks in POP; the next frame or gap re-anchors.
+;
+; Registers: r0, r1, r2 the frame words, the current one in r0 (it holds
+; bit r3 - 1 of the frame at position (r3 - 1) & 15); r3 the bits left;
+; r4 the tick counter of the delay loop and scratch; r5 the command and
+; scratch; r6 PW; r7 IV. r7 is the `.csr` scratch only before r7 is set.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    D0PIN = 0               ; BIDIR0
+        .equ    D1PIN = 1               ; BIDIR1
+        .pins   D0 = D0PIN, D1 = D1PIN
+        .equ    ODBITS = (1 << D0PIN) | (1 << D1PIN)
+        .equ    TICKMIN = 100           ; the shortest tick the schedule is proved at
+        .tick   TICKMIN
+        .equ    K_FRAME = 0             ; command kinds, bits 15:13
+        .equ    K_CARD26 = 1
+        .equ    K_WIDTH = 2
+        .equ    K_PERIOD = 3
+        .equ    K_GAP = 4
+        .equ    NMAX = 48               ; the longest frame: three words
+
+start:  CSRR    r7, OD_MASK
+        ORI     r7, ODBITS
+        CSRW    OD_MASK, r7             ; D0 and D1 open drain
+        SETP    D0, 1                   ; both released: the pull-ups hold them high
+        SETP    D1, 1
+        LDI     r6, 10                  ; PW: 50 us at a 5 us tick
+        LDI     r7, 200                 ; IV: 1 ms
+
+cmd:    POP     r5                      ; the next command (blocks)
+        MOV     r4, r5
+        SHRI    r4, 13                  ; the kind
+        SHLI    r5, 3
+        SHRI    r5, 3                   ; v, bits 12:0
+        CMPI    r4, K_FRAME
+        BZ      frame
+        CMPI    r4, K_CARD26
+        BZ      card26
+        CMPI    r4, K_WIDTH
+        BZ      width
+        CMPI    r4, K_PERIOD
+        BZ      period
+        CMPI    r4, K_GAP
+        BNZ     cmd                     ; 5..7: ignored
+gap:    SETD    1                       ; re-anchor after the unbounded POP
+        WAITD   1
+        MOV     r4, r5
+        CALL    delay                   ; v ticks of idle line
+        JMP     cmd
+width:  MOV     r6, r5
+        JMP     cmd
+period: MOV     r7, r5
+        JMP     cmd
+
+; FRAME: N in r5, then ceil(N / 16) words into r0, r1, r2.
+frame:  TEST    r5, r5
+        BZ      cmd                     ; N = 0: dropped
+        CMPI    r5, NMAX + 1
+        BC      cmd                     ; N > 48: dropped
+        MOV     r3, r5                  ; bits left
+        ADDI    r5, 15
+        SHRI    r5, 4                   ; words to pop: 1, 2 or 3
+        POP     r0
+        DEC     r5
+        BZ      send
+        POP     r1
+        DEC     r5
+        BZ      send
+        POP     r2
+        JMP     send
+
+; CARD26: FC in r0, card in r1; build the 26-bit frame
+; P(even) FC[7:0] CARD[15:0] P(odd), right-aligned: r0 = bits 25:16,
+; r1 = bits 15:0.
+card26: POP     r0                      ; FC in bits 7:0
+        POP     r1                      ; the card number
+        LDIH    r0, 0                   ; keep FC's eight bits only (LDIH clears 15:8)
+        MOV     r5, r1
+        SHRI    r5, 12                  ; card[15:12]
+        XOR     r5, r5, r0              ; with FC: the first 12 data bits
+        PAR     r5, r5                  ; C = their XOR = the even parity bit
+        BNC     pe0
+        LDIH    r0, 1                   ; P(even) at bit 8, above FC
+pe0:    SHLI    r0, 1                   ; P FC at 9:1
+        MOV     r5, r1
+        SHRI    r5, 15
+        OR      r0, r0, r5              ; card[15] at bit 0: r0 = frame bits 25:16
+        MOV     r5, r1
+        SHLI    r5, 4                   ; card[11:0], the last 12 data bits
+        SHLI    r1, 1                   ; card[14:0] at 15:1
+        PAR     r5, r5                  ; C = their XOR
+        BC      po0                     ; odd already: P(odd) = 0
+        ORI     r1, 1                   ; P(odd) = 1
+po0:    LDI     r3, 26
+
+; Send r3 bits from r0 (r1, r2), MSB first. The anchor first: from here on
+; every interval is measured from a deadline.
+send:   SETD    1
+        WAITD   1
+bit:    MOV     r4, r7
+        SUB     r4, r4, r6
+        DEC     r4                      ; IV - PW - 1 ticks before the fall
+        MOV     r5, r3
+        DEC     r5
+        ANDI    r5, 15                  ; the bit's position in r0
+        SHR     r5, r0, r5
+        ANDI    r5, 1                   ; Z: a 0
+        BZ      zero
+        CALL    delay
+        SETP    D1, 0, D                ; a 1: D1 falls ...
+        WAITD   1                       ; ... here, at F
+        MOV     r4, r6
+        DEC     r4                      ; PW - 1 ticks
+        CALL    delay
+        SETP    D1, 1, D
+        WAITD   1                       ; released at F + PW
+        JMP     next
+zero:   CALL    delay
+        SETP    D0, 0, D                ; a 0: D0 falls ...
+        WAITD   1                       ; ... here, at F
+        MOV     r4, r6
+        DEC     r4
+        CALL    delay
+        SETP    D0, 1, D
+        WAITD   1                       ; released at F + PW
+next:   DEC     r3
+        BZ      cmd                     ; the frame is out
+        MOV     r5, r3
+        ANDI    r5, 15
+        BNZ     bit                     ; more bits in r0
+        MOV     r0, r1                  ; r0 is spent: the next word
+        MOV     r1, r2
+        JMP     bit
+
+; delay: r4 ticks of WAITD 1 (none for r4 = 0). Nothing is staged while it
+; runs; the caller stages its edge after it and lands it on one more WAITD 1.
+delay:  TEST    r4, r4
+        BZ      d_ret
+d_tick: WAITD   1
+        DJNZ    r4, d_tick
+d_ret:  RET

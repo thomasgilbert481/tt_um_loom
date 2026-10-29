@@ -66,6 +66,8 @@ own from the bit rate it measures on every sync byte.
 | `lin_master.loom` | TX = OUT0 (to a LIN transceiver's TXD), RX = IN0 (its RXD) | 128, and an 11-word frame buffer at 0x1F5 | 10 clocks per tick, 16 ticks per bit (the deadline pairs alone would allow 7) | 28 clocks | 19200, 10417 and 9600 bit/s (TICK 162 + 195/256, 300, 325 + 133/256); 195 kbit/s (TICK 16) and 100 kbit/s (TICK 31 + 64/256) as test rates; a slave 2 % off |
 | `lin_slave.loom` | TX = OUT0, RX = IN0 (thread 0); OUT1, IN1 beside the master | 218 (runs 90 words into the next quarter), and an 80-word table at 0x180 | 32 clocks (set by the program; the half-bit tick it measures is 1250 clocks or more at LIN rates) | 4 clocks | a master at 19200, 10417 and 9600 bit/s, each 14 % slow, exact and 14 % fast; 100 kbit/s as the test rate |
 | `hdlc_loopback.loom` | TX = OUT0, RX = IN0 | 127 (thread 0) + 152 (thread 1: 103, and a 49-word report block at 0x148); buffers 0x100 (TX) and 0x180 (RX) | thread 0: 64 clocks per bit (781 kbit/s); thread 1: 19 clocks per tick, 8 ticks per bit (329 kbit/s) | 0 clocks (both threads) | 329 kbit/s wire loopback (thread 0 TICK 152, thread 1 TICK 19) and 64 kbit/s (TICK 781 + 64/256; TICK 97 + 168/256); a sender at +1 % (RTL), +1.5 % and -3 % (329 kbit/s) and +-2.5 % (64 kbit/s) |
+| `wiegand_reader.loom` | D0 = BIDIR0, D1 = BIDIR1 (open drain, the panel's pull-ups) | 107 | 100 clocks per tick (host-set; suggested 250, 5 us at 50 MHz) | 4 clocks | 50 us pulses every 1 ms at 50 MHz (TICK 250, PW 10, IV 200); at a 5 MHz test clock (TICK 100, 20 us): PW 20, 40 and 100 us, IV 200 us and 20 ms; every pulse and interval exact to the clock |
+| `wiegand_panel.loom` | D0 = IN0, D1 = IN1 | 109 | 16 clocks per tick (host-set; suggested 250, 5 us); timeouts only | no deadline pairs; falls seen 2 to 26 clocks late (a 6-slot poll) | SIA AC-01's windows at 5 MHz (TICK 25): pulses 20 to 100 us, 200 us intervals with +-2 us jitter; 20 ms intervals at 50 MHz (TICK 250, 25 ms timeout); glitches under 2 ticks (10 us) ignored |
 
 Every program assembles with `--strict` and no diagnostic at all: each
 deadline pair is proved, apart from the five intervals declared `.bounded`
@@ -101,6 +103,15 @@ proved `.tick`. `ir_nec_tx` has the fourth and fifth, the ws2812 idiom
 again: the two `POP`s of the next frame or repeat word, each guarded by a
 `WAITB INQ_NE, T` right after a deadline, on an interval of 25 slots
 against 8 ticks of at least 16 clocks.
+
+The two Wiegand programs run together, reader on thread 0 (0x000, 107 words) and panel on
+thread 1 (0x080, 109 words), each in its own quarter.
+
+`wiegand_reader` and `wiegand_panel` keep the M2 convention for the rate:
+the host sets each one's tick. The reader's width and interval are whole
+ticks, so its tick is the resolution; the panel's tick scales its glitch
+threshold (2 ticks), its stuck-line limit (255 ticks) and its inter-frame
+timeout (5000 ticks by default, or a word the host pushes before RUN).
 
 ```
 python -m tools.loomasm firmware/uart_rx.loom --strict --listing
@@ -1166,13 +1177,89 @@ sends and removes the stuff bits, and finds flags and aborts.
   `test_loopback_short_and_stuff_heavy_frames` adds the stuff-bit path
   (`SETP` and the `BE_CFG` write) on both sides.
 
+## wiegand_reader.loom: a Wiegand card reader
+
+Written on 2026-10-28, after the hardware was complete (D-032), as a
+protocol Loom was not designed for (D-035). Wiegand is the interface
+between access-control card readers and door controllers: two
+open-collector lines, idle high; a 0 is a low pulse on D0, a 1 a low pulse
+on D1, never both at once. SIA AC-01 (1996) gives a pulse width of 20 to
+100 us and an interval of 200 us to 20 ms (as quoted by US patent
+8,943,562 and by Suprema's BioStar 2 note; the standard itself was not
+reachable, see `tools/protomodels/wiegand.py`).
+
+Nothing in Loom was built for Wiegand. The reader uses the open-drain BIDIR
+pins built for I2C, the deadline-latched `SETP ... D` built for ws2812's
+clock-exact edges, and a `WAITD 1` loop that counts the host's width and
+interval in ticks. What the firmware does that no hardware does: the line
+per bit, the pulse and interval timing, the frame layout, and the two
+parities of the 26-bit format, computed with `PAR`.
+
+- **Host commands** (push to thread 0): bits 15:13 the kind, 12:0 a value.
+  0 FRAME, N = 1 to 48, then ceil(N/16) words of the frame, right-aligned,
+  most significant word first; 1 CARD26, then the facility code and the card
+  number (the program adds both parities); 2 WIDTH, PW in ticks; 3 PERIOD,
+  IV in ticks, fall to fall (PW < IV; reset values 10 and 200); 4 GAP, hold
+  the lines idle for v ticks; 5 to 7 ignored.
+- **Results**: none.
+- **Timing**: every fall and release is a staged write landing on a
+  deadline, so each width is PW ticks and each interval IV ticks to the
+  clock (the tests check every pulse). Every deadline pair is proved at a
+  tick of 100 clocks or more; worst slack 4 clocks, on the path from a
+  release through the next bit's selection to the first tick of the
+  interval.
+- **Weaker than a peripheral**: widths and intervals are whole ticks; at
+  the suggested 5 us tick that is a 5 us step, finer than SIA's windows
+  need. N is at most 48 (three words in registers); INQ is four deep, so a
+  48-bit frame is the whole queue.
+
+## wiegand_panel.loom: a Wiegand door controller
+
+Written on 2026-10-28, after the hardware was complete (D-032), as a
+protocol Loom was not designed for (D-035). Loom has no pulse counter on two
+pins and no inter-frame timeout in hardware. The panel uses the timed
+waits built for the PS/2 and I2C timeouts (`WAITP ... T` against `SETD`)
+for the glitch threshold and the stuck-line limit, the tick restart built
+for the UART, CAN and Manchester receivers (a `CSRW TICK_INT` at every
+fall, so the threshold is measured from the fall), and `NOW` compared in
+firmware for the inter-frame timeout, which is longer than `SETD`'s 255
+ticks. What the firmware does that no hardware does: watching two lines at
+once (no wait instruction watches two pins, so a 6-slot poll), counting,
+ending the frame, the glitch and both-low checks and the 26-bit parity.
+
+- **Set-up**: optionally one word pushed before RUN, the timeout END in
+  ticks (default 5000, 25 ms at a 5 us tick, past SIA's 20 ms).
+- **Results** (pop thread 0): per frame a status word, bits 7:0 N, 8 P26
+  (N = 26, parities checked), 9 PERR, 10 GLITCH (a pulse under 2 ticks
+  ignored), 11 BOTH (both lines low: that pulse not counted), 12 LONG (a
+  pulse of 255 ticks: the frame ends), 13 OVER (N > 48); then ceil(min(N,
+  48)/16) words of the bits in the reader's layout.
+- **Thresholds measured** (model, 5 MHz, tick 25): a pulse of 68 clocks
+  rejected, 70 accepted for one alignment; in general under 2 ticks
+  always rejected, over 2 ticks plus 30 clocks always accepted (10.6 us at
+  50 MHz and a 5 us tick, against SIA's 20 us minimum).
+- **Weaker than a peripheral**: a fall is seen 2 to 26 clocks after the
+  pad; both lines low at once is checked at the fall, at the threshold and
+  at the release of each pulse, not continuously; OUTQ holds one frame of
+  48 bits or fewer, so the host reads each frame before the next one ends.
+
+**Tests.** `tools/tests/test_fw_wiegand.py` (L3), on the model under pytest and on the
+RTL under cocotb (`LOOM_FW_ONLY=test_fw_wiegand`). The RTL runs at a 5 MHz
+test clock: the reader's tick 100 (20 us), the panel's 25 (5 us), SIA's
+shortest interval (200 us) and a host-set 500 us timeout, so a 26-bit frame
+is 26,000 clocks; the 50 MHz bodies and the 20 ms intervals are
+`model_only`.
+
+**PHY-GL-SDF candidate**: `test_reader_sends_a_26_bit_card_with_exact_pulses`
+(RTL; 26 latched falls and releases on two open-drain pads, each edge
+checked to the clock, about 30,000 clocks).
 
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py`, `test_fw_wiegand.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks

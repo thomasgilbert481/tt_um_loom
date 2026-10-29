@@ -252,3 +252,45 @@ that sets more gets n mod 128.
 (thread 1, 103 words and a 49-word report block at 0x148) share one file
 so the wire loopback and its tests build from one source; buffers at 0x100
 (TX) and 0x180 (RX), so threads 2 and 3 must not be started.
+
+## Wiegand (`wiegand_reader.loom`, `wiegand_panel.loom`), integrated 2026-10-29
+
+### 1. SIA AC-01 was not read
+
+The standard is sold by SIA. The pulse-width window (20 to 100 us) and the
+interval window (200 us to 20 ms) come from two secondary sources that
+agree: US patent 8,943,562 (its background section cites the standard)
+and Suprema's BioStar 2 support article 24000028006.
+
+**Decision:** accepted. The model's docstring marks the four figures as
+checked against two secondary sources, not the standard. If a copy of
+AC-01 turns up, check them and any inter-frame figure it gives.
+
+### 2. The inter-frame timeout has no cited figure
+
+**Decision:** accepted as a choice, marked unchecked. The panel's default
+is 25 ms (5000 ticks of 5 us), longer than the widest legal interval, and
+the host can set it before RUN.
+
+### 3. The 37-bit (HID H10304) layout is unchecked
+
+**Decision:** accepted. Neither program depends on it: the reader sends a
+37-bit frame as raw data and the panel checks parity only for 26 bits.
+Only the tests' 37-bit card values use the layout, which the model marks
+unchecked.
+
+### 4. The panel polls the two lines
+
+No wait instruction watches two pins, so a fall is seen 2 to 26 clocks
+late and both lines low at once is checked at three points per pulse.
+
+**Decision:** accepted as a stated limit (program header and "Weaker than
+a peripheral" in `firmware/README.md`). Against SIA's 20 us minimum pulse,
+26 clocks at 50 MHz is 0.52 us. A thread per line would see falls within
+a slot but costs a second thread; not worth it for D-035.
+
+### 5. RTL tests at a 5 MHz board clock
+
+**Decision:** accepted, as for the NEC tests at 1.824 MHz: the waveforms
+are SIA's in microseconds, with fewer clocks per pulse. The 50 MHz bodies,
+the 20 ms intervals and the default 25 ms timeout run on the model only.
