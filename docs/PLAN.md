@@ -528,13 +528,18 @@ finished inside six hours; the L3 suite passes at gate level on that netlist;
       on them, PHY-GL-SDF 16 of 16 with the changed common programs
       (VERIFICATION L5). DShot600, DMX512 and Wiegand were not started
       then; they are the next item.
-- [ ] D-035, second batch, to the same bar: a DShot600 transmitter (and
+- [x] D-035, second batch, to the same bar: a DShot600 transmitter (and
       bidirectional telemetry if it fits); a DMX512 controller and fixture
       (ANSI E1.11); a Wiegand reader and panel. Thomas asked for them on
       2026-10-28; one agent per protocol in its own worktree
       (`tt_um_loom_fw7_{dshot,dmx,wieg}`, from acf8487), run by the nightly
       task, then integrated with the README section, the recounts and
       PHY-GL-SDF as the first batch was. Before the firmware freeze.
+      Done 2026-10-29 in one nightly run: Wiegand (589cc04), DMX512
+      (1357da1) and DShot600 with bidirectional telemetry (e1bc73e), each
+      green on both backends within 0.6 h of its agent's start; the
+      README section, info.md and the recounts; PHY-GL-SDF 6 of 6 on the
+      8x4 netlist (VERIFICATION L5).
 - [x] D-035, the common-settings gaps: the SPI slave in modes 1 and 2; the
       I2C master at exactly 100 and 400 kHz, checked against UM10204's
       timing; a UART baud-rate table; builds of the UART, SPI and I2C
@@ -987,3 +992,23 @@ Newest at the bottom. One line per session: date, model, what changed, next step
   window, cited sources); worktrees `tt_um_loom_fw7_{dshot,dmx,wieg}` on
   branches `fw7-*` from acf8487. No agent started in the day. Next: the
   nightly task runs the three agents and integrates them.
+- 2026-10-28 to 2026-10-29 (nightly D-035 run), Opus 5.5: the three
+  second-batch agents started at 23:12 and each was green on both
+  backends within 0.6 h. Integrated, each verified in main (--strict
+  clean, the module on the model and the RTL, check_all quick with
+  test_mutate_rekey): Wiegand reader and panel (589cc04: model 30
+  passed, RTL 24 of 24, 1,860 tool tests), DMX512 controller and fixture
+  (1357da1: model 14, RTL 4 of 4, 1,874), DShot600 transmitter and
+  bidirectional DShot with eRPM telemetry (e1bc73e: model 31, RTL 12 of
+  12, 1,905). Director decisions in
+  `docs/spec-questions/firmware-d035.md` (SIA AC-01 and ANSI E1.11 were
+  not read, their figures rest on secondary sources and are marked; the
+  DShot telemetry checksum inverted, as Betaflight and Bluejay have it).
+  CI on e1bc73e: test 283 of 283 (run 40821101047). README section,
+  info.md's program and hardware lists and the recounts (275 scenarios on
+  the model, 166 on the RTL; 1,905 tool tests). PHY-GL-SDF on the 8x4
+  netlist of run 37547764383: 6 of 6 (one scenario per new program; the
+  Wiegand panel with the reader), 22 of 22 for D-035. Worktrees and
+  branches removed; the second-batch M4 item is checked, so every D-035
+  item is. Next: the freeze run on 2026-11-08 as planned; the optional M5
+  video.

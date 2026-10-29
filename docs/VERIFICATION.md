@@ -149,6 +149,18 @@ reference model, check data and timing.
   - L3-HDLC: the wire loopback and frames from an ISO/IEC 13239 model
     (zero-bit insertion, NRZI, FCS-16 with RFC 1662's check value), with
     errors and a sender's clock offset; 14 scenarios, 6 on the RTL.
+  - L3-WIEGAND: `wiegand_reader`'s pulses checked against SIA AC-01's
+    windows by a panel model, and `wiegand_panel` fed by a reader model
+    with jitter, glitches, both lines low and missing bits; the two
+    together on two threads; 27 scenarios, 24 on the RTL.
+  - L3-DMX: `dmx_controller`'s packets checked field by field against
+    E1.11's transmit column, and `dmx_fixture` fed at the receive
+    column's limits, a sender 2 % off, short breaks, short marks and
+    framing errors; 14 scenarios, 4 on the RTL.
+  - L3-DSHOT: `dshot_tx`'s frames decoded pulse by pulse against windows
+    from Betaflight's timing, and `dshot_bidir` against an ESC model that
+    answers with GCR telemetry (delay, clock error, bad codes and
+    checksums, no reply); 19 scenarios, 12 on the RTL.
 
 **Tools finding T-1 (2026-09-24): the deadline checker is optimistic after
 `SETD`.** Every program's header says each deadline pair is proved, and
@@ -284,6 +296,18 @@ property that only reaches bounded depth is listed as bounded, not proven.
   table 10 in standard (TICK 31 + 64/256) and fast mode (TICK 7),
   `spi_slave` in modes 1 and 2, and `hdlc_loopback`'s stuff bits
   (`test_loopback_short_and_stuff_heavy_frames`); 16 of 16 in all.
+  Extended 2026-10-29 for D-035's second batch, same netlist and SDF:
+  `wiegand_reader` `test_reader_sends_a_26_bit_card_with_exact_pulses`,
+  `dmx_controller` `test_controller_sends_short_packets_timed_to_e111`,
+  `dmx_fixture` `test_fixture_keeps_its_window_and_reports_each_packet`,
+  `dshot_tx` `test_tx_one_shot_frames_across_the_range_board_600_48MHz`
+  and `dshot_bidir` `test_bidir_reply_errors_bad_code_0` (the reply path:
+  turnaround, GCR decode, a bad code and a timeout): 5 of 5 passed, 7.0
+  ms simulated, 15 to 32 minutes in four parallel groups. Then
+  `wiegand_panel` through `test_reader_and_panel_together` (the reader on
+  thread 0 wired to the panel on thread 1, as the LIN slave ran with its
+  master): 1 of 1, 2.8 ms simulated, 19 minutes. 22 of 22 for D-035 in
+  all.
 - PHY-PRECHECK: TT precheck clean on every push to main.
 
 ### L6: FPGA and bench
@@ -347,7 +371,7 @@ run it.
 | L2-RAND, L2-TRACE, L2-SLOT | `tools/loomgen` + `test/test_cosim.py` | lockstep on every cycle: retire record, pads, `HOST_IRQ`, guard registers, periodic full state. Both sides built from `CTRL.CAPS`, so the M2 features (FIFOs, bit engine, `SETP ... D`) are exercised, and two seeds drive the host port throughout the run. Slice A (2026-09-22): the generator drives `ENC`, `STUFF` and `DIFF` in a build with `CAPS[9]`; the default run and a 36 + 4 seed sweep at seed base 1000 (`LOOM_COSIM_SEEDS=36 LOOM_COSIM_SEED_BASE=1000 LOOM_COSIM_SPI_SEEDS=4`) both end with zero divergences between the two independently written implementations of 6.9.1, with every one of the 25 slice A bins hit. Slice B (the same day): the generator emits `LD`/`ST` into a per-thread data window in a build with `CAPS[5]`; the default run and a 36 + 4 seed sweep at seed base 2000 end with zero divergences between the two implementations of 6.11, all five `LD`/`ST` bins hit |
 | L2-COV | `test/cosim_coverage.py`, `test/cosim_coverage_m2.py` | 578 bins (25 added with slice A: the encoder, stuffer and DIFF each shift ran with, `SHI` leaving T set, the `BE_CFG` fields written), 33 empty at the default run, each listed with its reason |
 | L2-DEADLINE | `test/test_timing.py`, `test/test_setpd.py`, the assembler's checker | |
-| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD, from 2026-09-23 L3-USB-LS, L3-I2C-S, L3-CAN, from 2026-09-24 L3-MANCH, and from 2026-10-12 to 2026-10-27 (D-035) L3-IR-NEC, L3-ONEWIRE, L3-LIN, L3-HDLC | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 215 scenarios on the model, 126 on the RTL (2026-10-27, eighteen modules; it was 109 and 95 before D-035), from 2026-10-06 including `test_fw_four_at_once` (four programs on four threads, every pin edge of each on the same clock as alone) (the rest marked `model_only` with the reason; all 14 of those pass on the RTL too with `LOOM_FW_SET=model_only`: 2026-09-24, 351 s, and again on 2026-09-26 at 2c8fa48 after the T-1 firmware fixes, 256 s), no divergence between the sides |
+| L3-UART-TX/RX, L3-SPI-M, L3-SPI-S, L3-I2C-M, from 2026-09-22 L3-WS2812, L3-PS2, L3-JTAG, L3-SWD, from 2026-09-23 L3-USB-LS, L3-I2C-S, L3-CAN, from 2026-09-24 L3-MANCH, and from 2026-10-12 to 2026-10-29 (D-035) L3-IR-NEC, L3-ONEWIRE, L3-LIN, L3-HDLC, L3-WIEGAND, L3-DMX, L3-DSHOT | `tools/tests/test_fw_*.py` (golden model) and `test/test_fw.py` through `test/rtl_bench.py` (RTL) | the same test bodies and the same `tools/protomodels` models on both sides; 275 scenarios on the model, 166 on the RTL (2026-10-29, twenty-one modules; it was 109 and 95 before D-035), from 2026-10-06 including `test_fw_four_at_once` (four programs on four threads, every pin edge of each on the same clock as alone) (the rest marked `model_only` with the reason; all 14 of those pass on the RTL too with `LOOM_FW_SET=model_only`: 2026-09-24, 351 s, and again on 2026-09-26 at 2c8fa48 after the T-1 firmware fixes, 256 s), no divergence between the sides |
 | L4 formal | `formal/` (9 groups, `scripts/formal.sh`) | 22 properties: SCHED-1..3, FIFO-1..3, PIN-1, PIN-2, TIMER-1B/C, TIMER-2, ISA-1, ISA-2, SPI-1A..C, ISO-1, WAIT-1, WAIT-1A; unbounded where the engine closes it, k-induction otherwise, each recorded in `formal/README.md` with engine and depth. The two-copy miter `iso` is proved unbounded by `abc pdr` for all four threads with the debug port quiet, with a depth-24 BMC cross-check; `wait` is bounded at depth 40 at the reset tick period. Nothing in the list is unattempted. Four findings: F-1 (the TIMER-1 wording, corrected above), F-2 (PIN-1, a real bug, D-023), F-4 (the ISO-1 wording and the shared debug / register-file / staged-write ports) and F-5 (the WAIT-1 bound's unit); two harness findings came with slice B, F-6 (properties that took the LD/ST completion slot for an instruction) and F-7 (ISO-1 not comparing slice B's state or a thread's stores) |
 | L7 mutation | `tools/mutate` (operators, runner, report; `make SRC_DIR=<mutated copy>` under it) | M2 full pass: 823 mutants, 99.7 per cent killed with the 44 equivalents set aside; freeze-time run on d1ea0ac (2026-09-29): 911 mutants, 99.9 per cent with 60 equivalents set aside, eleven holes closed by new tests, one open survivor that is a bug (BUGS 11); the two results sections below |
 | L5 physical, L6 FPGA | | L5 is the CI `gds` run (DRC, LVS, antenna, precheck, gate-level tests); L6 is not done, by decision (D-024): nothing runs on hardware before silicon |

@@ -75,12 +75,12 @@ miss". The state on 2026-09-22 is:]
   so every built feature is exercised; 553 coverage bins, 33 empty with a
   recorded reason each; four of five hand-written mutants killed at the first
   seed.
-- L3 protocol: 215 scenarios on the model and 126 on the RTL across
-  twenty programs (seven of them, D-035, written after the hardware was
+- L3 protocol: 275 scenarios on the model and 166 on the RTL across
+  twenty-six programs (thirteen of them, D-035, written after the hardware was
   complete for protocols Loom was not designed for), one of them four
   programs at once, one per thread,
   whose pin edges each fall on the same clock as when that program runs
-  alone (`test_fw_four_at_once`: ISO-1 on the pins; the 89 left out of the routine RTL run are slow cases, each
+  alone (`test_fw_four_at_once`: ISO-1 on the pins; the 109 left out of the routine RTL run are slow cases, each
   marked with the reason: 115200-baud UART reception, most of the SPI mode
   sweep, the longest PS/2 frames, the USB host at +-0.25 per cent of the bit
   rate, the 257-byte EEPROM read, and the long cases of the later programs;

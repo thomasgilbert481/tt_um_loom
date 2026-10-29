@@ -45,17 +45,19 @@ timing exact and checkable before it runs.
   BIDIR0..BIDIR7 (`uio[7:0]`), each bidirectional pin with its own
   open-drain mode.
 
-Twenty protocol programs come with the design (besides two small UART
+Twenty-six protocol programs come with the design (besides two small UART
 demos from the first milestone), each with a test whose bodies run both on
 the golden model and on the RTL through the real SPI pads: UART transmit
 and receive, SPI master and slave, I2C master, a 24C02-style I2C EEPROM,
 WS2812, PS/2 host, JTAG (IDCODE read), SWD (DPIDR read), a CAN 2.0A node, a
 USB low-speed HID mouse (enumeration and an interrupt IN endpoint) and a
-Manchester loopback. Seven more were written after the hardware was
+Manchester loopback. Thirteen more were written after the hardware was
 complete, for protocols Loom was not designed for: an NEC infrared
 transmitter and receiver, a 1-Wire master with the ROM search and a
-DS18B20-style device, a LIN master and an auto-baud LIN slave, and an HDLC
-transmitter and receiver. `firmware/README.md` in the repository lists
+DS18B20-style device, a LIN master and an auto-baud LIN slave, an HDLC
+transmitter and receiver, a Wiegand card reader and door panel, a DMX512
+controller and fixture receiver, and a DShot600 transmitter with a
+bidirectional version that decodes the ESC's eRPM telemetry. `firmware/README.md` in the repository lists
 their pins, sizes and rates.
 
 Clock: 50 MHz at the typical corner. At the slow corner (1.08 V, 125 C) the
@@ -121,6 +123,12 @@ protocol programs, as wanted:
 - 1-Wire: a 4.7 kOhm pull-up to 3.3 V on the line.
 - LIN: a LIN transceiver (TXD on OUT0, RXD on IN0).
 - HDLC: OUT0 wired to IN0 for the loopback, or an NRZI sender at 3.3 V.
+- Wiegand: a card reader's D0 and D1 brought to 3.3 V on IN0 and IN1 (or
+  the reader program on BIDIR0 and BIDIR1), with pull-ups to 3.3 V.
+- DMX512: an RS-485 transceiver (DI from OUT0, RO to IN0) and a
+  fixture or a controller.
+- DShot: an ESC's signal input on OUT0, or on BIDIR0 with a pull-up for
+  bidirectional DShot.
 - A logic analyser to watch it all.
 
 Each program sets its pins in its source; `firmware/README.md` lists them.
