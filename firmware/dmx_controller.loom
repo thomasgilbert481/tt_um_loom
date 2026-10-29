@@ -1,0 +1,140 @@
+; dmx_controller.loom
+; A DMX512 controller (ANSI E1.11, USITT DMX512-A): the transmitter that
+; drives a lighting universe. TX goes to the DI input of an RS-485 driver
+; (1 = mark, the line's idle state); the driver's DE is tied on.
+;
+; Written on 2026-10-28, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, the FIFOs) and the bit engine's shift register in manual mode
+; (SHO, SEMANTICS 6.9), which was built for the synchronous serial
+; programs and USB's and CAN's encoders and here shifts out the eleven
+; bits of an 8N2 slot. No hardware knows DMX: the break, the mark after
+; break, the two stop bits, the framing of up to 513 slots and the
+; minimum break-to-break time are all firmware.
+;
+; Pins: TX = OUT0 (movable with the assembler's --pin TX=<pin>).
+;
+; Host command (INQ[0]), per packet:
+;     word 1     the start code in bits 7:0 (0 for dimmer data; 15:8 ignored)
+;     word 2     n, the slot count: 1 .. 512 (0 sends the start code alone,
+;                more than 512 is sent as 512)
+;     n words    the slots, one per word in bits 7:0 (15:8 ignored)
+; Nothing is ever pushed to OUTQ.
+;
+; Rate: one tick is one bit. The host sets TICK_INT = 200, TICK_FRAC = 0
+; before RUN: 4.000 us at 50 MHz, 250 kbit/s exactly, against E1.11's
+; 3.92 .. 4.08 us. The deadline pairs are proved for that tick (.tick
+; below; they also hold for any tick of 64 clocks or more).
+;
+; Timing, every figure from E1.11's transmit column (tools/protomodels/
+; dmx.py cites the table). Every pin write is the instruction right after
+; the WAITD that times it, so every edge lands the same 4 to 7 clocks after
+; its tick and all intervals below are exact multiples of 4 us:
+;     break                 44 bits = 176 us   (min 92 us, 176 typical)
+;     mark after break       4 bits =  16 us   (min 12 us)
+;     slot                  11 bits =  44 us   (start, 8 data LSB first, 2 stop)
+;     mark between slots     0 while the host keeps INQ fed; otherwise
+;                            whole bits until the next word arrives
+;     mark before break     at least 1 bit after the last stop bit
+;     break to break        at least 302 bits = 1208 us (min 1204 us), so
+;                            a short packet is padded with mark before break
+; The host must keep the gaps it causes within E1.11's limits: a mark
+; between slots and a mark before break under 1 s, and a new packet within
+; 1 s of the last break (the program idles in mark until it gets one).
+;
+; Host late. After each slot's second stop bit a non-blocking test
+; (WAITB INQ_NE, T, its deadline already reached) splits two cases: a word
+; is queued and the next slot's start bit follows the stop bit at once, or
+; INQ is empty and the line stays at mark while POP waits; SETD 1 and
+; WAITD 1 then start the slot on the second tick boundary after the word
+; arrives, so the stop bits are always whole and the gap is whole bits.
+; INQ holds four words, one slot is 44 us, so the host has 176 us of slack.
+;
+; Memory: 60 words of thread 0's quarter, no data memory. A fixture
+; (dmx_fixture.loom) may run beside it on another thread.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   200                     ; 250 kbit/s at 50 MHz
+        .equ    BREAK = 44              ; ticks (bits) of break
+        .equ    MAB = 4                 ; ticks of mark after break
+        .equ    BTB = 302               ; minimum ticks from break to break
+        .equ    MAXN = 512              ; slots in a packet, at most
+        .equ    BITS = 11               ; bits in a slot: 8N2
+
+; Registers: r0 the slot being framed, r1 slots still to send, r2 and r3
+; scratch, r4 0x0600 (the two stop bits), r5 BITS, r6 the tick after which
+; the next break may start, r7 the .csr scratch.
+
+start:  SETP    TX, 1                   ; mark
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
+        .csr    BE_PINS, pin(TX)        ; SHO writes TX; BE_CFG 0: NRZ, LSB first
+        LDI     r4, 0
+        LDIH    r4, 6                   ; r4 = 0x0600: stop bits at 9 and 10
+        LDI     r5, BITS
+        CSRR    r6, NOW                 ; no break yet: the first may start at once
+
+; ------------------------------------------------------------- the packet
+; The break starts two ticks after NOW has reached r6, the last break's
+; tick + BTB - 2. d = r6 - NOW is 1 .. BTB exactly when NOW has not
+; reached it (r6 is under BTB ticks past the last break, which is behind
+; NOW); any other d, a stale r6 after a long idle included, means at once.
+; Waiting: TD = r6 and WAITD 0 wait for that tick (WAITD 0 sets no
+; deadline of its own), then SETD 1 and WAITD 1 put the break on the
+; second tick boundary after it: r6 + 2 when NOW is exactly r6.
+packet: POP     r0                      ; the start code
+        POP     r1                      ; n
+        MOV16   r2, MAXN + 1
+        CMP     r1, r2                  ; C = (n > 512)
+        BNC     nok
+        MOV16   r1, MAXN
+nok:    CSRR    r2, NOW
+        SUB     r2, r6, r2              ; d = r6 - NOW
+        BZ      now
+        MOV16   r3, BTB
+        CMP     r3, r2                  ; C = (d <= BTB): too soon, wait
+        BNC     now
+        CSRW    TD, r6
+        WAITD   0                       ; until NOW reaches r6
+now:    SETD    1
+brk:    WAITD   1
+        SETP    TX, 0                   ; break
+        CSRR    r6, TD                  ; the break's tick
+        MOV16   r3, BTB - 2
+        ADD     r6, r6, r3              ; the next one on r6 + 2 or later
+        CALL    frame                   ; the start code's slot, ready in SR
+        WAITD   BREAK
+        SETP    TX, 1                   ; mark after break
+        WAITD   MAB - 1                 ; the start bit one tick on, below
+
+; One slot: SR holds {stop, stop, data 7:0, start}, CNT = 11; the first
+; WAITD 1 is the start bit's tick and the eleventh SHO the second stop bit.
+fbit:   WAITD   1
+        SHO                             ; Z = (CNT == 0): the slot is out
+        BNZ     fbit
+        TEST    r1, r1
+        BZ      pend                    ; the last slot of the packet
+        DEC     r1
+        WAITB   INQ_NE, T               ; TD has passed: T = 0 only if a word is queued
+        BT      late
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, so INQ holds a word"
+        POP     r0                      ; cannot block
+        CALL    frame
+        JMP     fbit                    ; back to back: the start bit one tick on
+
+late:   POP     r0                      ; the host is late: mark until a word comes
+        SETD    1                       ; a whole tick past the next boundary
+        CALL    frame
+        JMP     fbit
+
+pend:   WAITD   1                       ; the second stop bit lasts a whole bit
+        JMP     packet
+
+; frame: SR <= the slot for the byte in r0 bits 7:0, CNT <= 11.
+frame:  SHLI    r0, 8
+        SHRI    r0, 7                   ; data in 8:1, the start bit 0 in bit 0
+        OR      r0, r0, r4              ; the stop bits
+        LDSR    r0
+        CSRW    CNT, r5
+        RET

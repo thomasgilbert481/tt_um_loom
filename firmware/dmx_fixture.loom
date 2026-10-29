@@ -1,0 +1,266 @@
+; dmx_fixture.loom
+; A DMX512 receiver (ANSI E1.11, USITT DMX512-A) for a fixture: it follows
+; the universe, keeps only the window of slots the host asks for, and
+; reports every packet. RX comes from the RO output of an RS-485 receiver
+; (1 = mark, the idle state).
+;
+; Written on 2026-10-28, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, timed waits, NOW, the FIFOs) and two words of data memory
+; through LD/ST of slice B (SEMANTICS 6.11, built for the I2C EEPROM's
+; array). No hardware knows DMX, and Loom has no UART receiver either:
+; finding a break by its length, checking the mark after break, sampling
+; the 8N2 slots, counting them and the window are all firmware.
+;
+; Pins: RX = IN0 (movable with the assembler's --pin RX=<pin>).
+;
+; Host command (INQ[0]), once, after RUN: two words.
+;     word 1     A, the window's first slot, 1 .. 512
+;     word 2     C, the number of slots in it, 0 .. 513 - A
+; The window is fixed from then on (CTRL.RESET of the thread to change it).
+;
+; Result (OUTQ[0]), one word each, three kinds told apart by bits 15:14:
+;     a slot     bits 15:9 zero, 7:0 the slot's value, bit 8 a framing
+;                error (its stop bit was low); pushed as it arrives, for
+;                every slot A .. A + C - 1 of the packet, whatever its
+;                start code
+;     S1         bit 15 set: the packet's status, pushed when it ends
+;                bits 7:0  the start code
+;                bit 8     the start code's stop bit was low
+;                bit 9     MAB: the mark after break was under 8 us
+;                bit 10    SHORT: a low longer than a slot but shorter than
+;                          a break was seen (since the last report); it
+;                          ends a packet
+;                bit 11    LOST: a word of this report or of the last one
+;                          was dropped, OUTQ being full
+;                bit 12    EMPTY: the packet ended before its start code
+;     S2         bit 14 set, right after its S1: bits 9:0 the slots
+;                received after the start code (0 .. 512), bits 13:10 the
+;                frames with a framing error, saturating at 15
+; A packet ends at its 512th slot, at the next break (found when the line
+; rises again, at least 88 us after it fell) or at a short break. A packet
+; followed by nothing is reported when the next break comes. Every push
+; tests OUTQ first and drops the word if it is full (LOST), so the
+; receiver never stalls: the host should pop at least one word every
+; 44 us, a slot's time, while the window is passing, and two per packet.
+;
+; Rate: eight ticks a bit. The host sets TICK_INT = 25, TICK_FRAC = 0
+; before RUN (3.125 MHz at 50 MHz: 200 clocks, 4 us, a bit). The deadline
+; pairs are proved for that tick (.tick below).
+;
+; Timing, against E1.11's receive column (tools/protomodels/dmx.py cites
+; the table):
+;   - Break. Every low run that covers a slot's stop bit is timed with NOW,
+;     from the slot's start edge to the rise: 175 ticks (87.5 us) or more
+;     is a break, so a break of 88 us is always taken (each end is seen to
+;     within a tick) and one under about 86.5 us never is. A low run of 84
+;     ticks (10.5 bits, more than any slot can be low) up to that is SHORT;
+;     a shorter one that covers the first stop bit is a framing error.
+;   - Mark after break. TD is set 15 ticks after the tick in which the rise
+;     was seen and the start code's start bit is waited for with a timeout
+;     there: a fall before TD is MAB. 8 us (16 ticks) is always good; a
+;     mark down to about 7.1 us may pass too.
+;   - Slots. Like uart_rx: WAITP finds the start bit (a level, so a start
+;     bit that comes while the last slot is being booked is not lost),
+;     SETD 0 anchors on it, and the samples are taken by the JP after each
+;     WAITD, 4 ticks into the start bit and 8 ticks apart: 12 - phase
+;     clocks off mid-bit, phase 0 .. 24, so -13 .. +12 of a 200-clock bit
+;     at the nominal rate. At E1.11's 3.92 .. 4.08 us a bit (+-2 %), the
+;     stop-bit sample drifts by at most 0.19 bit more: about 50 clocks of
+;     the 100 a half bit leaves. The second stop bit is not sampled: the
+;     slot is booked in it, and the next start bit is looked for from the
+;     middle of the first stop bit, so a mark between slots of 0 works.
+;   - A break-to-break time is not checked (E1.11 sets one for receivers,
+;     1196 us, but a receiver need not reject a fast sender).
+;
+; Weaker than a dedicated receiver: a framing error is decided on the
+; first stop bit alone; a break that starts inside a slot, after a data
+; bit was high, makes a framing error first and is only found if the line
+; rises and falls again; a low run longer than 2^15 ticks (16.4 ms) wraps
+; NOW and may be taken for a short one; and a mark after break under about
+; 3 us, flagged MAB, can end while the last packet is still being reported,
+; and then the start code is sampled late and may be misread.
+;
+; Memory: 127 words of thread 0's quarter, and the window: two words at
+; 0x0FE..0x0FF, the top of thread 1's quarter (an LDI reaches them, where
+; an address above 255 would cost a word more at both uses). The image does
+; not load them (the program writes them before it reads them). A program
+; on thread 1 must leave them alone: dmx_controller, 60 words from 0x080,
+; does, so the two run together as threads 0 and 1.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   25                      ; eight ticks a bit at 250 kbit/s
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    BRKT = 175              ; ticks of low run that make a break
+        .equ    SHORTT = 84             ; ticks of low run that make a short break
+        .equ    MABT = 15               ; ticks after the rise: the MAB check
+        .equ    FULL = 513              ; frames in a whole packet
+        .equ    WIN = 256 - 2           ; the window: A - 1, then C
+        .equ    MABF = 0x02             ; S1 flags, kept in 7:0 (bit 7 the
+                                        ; marker) and swapped to 15:8 when pushed
+        .equ    SHORTF = 0x04
+        .equ    LOSTF = 0x08
+        .equ    EMPTYF = 0x10
+
+; Registers: r0 the slot, or NOW at a rise; r1 a bit count, or 0 while
+; hunting and 1 in a packet; r2 scratch; r3 S2 as it grows (frames so far,
+; start code included, in 9:0, framing errors in 13:10); r4 window slots
+; still to skip; r5 window slots still to keep; r6 NOW at a start edge, or
+; scratch; r7 S1 as it grows.
+
+start:  POP     r4                      ; A
+        POP     r5                      ; C
+        DEC     r4                      ; slots before the window
+        MOV16   r2, WIN
+        ST      r4, r2, 0
+        ST      r5, r2, 1
+        LDI     r7, 0x80                ; S1 swapped (below), no flags yet
+
+; ---------------------------------------------------------------- hunting
+; No packet: time every low run until one is a break.
+hunt:   LDI     r1, 0                   ; hunting
+        WAITP   RX, 0                   ; a fall
+        CSRR    r6, NOW
+; The low run that started at r6 ends; r1 says who asked.
+low:    WAITP   RX, 1
+        CSRR    r0, NOW                 ; the rise
+        SUB     r2, r0, r6              ; the low run, in ticks
+        LDI     r6, BRKT
+        CMP     r2, r6                  ; C = a break
+        BC      isbrk
+        LDI     r6, SHORTT
+        CMP     r2, r6                  ; C = a short break
+        BNC     nolow
+        ORI     r7, SHORTF
+        TEST    r1, r1
+        BZ      hunt                    ; hunting: hunt on
+        CALL    report                  ; in a packet: it ends here
+        JMP     hunt
+nolow:  TEST    r1, r1
+        BZ      hunt
+        LDI     r0, 0                   ; in a packet: a zero slot, framing error
+        JMP     ferr
+isbrk:  TEST    r1, r1
+        BZ      brk
+        CALL    report                  ; the packet before this break
+
+; ------------------------------------------------------------ the break
+; The rise was seen at r0. A new packet: no frames, the window reloaded,
+; then the start code's start bit, which must not come before r0 + MABT.
+brk:    ADDI    r0, MABT
+        CSRW    TD, r0                  ; the MAB check's deadline
+        LDI     r3, 0
+        LDIH    r3, 0x40                ; S2: bit 14, no frames, no errors
+        MOV16   r2, WIN
+        LD      r4, r2, 0
+        LD      r5, r2, 1
+        LDI     r1, 1                   ; in a packet
+        WAITP   RX, 0, T                ; a fall before TD: MAB too short
+        BT      pwait                   ; timed out: the MAB is long enough
+        ORI     r7, MABF                ; the start bit is already here
+        JMP     pstart
+
+; ------------------------------------------------------------- the slots
+pwait:  WAITP   RX, 0                   ; a start bit (or already low)
+pstart: SETD    0                       ; anchor on its edge
+        CSRR    r6, NOW                 ; and keep it, to time a break
+pmid:   WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 1, pwait            ; high again: a glitch
+        LDI     r1, 8
+pbit:   WAITD   OVS                     ; the middle of the next data bit
+        JP      RX, 0, p0               ; sampled one slot after its tick
+        SHLI    r0, 1                   ; MSB first here, reversed below
+        INC     r0
+        DJNZ    r1, pbit
+        JMP     pstop
+p0:     SHLI    r0, 1
+        DJNZ    r1, pbit
+pstop:  WAITD   OVS                     ; the middle of the first stop bit
+        JP      RX, 0, s1lo
+        REV     r0, r0
+        SHRI    r0, 8                   ; the byte in 7:0
+        CALL    slot
+pend:   MOV     r2, r3
+        SHLI    r2, 6                   ; the frame count alone, in 15:6
+        MOV16   r6, FULL << 6
+        CMP     r2, r6
+        BNZ     pwait
+        CALL    report                  ; 512 slots: the packet is whole
+        JMP     hunt
+
+; The first stop bit is low. After a zero byte the line has been low since
+; the start edge (r6): time the run, which may be a break. Otherwise it is
+; a framing error.
+s1lo:   REV     r0, r0
+        SHRI    r0, 8                   ; the byte; Z = a zero byte
+        BNZ     ferr
+        LDI     r1, 1                   ; in a packet
+        JMP     low
+ferr:   LDIH    r0, 1                   ; bit 8: framing error
+        CALL    slot
+        WAITP   RX, 1                   ; back to mark first
+        JMP     pend
+
+; slot: book the frame in r0 (start code or slot, bit 8 a framing error).
+; Called in the first stop bit, after its WAITD (or after a low run that
+; was not a break): TD is reached, so the WAITB below never waits.
+slot:   MOV     r2, r3
+        SHLI    r2, 6                   ; Z = frame 0, the start code
+        BNZ     sdata
+        SWAP    r2, r0                  ; the start code into 15:8, its stop
+        OR      r7, r7, r2              ; bit into bit 0 (S1 is kept swapped)
+        JMP     scount
+sdata:  TEST    r4, r4
+        BZ      stake
+        DEC     r4                      ; before the window
+        JMP     scount
+stake:  TEST    r5, r5
+        BZ      scount                  ; past the window
+        DEC     r5
+        WAITB   OUTQ_NF, T              ; T = 1: OUTQ is full
+        BT      slost
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out of OUTQ"
+        PUSH    r0                      ; a slot of the window
+        JMP     scount
+slost:  ORI     r7, LOSTF
+scount: INC     r3                      ; one frame more
+        MOV     r2, r0
+        SHRI    r2, 9                   ; C = bit 8, a framing error
+        BNC     sret
+        MOV     r2, r3
+        SHRI    r2, 10
+        CMPI    r2, 16 + 15             ; saturated? (bit 14 is S2's marker)
+        BZ      sret
+        LDI     r2, 0
+        LDIH    r2, 4                   ; one framing error more, in 13:10
+        ADD     r3, r3, r2
+sret:   RET
+
+; report: push S1 and S2 for the packet that just ended, and start S1
+; afresh. SETD 0 first makes TD reached, so neither WAITB waits: a word
+; that finds OUTQ full is dropped and LOST goes into the next S1 (an S1
+; whose S2 was dropped is followed by no S2).
+report: SETD    0
+        MOV     r2, r3
+        SHLI    r2, 6                   ; Z = no frame at all
+        BNZ     rnum
+        ORI     r7, EMPTYF
+        INC     r3                      ; so that the DEC below gives 0
+rnum:   DEC     r3                      ; slots after the start code
+        SWAP    r7, r7                  ; S1: flags to 12:8, start code to 7:0
+        WAITB   OUTQ_NF, T
+        BT      rlost
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out of OUTQ"
+        PUSH    r7
+        WAITB   OUTQ_NF, T
+        BT      rlost
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out of OUTQ"
+        PUSH    r3
+        LDI     r7, 0x80                ; S1 afresh, no flags
+        RET
+rlost:  LDI     r7, 0x80 | LOSTF        ; S1 afresh, LOST
+        RET
+; The window, A - 1 then C: written by the program at start, never loaded.
+; WIN = 0x0FE, the top of thread 1's quarter.

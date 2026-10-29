@@ -68,9 +68,11 @@ own from the bit rate it measures on every sync byte.
 | `hdlc_loopback.loom` | TX = OUT0, RX = IN0 | 127 (thread 0) + 152 (thread 1: 103, and a 49-word report block at 0x148); buffers 0x100 (TX) and 0x180 (RX) | thread 0: 64 clocks per bit (781 kbit/s); thread 1: 19 clocks per tick, 8 ticks per bit (329 kbit/s) | 0 clocks (both threads) | 329 kbit/s wire loopback (thread 0 TICK 152, thread 1 TICK 19) and 64 kbit/s (TICK 781 + 64/256; TICK 97 + 168/256); a sender at +1 % (RTL), +1.5 % and -3 % (329 kbit/s) and +-2.5 % (64 kbit/s) |
 | `wiegand_reader.loom` | D0 = BIDIR0, D1 = BIDIR1 (open drain, the panel's pull-ups) | 107 | 100 clocks per tick (host-set; suggested 250, 5 us at 50 MHz) | 4 clocks | 50 us pulses every 1 ms at 50 MHz (TICK 250, PW 10, IV 200); at a 5 MHz test clock (TICK 100, 20 us): PW 20, 40 and 100 us, IV 200 us and 20 ms; every pulse and interval exact to the clock |
 | `wiegand_panel.loom` | D0 = IN0, D1 = IN1 | 109 | 16 clocks per tick (host-set; suggested 250, 5 us); timeouts only | no deadline pairs; falls seen 2 to 26 clocks late (a 6-slot poll) | SIA AC-01's windows at 5 MHz (TICK 25): pulses 20 to 100 us, 200 us intervals with +-2 us jitter; 20 ms intervals at 50 MHz (TICK 250, 25 ms timeout); glitches under 2 ticks (10 us) ignored |
+| `dmx_controller.loom` | TX = OUT0 (to an RS-485 driver's DI) | 60 | 200 clocks per tick, one tick per bit (the pairs also hold from 64) | 132 clocks (one `.bounded` POP) | 250 kbit/s (TICK 200) at 50 MHz, every field against E1.11's transmit column; 512-slot packets; a late host |
+| `dmx_fixture.loom` | RX = IN0 (from an RS-485 receiver's RO) | 127, and the window in 2 words at 0x0FE | 25 clocks per tick, 8 ticks per bit | 71 clocks (three `.bounded` PUSHes) | 250 kbit/s (TICK 25); a sender at 3.92 and 4.08 us a bit (+-2 %), break 88 us, MAB 8 us, marks 0 to 1 ms; short breaks (84, 60 us), MAB 6 us, framing errors |
 
 Every program assembles with `--strict` and no diagnostic at all: each
-deadline pair is proved, apart from the five intervals declared `.bounded`
+deadline pair is proved, apart from the nine intervals declared `.bounded`
 below, and none is unbounded (the M2 five in
 `tools/tests/test_fw_build.py`, the M3 and M4 programs in their own test
 modules). Each fits in thread 0's quarter of the 512-word memory of D-020,
@@ -103,6 +105,11 @@ proved `.tick`. `ir_nec_tx` has the fourth and fifth, the ws2812 idiom
 again: the two `POP`s of the next frame or repeat word, each guarded by a
 `WAITB INQ_NE, T` right after a deadline, on an interval of 25 slots
 against 8 ticks of at least 16 clocks.
+`dmx_controller` has the sixth, the same idiom: the `POP` of the next
+slot, guarded by a `WAITB INQ_NE, T` just before it. `dmx_fixture` has
+the seventh to ninth, the receive side of it: three `PUSH`es, each
+guarded by a `WAITB OUTQ_NF, T` just before it (only the host takes words
+out of OUTQ, so the space cannot go).
 
 The two Wiegand programs run together, reader on thread 0 (0x000, 107 words) and panel on
 thread 1 (0x080, 109 words), each in its own quarter.
@@ -1254,12 +1261,120 @@ is 26,000 clocks; the 50 MHz bodies and the 20 ms intervals are
 (RTL; 26 latched falls and releases on two open-drain pads, each edge
 checked to the clock, about 30,000 clocks).
 
+## dmx_controller.loom: DMX512 controller
+
+- **Written** 2026-10-28, after the hardware was complete (D-032), as a
+  protocol Loom was not designed for (D-035): DMX512 (ANSI E1.11, USITT
+  DMX512-A), the stage-lighting bus. Hardware reused: the M2 core (pins,
+  deadlines, the FIFOs) and the bit engine's shift register in manual mode
+  (`SHO`, `CNT`), built for the synchronous serial programs and for USB's
+  and CAN's encoders, here shifting out an eleven-bit 8N2 slot in one
+  `LDSR` and the three-slot loop `WAITD 1; SHO; BNZ`. No hardware knows
+  DMX: the break, the mark after break, the second stop bit, the framing
+  of up to 513 slots and the minimum break-to-break time are firmware.
+- **What it does**: a DMX512 transmitter for one universe on one pin (TX
+  = OUT0 to an RS-485 driver's DI, 1 = mark). Per packet: a break, a mark
+  after break, the start code and n slots, each 8N2 LSB first.
+- **Host command** (push to thread 0): the start code (bits 7:0), n (1 to
+  512; 0 sends the start code alone, more than 512 is sent as 512), then
+  the n slots, one per word in 7:0. Nothing comes back.
+- **Timing**, from E1.11's transmit column, all exact: every pin write is
+  the instruction after the `WAITD` that times it, so every edge lands the
+  same few clocks after its tick. Break 44 bits (176 us, the typical value;
+  the minimum is 92), MAB 4 bits (16 us; min 12), slots back to back (mark
+  between slots 0) while INQ has a word, at least one bit of mark before
+  break, and break to break at least 302 bits (1208 us; min 1204): a short
+  packet is padded with mark before break, which the program times from
+  the last break's tick with `NOW` and a `CSRW TD`.
+- **A late host**: after each slot's second stop bit a non-blocking
+  `WAITB INQ_NE, T` decides. With a word queued the next start bit follows
+  at once; with INQ empty the line stays at mark (E1.11 allows a mark
+  between slots up to 1 s) and `SETD 1; WAITD 1` starts the slot on the
+  second tick boundary after the word arrives, so the stop bits stay whole
+  and the gap is whole bits. INQ's four words are 176 us of slack. Keeping
+  each gap and the refresh (a break at least once a second) within E1.11's
+  limits is the host's part.
+- **Rate**: one tick a bit, TICK 200 at 50 MHz: 4.000 us, against E1.11's
+  3.92 to 4.08 us.
+- **Memory**: 60 words of thread 0's quarter; no data memory. Runs beside
+  `dmx_fixture` (tested with the controller on thread 1).
+- **Measured** (model and RTL): break 8800 clocks, MAB 800, every slot
+  edge on the 200-clock grid of its start edge, mark between slots 0 for
+  queued words and whole bits for a late host, break to break 60400 clocks
+  for a short packet; a 512-slot packet (model) with every edge in E1.11's
+  window.
+- **Weaker than a dedicated controller**: the break and MAB are fixed
+  (176 us and 16 us, inside the standard; changing them is two `.equ`s);
+  no RDM (E1.20), which needs the line turned round.
+
+## dmx_fixture.loom: DMX512 receiver for a fixture
+
+- **Written** 2026-10-28, after the hardware was complete (D-032), as a
+  protocol Loom was not designed for (D-035). Hardware reused: the M2 core
+  (pins, deadlines, timed waits, `NOW`, the FIFOs) and two words of data
+  memory through `LD`/`ST` of slice B, built for the I2C EEPROM's array.
+  Loom has no UART receiver and nothing that measures a pulse: finding a
+  break by its length (`NOW` at both ends of every low run that covers a
+  stop bit), checking the mark after break (a `WAITP ..., T` against a
+  deadline set from the rise), sampling 8N2 slots, counting them and
+  keeping the window are firmware.
+- **What it does**: follows the universe on RX = IN0 (an RS-485
+  receiver's RO), pushes the slots of its window as they come, and pushes
+  a status pair when each packet ends.
+- **Host command** (push to thread 0, once): A, the first slot of the
+  window (1 to 512), and C, its length (0 to 513 - A).
+- **Result** (pop thread 0), told apart by bits 15:14: a slot word (bits
+  7:0 the value, bit 8 a framing error), then per packet S1 (bit 15; 7:0
+  the start code, bit 8 its framing error, bit 9 MAB under 8 us, bit 10 a
+  short break, bit 11 a word dropped for a full OUTQ, bit 12 no start
+  code) and S2 (bit 14; 9:0 the slots received, 0 to 512; 13:10 framing
+  errors, saturating at 15). A packet ends at its 512th slot, at the next
+  break or at a short break; the window is pushed for every start code,
+  and S1 says which.
+- **Why live pushes**: 512 slots are 256 words packed, half the whole
+  memory, and OUTQ holds four words. So the fixture keeps no buffer: each
+  window slot is pushed in its first stop bit after a non-blocking test,
+  and dropped (with bit 11) if OUTQ is full. The receiver never stalls, so
+  it never loses the line; the host pops a word per 44 us while the window
+  passes.
+- **Timing**, against E1.11's receive column. Break: a low run of 175
+  ticks (87.5 us) or more, so 88 us is always taken and under about 86.5
+  us never; 84 ticks (10.5 bits, more than any slot can be low) up to that
+  is a short break, which ends the packet; the fixture then waits for a
+  real break. MAB: a deadline 15 ticks after the rise; a start bit before
+  it sets bit 9, so 8 us always passes and about 7.1 us may. Slots: as
+  `uart_rx`, a level wait for the start bit, `SETD 0` on its edge, samples
+  4 ticks in and 8 apart (-13 to +12 clocks of mid-bit at 200 clocks a
+  bit, plus 0.19 bit of drift by the stop bit at +-2 %).
+- **Rate**: eight ticks a bit, TICK 25 at 50 MHz.
+- **Memory**: 127 words of thread 0's quarter, and the window (A - 1, C)
+  in 2 words at 0x0FE..0x0FF, the top of thread 1's quarter, where one
+  `LDI` reaches them; written before they are read, so not in the image.
+  A program on thread 1 must leave them (`dmx_controller` does).
+- **Weaker than a dedicated receiver**: a framing error is decided on the
+  first stop bit only (the slot is booked in the second); a break that
+  starts after a high data bit inside a slot gives a framing error and is
+  missed unless the line rises and falls again; a low run over 2^15 ticks
+  (16 ms) wraps `NOW`; a MAB under about 3 us (flagged) may end while the
+  last report is still going out, and the start code is then sampled late;
+  break-to-break time is not checked; a packet followed by silence is
+  reported only at the next break.
+
+**PHY-GL-SDF candidates**:
+
+- `dmx_controller`: `test_controller_sends_short_packets_timed_to_e111`
+  (two short packets, 2.23 ms of simulated time, 111,000 clocks with the
+  host traffic; every edge of the break, MAB
+  and slots on its exact clock, and the break-to-break padding).
+- `dmx_fixture`: `test_fixture_keeps_its_window_and_reports_each_packet`
+  (one five-slot packet and the next break, 1.44 ms, 72,000 clocks).
+
 ## Tests
 
 `tools/tests/test_fw_uart.py`, `test_fw_spi.py`, `test_fw_spi_slave.py`,
 `test_fw_i2c.py`, `test_fw_ws2812.py`, `test_fw_ps2.py`, `test_fw_jtag.py`,
 `test_fw_swd.py`, `test_fw_i2c_slave.py`, `test_fw_can.py`,
-`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py`, `test_fw_wiegand.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
+`test_fw_manchester.py`, `test_fw_ir_nec.py`, `test_fw_onewire.py`, `test_fw_lin.py`, `test_fw_hdlc.py`, `test_fw_wiegand.py`, `test_fw_dmx.py` and `test_fw_usb.py` (with `tools.protomodels.usb.UsbHost`,
 a low-speed host that checks every device packet against the USB 2.0
 timing limits) run each program end to end, loaded, configured and fed
 through `tools.loomhost.Loom` (every host access is SPI bytes, 64 clocks

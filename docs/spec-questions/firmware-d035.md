@@ -294,3 +294,53 @@ a slot but costs a second thread; not worth it for D-035.
 **Decision:** accepted, as for the NEC tests at 1.824 MHz: the waveforms
 are SIA's in microseconds, with fewer clocks per pulse. The 50 MHz bodies,
 the 20 ms intervals and the default 25 ms timeout run on the model only.
+
+## DMX512 (`dmx_controller.loom`, `dmx_fixture.loom`), integrated 2026-10-29
+
+### 1. ANSI E1.11 was not read
+
+The timing figures come from E1.11-2008's timing table as recalled,
+cross-checked against secondary sources that quote it: the TeensyDMX
+break-timing notes, NXP AN3315, Zilog RD0016 and Microchip AN1076.
+
+**Decision:** accepted. `tools/protomodels/dmx.py` marks each figure
+checked or unchecked. The bit time (3.92 to 4.08 us) and the 1 s limits on
+the marks are unchecked; the controller's bit is exactly 4.000 us, so no
+firmware timing sits at an unchecked figure. Confirm the table and those
+figures if a copy of E1.11 turns up.
+
+### 2. Break-to-break minimum
+
+AN1076 calls 1204 us the minimum packet time, which may be a different
+quantity from break to break.
+
+**Decision:** accepted. The controller pads to 1208 us break to break,
+which meets either reading.
+
+### 3. The fixture checks only the first stop bit
+
+**Decision:** accepted as a stated limit (program header, "Weaker than a
+dedicated receiver"). The slot is booked during the second stop bit.
+
+### 4. The window is reported for every start code
+
+**Decision:** accepted. The start code is in status word S1, so the host
+decides; a dimmer acts only on start code 0.
+
+### 5. A low run between a slot and a break
+
+A low of 10.5 bits to 88 us is not a break under E1.11.
+
+**Decision:** accepted. It is flagged as a short break, ends the packet,
+and nothing is accepted until a real break: no slot is taken from a packet
+whose framing is in doubt.
+
+### 6. Window slots go straight to OUTQ
+
+512 slots would take half the memory, and OUTQ holds four words.
+
+**Decision:** accepted. A word that finds OUTQ full is dropped and the
+status says so; the receiver never stalls. A host reading a large window
+must keep up with 44 us per slot. The window settings sit at 0x0FE..0x0FF,
+the top of thread 1's quarter, so a program on thread 1 must leave them
+(`dmx_controller` does).
