@@ -95,7 +95,15 @@
         .equ    READ_SPAD = 0xBE
         .equ    WRITE_SPAD = 0x4E
 
+; OD_MASK first: onewire_master sets its own bit 13 to 15 slots after its
+; start, and CSRR, ORI, CSRW is not atomic across threads (SEMANTICS 2,
+; 6.6). Done here at once, the two programs under one RUN never overlap
+; (in three of four start phases they did, and one bit was lost). PIN_OE
+; is still 0, so no pad is driven before SETP OW, 1.
 start:  .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        CSRR    r7, OD_MASK
+        ORI     r7, OWBIT
+        CSRW    OD_MASK, r7             ; OW open drain
         LDI     r7, 0
         CSRW    TICK_FRAC, r7
         CSRW    CRC_INIT, r7            ; Maxim: the CRC starts at 0
@@ -105,9 +113,6 @@ start:  .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .t
         CSRW    BE_CFG, r7
         LDI     r7, (OWPIN << 5) | OWPIN
         CSRW    BE_PINS, r7             ; SHO drives OW, SHI samples it
-        CSRR    r7, OD_MASK
-        ORI     r7, OWBIT
-        CSRW    OD_MASK, r7             ; OW open drain
         SETP    OW, 1                   ; let go of the line
         LDI     r2, DATA
         LDI     r1, 8
