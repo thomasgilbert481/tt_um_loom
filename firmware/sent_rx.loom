@@ -1,0 +1,261 @@
+; sent_rx.loom
+; SENT (SAE J2716) receiver on IN0: finds the sync pulse, learns the
+; transmitter's tick from it, decodes the nibbles, checks them and the CRC,
+; and delivers every frame with a status word to the host through OUTQ[0].
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; SENT. The program time-stamps every falling edge with `WAITE` (built for
+; the I2C and PS/2 clock edges) and a read of the `NOW` tick counter (built
+; as the deadline timebase, SEMANTICS 4), and checks the CRC with the bit
+; engine's CRC unit (built for USB, CAN and HDLC), fed by `SHO` with its
+; output pointed at a pin index no write reaches (SEMANTICS 6.3). What the
+; firmware does that no hardware does: the sync search, the tick learnt
+; from each sync (a division per nibble, in software: Loom has no divider),
+; the nibble windows, the 1/64 sync-to-sync rule and both CRC variants.
+;
+; Pin: RX = IN0, idle high (the line's pull-up is at the receiver in J2716;
+; put it on the board).
+;
+; Decisions (2026-11-03, on the open spec readings): the J2716 figures are
+; from public descriptions of the standard, not its text, and are marked
+; unchecked in tools/protomodels/sent.py; the CRC table matches the
+; published 16-entry table. The 1/64 rule is taken against the previous
+; sync. The sync window is +-22 % (J2716 allows the sender +-20 %): the
+; extra 2 % is measurement margin, so a sender at the edge is not rejected
+; for a one-unit error. The first frame after a lost sync is delivered with
+; status bit 3 set, not dropped: the host decides. The pause pulse's length
+; is not checked and the slow serial channel is left to the host (it sees
+; every status nibble): the program is already 18 words past its quarter.
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT of the measuring tick, 1/16 of the nominal SENT tick, in
+;      clocks (3 us at 50 MHz: 150 / 16 = 9 + 96/256).
+;   2. The layout, as for sent_tx.loom: bits 2:0 N data nibbles (1..6);
+;      bit 3 PAUSE; bit 4 LEGACY (the CRC before J2716 2010); bits 15:8
+;      TICK_FRAC of the measuring tick.
+;
+; Results (FIFO space read, thread 0). Per frame, its nibbles in wire order,
+; four to a word, most significant first and zero-filled, as sent_tx.loom
+; takes them: word A = status, d1, d2, d3 and, if N > 3, word B = d4, d5,
+; d6, 0; then a status word:
+;   bit 0      CRC error
+;   bit 1      a nibble out of range (shorter than 11.5 or not shorter than
+;              27.5 ticks; it reads as 0 or 15)
+;   bit 2      sync ratio error: this sync differs from the previous one by
+;              more than 1/64 of the previous one
+;   bit 3      no previous sync: the first frame, or the first after a lost
+;              sync, so the 1/64 rule could not be applied
+;   bits 8:4   the layout word's bits 4:0
+;   bits 11:9  0
+;   bits 15:12 the received CRC nibble
+; A frame with any of bits 2:0 set is invalid under J2716; it is reported
+; anyway, flagged, so the host sees what came. Word A goes out when its
+; fourth nibble is in, so a host must keep OUTQ from filling: a full OUTQ
+; stalls the program and it loses the frame (and finds the next sync).
+;
+; The tick. NOW counts measuring ticks of 1/16 of the nominal SENT tick.
+; A sync of S units makes the transmitter's tick S / 56 units, and a pulse of
+; P units is 56 P / S of its ticks; a nibble's value is that rounded, less
+; 12: v = floor((56 P - 11.5 S) / S), computed as a 4-bit restoring division
+; with r0 = 8 S. A sync is accepted from 699 to 1093 units: 56 nominal ticks
+; at -22 .. +22 %, the +-20 % clock tolerance of J2716 and 2 % of margin.
+; Every pulse is measured falling edge to falling edge, so the low time does
+; not matter to the receiver (it needs only to be longer than one slot).
+;
+; Framing. After the sync come N + 2 nibbles (status, data, CRC), then, with
+; PAUSE, one pulse of any length (the pause pulse, not checked), then the
+; next frame's sync. If that pulse is not a sync the frame stream is lost:
+; the program measures pulse after pulse until one is, and flags the next
+; frame bit 7. With PAUSE, a pause pulse as long as a sync can be taken for
+; one while hunting; the frame that follows then fails (its sync measured
+; as a status nibble is out of range) and the hunt goes on: the stream is
+; found again within two frames.
+;
+; Measurement. `WAITE` sees a falling edge 2 to 6 clocks after it (the
+; synchroniser and the 4-clock slot grid), the same for every edge, so a
+; pulse is measured to within 4 clocks plus one unit. The decoding of a
+; nibble takes at most 76 slots after its edge, and must end before the next
+; falling edge: 12 ticks of the fastest transmitter (-20 %) last 9.6 nominal
+; ticks, so the nominal tick must be 32 clocks or more (304 clocks; 3 us is
+; 150 clocks at 50 MHz). A pulse longer than 1023 units (64 nominal ticks)
+; is too long for a nibble whatever the sync; a pulse longer than 65535
+; units (an idle line) is measured modulo 65536.
+;
+; Registers: r0 8 S (0: no previous sync), r1 11.5 S, r2 NOW at the last
+; falling edge, r3 the word being filled, after a 1 that marks how full it
+; is, r4 the nibble and scratch, r5 the status word (layout in bits 8:4),
+; r6 the data nibbles left, r7 scratch.
+;
+; Size: 146 words, 18 more than a quarter of the 512-word memory: on thread
+; t it spills into thread t + 1's first 18 words, so that thread cannot
+; run a program of its own (as lin_slave and onewire_master spill). With
+; sent_tx.loom (108 words) on thread 0 and this program on thread 1, the
+; two take 0x000..0x06B and 0x080..0x111; thread 2 is left idle (its reset
+; vector, 0x100, is inside this program) and thread 3 keeps its quarter.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   32                      ; no WAITD: nothing to prove (header)
+        .equ    SMIN   = 699            ; a sync, in units (header)
+        .equ    SMAX   = 1093
+        .equ    E_CRC  = 0x01           ; status word bits
+        .equ    E_RANGE = 0x02
+        .equ    E_SYNC = 0x04
+        .equ    E_FIRST = 0x08
+        .equ    NOPIN  = 15             ; a pin index no write reaches (SEMANTICS 6.3)
+        .equ    POLY   = 0xD << 12      ; x^4 + x^3 + x^2 + 1, left-aligned
+        .equ    SEED   = 0x3 << 12      ; 0101 moved through x^4 (sent_tx.loom)
+        .equ    CFG    = 0x202          ; BE_CFG: DIR = 1 (MSB first), CRC_EN
+
+start:  .csr    BE_PINS, NOPIN          ; SHO feeds the CRC and writes no pad
+        .csr    CRC_POLY, POLY
+        .csr    CRC_INIT, SEED
+        .csr    BE_CFG, CFG
+        POP     r7                      ; 1. TICK_INT
+        CSRW    TICK_INT, r7
+        POP     r5                      ; 2. the layout and TICK_FRAC
+        MOV     r7, r5
+        SHRI    r7, 8
+        CSRW    TICK_FRAC, r7
+        ANDI    r5, 0x1F
+        SHLI    r5, 4                   ; the status word: layout in bits 8:4
+        CALL    edge                    ; a first falling edge
+
+; Hunt: pulse after pulse until one is a sync. Entered at a falling edge.
+lost:   LDI     r0, 0                   ; the stream is lost
+hunt:   CALL    edge                    ; r4: the pulse just ended
+chk:    MOV16   r7, SMIN
+        CMP     r4, r7
+        BNC     lost                    ; too short for a sync
+        MOV16   r7, SMAX + 1
+        CMP     r4, r7
+        BC      lost                    ; too long
+
+; A sync of S = r4 units. The 1/64 rule against the previous one (8 S in r0).
+        TEST    r0, r0
+        BZ      first
+        MOV     r7, r0
+        SHRI    r7, 3                   ; the previous S
+        SUB     r1, r4, r7              ; C: S >= the previous
+        BC      pos
+        NEG     r1, r1
+pos:    SHLI    r1, 6                   ; 64 |S - S'|, below 2^15 in the window
+        CMP     r7, r1                  ; C: S' >= 64 |S - S'|
+        BC      fine
+        ORI     r5, E_SYNC
+        JMP     fine
+first:  ORI     r5, E_FIRST
+fine:   MOV     r0, r4
+        SHLI    r0, 3                   ; 8 S
+        MOV     r1, r4
+        SHLI    r1, 1
+        ADD     r1, r1, r4              ; 3 S
+        ADD     r1, r1, r0              ; 11 S
+        MOV     r7, r4
+        SHRI    r7, 1
+        ADD     r1, r1, r7              ; 11.5 S
+        CRCI
+
+; The status nibble, then N data nibbles into the CRC.
+        CALL    meas
+        LDI     r3, 0x10                ; the mark, then the status nibble
+        OR      r3, r3, r4
+        MOV     r6, r5
+        SHRI    r6, 4
+        ANDI    r6, 7                   ; N
+dat:    CALL    meas
+        CMPI    r6, 1
+        BNZ     feed
+        MOV     r7, r5
+        SHRI    r7, 8
+        ANDI    r7, 1                   ; LEGACY
+        BZ      feed
+        STCRC   r7                      ; LEGACY, the last nibble: C + d,
+        SHLI    r4, 12                  ; unshifted, in bits 15:12 (sent_tx)
+        XOR     r7, r7, r4
+        CSRW    CRC, r7
+        SHRI    r4, 12
+        JMP     fed
+feed:   MOV     r7, r4
+        SHLI    r7, 12
+        LDSR    r7
+        SHO
+        SHO
+        SHO
+        SHO
+fed:    SHLI    r3, 4                   ; C: the mark went out, the word is full
+        BNC     part
+        OR      r3, r3, r4
+        PUSH    r3                      ; word A
+        LDI     r3, 1
+        JMP     next
+part:   OR      r3, r3, r4
+next:   DJNZ    r6, dat
+
+; The CRC nibble, the report, the pause pulse, the next sync.
+        CALL    meas
+        STCRC   r7
+        SHRI    r7, 12
+        CMP     r7, r4
+        BZ      crcok
+        ORI     r5, E_CRC
+crcok:  SHLI    r4, 12
+        OR      r5, r5, r4              ; the received CRC in bits 15:12
+        CMPI    r3, 1
+        BZ      whole                   ; no nibble since the last full word
+al:     SHLI    r3, 4                   ; zero-fill up to the mark
+        BNC     al
+        PUSH    r3
+whole:  PUSH    r5                      ; the status word
+        SHRI    r5, 4
+        ANDI    r5, 0x1F
+        SHLI    r5, 4                   ; flags and CRC cleared
+        MOV     r7, r5
+        SHRI    r7, 7
+        ANDI    r7, 1                   ; PAUSE
+        BZ      nopau
+        CALL    edge                    ; the pause pulse, any length
+nopau:  CALL    edge                    ; this should be the next sync
+        JMP     chk
+
+; meas: the next pulse as a nibble value in r4 (0..15). Out of range: 0 or
+; 15 and E_RANGE. v = floor((56 P - 11.5 S) / S), r0 = 8 S, r1 = 11.5 S.
+meas:   CALL    edge                    ; r4 = P, in units
+        MOV     r7, r4
+        SHRI    r7, 10
+        BNZ     mlong                   ; 1024 units or more
+        SHLI    r4, 3                   ; 8 P
+        MOV     r7, r4
+        SHLI    r7, 3                   ; 64 P
+        SUB     r7, r7, r4              ; 56 P
+        SUB     r7, r7, r1              ; C: 56 P >= 11.5 S
+        BNC     mshort
+        MOV     r4, r7
+        SHRI    r4, 1
+        CMP     r4, r0                  ; C: the rest >= 16 S, 27.5 ticks or more
+        BC      mlong
+        LDI     r4, 1                   ; a mark: four quotient bits follow it
+mdiv:   SHLI    r4, 1
+        CMP     r7, r0                  ; C: the rest >= 8 S
+        BNC     mz
+        SUB     r7, r7, r0
+        ORI     r4, 1
+mz:     SHLI    r7, 1
+        CMPI    r4, 16
+        BNC     mdiv
+        ANDI    r4, 15
+        RET
+mshort: LDI     r4, 0
+        JMP     mr
+mlong:  LDI     r4, 15
+mr:     ORI     r5, E_RANGE
+        RET
+
+; edge: wait for a falling edge; r4 = the units since the one before.
+edge:   WAITE   RX, FALL
+        CSRR    r7, NOW
+        SUB     r4, r7, r2
+        MOV     r2, r7
+        RET

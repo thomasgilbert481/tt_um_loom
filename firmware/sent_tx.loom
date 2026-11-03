@@ -1,0 +1,211 @@
+; sent_tx.loom
+; SENT (SAE J2716) sensor transmitter on OUT0, fed by the host through INQ[0].
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; SENT. The program uses three pieces of hardware built for other jobs: the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016), built
+; so that WS2812 pulses land on the exact clock, puts every falling and rising
+; edge on the exact clock edge of its tick; the fractional tick divider
+; (TICK_FRAC, SEMANTICS 4), built for UART rates, gives any SENT tick from 3
+; to 90 us at any board clock; and the bit engine's CRC unit (SEMANTICS 6.9),
+; built for USB, CAN and HDLC, computes the 4-bit SENT CRC, fed by `SHO` with
+; its output pointed at a pin index no write reaches (6.3), so the shift
+; changes no pad. What the firmware does that no hardware does: the pulse
+; train (a 56-tick sync, nibbles of 12 + value ticks, the pause pulse), the
+; packing of nibbles, the choice of CRC variant, and the frame stream with
+; its repeats.
+;
+; Pin: TX = OUT0, push-pull, idle high. SENT is a single-ended line driven
+; by the sensor against a pull-up at the receiver (J2716 shows a filtered
+; output stage); a push-pull pad driving the J2716 output filter is the
+; plain choice, and OUT0..5 cannot be open drain anyway (SEMANTICS 3). Put
+; the RC filter of the standard between the pad and the harness.
+;
+; Host words (FIFO space, thread 0), in this order after RUN:
+;   1. TICK_INT of one SENT tick, in clocks (32 or more, .tick below).
+;   2. The layout: bits 2:0 N, the number of data nibbles (1..6); bit 3
+;      PAUSE (a pause pulse ends every frame); bit 4 LEGACY (the CRC of
+;      J2716 before 2010; 0 gives the recommended CRC); bits 15:8 TICK_FRAC.
+;   3. Only if PAUSE: the pause pulse in ticks, 12..768.
+;   then frames. A frame is its nibbles in wire order, four to a word, most
+;   significant nibble first: word A = status, d1, d2, d3; and, if N > 3,
+;   word B = d4, d5, d6, unused. Nibbles past d_N are ignored. So a 6-nibble
+;   frame with status 0 and data 1..6 is 0x0123, 0x4560.
+; The program computes the CRC nibble. Nothing is pushed to OUTQ.
+;
+; The stream. The first frame starts (its sync's falling edge) 2 ticks after
+; it is complete in INQ. From then on frames follow back to back, as a SENT
+; sensor sends them: at the end of each frame (after its CRC nibble, or its
+; pause pulse) the program takes the next frame if it is queued, and sends
+; the last one again if it is not, so the line never stops. A frame of two
+; words whose second word is not queued yet is held, and the old frame is
+; sent once more while it comes. INQ holds four words: two frames of two
+; words, four of one.
+;
+; Wire format (J2716 JAN2010 section 5.2, unchecked: see the model's
+; docstring for the sources). Every pulse is the time between two falling
+; edges; each starts with a low time of L = 5 ticks and is high for the rest:
+;   sync (calibration) pulse   56 ticks
+;   status nibble, data nibbles, CRC nibble   12 + value ticks (12..27)
+;   pause pulse (optional)     the host's length, 12..768 ticks
+; The CRC is CRC-4, x^4 + x^3 + x^2 + 1, seed 0101, over the data nibbles
+; only (not the status nibble). The recommended variant (J2716 2010 and
+; later) runs one more zero nibble through it after the data.
+;
+; The CRC unit. It is a serial CRC in which the data enter at the top: each
+; nibble d does C = (C + d * x^4) mod P, four `SHO`s, MSB first. The SENT CRC
+; of J2716 is written as the table form C = T[C] + d, that is C = C * x^4 + d
+; mod P, with the data added after the shift. The two agree after one more
+; shift when the engine starts from seed * x^4 mod P: with seed 0101 that is
+; x^6 + x^4 = x + 1 mod P, 0011. So with CRC_INIT = 3 (left-aligned 0x3000)
+; and every data nibble fed, the engine holds the recommended CRC (the data
+; and the zero nibble); and the legacy CRC is the engine after N - 1 nibbles
+; plus the last nibble, unshifted, which the program writes back with
+; `CSRW CRC`. tools/protomodels/sent.py computes both from the table form.
+;
+; Timing. Each edge is `SETP TX, v, D` and the WAITD that lands it, so it
+; changes the pad on the exact clock edge of its tick (SEMANTICS 6.10 rule
+; 1), whatever the code between the deadlines does. `pulse` is the one
+; subroutine that makes edges: entered at a falling edge, it lands the rise
+; L ticks later and the next falling edge 12 + r4 ticks after the first.
+; Everything between pulses (the next nibble, the CRC, a new frame) runs in
+; the L ticks before the next rise, proved for ticks of 32 clocks or more
+; (.tick): 3 us at 10.7 MHz or more, any J2716 tick at 50 MHz.
+;
+; Registers: r0 word A, r1 word B, r2 the layout (bits 4:0), HALF (bit 5)
+; and the pause pulse less 12 (bits 15:6), r3 a held word A, r4 the pulse
+; length less 12 and scratch, r5 the nibbles still to send, r6 the data
+; nibbles left, r7 the nibbles left in word A, then scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   32                      ; the shortest tick the schedule is proved for
+        .equ    L      = 5              ; the low time of every pulse, ticks
+        .equ    NMASK  = 0x07           ; layout: data nibbles
+        .equ    PAUSE  = 0x08           ;         a pause pulse ends the frame
+        .equ    LEGACY = 0x10           ;         the CRC before J2716 2010
+        .equ    HALF   = 0x20           ; word A of a two-word frame held in r3
+        .equ    NOPIN  = 15             ; a pin index no write reaches (SEMANTICS 6.3)
+        .equ    POLY   = 0xD << 12      ; x^4 + x^3 + x^2 + 1, left-aligned
+        .equ    SEED   = 0x3 << 12      ; 0101 moved through x^4 (header)
+        .equ    CFG    = 0x202          ; BE_CFG: DIR = 1 (MSB first), CRC_EN
+
+start:  SETP    TX, 1                   ; idle high
+        .csr    BE_PINS, NOPIN          ; SHO feeds the CRC and writes no pad
+        .csr    CRC_POLY, POLY
+        .csr    CRC_INIT, SEED
+        .csr    BE_CFG, CFG
+        POP     r7                      ; 1. TICK_INT
+        CSRW    TICK_INT, r7
+        POP     r2                      ; 2. the layout and TICK_FRAC
+        MOV     r7, r2
+        SHRI    r7, 8
+        CSRW    TICK_FRAC, r7
+        ANDI    r2, NMASK | PAUSE | LEGACY
+        MOV     r7, r2
+        ANDI    r7, PAUSE
+        BZ      first
+        POP     r4                      ; 3. the pause pulse, ticks
+        SUBI    r4, 12
+        SHLI    r4, 6
+        OR      r2, r2, r4              ; bits 15:6: the pause less 12
+
+; The first frame: wait until it is all in INQ, then start 2 ticks later.
+first:  POP     r0                      ; word A
+        MOV     r7, r2
+        ANDI    r7, NMASK
+        CMPI    r7, 4                   ; C: N >= 4, a second word
+        BNC     one1
+        POP     r1                      ; word B
+one1:   SETD    0                       ; re-anchor after the unbounded POPs
+        SETP    TX, 0, D
+        WAITD   2                       ; the first sync's falling edge
+
+; A frame, entered at its sync's falling edge (landed).
+go:     CRCI
+        LDI     r4, 56 - 12
+        CALL    pulse                   ; the sync (calibration) pulse
+        MOV     r5, r0
+        MOV     r4, r5
+        SHRI    r4, 12                  ; the status nibble
+        SHLI    r5, 4                   ; d1, d2, d3 follow in word A
+        LDI     r7, 3
+        MOV     r6, r2
+        ANDI    r6, NMASK
+        CALL    pulse                   ; the status nibble (not in the CRC)
+
+; N data nibbles, each fed to the CRC, the last one specially for LEGACY.
+dat:    CMPI    r6, 1
+        BNZ     feed
+        MOV     r4, r2
+        ANDI    r4, LEGACY
+        BZ      feed
+        STCRC   r4                      ; LEGACY, the last nibble: C + d,
+        XOR     r4, r4, r5              ; unshifted, in bits 15:12 (the bits
+        CSRW    CRC, r4                 ; below are never read)
+        JMP     fed
+feed:   LDSR    r5                      ; the nibble in bits 15:12
+        SHO
+        SHO
+        SHO
+        SHO
+fed:    MOV     r4, r5
+        SHRI    r4, 12                  ; this nibble
+        SHLI    r5, 4
+        DEC     r7
+        BNZ     nsw
+        MOV     r5, r1                  ; d4, d5, d6 from word B
+nsw:    CALL    pulse
+        DJNZ    r6, dat
+        STCRC   r4
+        SHRI    r4, 12                  ; the CRC nibble
+        CALL    pulse
+        MOV     r4, r2
+        ANDI    r4, PAUSE
+        BZ      fetch
+        MOV     r4, r2
+        SHRI    r4, 6                   ; the pause pulse less 12
+        CALL    pulse
+
+; The end of a frame, at the next sync's falling edge (landed): take the next
+; frame if it is queued, else send this one again. A WAITB ... T against a
+; reached TD is a test, not a wait.
+fetch:  WAITB   INQ_NE, T
+        BT      go                      ; nothing new: the same frame again
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r7
+        MOV     r4, r2
+        ANDI    r4, NMASK
+        CMPI    r4, 4                   ; C: N >= 4, two words a frame
+        BNC     one
+        MOV     r4, r2
+        ANDI    r4, HALF
+        BNZ     second                  ; r7 is word B of the held frame
+        MOV     r3, r7                  ; word A: hold it
+        ORI     r2, HALF
+        WAITB   INQ_NE, T               ; word B queued as well?
+        BT      go                      ; not yet: the old frame once more
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r7
+second: MOV     r0, r3
+        MOV     r1, r7
+        XORI    r2, HALF                ; set until here
+        JMP     go
+one:    MOV     r0, r7
+        JMP     go
+
+; One pulse: entered at its falling edge (landed, TD there); lands the rise
+; L ticks later and the next falling edge 12 + r4 ticks after the first, and
+; returns with TD there. r4 is cleared.
+pulse:  SETP    TX, 1, D
+        WAITD   L                       ; the rise
+        WAITD   12 - L - 1              ; the high time's fixed part
+        TEST    r4, r4
+        BZ      pend
+pl:     WAITD   1                       ; one tick per unit of r4
+        DJNZ    r4, pl
+pend:   SETP    TX, 0, D
+        WAITD   1                       ; the next falling edge
+        RET
