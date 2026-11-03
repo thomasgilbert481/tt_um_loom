@@ -1,0 +1,165 @@
+; hot_swap_dshot.loom
+;
+; Decisions (2026-11-03): the swap word stays in this demo program, not in
+; the shipped dshot_tx.loom, so the shipped program is unchanged. The
+; host cannot write instruction memory while any thread runs (SEMANTICS
+; 7), and no thread can start or stop another, so the swap is
+; cooperative: the replaced program must have a hand-over point. The
+; loader does not checksum the image.
+;
+; Live reprogramming: thread 3 runs a one-shot DShot600 transmitter on OUT3
+; and, when the host tells it to, replaces itself with a new program sent
+; through INQ[3], while threads 0..2 keep running untouched.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), for a
+; judge's question about D-035: loading a program through the host port
+; stops all four threads (docs/HOST_PROTOCOL.md SPACE 1, SEMANTICS 7: host
+; IMEM writes are valid only while RUN == 0), so can one thread's protocol
+; be replaced while the other three run? Nothing in Loom was built for
+; that. The program uses two pieces of hardware built for other jobs: `ST`
+; (SEMANTICS 6.11, D-027), built so that a device emulator (a 24C02) can
+; keep its data in the instruction memory, and the FIFOs (6.7), built to feed
+; protocol data. Because "data memory is the instruction memory" and "a word
+; written by ST is an instruction word like any other" (6.11), a thread can
+; write code; the firmware supplies everything else: the swap command, the
+; handover point, the image format and the resident loader.
+;
+; What it cannot do, exactly (no RTL change, D-032): a thread cannot stop,
+; start or redirect another thread (the only RUN write is HALT, of its own
+; thread, 6.2; no CSR holds RUN, RESET or PC), and the host cannot write the
+; memory while any thread runs (7). So the swap is cooperative: the
+; program being replaced must have a handover point, here the POP that
+; waits for its next command. A program with no such point (any shipped
+; program loaded as is) can be swapped in but not swapped out again.
+;
+; Protocol A (the DShot part) is firmware/dshot_tx.loom reduced to one-shot
+; mode: the same frame, checksum, 20/7/14-tick bit cells and deadline-latched
+; edges, so every edge lands on the exact clock edge of its tick (6.10 rule
+; 1). The repeat stream is left out: its interval word (bit 15 = 1) is the
+; swap word here. The tick is the host's, as for dshot_tx: TICK_INT 4,
+; TICK_FRAC 43 at 50 MHz (DShot600, 83.36 clocks a bit).
+;
+; Host commands (FIFO space, thread 3):
+;   frame word, bit 15 = 0: bits 11:0 the packet (value << 1 | telemetry, as
+;               Betaflight packs it), bits 14:12 ignored; one frame is sent
+;               about 40 ticks after the word is taken. Nothing goes to OUTQ.
+;   swap,       bit 15 = 1 (bits 14:0 ignored), then the image:
+;               word 1  TICK_INT for the new program
+;               word 2  TICK_FRAC for it
+;               word 3  n, the image length in words, 1 .. ROOM (108)
+;               n words the image, written to BASE, BASE + 1, ...; the new
+;                       program starts at BASE, thread 3's reset vector
+;               An n of 0 or above ROOM is refused: the n words that follow
+;               are taken and dropped, nothing is written, and the DShot
+;               program carries on (its code is still intact).
+; A swap word is only ever taken at the POP of `idle`, which is reached
+; only between frames: a swap pushed while a frame is on the wire waits in
+; INQ until the frame's last bit cell has ended. Words pushed after the
+; image are the new program's commands.
+;
+; The handover, and why no thread ever runs a half-written program:
+;   1. The DShot code jumps to the resident loader (LOADER .. 511). The
+;      loader is outside BASE .. BASE + ROOM - 1, so it never writes a word it
+;      executes, and the image cannot reach it.
+;   2. Each `ST` completes before the loader's next instruction issues: the
+;      store is made in the F cycle of the ST's second slot and is visible to
+;      fetches from the next cycle (6.11), four cycles before the thread's
+;      next F. Only thread 3 ever executes words of thread 3's quarter, and
+;      it is in the loader while they are written.
+;   3. The jump to BASE is the loader's last instruction, after the last ST.
+; The other threads lose nothing: an LD/ST pair takes "no cycle of any other
+; thread's" (6.11) and each thread owns its slot whatever the others do (2),
+; so their pin edges are on the same clocks with and without a swap
+; (tools/tests/test_fw_hot_swap.py measures that).
+;
+; Memory: thread 3's quarter, 384 .. 511. The DShot code takes BASE ..,
+; the loader the last 20 words; a new image may use 108 words, and BASE ..
+; BASE + n - 1 after the swap is the image only (the old code beyond it
+; stays but is never reached). firmware/ws2812.loom (52 words, as shipped,
+; with `.thread 3` and DOUT on OUT3) is the image the tests send.
+;
+; Registers: r0 the frame being shifted out, r1 bits left in it, r5 the
+; command word, r6 scratch; in the loader r0 TICK_INT, r1 TICK_FRAC, r2 the
+; words left, r3 the address, r4 the word.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 3
+        .pins   DOUT = OUT3
+        .tick   4                       ; the shortest tick the schedule is proved for
+        .equ    BIT  = 20               ; ticks per bit (MOTOR_BITLENGTH)
+        .equ    T0H  = 7                ; high time of a 0 (MOTOR_BIT_0)
+        .equ    T1H  = 14               ; high time of a 1 (MOTOR_BIT_1)
+        .equ    T0L  = BIT - T0H        ; 13
+        .equ    T1L  = BIT - T1H        ; 6
+        .equ    PREPT = 2 * BIT         ; 40 ticks from the word to the first rise
+        .equ    BASE = 384              ; thread 3's reset vector (SEMANTICS 5)
+        .equ    LOADER = 492            ; the resident loader: the last 20 words
+        .equ    ROOM = LOADER - BASE    ; 108 words a new image may use
+
+start:  SETP    DOUT, 0                 ; the line idles low
+
+; The handover point: between frames the program waits here, and only here.
+idle:   POP     r5                      ; blocks while INQ is empty
+        SETD    0                       ; re-anchor after the unbounded POP
+        ADD     r6, r5, r5              ; C = bit 15
+        BC      loader                  ; a swap word: hand over
+
+; A frame from the packet in r5 bits 11:0 (bits 15:12 ignored), as in
+; dshot_tx.loom: checksum = the XOR of the three nibbles.
+        SHLI    r5, 4                   ; packet << 4: bits 15:12 drop out
+        MOV     r0, r5                  ; the frame, checksum still 0
+        SHRI    r5, 4                   ; v = the 12-bit packet
+        MOV     r6, r5                  ; csum = v ^ v >> 4 ^ v >> 8:
+        SHRI    r6, 4
+        XOR     r6, r6, r5
+        SHRI    r6, 4
+        XOR     r6, r6, r5
+        ANDI    r6, 15                  ; the low nibble is the checksum
+        OR      r0, r0, r6              ; the 16-bit frame
+        LDI     r1, 16
+        SETP    DOUT, 1, D              ; stage the first rise
+        WAITD   PREPT                   ; it lands on the frame start
+
+; bit is entered at the rise that starts a bit (it has just landed): r0
+; holds the bits not yet sent, r1 how many are left, this one included.
+bit:    SETP    DOUT, 0, D              ; stage the fall
+        SHLI    r0, 1                   ; C = this bit
+        BC      one
+        WAITD   T0H                     ; 7 ticks high; the fall lands here
+        DJNZ    r1, zn                  ; more bits in the frame?
+        WAITD   T0L                     ; no: the end of the last bit cell
+        JMP     idle
+zn:     SETP    DOUT, 1, D              ; stage the next rise
+        WAITD   T0L                     ; it lands on the cell boundary
+        JMP     bit
+one:    WAITD   T1H                     ; 14 ticks high
+        DJNZ    r1, on
+        WAITD   T1L                     ; the end of the last bit cell
+        JMP     idle
+on:     SETP    DOUT, 1, D
+        WAITD   T1L                     ; 6 ticks low
+        JMP     bit
+
+; ------------------------------------------------- the resident loader
+; Entered from idle with the swap word taken. No deadlines: it only waits
+; for words. Every ST writes below LOADER (n <= ROOM), never itself.
+        .org    LOADER
+loader: POP     r0                      ; TICK_INT for the new program
+        POP     r1                      ; TICK_FRAC
+        POP     r2                      ; n
+        OR      r2, r2, r2              ; Z = (n == 0)
+        BZ      start                   ; no image: carry on as DShot
+        LDI     r4, ROOM
+        SUB     r4, r4, r2              ; C = (ROOM >= n)
+        BNC     drop                    ; too long: it would reach the loader
+        MOV16   r3, BASE
+copy:   POP     r4                      ; the next image word
+        ST      r4, r3, 0               ; done before the next instruction issues
+        ADDI    r3, 1
+        DJNZ    r2, copy
+        CSRW    TICK_INT, r0            ; the new program's tick (clears ACC)
+        CSRW    TICK_FRAC, r1
+        JMP     BASE                    ; the last instruction: the image is whole
+drop:   POP     r4                      ; refused: take the n words, write none
+        DJNZ    r2, drop
+        JMP     start                   ; the DShot code is untouched
