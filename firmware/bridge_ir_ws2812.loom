@@ -1,0 +1,526 @@
+; bridge_ir_ws2812.loom
+;
+; Decisions (2026-11-03): both threads spill into thread 2's quarter (339
+; of 512 words), so thread 2 stays idle beside the bridge. The key codes
+; are the widely published table for the common 21-key NEC remote, not a
+; manufacturer's document. A held key steps on every repeat code.
+;
+; An infrared remote drives an LED strip, with no host in the loop: thread
+; 0 decodes NEC frames and repeat codes from a receiver module on IN0 and
+; turns each key into a strip state; thread 1 drives a WS2812B strip on
+; OUT0 and refreshes it whenever that state changes. The host loads the
+; image, sets thread 0's tick and starts both threads; nothing passes
+; through the FIFOs afterwards.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol pair Loom was not designed for (D-035). Nothing in Loom was built
+; for infrared or for WS2812. Thread 0 is firmware/ir_nec_rx.loom's
+; receiver: the timed waits (WAITP ... T against SETD, SEMANTICS 6.4, built
+; for PS/2 and I2C timeouts) measure every mark and space, and CSRW
+; TICK_INT restarts the tick grid on each accepted edge (SEMANTICS 4, built
+; for the UART, CAN and Manchester receivers). Thread 1 is
+; firmware/ws2812.loom's transmitter: every edge is a deadline-latched pin
+; write (SETP pin, v, D, SEMANTICS 6.10, built for clock-exact edges). The
+; two meet in one word of data memory (LD/ST, 6.11, built so device
+; emulators can keep a register file). What the firmware does that no
+; hardware does: NEC's pulse-distance decoding and checks, the command
+; map, brightness scaling, the WS2812 bit timing and the hand-off.
+;
+; Pins: RX = IN0 (thread 0; the demodulated output of a TSOP38238 or alike,
+; low while a 38 kHz burst is present, idle high), DOUT = OUT0 (thread 1; to
+; the strip's DIN, through a 5 V level shifter on a real board).
+;
+; -------------------------------------------------------- the command map
+; Standard NEC frames to address ADDR (0x00) only, with the key codes of
+; the common 21-key NEC remote (QUESTIONS.md 1: taken from the widely
+; published key table of that remote, not from a manufacturer's document):
+;     0..9  0x16 0x0C 0x18 0x5E 0x08 0x1C 0x5A 0x42 0x52 0x4A
+;           colour 0..9, and the strip on
+;     VOL+  0x15  one level brighter (nothing when off or at level 7)
+;     VOL-  0x07  one level dimmer (nothing when off or at level 0)
+;     PLAY  0x43  on / off (colour and level are kept)
+; A repeat code (the key is still held) applies the last frame's key again
+; if that key was VOL+ or VOL-, so a held key ramps one level every 108 ms.
+; Anything else ends the hold, and a repeat after it does nothing: a frame
+; of another address, an extended (16-bit) address, a wrong inverse, a key
+; not in the map, a mark or space out of its window. Such frames are
+; ignored: they change nothing on the strip.
+;
+; Colours (R, G, B at level 7): 0 white 255 255 255, 1 red 255 0 0, 2
+; orange 255 96 0, 3 yellow 255 224 0, 4 green 0 255 0, 5 cyan 0 255 255,
+; 6 blue 0 0 255, 7 violet 128 0 255, 8 magenta 255 0 160, 9 warm white
+; 255 160 64. At level L each byte is c >> (7 - L): a step halves or
+; doubles the light, which the eye sees as even steps. After RUN the strip
+; is off, colour 0, level 4, and the first frame blanks it.
+;
+; STATE (one word): bits 3:0 the colour, 6:4 the level, 7 on; initial 0x40.
+;
+; -------------------------------------------------------------- the strip
+; Every LED shows the same colour, so a frame needs no buffer: thread 1
+; holds G, R and B in three registers and sends them NLEDS times. NLEDS is
+; a data word the host may patch before RUN (1 .. 65535; 0 is not allowed);
+; it is 60 in the image, one metre of a 60 LED/m strip, a frame of 1.84 ms.
+; It is bounded by the refresh time (30.72 us an LED) and the supply, not
+; by the word budget. The tests use 8 on the RTL to save clocks.
+;
+; Timing as ws2812.loom (whose header gives the datasheet windows): TICK_INT
+; 1, so every WAITD counts clocks at 50 MHz: T0H 20 clocks (0.40 us), T1H
+; 40 (0.80), period 64 (1.28 us) for both values, so T0L 44 and T1L 24; the
+; line then stays low RSTN * RSTW = 2750 clocks (55 us > 50 us) before the
+; next frame can start. Thread 1 sets its own tick: the datasheet fixes the
+; rate, so the host must not.
+;
+; The byte fetch. ws2812.loom's fetch from INQ is five slots; rotating G, R
+; and B through r0 would be seven, two more than a 0 bit's low phase has.
+; So the bit loop is written three times, one copy per byte of an LED: at
+; the end of a G byte the G copy loads R (MOV, LDI) and jumps into the R
+; copy, R loads B, and B counts the LED (DJNZ r6) and loads G or ends the
+; frame. Every byte fetch is then two or three slots and no POP is left to
+; declare bounded: every pair is proved (worst slack in the listing).
+;
+; ------------------------------------------- the hand-off (SEMANTICS 6.11)
+; One shared word, STATE, written by thread 0 only (one ST) and read by
+; thread 1 only (one LD). An LD or ST is one access at one edge, so the
+; word is never half written. Thread 1 reads STATE once, computes G, R and
+; B into registers before the first rise, and the whole frame comes from
+; those registers; it reads again only after the frame and its reset gap.
+; So every frame shows one state, never a mix of two, and a frame is never
+; cut short. Changes faster than frames coalesce (the newest wins, and the
+; strip always ends on the last state). Thread 1 compares each read with
+; the state it last sent and starts a frame only when they differ, so the
+; strip is refreshed only on a change: a key that changes nothing (a digit
+; already shown, VOL+ at level 7) sends nothing. Thread 1 never waits on
+; thread 0 (no flag, no FIFO), LD takes two of its own slots whatever the
+; others do (6.11) and the barrel gives it every fourth clock (SEMANTICS
+; 2), so its edges do not depend on the IR traffic. The latency from the
+; end of a key's last burst to the first rise is at most one frame and its
+; reset gap (if one is running) plus 5 us of polling and about 1 us of
+; arithmetic.
+;
+; Shared pin registers: thread 0 only reads IN0 and writes none of the pin
+; CSRs; thread 1 drives OUT0 with SETP only, and pin commits are
+; bit-masked (SEMANTICS 6.3); neither touches OD_MASK, PIN_OE, OUTGRP or
+; BE_PINS. No shared register is read-modify-written, so the start-up race
+; of two threads each setting a bit of OD_MASK (W-037 hazard 2) cannot
+; happen here.
+;
+; Memory, 339 of the 512 words: thread 0 151 words (0 .. 120 the
+; receiver and the key lookup, 302 .. 331 apply), thread 1 142 words (128
+; .. 240 the transmitter, 332 .. 360 change), the data 46 words at 256 ..
+; 301 (STATE, NLEDS, LAST, the colours, the key map). Neither thread fits
+; its quarter (the receiver alone is 112 words, the three bit loops 75), so
+; both spill into thread 2's quarter after the data: thread 2 cannot run
+; beside the bridge, and thread 3's quarter (384 .. 511) is free for a
+; third program.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0, DOUT = OUT0
+        .equ    DATA  = 256             ; STATE, NLEDS, LAST, colours, keys
+        .equ    COLS  = DATA + 3        ; colour c: G, R, B at COLS + 3c .. + 2
+        .equ    KEYS  = COLS + 30       ; the key map: action << 8 | code
+        .equ    NKEYS = 13
+        .equ    ADDR  = 0x00            ; the remote's address
+        .equ    UP    = 10              ; actions: 0..9 a colour, then these
+        .equ    DOWN  = 11
+        .equ    POWER = 12
+        .equ    NONE  = 63              ; LAST: no key to repeat
+        .equ    ON    = 0x80            ; STATE bit 7
+
+; ================================================= thread 0: NEC to STATE
+; ir_nec_rx.loom's receiver (its header gives the tick, the windows, the
+; glitch filter and how a pulse is measured), with its reports replaced:
+; a good frame or a repeat code applies the command map to STATE, and
+; every error (a window, a timeout, an inverse) ends the hold instead of
+; being pushed. The tick comes from the host: 1757 + 208/256 clocks at
+; 50 MHz, 1/16 of the NEC unit; 64 or more (the receiver's header).
+; r0 the item, then the command; r1 = 0x8000; r2 the address half, then
+; the action; r3 the command half, then STATE; r4 bits left, then scratch;
+; r5 the glitch-filter delay; r6 TICK_INT; r7 scratch and the data base.
+        .thread 0
+        .tick   64                      ; TICK_INT 64 or more (header)
+        .equ    G     = 2               ; glitch filter, ticks
+        .equ    LMMIN = 188 - G         ; leader mark window, minus the filter
+        .equ    LMMAX = 324 - G
+        .equ    RSMIN = 44 - G          ; repeat space
+        .equ    RSMAX = 84 - G
+        .equ    LSMIN = 92 - G          ; leader space
+        .equ    LSMAX = 164 - G
+        .equ    MMIN  = 8 - G           ; a one-unit mark or space
+        .equ    MMAX  = 24 - G
+        .equ    S1MIN = 32 - G          ; the space of a 1
+        .equ    S1MAX = 64 - G
+        .equ    I_REP = 16              ; r0: measuring a repeat code
+
+start:  CSRR    r6, TICK_INT            ; P, kept for the restarts
+        MOV     r5, r6
+        SHRI    r5, 1                   ; P / 2 slots = 2 ticks: the glitch filter,
+        SUBI    r5, 4                   ; less the 4 other slots of wlow / whigh
+        LDI     r1, 0
+        LDIH    r1, 0x80                ; r1 = 0x8000
+
+; Hunt for a leader: an idle (high) line first, then a confirmed mark.
+hunt:   WAITP   RX, 1
+h2:     SETD    255                     ; re-armed every 255 ticks
+        CALL    wlow
+        BT      h2                      ; no mark yet
+        LDI     r4, 32
+        LDI     r0, 0
+        SETD    LMMIN                   ; the leader mark, 188 .. 324 ticks
+        CALL    whigh
+        BNT     hunt                    ; too short for a leader: noise, ignored
+        SETD    LMMAX - LMMIN
+        CALL    whigh
+        BT      bad                     ; too long
+
+; The leader space: 44 .. 84 ticks is a repeat code, 92 .. 164 a frame.
+        SETD    RSMIN
+        CALL    wlow
+        BNT     bad                     ; too short
+        SETD    RSMAX - RSMIN
+        CALL    wlow
+        BNT     rep                     ; a repeat code
+        SETD    LSMIN - RSMAX
+        CALL    wlow
+        BNT     bad                     ; between the two windows
+        SETD    LSMAX - LSMIN
+        CALL    wlow
+        BT      bad                     ; too long
+        JMP     mark                    ; a frame: 32 data bits follow
+rep:    LDI     r0, I_REP               ; a repeat code: one burst follows
+        LDI     r4, 0
+
+; A mark, 8 .. 24 ticks; r4 = data bits left (0: the last burst).
+mark:   SETD    MMIN
+        CALL    whigh
+        BNT     bad                     ; too short
+        SETD    MMAX - MMIN
+        CALL    whigh
+        BT      bad                     ; too long
+        TEST    r4, r4
+        BZ      done                    ; that was the last burst
+
+; A space: 8 .. 24 ticks is a 0, 32 .. 64 a 1, least significant first.
+        SETD    MMIN
+        CALL    wlow
+        BNT     bad                     ; too short
+        SETD    MMAX - MMIN
+        CALL    wlow
+        BNT     zero                    ; a 0
+        SETD    S1MIN - MMAX
+        CALL    wlow
+        BNT     bad                     ; between the 0 and 1 windows
+        SETD    S1MAX - S1MIN
+        CALL    wlow
+        BT      bad                     ; too long: the frame stopped
+        SHRI    r3, 1
+        OR      r3, r3, r1              ; a 1
+        JMP     next
+zero:   SHRI    r3, 1
+next:   DEC     r4
+        CMPI    r4, 16
+        BNZ     mark
+        MOV     r2, r3                  ; the first 16 bits are whole
+        JMP     mark
+
+; The last burst has ended. A repeat code applies LAST if it is VOL+ or
+; VOL-; a frame must be standard NEC to ADDR with a good inverse.
+done:   MOV16   r7, DATA
+        TEST    r0, r0
+        BZ      frame
+        LD      r2, r7, 2               ; LAST
+        CMPI    r2, UP
+        BNC     hunt                    ; a colour: not repeated
+        CMPI    r2, POWER
+        BC      hunt                    ; POWER or NONE: not repeated
+        JMP     apply
+frame:  MOV     r4, r3                  ; the command half: ~command, command
+        SWAP    r4, r4
+        XOR     r4, r4, r3
+        NOT     r4, r4                  ; zero when bits 15:8 invert bits 7:0
+        BNZ     bad
+        MOV     r4, r2                  ; the same test on the address half
+        SWAP    r4, r4
+        XOR     r4, r4, r2
+        NOT     r4, r4
+        BNZ     bad                     ; an extended (16-bit) address
+        LDI     r4, ADDR
+        XOR     r4, r4, r2
+        SHLI    r4, 8                   ; Z: the address is ADDR
+        BNZ     bad
+        MOV     r0, r3
+        SHLI    r0, 8
+        SHRI    r0, 8                   ; the command
+        MOV16   r7, KEYS
+        LDI     r4, NKEYS
+look:   LD      r2, r7, 0               ; action << 8 | code
+        XOR     r3, r2, r0
+        SHLI    r3, 8                   ; Z: this key
+        BZ      found
+        INC     r7
+        DJNZ    r4, look
+bad:    MOV16   r2, NONE << 8           ; not for us: ignored, the hold ends
+found:  SHRI    r2, 8                   ; the action
+        MOV16   r7, DATA
+        ST      r2, r7, 2               ; LAST
+        CMPI    r2, NONE
+        BZ      hunt
+        JMP     apply                   ; (after the data: thread 0 spills there)
+
+; wlow / whigh: ir_nec_rx.loom's, unchanged. Wait until RX is low / high
+; or TD is reached, through the glitch filter. T = 1: TD came first. T = 0:
+; the new level held for r5 slots (2 ticks); a confirmed edge restarts the
+; tick grid (CSRW TICK_INT clears ACC).
+wlow:   WAITP   RX, 0, T
+        BT      wlr
+        MOV     r7, r5
+wld:    DJNZ    r7, wld
+        JP      RX, 1, wlow             ; high again: a glitch
+        CSRW    TICK_INT, r6            ; the next window starts here
+wlr:    RET
+whigh:  WAITP   RX, 1, T
+        BT      whr
+        MOV     r7, r5
+whd:    DJNZ    r7, whd
+        JP      RX, 0, whigh            ; low again: a glitch
+        CSRW    TICK_INT, r6
+whr:    RET
+
+; ============================================== thread 1: STATE to WS2812
+; ws2812.loom's transmitter with its INQ replaced by three registers.
+; r0 the bit shifter (the byte in 15:8, shifted left), r1 the bits left in
+; the byte (then the reset-gap count), r2 the state last sent, r3 r4 r5 G R
+; B in bits 15:8, r6 the LEDs left, r7 DATA (the .csr scratch before).
+        .thread 1
+        .equ    T0H  = 20               ; 0.40 us
+        .equ    T1H  = 40               ; 0.80 us
+        .equ    PER  = 64               ; 1.28 us
+        .equ    T0L  = PER - T0H        ; 44 = 0.88 us
+        .equ    T1L  = PER - T1H        ; 24 = 0.48 us
+        .equ    FIRST = 32              ; re-anchor to the first rise
+        .equ    RSTW = 250              ; reset gap = RSTN * RSTW clocks
+        .equ    RSTN = 11               ; 2750 clocks = 55 us > 50 us
+        .equ    POLL = 250              ; STATE is read every 5 us when idle
+
+wstart: .csr    TICK_INT, 1             ; one tick is one clock: the datasheet
+        .csr    TICK_FRAC, 0            ; fixes this rate, not the host
+        SETP    DOUT, 0                 ; the line idles low
+        MOV16   r7, DATA
+        LDI     r2, 0
+        NOT     r2, r2                  ; 0xFFFF: no state sent yet
+        SETD    0
+
+; Poll STATE; on a change take it whole, then build G, R and B.
+poll:   LD      r0, r7, 0               ; STATE: one access, one whole word
+        CMP     r0, r2
+        BZ      idle
+        JMP     change                  ; (after the data: thread 1 spills there)
+idle:   WAITD   POLL
+        JMP     poll
+
+; A frame starts as ws2812.loom's does, with the first G byte.
+lit:    SETD    0
+        MOV     r0, r3
+        LDI     r1, 8
+        SETP    DOUT, 1, D              ; stage the first rise
+        SHLI    r0, 1                   ; C = the first bit
+        BC      first1
+        WAITD   FIRST                   ; the rise lands on this deadline
+        JMP     g_z
+first1: WAITD   FIRST
+        JMP     g_o
+
+; The bit loop, once per byte of an LED (header). Each copy is
+; ws2812.loom's z_bit / o_bit: entered at the rise of a bit whose value it
+; is named for (_z a 0, _o a 1), TD that rise's deadline, r0 the bits not
+; yet sent and r1 how many are left, this one included. At the end of a
+; byte the copy loads the next byte and jumps into the next copy.
+; ---------------------------------------------------------------- G byte
+g_z:    SETP    DOUT, 0, D              ; stage the fall
+        WAITD   T0H                     ; 0.40 us high; the fall lands here
+        DJNZ    r1, g_zn
+        MOV     r0, r4                  ; G done: R next
+        LDI     r1, 8
+        JMP     r_zn
+g_zn:   SETP    DOUT, 1, D              ; stage the next rise
+        SHLI    r0, 1                   ; C = the next bit
+        BC      g_z1
+        WAITD   T0L                     ; the rise lands on the period boundary
+        JMP     g_z
+g_z1:   WAITD   T0L
+        JMP     g_o
+g_o:    SETP    DOUT, 0, D              ; stage the fall
+        DJNZ    r1, g_on
+        MOV     r0, r4
+        LDI     r1, 8
+        JMP     r_on
+g_on:   WAITD   T1H                     ; 0.80 us high; the fall lands here
+        SETP    DOUT, 1, D
+        SHLI    r0, 1
+        BC      g_o1
+        WAITD   T1L
+        JMP     g_z
+g_o1:   WAITD   T1L
+        JMP     g_o
+
+; ---------------------------------------------------------------- R byte
+r_z:    SETP    DOUT, 0, D
+        WAITD   T0H
+        DJNZ    r1, r_zn
+        MOV     r0, r5                  ; R done: B next
+        LDI     r1, 8
+        JMP     b_zn
+r_zn:   SETP    DOUT, 1, D
+        SHLI    r0, 1
+        BC      r_z1
+        WAITD   T0L
+        JMP     r_z
+r_z1:   WAITD   T0L
+        JMP     r_o
+r_o:    SETP    DOUT, 0, D
+        DJNZ    r1, r_on
+        MOV     r0, r5
+        LDI     r1, 8
+        JMP     b_on
+r_on:   WAITD   T1H
+        SETP    DOUT, 1, D
+        SHLI    r0, 1
+        BC      r_o1
+        WAITD   T1L
+        JMP     r_z
+r_o1:   WAITD   T1L
+        JMP     r_o
+
+; ---------------------------------------------------------------- B byte
+; The end of a B byte is the end of an LED: the next LED's G, or the end.
+b_z:    SETP    DOUT, 0, D
+        WAITD   T0H
+        DJNZ    r1, b_zn
+        DJNZ    r6, b_zm                ; another LED?
+        JMP     fend                    ; no: the fall that just landed was the last
+b_zm:   MOV     r0, r3
+        LDI     r1, 8
+        JMP     g_zn
+b_zn:   SETP    DOUT, 1, D
+        SHLI    r0, 1
+        BC      b_z1
+        WAITD   T0L
+        JMP     b_z
+b_z1:   WAITD   T0L
+        JMP     b_o
+b_o:    SETP    DOUT, 0, D
+        DJNZ    r1, b_on
+        DJNZ    r6, b_om
+        JMP     o_last
+b_om:   MOV     r0, r3
+        LDI     r1, 8
+        JMP     g_on
+b_on:   WAITD   T1H
+        SETP    DOUT, 1, D
+        SHLI    r0, 1
+        BC      b_o1
+        WAITD   T1L
+        JMP     b_z
+b_o1:   WAITD   T1L
+        JMP     b_o
+
+o_last: WAITD   T1H                     ; the fall of the frame's last bit
+fend:   LDI     r1, RSTN                ; the reset gap: the strip latches
+rst:    WAITD   RSTW
+        DJNZ    r1, rst
+        JMP     poll
+
+; ================================================================== data
+; At DATA, in thread 2's quarter. STATE is written by thread 0 only and
+; read by thread 1 only; NLEDS by the host only; LAST by thread 0 only.
+        .org    DATA
+        .word   0x40                    ; STATE: off, colour 0, level 4
+        .word   60                      ; NLEDS
+        .word   NONE                    ; LAST
+; The colours, G, R, B at level 7 (the wire order of a WS2812B).
+        .word   255, 255, 255           ; 0 white
+        .word     0, 255,   0           ; 1 red
+        .word    96, 255,   0           ; 2 orange
+        .word   224, 255,   0           ; 3 yellow
+        .word   255,   0,   0           ; 4 green
+        .word   255,   0, 255           ; 5 cyan
+        .word     0,   0, 255           ; 6 blue
+        .word     0, 128, 255           ; 7 violet
+        .word     0, 255, 160           ; 8 magenta
+        .word   160, 255,  64           ; 9 warm white
+; The key map: action << 8 | NEC command.
+        .word   0 << 8 | 0x16, 1 << 8 | 0x0C, 2 << 8 | 0x18, 3 << 8 | 0x5E
+        .word   4 << 8 | 0x08, 5 << 8 | 0x1C, 6 << 8 | 0x5A, 7 << 8 | 0x42
+        .word   8 << 8 | 0x52, 9 << 8 | 0x4A
+        .word   UP << 8 | 0x15, DOWN << 8 | 0x07, POWER << 8 | 0x43
+
+; ============================================ thread 0, continued: apply
+; Past the data, in thread 2's quarter: thread 0's 128 words hold the
+; receiver and the key lookup, and this is the rest.
+        .thread 0
+        .org    KEYS + NKEYS
+; Apply action r2 to STATE (r7 = DATA). Only this thread writes STATE.
+apply:  LD      r3, r7, 0               ; STATE
+        CMPI    r2, UP
+        BC      notcol
+        SHRI    r3, 4                   ; a colour: bits 3:0 = r2, and on
+        SHLI    r3, 4
+        OR      r3, r3, r2
+        LDI     r4, ON
+        OR      r3, r3, r4
+        JMP     store
+notcol: LDI     r4, ON
+        CMPI    r2, POWER
+        BNZ     level
+        XOR     r3, r3, r4              ; on / off
+        JMP     store
+level:  TEST    r3, r4
+        BZ      same                    ; off: VOL+ and VOL- do nothing
+        MOV     r4, r3
+        SHRI    r4, 4
+        ANDI    r4, 7                   ; the level
+        CMPI    r2, UP
+        BNZ     down
+        CMPI    r4, 7
+        BZ      same                    ; already the brightest
+        ADDI    r3, 16
+        JMP     store
+down:   TEST    r4, r4
+        BZ      same                    ; already the dimmest
+        SUBI    r3, 16
+store:  ST      r3, r7, 0               ; one access: never half written
+same:   JMP     hunt                    ; (out of a branch's reach)
+t0end:                                  ; the first word after thread 0
+
+; ============================================ thread 1, continued: change
+; Also past the data: STATE has changed, so build G, R and B from it.
+        .thread 1
+        .org    t0end
+change: MOV     r2, r0                  ; the state this frame shows
+        LD      r6, r7, 1               ; NLEDS
+        MOV     r1, r0
+        ANDI    r1, 15                  ; the colour c
+        MOV     r5, r1
+        SHLI    r5, 1
+        ADD     r5, r5, r1
+        ADD     r5, r5, r7              ; DATA + 3c
+        LD      r3, r5, COLS - DATA     ; G, R, B in bits 7:0
+        LD      r4, r5, COLS - DATA + 1
+        LD      r5, r5, COLS - DATA + 2
+        MOV     r1, r0
+        SHRI    r1, 4
+        ANDI    r1, 7                   ; the level L
+        LDI     r0, 7
+        SUB     r1, r0, r1              ; 7 - L
+        SHR     r3, r3, r1              ; c >> (7 - L)
+        SWAP    r3, r3                  ; to bits 15:8, MSB first
+        SHR     r4, r4, r1
+        SWAP    r4, r4
+        SHR     r5, r5, r1
+        SWAP    r5, r5
+        MOV     r0, r2
+        SHRI    r0, 7                   ; the ON bit (STATE < 0x100)
+        BNZ     go
+        LDI     r3, 0                   ; off: every LED dark
+        LDI     r4, 0
+        LDI     r5, 0
+go:     JMP     lit
