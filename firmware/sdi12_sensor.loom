@@ -1,0 +1,293 @@
+; sdi12_sensor.loom
+; An SDI-12 sensor (SDI-12 version 1.4, 2021-01-30, sdi-12.org) at an
+; address the host sets: it sleeps until a break, then answers the
+; acknowledge (a!, and the wildcard ?!), send-identification (aI!), start
+; measurement (aM!) and send data (aD0!) commands with strings the host
+; supplies, inside the response window of section 7.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): SDI-12 is in no Loom design
+; document. It needs the M2 core (pins, deadlines, the FIFOs), the bit
+; engine's shift register in manual mode (SHO and SHI, SEMANTICS 6.9),
+; built for the synchronous serial programs and USB's and CAN's encoders,
+; whose INV bit here makes SDI-12's negative logic, PAR for the even
+; parity, and LD/ST of slice B (SEMANTICS 6.11, built for the I2C EEPROM's
+; array), which hold the address and the response strings. No hardware
+; knows SDI-12: the break detection, the 8.33 ms marking rule, the 7E1
+; frame, the command parser, the turn-around of the line, the response
+; window and the sleep rules are all firmware.
+;
+; Wire: as sdi12_recorder.loom (section 3.1, Table 1: marking, logical 1,
+; -0.5 to 1.0 V; spacing, logical 0, 3.5 to 5.5 V), through the same
+; three-state driver and receiver:
+;     TX  = OUT0  the driver's input in wire polarity, 1 = spacing
+;     DIR = OUT1  the driver's enable, 1 = the sensor drives the line
+;     RX  = IN0   the line, 1 = spacing
+; BE_CFG.INV = 1: SHO sends ~bit, SHI takes ~RX.
+;
+; Host set-up (INQ[0]), once, after RUN: the address character, then three
+; strings, each its characters one per word in bits 6:0 and a 0 word:
+; what follows the address in the response to aI! (section 4.4.2, Table
+; 7: "llccccccccmmmmmmvvvxxx...", ll = 14 for version 1.4), to aM! (4.4.5,
+; Table 9: "tttn"), and to aD0! (4.4.8, Table 11: the values, "+1.25-3.5").
+; The three together hold at most STRMAX characters; more are dropped.
+; Nothing is pushed to OUTQ.
+;
+; Behaviour (section 7 unless named):
+;     standby      after a break only: spacing for BRK = 10 bits (8.33 ms;
+;                  a break is not one below 6.5 ms and always one above
+;                  12 ms; a character's longest spacing run, a start bit
+;                  and eight 0s, is 9 bits) and then MARK = 10 bits (8.33
+;                  ms) of marking before it looks for an address
+;     address      its own, or '?' with '!' (4.4.3); any other address
+;                  sends it back to standby, so do a framing error (it may
+;                  be a break) and 120 bits (100 ms) of marking
+;     commands     a! and ?! (4.4.1), aI!, aM!, aD0!; a parity error or
+;                  any other command is ignored up to its '!', with no
+;                  response, and the sensor stays awake
+;     response     it drives the line marking from 2 bits (1.67 ms) after
+;                  the command's last stop bit, so 8.33 ms of its own
+;                  marking come before its first start bit at 12 bits
+;                  (10 ms, max 15 ms + 0.4); then the address, the string,
+;                  <CR><LF>, back to back (gap 0, max 1.66 ms); it
+;                  releases the line at the end of the <LF>'s stop bit
+;                  (max 7.5 ms)
+; Every edge is the SHO or SETP right after its WAITD, 6 to 9 clocks after
+; its tick. Each received character is sampled from its own start edge.
+;
+; Rate: eight ticks a bit, set by the host before RUN (the M2 convention):
+; TICK_INT 5208, TICK_FRAC 85 at 50 MHz; TICK_INT 24 on the tests' slow
+; clock of 230.4 kHz. The deadline pairs are proved for 24 clocks (.tick).
+;
+; Limits. No service request (4.4.6): ttt is the host's string, and a
+; sensor whose ttt is not 000 should be asked for D0 after ttt seconds,
+; as the standard's recorder does anyway. No change of address (aAb!), no
+; concurrent, verification, CRC or extended commands (4.4.4, 4.4.7 to
+; 4.4.13): they are ignored. aD1! .. aD9! are ignored, so aM!'s n must be
+; what the aD0! string holds.
+;
+; Memory: 126 words of the quarter of the thread it runs on (thread 0 as
+; written; thread 1, at 0x080, beside sdi12_recorder.loom, with only its
+; .thread and .pins lines changed) and 0x180 .. 0x1FF, thread 3's quarter: the
+; address, the string pointers and the strings (DATA, 5 words loaded and
+; STRMAX + 3 written), and the 44 words of set-up code (ICODE). Thread 3
+; must not be started.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, DIR = OUT1, RX = IN0
+        .tick   24                      ; the fastest tick supported (header)
+        .equ    BRK = 10 * 8            ; break: spacing, ticks
+        .equ    MARK = 10 * 8           ; marking after it, ticks
+        .equ    SLEEP = 120 * 8         ; marking before standby, ticks
+        .equ    NEXT = 10 * 8           ; next start bit by, ticks after a stop bit
+        .equ    DATA = 0x180
+        .equ    S_ADDR = 0              ; offsets from DATA
+        .equ    S_PID = 1               ; where each string starts
+        .equ    S_PM = 2
+        .equ    S_PD = 3
+        .equ    NULLS = DATA + 4        ; the empty string, for a!
+        .equ    STR = DATA + 5
+        .equ    STRMAX = 72
+        .equ    ICODE = STR + STRMAX + 3
+
+; Registers: r0 a character, r1 the action or scratch, r2 the response
+; string, r3 the parser's state, r4 the address received, r5 the flags,
+; r6 a start-bit deadline, r7 DATA (and .csr scratch).
+
+start:  JMP     sinit                   ; the set-up, at ICODE
+
+; ------------------------------------------------------------- standby
+; A break: spacing for BRK ticks without a mark (a shorter run is data or
+; noise), then MARK ticks of marking without a spacing.
+sleep:  WAITP   RX, 1                   ; spacing
+        SETD    BRK
+        WAITP   RX, 0, T                ; marking before BRK: not a break
+        BNT     sleep
+brkend: WAITP   RX, 0                   ; the end of the break
+        SETD    MARK
+        WAITP   RX, 1, T                ; spacing before MARK: not yet awake
+        BNT     sleep
+        CSRR    r6, NOW
+        MOV16   r0, SLEEP - MARK
+        ADD     r6, r6, r0              ; 100 ms of marking from the break's end
+
+; -------------------------------------------------------------- awake
+; Characters until the command's '!', each start bit by r6: SLEEP for the
+; first (a timeout is standby), NEXT after the stop bit before it for the
+; others. Each is parsed during its parity bit and stop bit.
+cmd:    LDI     r3, 0                   ; the parser: the address next
+        LDI     r0, 0
+rxc:    LDI     r5, 0
+rxs:    CSRW    TD, r6
+        WAITP   RX, 1, T                ; spacing: a start bit
+        BT      rxto                    ; the deadline: T = 1
+        SETD    0                       ; this frame's grid from its edge
+        WAITD   4                       ; the middle of the start bit
+        JP      RX, 0, rxs              ; marking again: a glitch
+        LDI     r0, 8
+        CSRW    CNT, r0
+rxb:    WAITD   8                       ; the middle of the next bit
+        SHI                             ; SR <= {~RX, SR[15:1]}
+        BNZ     rxb
+        STSR    r0
+        SHRI    r0, 8                   ; {parity, data 6:0}
+        PAR     r0, r0                  ; C = odd: a parity error
+        BNC     rxpe
+        LDI     r5, 1
+rxpe:   SHLI    r0, 9
+        SHRI    r0, 9                   ; the character
+        CSRR    r6, TD
+        ADDI    r6, 46
+        ADDI    r6, NEXT + 12 - 46      ; NEXT after the stop bit's end
+
+; The parser. States (r3): 0 the address, 1 the command letter, 2 a '!'
+; to answer with the string at r2, 4 the '0' of D0, 6 skipping to the '!'
+; of a command it ignores. Actions (r1), taken after the stop bit: 0 the
+; next character, 1 respond, 2 ignored (stay awake), 3 standby.
+        LDI     r1, 0
+        TEST    r5, r5
+        BZ      pok
+        LDI     r3, 6                   ; a parity error: ignore the command
+        JMP     p6
+pok:    TEST    r3, r3
+        BNZ     p1
+        LDI     r3, 1                   ; the address:
+        MOV     r4, r0
+        CMPI    r0, '?'                 ; the wildcard
+        BZ      pdone
+        LD      r1, r7, S_ADDR
+        CMP     r0, r1
+        LDI     r1, 0                   ; (LDI keeps Z)
+        BZ      pdone                   ; its own
+        LDI     r1, 3                   ; another sensor's: standby
+        JMP     pdone
+p1:     CMPI    r0, '!'
+        BNZ     p1x
+        CMPI    r3, 2
+        BZ      presp                   ; aI!, aM!, aD0!
+        CMPI    r3, 1
+        BNZ     pign                    ; '!' ends an ignored command
+        MOV16   r2, NULLS               ; a! (and ?!): the address alone
+presp:  LDI     r1, 1
+        JMP     pdone
+pign:   LDI     r1, 2
+        JMP     pdone
+p1x:    CMPI    r3, 1
+        BNZ     p2
+        LDI     r3, 6
+        CMPI    r4, '?'                 ; '?' only with '!'
+        BZ      pdone
+        MOV     r1, r0
+        SUBI    r1, 32
+        SUBI    r1, 32                  ; the letter - 64: D 4, I 9, M 13
+        LDI     r3, 2
+        LD      r2, r7, S_PID
+        CMPI    r1, 'I' - 64
+        BZ      pmore
+        LD      r2, r7, S_PM
+        CMPI    r1, 'M' - 64
+        BZ      pmore
+        LDI     r3, 4
+        LD      r2, r7, S_PD
+        CMPI    r1, 'D' - 64
+        BZ      pmore
+p6:     LDI     r3, 6                   ; anything else: ignored
+        JMP     pmore
+p2:     CMPI    r3, 4
+        BNZ     p6                      ; state 2 without '!', or 6
+        LDI     r3, 2
+        CMPI    r0, '0'
+        BNZ     p6
+pmore:  LDI     r1, 0
+pdone:  WAITD   8                       ; the middle of the stop bit
+        JP      RX, 0, pstop            ; marking: a good stop bit
+        JMP     brkend                  ; spacing: a framing error, or a break
+pstop:  TEST    r1, r1
+        BZ      rxc                     ; the next character
+        CMPI    r1, 1
+        BZ      resp
+        CMPI    r1, 3
+        BZ      sleep
+        JMP     awake                   ; ignored: stay awake
+rxto:   TEST    r3, r3
+        BZ      sleep                   ; 100 ms of marking: standby
+awake:  CSRR    r6, NOW
+        MOV16   r0, SLEEP
+        ADD     r6, r6, r0
+        JMP     cmd
+
+; ------------------------------------------------------------ response
+; From the middle of the '!''s stop bit (TD): its end 4 ticks on, the
+; line driven marking 16 ticks after that, the first start bit 96 ticks
+; (12 bits) after the end; then the characters back to back and the
+; release at the end of the <LF>'s stop bit.
+resp:   WAITD   20                      ; 2 bits after the command's end
+        SETP    DIR, 1                  ; driven: TX is marking already
+        WAITD   72                      ; txchar's WAITD 8 makes it 12 bits
+        LD      r0, r7, S_ADDR
+rsend:  CALL    txchar
+        LD      r0, r2, 0
+        INC     r2
+        TEST    r0, r0
+        BNZ     rsend                   ; the string, up to its 0
+        LDI     r0, 13
+        CALL    txchar                  ; <CR>
+        LDI     r0, 10
+        CALL    txchar                  ; <LF>
+        WAITD   8                       ; the end of its stop bit
+        SETP    DIR, 0                  ; released
+        JMP     awake
+
+; ------------------------------------------------- ICODE: the set-up
+        .org    ICODE
+sinit:  SETP    TX, 0                   ; marking
+        SETP    DIR, 0                  ; released
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0x80            ; INV; NRZ, LSB first
+        MOV16   r7, DATA
+        POP     r0
+        ST      r0, r7, S_ADDR          ; the address
+; The three strings into STR one after another, each with its 0, their
+; starts in S_PID, S_PM, S_PD; characters past STRMAX are dropped.
+        MOV16   r2, STR
+        MOV16   r1, DATA + S_PID
+        LDI     r3, 3
+        LDI     r4, STRMAX
+lds:    ST      r2, r1, 0               ; this string starts here
+        INC     r1
+ldc:    POP     r0
+        TEST    r0, r0
+        BZ      ldz                     ; the string's end
+        TEST    r4, r4
+        BZ      ldc                     ; full: dropped
+        DEC     r4
+ldz:    ST      r0, r2, 0
+        INC     r2
+        TEST    r0, r0
+        BNZ     ldc
+        DJNZ    r3, lds
+        JMP     sleep
+
+; txchar: the character in r0 (bits 6:0) as one 7E1 frame from the next
+; tick on: SR = {stop 1, parity, data 6:0, start 0}, ten SHOs a bit
+; apart, LSB first, each the instruction after its WAITD. Returns after the
+; stop bit's SHO; the stop bit ends at TD + 8. Uses r1.
+txchar: MOV     r1, r0
+        SHLI    r1, 1                   ; the start bit, 0, in bit 0
+        PAR     r1, r1                  ; C = odd: the parity bit is 1
+        LDIH    r1, 2                   ; the stop bit (bit 9), parity 0
+        BNC     txev
+        LDIH    r1, 3                   ; parity 1
+txev:   LDSR    r1
+        LDI     r1, 10
+        CSRW    CNT, r1
+txb:    WAITD   8
+        SHO                             ; TX = ~bit: negative logic
+        BNZ     txb
+        RET
+
+; The data: the address, the pointers and the empty string (the image
+; loads them; the strings are written before they are read).
+        .org    DATA
+        .word   0, 0, 0, 0, 0

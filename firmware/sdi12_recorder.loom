@@ -1,0 +1,374 @@
+; sdi12_recorder.loom
+;
+; Decisions (2026-11-03): the inter-character limit is 1.66 ms (SDI-12
+; v1.4 section 7.0; 7.5 ms is the line-release time). Section 7.2 measures
+; the third try's 100 ms from the break's end in one sentence and its
+; falling edge in the next: the third try goes 114.2 ms after the fall,
+; which meets both readings.
+;
+; An SDI-12 data recorder (SDI-12 version 1.4, 2021-01-30, sdi-12.org): it
+; wakes the sensors with a break when the bus needs one, sends the command
+; the host gives it, releases the line and reads the sensor's response up
+; to its <CR><LF>, retrying as section 7.2 asks.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): SDI-12 is in no Loom design
+; document. It needs the M2 core (pins, deadlines, the FIFOs), the bit
+; engine's shift register in manual mode (SHO and SHI, SEMANTICS 6.9),
+; built for the synchronous serial programs and USB's and CAN's encoders,
+; whose INV bit here makes SDI-12's negative logic, PAR (built for parity
+; and LIN's identifier) for the even parity, and LD/ST of slice B
+; (SEMANTICS 6.11, built for the I2C EEPROM's array and USB's descriptors),
+; which keep the command for the retries and the response until it is
+; known to be good. No hardware knows SDI-12: the 7E1 frame, the break and
+; marking, the decision when a break is due, the turn-around of the line,
+; the response window, the retry sequence and the validity checks are all
+; firmware.
+;
+; Wire (section 3.1, Table 1). One data line, negative logic: marking, a
+; logical 1 and the idle state, is -0.5 to 1.0 V; spacing, a 0, is 3.5 to
+; 5.5 V. The board needs a 5 V three-state driver and a receiver:
+;     TX  = OUT0  the driver's input, in wire polarity: 1 = spacing (high
+;                 voltage), 0 = marking. Through a non-inverting 5 V
+;                 buffer such as a 74AHCT1G125.
+;     DIR = OUT1  the driver's enable: 1 = the recorder drives the line
+;                 (the 1G125's active-low OE through an inverter, or a
+;                 buffer with an active-high enable), 0 = released.
+;     RX  = IN0   the line through a receiver (a divider or a 5 V tolerant
+;                 buffer), wire polarity: 1 = spacing. It sees the line
+;                 whether or not the recorder drives it.
+; The bit engine runs with BE_CFG.INV = 1, so SHO puts ~bit on TX and SHI
+; takes ~RX: the firmware's bits are SDI-12's logical bits.
+;
+; Host command (INQ[0]): the command's characters, one per word in bits
+; 6:0, ending with '!' (section 4.4: the last character of a command), for
+; example '0', 'M', '!'. Bit 8 of the first word forces a break. At most
+; CMDMAX characters, the '!' included; a longer command is not sent and is
+; reported with the format flag and no try.
+;
+; Result (OUTQ[0]), per try: the response's characters as they arrive,
+; one per word in bits 6:0 (bits 15:7 clear; the <CR><LF> included), each
+; pushed during its own stop bit, then an end-of-try word:
+;     bit 15     1: the end of a try (no character word has it)
+;     bit 14     1: the last word for this command (a valid response, the
+;                ninth try, or a command too long); 0: a retry follows
+;     bit 8      timeout: no start bit within 17.5 ms of the command, or
+;                8.33 ms of marking inside the response (7.2 case 2)
+;     bit 9      parity error in a character of the response
+;     bit 10     framing error: a stop bit was spacing
+;     bit 11     format: the response does not start with the address
+;                (any address answers '?'), a <LF> without <CR>, or a
+;                command too long (then nothing was sent, try 0)
+;     bit 12     overrun: OUTQ was full, a character was not pushed
+;     bits 3:0   the try, 1 .. 9
+; Bits 12:8 all clear: the try's response is valid. The host keeps OUTQ
+; from filling: one character arrives every 8.33 ms.
+;
+; Rate: eight ticks a bit. The host writes TICK_INT and TICK_FRAC before
+; RUN (the M2 convention): 1200 baud is TICK_INT 5208, TICK_FRAC 85 at 50
+; MHz (5208.33 clocks, exact to 0.0001 %), TICK_INT 24 at 230.4 kHz, the
+; tests' slow clock. The deadline pairs are proved for ticks of 16 clocks
+; or more (.tick below). Every time below is in bits of 1200 baud, 0.833 ms.
+;
+; Timing (section 7, Figure 3; every figure +-0.40 ms except the gap):
+;     break        15 bits = 12.5 ms spacing (min 12 ms), when needed:
+;                  for the first command, a new address, the host's bit 8,
+;                  or when the line has been marking 96 bits (80 ms) since
+;                  the last response (a break is due after 87 ms)
+;     marking      11 bits = 9.17 ms after the break (min 8.33 ms); one
+;                  bit when there is no break
+;     command      characters back to back (gap 0, max 1.66 ms)
+;     release      DIR = 0 at the end of the last stop bit (max 7.5 ms)
+;     response     its first start bit by 21 bits = 17.5 ms after that
+;                  stop bit (the sensor has 15 ms + 0.4; 7.2's wait before
+;                  a retry is 16.67 ms), each next one by 10 bits = 8.33 ms
+;                  after the stop bit before it (7.2 case 2)
+;     retries      7.2: after a timeout or an invalid response (once it has
+;                  ended) the command is sent again without a break, not
+;                  before 21 bits after the last stop bit, three tries in
+;                  all, the third of a sequence that began with a break not
+;                  before 137 bits = 114.2 ms after the break's fall, 101.7
+;                  ms after its end (7.2 says both "more than 100 ms after
+;                  the end of the break" and "after 100 ms after the falling
+;                  edge": this meets both); then the whole sequence, break
+;                  and three tries, twice more: nine tries at most
+; Every edge the recorder makes is the SHO or SETP right after the WAITD
+; that times it, 6 to 9 clocks after its tick: at 1200 baud nothing beyond
+; the tick's own resolution. Each received character is sampled from its
+; own start edge, 1/2 to 5/8 of a bit into each bit.
+;
+; Limits. The recorder does not wait for a service request (section 4.4.6)
+; after an aM! whose ttt is not 000: the host waits ttt seconds and sends
+; aD0!, which then gets a break (the line has been marking for longer than
+; 80 ms). It checks no CRC (aMC!, 4.4.12). The 80 ms decision is made by a
+; timed WAITB and by NOW; a host that leaves a result in OUTQ for more than
+; 2^15 ticks (3.4 s at 1200 baud) before it sends the next command can make
+; the NOW test wrong, and the sensor, asleep, then fails the first
+; sequence: the second one starts with a break (7.2).
+;
+; Memory: 126 words at 0x000 (thread 0's quarter), 76 at 0x100 (VCODE)
+; and the variables and the command buffer at 0x150..0x167 (VARS): thread
+; 2's quarter, so threads 1 and 3 may run other programs (the SDI-12 sensor
+; runs on thread 1 beside it), thread 2 must not.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, DIR = OUT1, RX = IN0
+        .tick   16                      ; the fastest tick supported (header)
+        .equ    TIMEOUT = 1             ; result flags, in r5; status bits 15:12
+        .equ    PARITY = 2
+        .equ    FRAMING = 4
+        .equ    FORMAT = 8
+        .equ    OVERRUN = 16
+        .equ    BRKBITS = 15            ; break, bits
+        .equ    MARKBITS = 11           ; marking after a break, bits
+        .equ    FIRST = 21 * 8          ; first start bit by, ticks after the command
+        .equ    NEXT = 10 * 8           ; next start bit by, ticks after a stop bit
+        .equ    IDLE = 96 * 8           ; marking after which a break is sent, ticks
+        .equ    WAKE = 137 * 8          ; the third try's earliest, ticks after the break
+        .equ    VCODE = 0x100           ; code in thread 2's quarter
+        .equ    VARS = 0x150            ; variables, offsets below
+        .equ    V_END = 0               ; the end of the last command and response
+        .equ    V_BRK = 1               ; the fall of this sequence's break
+        .equ    V_ADDR = 2              ; the last address sent
+        .equ    V_TRY = 3               ; tries in this sequence
+        .equ    V_DOBRK = 4             ; 1: this sequence begins with a break
+        .equ    V_CEND = 5              ; the end of the command's last stop bit
+        .equ    CMD = VARS + 8          ; the command
+        .equ    CMDMAX = 16
+
+; Registers: r0 a character, r1 the character before it or a flag, r2 a
+; buffer pointer, r3 the tries, r4 room left in a buffer or scratch, r5
+; the flags, r6 a start-bit deadline or a time, r7 VARS (and .csr scratch).
+
+start:  JMP     vstart                  ; set-up at VCODE
+
+; -------------------------------------------------------------- a command
+; A break is due if the line has been marking IDLE ticks since the last
+; response: the WAITB times out then, or, if the result took long to be
+; read and the WAITB starts late, NOW is already past it.
+next:   LD      r6, r7, V_END
+        MOV16   r0, IDLE
+        ADD     r6, r6, r0
+        CSRW    TD, r6
+        LDI     r1, 0                   ; r1: a break is due
+        WAITB   INQ_NE, T
+        BNT     word
+        LDI     r1, 1
+word:   POP     r0                      ; the first character
+        CSRR    r4, NOW
+        SUB     r4, r4, r6              ; reached(NOW, TD): bit 15 clear
+        SHLI    r4, 1                   ; C = bit 15
+        BC      nlate
+        LDI     r1, 1
+nlate:  MOV     r4, r0
+        SHRI    r4, 9                   ; C = bit 8, the host's break
+        BNC     nfrc
+        LDI     r1, 1
+nfrc:   MOV16   r2, CMD
+        LDI     r4, CMDMAX
+        LDI     r5, 0
+cchar:  SHLI    r0, 9
+        SHRI    r0, 9                   ; the character, bits 6:0
+        SUBI    r4, 1                   ; C = 1: there was room
+        BNC     clong
+        ST      r0, r2, 0
+        INC     r2
+        JMP     cbang
+clong:  LDI     r4, 0
+        LDI     r5, FORMAT              ; too long: not sent
+cbang:  CMPI    r0, '!'
+        BZ      cdone
+        POP     r0
+        JMP     cchar
+cdone:  LDI     r3, 0                   ; no try yet
+        TEST    r5, r5
+        BZ      cok
+        JMP     toolong
+cok:    LD      r0, r7, CMD - VARS      ; the address
+        LD      r4, r7, V_ADDR
+        CMP     r0, r4
+        BZ      same
+        LDI     r1, 1                   ; another sensor: a break
+        ST      r0, r7, V_ADDR
+same:   ST      r1, r7, V_DOBRK
+
+; ------------------------------------------------------- tries (7.2)
+; r3 counts every try; V_TRY the tries of this sequence. A sequence begins
+; with a break when V_DOBRK says so; every sequence after the first does.
+seq:    LDI     r0, 0
+        ST      r0, r7, V_TRY
+try:    INC     r3
+        SETP    DIR, 1                  ; drive the line, marking
+        LD      r0, r7, V_TRY
+        LD      r1, r7, V_DOBRK
+        TEST    r0, r0
+        BNZ     nobrk                   ; a retry: no break
+        TEST    r1, r1
+        BZ      nobrk
+        SETP    TX, 1                   ; the break: spacing
+        SETD    0
+        CSRR    r6, NOW
+        ST      r6, r7, V_BRK
+        WAITD   BRKBITS * 8             ; 15 bits, less the SETD's phase
+        SETP    TX, 0                   ; marking
+        WAITD   MARKBITS * 8 - 8        ; the last bit of it is send's first WAITD
+        JMP     send
+nobrk:  SETD    0                       ; one bit of marking (7 to 8 ticks)
+
+; The command from CMD, characters back to back, then the release at the
+; end of the last stop bit.
+send:   MOV16   r2, CMD
+sch:    LD      r0, r2, 0
+        INC     r2
+        CALL    txchar
+        CMPI    r0, '!'
+        BNZ     sch
+        WAITD   8                       ; the end of the last stop bit
+        SETP    DIR, 0                  ; released
+        CSRR    r6, TD
+        ST      r6, r7, V_CEND
+        ADDI    r6, 63
+        ADDI    r6, 63
+        ADDI    r6, FIRST - 126         ; the first start bit's deadline
+
+; The response, one 7E1 frame at a time, each start bit by the deadline in
+; r6, each character pushed to OUTQ during its own stop bit, until a <LF>
+; or a timeout. r2 counts the characters, r4 keeps the first.
+        LDI     r2, 0
+        LDI     r5, 0
+        LDI     r0, 0
+rxc:    MOV     r1, r0                  ; the character before
+rxs:    CSRW    TD, r6
+        WAITP   RX, 1, T                ; spacing: a start bit
+        BT      rxto                    ; the deadline: T = 1
+        SETD    0                       ; this frame's grid from its edge
+        WAITD   4                       ; the middle of the start bit
+        JP      RX, 0, rxs              ; marking again: a glitch
+        LDI     r0, 8
+        CSRW    CNT, r0
+rxb:    WAITD   8                       ; the middle of the next bit
+        SHI                             ; SR <= {~RX, SR[15:1]}
+        BNZ     rxb
+        STSR    r0
+        SHRI    r0, 8                   ; {parity, data 6:0}
+        PAR     r0, r0                  ; C = odd: a parity error
+        BNC     rxpe
+        ORI     r5, PARITY
+rxpe:   SHLI    r0, 9
+        SHRI    r0, 9                   ; the character
+        TEST    r2, r2
+        BNZ     rxn1
+        MOV     r4, r0                  ; the first
+rxn1:   INC     r2
+        WAITB   OUTQ_NF, T              ; TD is reached: a test, T = 1 full
+        BT      rxov
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition; only the host pops OUTQ"
+        PUSH    r0
+        JMP     rxnx
+rxov:   ORI     r5, OVERRUN
+rxnx:   CSRR    r6, TD
+        ADDI    r6, 46
+        ADDI    r6, NEXT + 12 - 46      ; NEXT after the stop bit's end
+        WAITD   8                       ; the middle of the stop bit
+        JP      RX, 0, rxsok            ; marking: a good stop bit
+        ORI     r5, FRAMING
+rxsok:  CMPI    r0, 10                  ; <LF>
+        BNZ     rxc
+        CMPI    r1, 13                  ; after <CR>?
+        BZ      check
+        ORI     r5, FORMAT
+        JMP     check
+rxto:   ORI     r5, TIMEOUT
+check:  JMP     vcheck                  ; continued at VCODE
+
+; ----------------------------------------- VCODE: the check and the retries
+        .org    VCODE
+vstart: SETP    TX, 0                   ; marking
+        SETP    DIR, 0                  ; released
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0x80            ; INV; NRZ, LSB first
+        MOV16   r7, VARS
+        JMP     next
+
+; txchar: the character in r0 (bits 6:0, kept) as one 7E1 frame from the
+; next tick on: SR = {stop 1, parity, data 6:0, start 0}, ten SHOs a bit
+; apart, LSB first, each the instruction after its WAITD. Returns after the
+; stop bit's SHO; the stop bit ends at TD + 8. Uses r4.
+txchar: MOV     r4, r0
+        SHLI    r4, 1                   ; the start bit, 0, in bit 0
+        PAR     r4, r4                  ; C = odd: the parity bit is 1
+        LDIH    r4, 2                   ; the stop bit (bit 9), parity 0
+        BNC     txev
+        LDIH    r4, 3                   ; parity 1
+txev:   LDSR    r4
+        LDI     r4, 10
+        CSRW    CNT, r4
+txb:    WAITD   8
+        SHO                             ; TX = ~bit: negative logic
+        BNZ     txb
+        RET
+
+; A response is valid if no flag is set and its first character is the
+; address the command was sent to, or any address for '?'.
+vcheck: TEST    r2, r2
+        BZ      vflag                   ; nothing received
+        LD      r1, r7, CMD - VARS      ; the address sent
+        CMPI    r1, '?'
+        BZ      vflag
+        CMP     r4, r1
+        BZ      vflag
+        ORI     r5, FORMAT
+toolong:                                ; (r3 = 0, r5 = FORMAT: not sent)
+vflag:  MOV     r6, r5
+        SHLI    r6, 8                   ; the flags, 12:8
+        OR      r6, r6, r3              ; the try, 3:0
+        LDI     r0, 0
+        LDIH    r0, 0x80
+        OR      r6, r6, r0              ; bit 15: the end of a try
+        TEST    r5, r5
+        BZ      vfin                    ; valid
+        TEST    r3, r3
+        BZ      vfin                    ; not sent
+        CMPI    r3, 9
+        BZ      vfin                    ; nine tries: given up
+        PUSH    r6                      ; this try's end; more follow
+; A retry (7.2): not before FIRST after the command's last stop bit, and
+; the third of a sequence that began with a break not before WAKE after
+; the break's fall. WAITD 0 waits for a TD already set (SEMANTICS 6.4).
+        LD      r6, r7, V_CEND
+        ADDI    r6, 63
+        ADDI    r6, 63
+        ADDI    r6, FIRST - 126
+        CSRW    TD, r6
+        WAITD   0
+        LD      r0, r7, V_TRY
+        INC     r0
+        ST      r0, r7, V_TRY
+        CMPI    r0, 3
+        BZ      vseq                    ; three tries: a new sequence
+        CMPI    r0, 2
+        BNZ     vgo
+        LD      r1, r7, V_DOBRK
+        TEST    r1, r1
+        BZ      vgo
+        LD      r6, r7, V_BRK
+        MOV16   r1, WAKE
+        ADD     r6, r6, r1
+        CSRW    TD, r6
+        WAITD   0
+vgo:    JMP     try
+vseq:   LDI     r0, 1
+        ST      r0, r7, V_DOBRK         ; the next sequence: break first
+        JMP     seq
+vfin:   LDIH    r0, 0xC0
+        OR      r6, r6, r0              ; bit 14: the last word for this command
+        PUSH    r6
+        CSRR    r6, NOW
+        ST      r6, r7, V_END           ; the line is marking from here
+        JMP     next
+
+; The variables (the image loads them; the command buffer is written
+; before it is read).
+        .org    VARS
+        .word   0, 0, 0, 0, 0, 0
