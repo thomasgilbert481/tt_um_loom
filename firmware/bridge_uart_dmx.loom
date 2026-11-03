@@ -1,0 +1,356 @@
+; bridge_uart_dmx.loom
+; A UART-to-DMX512 bridge: thread 0 receives a serial stream (8N1, for
+; example 115200 baud from a PC or a lighting console) and parses it into
+; universe buffers in data memory; thread 1 sends DMX512 packets (ANSI
+; E1.11) continuously from the newest complete one. No host in the loop:
+; the host loads the image, sets the two ticks and starts both threads, and
+; afterwards reads only an optional status word from OUTQ[0].
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core (pins,
+; deadlines, a FIFO for the status word), each thread's own bit engine in
+; manual mode (SHI shifts the UART bits in, SHO the DMX slots out:
+; SEMANTICS 6.9, built for the synchronous serial programs) and LD/ST to
+; data memory (6.11, built so device emulators can keep a register file).
+; No hardware knows either protocol or the bridge between them: the UART
+; framing, the frame parser, the triple-buffered hand-off between the two
+; threads and all of DMX's framing and timing are firmware. Thread 1's
+; transmitter is firmware/dmx_controller.loom with its INQ replaced by the
+; buffers; thread 0's receiver is firmware/uart_rx.loom's, with SHI.
+;
+; Pins: RX = IN0 (thread 0), TX = OUT0 (thread 1, to the DI input of an
+; RS-485 driver whose DE is tied on).
+;
+; Decisions (2026-11-03): the universe is 209 slots, not 512, because a
+; tear-free whole-frame update with neither thread waiting needs three
+; buffers, and three of 512 slots do not fit in 512 words; a single
+; 512-slot buffer would let one frame straddle two packets. The DMX USB
+; Pro framing below was written from the widely used description of
+; Enttec's API and has not been checked against Enttec's own document.
+;
+; ---------------------------------------------------------- UART framing
+; The DMX USB Pro framing (Enttec's API, message label 6, "Output Only
+; Send DMX Packet Request"), which PC lighting software already emits:
+;     0x7E, label, LEN lo, LEN hi, LEN data bytes, 0xE7
+; For label 6 the data bytes are the start code then slots 1, 2, ...
+; Such a message whose end byte is 0xE7 and whose every byte had a good
+; stop bit is a frame: it replaces the whole universe, so the next packet
+; carries the start code and LEN - 1 slots. Data bytes past the buffer's
+; capacity (1 + N) are not stored: the packet carries the first N slots.
+; LEN 0 (no start code) is ignored, other labels are skipped by their
+; length, and a framing error anywhere drops the frame being parsed and
+; hunts for the next 0x7E. A dropped frame changes nothing on the wire.
+;
+; UART rate: 8 ticks a bit. The host sets thread 0's TICK_INT/TICK_FRAC
+; to one eighth of a bit before RUN (115200 baud: 54 + 64/256; the tests:
+; 16, 128 clocks a bit). The deadline pairs are proved for ticks of 16
+; clocks or more (.tick below). Samples sit within -P+12 .. +12 clocks of
+; mid-bit (uart_rx.loom's slow entry, P the tick). Each byte is parsed
+; during its own stop bit, before the stop sample, and the start-bit wait
+; is back at most 12 slots (48 clocks) after the stop sample (the publish
+; path; 3 slots otherwise), so bytes back to back are received at 16
+; clocks a tick: the next start edge is at least 4P - 12 = 52 clocks after
+; the stop sample, less what a fast sender's rate error takes. Tested on
+; the golden model with bytes back to back: at P = 16 a sender 2 % fast to
+; 3 % slow loses nothing (3 % fast drops frames); at 115200 baud +-3 %.
+;
+; ------------------------------------------------------------- DMX rate
+; Thread 1's tick is one bit: TICK_INT 200, TICK_FRAC 0, 4.000 us at
+; 50 MHz, 250 kbit/s exactly. Break 44 bits (176 us), mark after break 4
+; bits (16 us), slots of 11 bits back to back, break to break at least
+; 302 bits (1208 us), as in dmx_controller.loom, whose header gives the
+; E1.11 transmit-column figures each is checked against.
+;
+; ------------------------------------------- the hand-off (SEMANTICS 6.11)
+; Three buffers; two shared words, each written by one thread only:
+; LATEST (thread 0: the buffer holding the newest complete frame) and
+; READING (thread 1: the buffer the current packet comes from).
+;   thread 0  parses into its back buffer W, never LATEST or READING. At a
+;             frame's end: L = LD LATEST; ST LATEST = W; rd = LD READING;
+;             the next W is L if rd == W, else the buffer that is neither
+;             W nor rd. It never waits for thread 1.
+;   thread 1  once a packet, inside the break:
+;             R = LD LATEST; ST READING = R; R = LD LATEST; ST READING = R,
+;             then the packet's count, start code and slots all come from R.
+; Thread 0 stores only into W and W is never thread 1's R, for every
+; interleaving of the two sequences (all 420 checked exhaustively in the
+; design note), provided thread 0 publishes at most once while thread 1
+; runs its four accesses (about ten slots): frames are at least six bytes
+; apart. An LD or ST is one access at one edge, so no word is ever half
+; written, and R changes only between packets, so every packet is one
+; whole frame, never a mix of two. Frames that arrive faster than packets
+; go out are coalesced: the newest wins. Thread 1 never waits on anything
+; thread 0 does (no flag, no FIFO), LD/ST take two of its own slots
+; whatever the others do (6.11) and the barrel gives it every fourth clock
+; (SEMANTICS 2), so the DMX timing does not depend on the UART traffic.
+;
+; Buffer: word 0 = n, the slot count; words 1 .. hold the bytes packed two
+; a word, low byte first: start code, slot 1, slot 2, ... Capacity 1 + N
+; bytes, with N = 209 below: three buffers of 106 words fill the memory
+; from 194, just above thread 1's code, to the end. A full universe of 512
+; slots would need three buffers of 257 words, more than the whole memory;
+; two buffers could not be both tear-free and lossless without thread 0
+; waiting for thread 1. So the bridge drives slots 1 .. 209 (a fixture
+; patched above 209 gets no data from it), and a full packet of 209 slots
+; repeats every 9.4 ms (106 Hz) where 512 slots would take 22.8 ms.
+;
+; Status (OUTQ[0]): after each frame is published, the count of frames
+; published so far (mod 2^16), if OUTQ has room; otherwise that word is
+; dropped (the next carries the count). Nothing is read from INQ.
+;
+; Memory, all 512 words: thread 0 111 words (0 .. 110), the three shared
+; words LATEST, READING, COUNT at 125 .. 127, thread 1 65 words (128 ..
+; 192), the buffers at 194, 300 and 406 (one word free at 193). Threads 2
+; and 3 cannot run beside it: their quarters hold the buffers.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0, TX = OUT0
+        .equ    N = 209                 ; slots a buffer holds
+        .equ    CAP = N + 1             ; bytes a buffer holds (even: see data)
+        .equ    BUFW = CAP / 2 + 1      ; words a buffer takes, with its count
+        .equ    BUF0 = 512 - 3 * BUFW   ; the three buffers, to the end of memory
+        .equ    BUF1 = BUF0 + BUFW
+        .equ    BUF2 = BUF1 + BUFW
+        .equ    SUM = BUF0 + BUF1 + BUF2
+        .equ    SHARED = 125            ; LATEST, READING, COUNT
+        .equ    SYNC = 0x7E             ; the framing (header)
+        .equ    ENDB = 0xE7
+        .equ    LBL = 6                 ; the label of a DMX packet
+        .equ    OVS = 8                 ; UART ticks a bit
+        .equ    HUNT = 0                ; thread 0's states (r1)
+        .equ    LABEL = 1
+        .equ    LENL = 2
+        .equ    LENH = 3
+        .equ    DATA = 4
+        .equ    ENDS = 5                ; the end byte is next
+        .equ    SEL = 6                 ; published: choose the next W first
+        .equ    PUB = 7                 ; publish after this stop bit
+
+; =============================================== thread 0: UART to buffers
+; r0 the byte, r1 the state, r2 the length left (then the next count), r3
+; where the next data word goes (0: not storing), r4 the bytes of room
+; left, r5 W, r6 the low byte held (then L), r7 scratch (then rd).
+        .thread 0
+        .tick   16                      ; the shortest tick the pairs are proved for
+        .csr    BE_PINS, pin(RX) << 5   ; SHI reads RX; BE_CFG 0: LSB first
+        LDI     r1, HUNT
+        MOV16   r5, BUF1                ; LATEST = READING = BUF0 at load
+
+rx:     WAITP   RX, 0                   ; the start bit (or already low)
+        SETD    0                       ; re-anchor on its edge
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 1, rx               ; high again: a glitch
+        LDI     r0, 8
+        CSRW    CNT, r0                 ; eight SHIs
+bit:    WAITD   OVS                     ; the middle of the next data bit
+        SHI                             ; sample; Z on the eighth
+        BNZ     bit
+        STSR    r0
+        SHRI    r0, 8                   ; the byte, from SR 15:8
+
+; The byte is parsed here, during its stop bit (the pair to the stop
+; sample is the longest of thread 0). Nothing is published until the stop
+; bit is good.
+        CMPI    r1, DATA
+        BZ      data
+        BC      late                    ; ENDS or SEL
+        CMPI    r1, LENL
+        BZ      lenl
+        BC      lenh
+        TEST    r1, r1
+        BNZ     label
+hunt:   LDI     r7, SYNC                ; HUNT: wait for 0x7E
+        CMP     r0, r7
+        BNZ     stop
+        LDI     r1, LABEL
+        JMP     stop
+label:  LDI     r3, 0                   ; LABEL: store only for label 6
+        LDI     r4, 0
+        CMPI    r0, LBL
+        BNZ     lab1
+        MOV16   r4, CAP
+lab1:   LDI     r1, LENL
+        JMP     stop
+lenl:   MOV     r2, r0                  ; LENL
+        LDI     r1, LENH
+        JMP     stop
+lenh:   SHLI    r0, 8                   ; LENH
+        OR      r2, r2, r0              ; Z: LEN 0, ignored
+        LDI     r1, HUNT                ; (LDI keeps Z)
+        BZ      stop
+        LDI     r1, DATA
+        TEST    r4, r4
+        BZ      stop                    ; skipping: r3 stays 0
+        MOV     r3, r5
+        INC     r3                      ; the first data word of W
+        JMP     stop
+
+; DATA: CAP is even, so a byte is a low byte exactly when the room left
+; after it is odd. A low byte is stored at once (the word's high byte 0),
+; so a frame with an even slot count needs no flush.
+data:   TEST    r4, r4
+        BZ      dnext                   ; full, or skipping
+        DEC     r4
+        MOV     r7, r4
+        ANDI    r7, 1
+        BZ      dhigh
+        MOV     r6, r0
+        ST      r6, r3, 0
+        JMP     dnext
+dhigh:  SHLI    r0, 8
+        OR      r6, r6, r0
+        ST      r6, r3, 0
+        INC     r3
+dnext:  DEC     r2
+        BNZ     stop
+        LDI     r1, ENDS
+        JMP     stop
+
+late:   CMPI    r1, SEL
+        BZ      sel
+        LDI     r1, HUNT                ; ENDS: whatever it is, hunt next
+        LDI     r7, ENDB
+        CMP     r0, r7
+        BNZ     stop                    ; not 0xE7: the frame is dropped
+        TEST    r3, r3
+        BZ      stop                    ; another label: nothing to publish
+        MOV16   r7, CAP - 1
+        SUB     r7, r7, r4              ; n = bytes stored - 1
+        ST      r7, r5, 0               ; W's count (W is not published yet)
+        MOV16   r7, SHARED
+        LD      r6, r7, 0               ; L = LATEST
+        LD      r2, r7, 2
+        INC     r2                      ; the count, once published
+        WAITB   OUTQ_NF, T              ; TD is reached: T = 1 only if OUTQ is full
+        LDI     r1, PUB
+        JMP     stop
+
+; SEL: the frame before this byte was published, with rd = READING read
+; just after. Store the count, choose the next W (header), then treat the
+; byte as HUNT does.
+sel:    LDI     r1, HUNT
+        MOV16   r3, SHARED
+        ST      r2, r3, 2               ; COUNT
+        CMP     r7, r5
+        BNZ     third
+        MOV     r5, r6                  ; rd == W: the next W is L
+        JMP     hunt
+third:  MOV16   r6, SUM
+        SUB     r6, r6, r5
+        SUB     r5, r6, r7              ; neither W nor rd
+        JMP     hunt
+
+stop:   WAITD   OVS                     ; the middle of the stop bit
+        JP      RX, 0, ferr             ; low: framing error
+        CMPI    r1, PUB
+        BNZ     rx
+        MOV16   r7, SHARED              ; publish: at most 11 slots to rx
+        ST      r5, r7, 0               ; LATEST = W
+        LD      r7, r7, 1               ; rd = READING
+        LDI     r1, SEL
+        BT      rx                      ; OUTQ was full: no status word
+        .bounded "the WAITB OUTQ_NF, T before the stop bit found room, and only the host pops OUTQ"
+        PUSH    r2                      ; the status word
+        JMP     rx
+
+ferr:   LDI     r1, HUNT                ; drop the frame (a pending SEL was done
+        WAITP   RX, 1                   ; by this byte's parse); wait for idle
+        JMP     rx
+
+        .org    SHARED
+        .word   BUF0                    ; LATEST
+        .word   BUF0                    ; READING
+        .word   0                       ; COUNT
+
+; ============================================= thread 1: buffers to DMX512
+; dmx_controller.loom's transmitter, its INQ replaced by the buffer R.
+; r0 the slot being framed, r1 slots still to send, r2 the word whose high
+; byte goes next (scratch before the break), r3 the next word of R, r4
+; 0x0600 (the two stop bits), r5 BITS, r6 the tick after which the next
+; break may start, r7 the address of LATEST.
+        .thread 1
+        .tick   200                     ; 250 kbit/s at 50 MHz
+        .equ    BREAK = 44              ; ticks (bits) of break
+        .equ    MAB = 4                 ; ticks of mark after break
+        .equ    BTB = 302               ; minimum ticks from break to break
+        .equ    BITS = 11               ; bits in a slot: 8N2
+
+start:  SETP    TX, 1                   ; mark
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
+        .csr    BE_PINS, pin(TX)        ; SHO writes TX; BE_CFG 0: NRZ, LSB first
+        LDI     r4, 0
+        LDIH    r4, 6                   ; r4 = 0x0600: stop bits at 9 and 10
+        LDI     r5, BITS
+        MOV16   r7, SHARED
+        CSRR    r6, NOW                 ; no break yet: the first may start at once
+
+; The break-to-break wait is dmx_controller.loom's (its header explains d).
+packet: CSRR    r2, NOW
+        SUB     r2, r6, r2              ; d = r6 - NOW
+        BZ      now
+        MOV16   r3, BTB
+        CMP     r3, r2                  ; C = (d <= BTB): too soon, wait
+        BNC     now
+        CSRW    TD, r6
+        WAITD   0                       ; until NOW reaches r6
+now:    SETD    1
+        WAITD   1
+        SETP    TX, 0                   ; break
+        CSRR    r6, TD                  ; the break's tick
+        MOV16   r3, BTB - 2
+        ADD     r6, r6, r3              ; the next one on r6 + 2 or later
+
+; Inside the break: take the newest frame (header), then its count and its
+; first word, which holds the start code.
+        LD      r3, r7, 0               ; R = LATEST
+        ST      r3, r7, 1               ; READING = R
+        LD      r3, r7, 0               ; R = LATEST, again
+        ST      r3, r7, 1               ; READING = R
+        LD      r1, r3, 0               ; n
+        LD      r2, r3, 1               ; start code, slot 1
+        ADDI    r3, 2
+        MOV     r0, r2
+        CALL    frame                   ; the start code's slot, ready in SR
+        WAITD   BREAK
+        SETP    TX, 1                   ; mark after break
+        WAITD   MAB - 1                 ; the start bit one tick on, below
+
+; One slot: SR holds {stop, stop, data 7:0, start}, CNT = 11; the first
+; WAITD 1 is the start bit's tick and the eleventh SHO the second stop bit.
+; Slots go back to back: the next is framed during this one's second stop
+; bit, from the high byte of r2 or from the next word.
+lo:     WAITD   1                       ; a low byte (the start code, even slots)
+        SHO
+        BNZ     lo
+        TEST    r1, r1
+        BZ      pend                    ; the last slot of the packet
+        DEC     r1
+        SWAP    r0, r2                  ; the high byte, in 7:0
+        CALL    frame
+hi:     WAITD   1                       ; a high byte (odd slots)
+        SHO
+        BNZ     hi
+        TEST    r1, r1
+        BZ      pend
+        DEC     r1
+        LD      r2, r3, 0               ; the next word
+        INC     r3
+        MOV     r0, r2
+        CALL    frame
+        JMP     lo
+
+pend:   WAITD   1                       ; the second stop bit lasts a whole bit
+        JMP     packet
+
+; frame: SR <= the slot for the byte in r0 bits 7:0, CNT <= 11.
+frame:  SHLI    r0, 8
+        SHRI    r0, 7                   ; data in 8:1, the start bit 0 in bit 0
+        OR      r0, r0, r4              ; the stop bits
+        LDSR    r0
+        CSRW    CNT, r5
+        RET
+
+; The first buffer as loaded: no frame yet, so the start code alone (0).
+        .org    BUF0
+        .word   0                       ; n
+        .word   0                       ; start code 0
