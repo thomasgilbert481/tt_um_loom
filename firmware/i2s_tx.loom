@@ -1,0 +1,238 @@
+; i2s_tx.loom
+;
+; Decisions (2026-11-03): underrun is per word (a missing word goes out as
+; zero), so a host that misses only a left word shifts later words one
+; channel; a per-frame rule did not fit. One thread reaches 16-bit stereo
+; at 65.1 kHz (SCK 2.083 MHz at 50 MHz); 96 kHz and 24-in-32 at 48 kHz are
+; out of reach, and at 48 kHz the host must refill INQ within about 40 us.
+;
+; I2S controller (master) transmitter: SCK, WS and SD out, 16-bit stereo
+; samples from the host through INQ[0]. Written on 2026-11-03, after the
+; hardware was complete (D-032), as a protocol Loom was not designed for
+; (D-035). It uses the bit engine's manual shifter (SHO, built for the
+; serial protocols: SPI, UART, CAN), MSB first, for SD; the deadline-latched
+; pin write (SETP pin, v, D, built for clock-exact UART and WS2812 edges)
+; for every SCK edge; and the FIFOs. What no hardware does: the continuous,
+; gap-free bit clock, the word-select timing and the frame layout are all
+; firmware. An I2S peripheral is a shift register clocked by a divider;
+; Loom spends one thread's every slot on it (see "Limits" below).
+;
+; Specification: NXP UM11732 "I2S bus specification" Rev 3.0, 17 Feb 2022
+; (the Philips text of Feb 1986, revised 5 June 1996):
+;   3.1  two's complement, MSB first; the receiver latches SD on the
+;        leading (rising) SCK edge; data may change on either edge.
+;   3.2  WS = 0 left, 1 right, latched on the rising edge; WS changes one
+;        SCK period before the MSB.
+;   Table 3: controller clock tHC, tLC >= 0.35T with a fixed mark/space
+;        ratio (note 2); transmitter delay tdtr <= 0.8T and hold
+;        thtr >= 0, both from the RISING edge (note 5); receiver set-up
+;        tsr >= 0.2T, hold thr >= 0.
+;
+; Pins: SCK = OUT0, SD = OUT1, WS = OUT2 (move with --pin; BIDIR pins work,
+; the program drives their output enables).
+;
+; Host format (FIFO space, thread 0): one 16-bit two's complement sample
+; per word, left then right, left first. 32 SCK per frame (16 per channel),
+; so fs = SCK / 32.
+;
+; Rate: one tick is half an SCK period, SCK = clk / (2 * tick). The host
+; sets TICK_INT and TICK_FRAC (debug space) before RUN. The schedule is
+; proved for a tick of at least 12 clocks (.tick 12): SCK <= 2.083 MHz,
+; fs <= 65.1 kHz at 50 MHz.
+;     48 kHz:   TICK_INT 16, TICK_FRAC 71  (16.277 clocks; fs 47.998 kHz)
+;     44.1 kHz: TICK_INT 17, TICK_FRAC 183 (17.715 clocks; fs 44.100 kHz)
+; Each SCK edge is a staged write that lands on its deadline. With a tick
+; of 17 clocks or more every edge is on its exact tick (within one clock
+; of the ideal fractional time; 44.1 kHz). Below that the WAITD of an
+; interval can issue in the tick's own X cycle when the WAITD before it
+; completed 3 clocks late, and the edge then lands at that WAITD's commit,
+; one clock after its tick (SEMANTICS 6.10 rule 2): at 48 kHz an edge is
+; within 2 clocks (40 ns) of the ideal and the mean rate is exact. At 12
+; clocks the interval has no slack and the edges fall on the slot grid,
+; which with 12 = 3 slots is exactly periodic (SEMANTICS 2).
+;
+; Bit timing. Each bit is a rise half and a fall half of one tick each:
+;     rise: WAITD (SCK rises) ; SHO (SD = the next bit) ; SETP SCK, 0, D
+;     fall: WAITD (SCK falls) ; <one op>                ; SETP SCK, 1, D
+; SD is clocked out on the leading edge (3.1 allows either edge): it
+; changes one slot after SCK rises: measured 4 clocks later at tick 12
+; and 6 to 9 at 48 and 44.1 kHz (WS the same), so the hold thtr is at
+; least 4 clocks (80 ns), the delay tdtr at most 9/32.6 = 0.28T against
+; 0.8T, and the receiver's set-up the rest of the period, 0.72T or more.
+; (An earlier version changed SD after the falling edge; at 48 kHz its
+; delay reached 26 clocks against 0.8T = 26.04, inside Table 3 by a
+; hair. This one has margin everywhere.)
+;
+; The LSB and WS. WS must change one SCK before the MSB, i.e. together
+; with the LSB, after the rising edge of bit 15. The rise half has one
+; slot, so the LSB does not come from SHO: one OUT writes SD and WS
+; together from r6 = LSB of the word | the next word's WS, computed in
+; earlier op slots. SD and WS form the OUT group, so they must be adjacent
+; pins (or SCK must not lie between them).
+;
+; Word work. The op slot of a fall half is the loop's DJNZ for bits 1..4.
+; Bits 5..16 are unrolled, and their op slots do the per-word work, one
+; each, in this order:
+;     b5  MOV r6, r0       the word being sent (still in r0) ...
+;     b6  ANDI r6, 1       ... its LSB ...
+;     b7  SHLI r6, BSD     ... in SD's place in the OUT word
+;     b8  XORI r2, MWS     the next word's WS level
+;     b9  OR r6, r6, r2    LSB and new WS: the OUT word for bit 15's rise
+;     b10 LDI r0, 0        underrun rule: the next word is 0 unless ...
+;     b11 WAITB INQ_NE, T  ... the host has queued one (a test, not a wait:
+;     b12 BT under          it follows a completed WAITD, so TD is reached)
+;     b13 POP r0           declared bounded (the WAITB argument of ws2812)
+;     b14 LDI r3, NLOOP    loop count for the next word
+;     (b15's rise half: OUT r6, the LSB and the new WS together)
+;     b15 LDSR r0          the next word into SR
+;     (b16's rise half: SHO, the next word's MSB)
+;     b16 JMP bits
+; Underrun rule: a word the host has not queued by bit 11 of the word
+; before it is sent as 0 (silence), and the frame timing does not move.
+; The `under` path replaces b13 and rejoins at b14 with the same slots.
+;
+; Start: SCK idles low; the program waits for the first queued word, then
+; sends a preamble of 12 SCK periods with WS = 1 and SD = 0 (the tail of
+; an empty right word, entered at b5), so the first left word starts with
+; a correct WS change. From then on SCK never stops.
+;
+; Limits (stated plainly). SCK <= 2.083 MHz at 50 MHz: 16-bit stereo up
+; to 65 kHz, which covers 44.1 and 48 kHz; 96 kHz, and 24-bit samples in
+; 32-bit slots at 48 kHz (both 3.072 MHz), are out of reach for one
+; thread. 48 kHz stereo is 96 k words/s through the host port with a
+; 4-word INQ, 41.7 us of audio: the host, not the chip, is the hard part.
+; SD and WS move on the 4-clock slot grid; only SCK is clock-exact.
+; No MCLK is generated: the receiver must derive its clock from SCK (for
+; example a PCM5102A in its 3-wire mode).
+;
+; Registers: r0 the word being sent, then the next one; r2 the WS level of
+; the word being sent, in WS's place in the OUT word; r3 the loop count;
+; r6 the OUT word for the LSB; r7 the .csr scratch.
+
+        .imem   512
+        .thread 0
+        .pins   SCK = OUT0, SD = OUT1, WS = OUT2
+        .tick   12                      ; half an SCK period, at the fastest
+        .equ    NLOOP = 4               ; bits 1..4 run in the loop
+        .equ    OUTB = min(pin(SD), pin(WS))
+        .equ    OUTN = max(pin(SD), pin(WS)) - OUTB + 1
+        .equ    BSD = pin(SD) - OUTB    ; SD's bit in an OUT word
+        .equ    MWS = 1 << (pin(WS) - OUTB)   ; WS's bit in an OUT word
+
+start:  .csr    OUTGRP, OUTB | (OUTN << 5)  ; OUT writes SD and WS
+        .csr    BE_PINS, pin(SD)        ; SHO drives SD
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, NRZ, no CRC
+        SETP    SCK, 0                  ; SCK idles low
+        SETP    SD, 0
+        SETP    WS, 1                   ; WS = 1: as if a right word ended
+        OEP     SCK, 1                  ; no-ops on OUT pins, needed on
+        OEP     WS, 1                   ; BIDIR pins
+        OEP     SD, 1
+        LDI     r2, MWS                 ; the preamble's WS level
+        LDI     r0, 0                   ; the preamble's word: zeros
+        LDSR    r0
+        WAITB   INQ_NE                  ; the first sample is queued
+        SETD    1                       ; re-anchor after the unbounded wait
+        JMP     b5                      ; the preamble: b5..b16, WS = 1
+
+; ------------------------------------------------- bits 1..4 of a word
+bits:   SETP    SCK, 1, D
+        WAITD   1                       ; SCK rises: the receiver latches
+        SHO                             ; SD = the next bit
+        SETP    SCK, 0, D
+        WAITD   1                       ; SCK falls
+        DJNZ    r3, bits
+
+; ------------------------------------------------- bits 5..16, unrolled
+b5:     SETP    SCK, 1, D                       ; b5
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        MOV     r6, r0                          ; the word being sent
+
+        SETP    SCK, 1, D                       ; b6
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        ANDI    r6, 1                           ; its LSB
+
+        SETP    SCK, 1, D                       ; b7
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        SHLI    r6, BSD                         ; in SD's place
+
+        SETP    SCK, 1, D                       ; b8
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        XORI    r2, MWS                         ; the next word's WS level
+
+        SETP    SCK, 1, D                       ; b9
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        OR      r6, r6, r2                      ; LSB | new WS: bit 15's OUT word
+
+        SETP    SCK, 1, D                       ; b10
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        LDI     r0, 0                           ; underrun: the next word is 0
+
+        SETP    SCK, 1, D                       ; b11
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        WAITB   INQ_NE, T                       ; a test: TD is reached, so T = 1 at once if INQ is empty
+
+        SETP    SCK, 1, D                       ; b12
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        BT      under                           ; nothing queued: send 0
+
+        SETP    SCK, 1, D                       ; b13
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        .bounded "the WAITB INQ_NE, T of bit 11 completed with T = 0 (the BT of bit 12 fell through; nothing between them writes T), so INQ held a word in its X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0                              ; one slot: it cannot stall
+
+b14:    SETP    SCK, 1, D                       ; b14
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        LDI     r3, NLOOP
+
+        SETP    SCK, 1, D                       ; b15
+        WAITD   1
+        OUT     r6                              ; the LSB and the new WS together
+        SETP    SCK, 0, D
+        WAITD   1
+        LDSR    r0                              ; the next word, after the LSB went out
+
+        SETP    SCK, 1, D                       ; b16
+        WAITD   1
+        SHO                                     ; the next word's MSB
+        SETP    SCK, 0, D
+        WAITD   1
+        JMP     bits
+
+; ------------------------------------------------- b13 on an underrun
+under:  SETP    SCK, 1, D
+        WAITD   1
+        SHO
+        SETP    SCK, 0, D
+        WAITD   1
+        JMP     b14                     ; r0 stays 0: the word is silence
