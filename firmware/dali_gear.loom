@@ -1,0 +1,325 @@
+; dali_gear.loom
+; A DALI control gear (IEC 62386-101 and -102: a lamp's ballast or LED
+; driver) at a short address the host sets: it follows the forward frames
+; on the bus, acts on those addressed to it, answers the queries with a
+; backward frame inside the settling window, and reports every frame it
+; acted on.
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): DALI is in no design
+; document. Hardware reused: the M2 core (pins, timed waits, NOW, the
+; FIFOs) and the bit engine's Manchester encoder (slice A, SEMANTICS 6.9.1,
+; ENC = 2), built for the Manchester loopback, which sends the backward
+; frame. No hardware knows DALI: the decoding of a forward frame from the
+; time between its edges (accepting the receiver's +-20 % half-bits, which
+; SHI's fixed sampling grid could not), the stop condition, the address
+; match (short, group, broadcast), the 62386-102 commands, the arc power
+; level and the settling time before the answer are firmware.
+;
+; Pins: TX = OUT0 to a DALI interface's transmit input, RX = IN0 from its
+; receive output, with dali_controller's polarity: TX = 1 pulls the bus
+; low, TX = 0 (also its reset value) releases it; RX is the bus level, 1 =
+; high (idle). Beside the controller it runs on
+; thread 1 with TX = OUT1, RX = IN1; the bench wires the pins into one bus.
+;
+; Host words (INQ[0]), once, before the first frame:
+;   word 1   the short address, 0..63; 64 or more: none (MASK)
+;   word 2   the groups: bit g set = a member of group g (0..15)
+; Report (OUTQ[0]), two words for every frame it acted on or could not
+; decode (frames for other addresses are not reported):
+;   word A   the forward frame, address byte in 15:8 (for an error: the
+;            last 16 bits received)
+;   word B   bits 7:0 the arc power level after the frame; bit 8 REPLIED, a
+;            backward frame was sent; bit 9 ERROR, not a forward frame (a
+;            violation or not 16 bits; then bit 8 is the violation and bits
+;            15:11 the bits counted, modulo 32, the start bit included); bit
+;            10 DROPPED, an earlier report was lost because OUTQ was full;
+;            bit 11 UNKNOWN, a command this gear does not implement (not
+;            acted on, no answer).
+; The host takes whole reports (two words). A report starts only when OUTQ
+; has room: the gear never waits for the host, so it never misses a frame;
+; one that finds OUTQ full is dropped, and the next says so.
+;
+; Addressing (62386-102): address byte 0AAAAAAS is short address A,
+; 100GGGGS group G, 1111111S broadcast, 1111110S broadcast to gear with
+; no short address; the special commands (101xxxx1, 110xxxx1) are ignored.
+; S = 0: direct arc power, the data byte is the level (0 off, 1..254, 255
+; MASK: no change); MIN 1 and MAX 254, so no level is clamped. S = 1: a
+; command. Implemented, all answered at once with no fading (fade time 0):
+;   0x00 OFF              level 0
+;   0x05 RECALL MAX LEVEL level 254
+;   0x06 RECALL MIN LEVEL level 1
+;   0x90 QUERY STATUS     bit 2 lamp on (level > 0), bit 6 no short
+;                         address; the other bits 0 (no failures, no fade,
+;                         and resetState and powerCycleSeen not kept)
+;   0x91 QUERY CONTROL GEAR PRESENT   0xFF (YES)
+;   0xA0 QUERY ACTUAL LEVEL           the level
+;   0xC0, 0xC1 QUERY GROUPS 0-7, 8-15 the group bits
+; The level at power-up is 254, the standard's default power-on level.
+;
+; Timing, from 62386-101 ed.2.0 (firmware/README.md names the sources):
+;   receive   as dali_controller: edge to edge in ticks of Te/8, an
+;             interval of 5..10 ticks a half-bit, 11..21 a double
+;             half-bit, else a violation; then the stop condition, the bus
+;             high for 46 ticks (2.40 ms) from the end of the last bit,
+;             before the frame is taken.
+;   answer    the backward frame's first edge 156 ticks (8.125 ms) after
+;             the end of the forward frame's last bit, inside the
+;             transmitter's 5.5 to 10.5 ms (and inside it too if the
+;             settling time were counted from the end of the stop
+;             condition: 5.7 ms); half-bits of 8 ticks, every edge a slot
+;             after its tick.
+;
+; Rate: the host writes TICK_INT and TICK_FRAC before RUN, Te/8: at 50 MHz
+; TICK_INT 2604, TICK_FRAC 43. Proved for ticks of 16 clocks or more, the
+; decoder's bound as in dali_controller; the RTL tests run TICK 25.
+;
+; Memory: 197 words, no data memory: from thread 0's reset vector 0x000 to
+; 0x0C4, 69 words into thread 1's quarter, so thread 1 must not be started
+; with this image alone. Beside dali_controller it is thread 1's (0x080 to
+; 0x144, into thread 2's quarter): threads 0 and 1 run, 2 must not, and
+; thread 3's quarter is free.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .tick   16                      ; the fastest tick supported (header)
+        .equ    CFG = (1 << 7) | (2 << 3) | (1 << 1)    ; INV, ENC Manchester, MSB first
+        .equ    HALF = 8                ; ticks per half-bit
+        .equ    HMIN = 5                ; a half-bit: 5 .. 10 ticks
+        .equ    DMIN = 11               ; a double half-bit: 11 .. 21 ticks
+        .equ    TEND = 22               ; no edge for this long: the frame ends
+        .equ    STOP = 46               ; 2.40 ms: the stop condition
+        .equ    ANSWER = 156            ; 8.125 ms: the backward frame starts
+        .equ    MAXL = 254
+        .equ    MINL = 1
+        .equ    NOADDR = 64             ; bit 6 of r7: no short address
+        .equ    REPLIED = 0x100         ; word B's flags
+        .equ    ERROR = 0x200
+        .equ    DROPPED = 0x400
+        .equ    UNKNOWN = 0x800
+
+; Registers: r0 the frame, r1 the bits counted, then word B's flags, r2
+; the last edge's NOW, r3 and r4 scratch (r4 the decoder's phase), r5 the
+; arc power level, r6 the groups, r7 the short address (64 = none) with
+; bit 15 set while a report has been dropped.
+
+start:  SETP    TX, 0                   ; released: the bus high
+        .csr    BE_PINS, pin(TX), r4    ; out = TX (the engine reads no pin)
+        POP     r7                      ; the short address
+        POP     r6                      ; the groups
+        MOV     r3, r7
+        SHRI    r3, 6                   ; Z = (r7 < 64): an address
+        BZ      haddr
+        LDI     r7, NOADDR
+haddr:  LDI     r5, MAXL                ; the power-on level
+        JMP     hunt
+
+; Not a forward frame: report it (bit 8 the violation, 15:11 the count)
+; once the bus has been quiet and high for STOP ticks.
+error:  MOV     r3, r1
+        SHLI    r3, 11                  ; the count, modulo 32
+        ANDI    r1, 32
+        SHLI    r1, 3                   ; the violation, in bit 8
+        OR      r1, r1, r3
+        MOV16   r3, ERROR
+        OR      r1, r1, r3
+wout:   SETD    STOP
+        WAITE   RX, ANY, T
+        BNT     wout                    ; an edge: not over yet
+        JP      RX, 0, wout             ; held low
+        JMP     report
+
+
+; ------------------------------------------------------- a forward frame
+hunt:   WAITE   RX, FALL                ; the start bit
+        CSRR    r2, NOW
+        CALL    rxframe
+        CMPI    r1, 17                  ; the start bit and 16 bits
+        BNZ     error
+        MOV16   r3, STOP                ; the stop condition: high and quiet
+        ADD     r3, r3, r2              ; until STOP ticks after the last bit
+        CSRW    TD, r3
+        WAITE   RX, ANY, T
+        BNT     error                   ; an edge: the frame goes on
+        JP      RX, 0, error
+        LDI     r1, 0                   ; word B's flags
+
+; Address byte A = r0 >> 8. With r3 = A >> 1: 0..63 short, 64..79 group,
+; 80..125 special commands, 126 unaddressed broadcast, 127 broadcast.
+        MOV     r3, r0
+        SHRI    r3, 9
+        MOV     r4, r7
+        SHLI    r4, 1
+        SHRI    r4, 1                   ; the short address, without bit 15
+        CMP     r3, r4
+        BZ      mine
+        MOV     r4, r3
+        SHRI    r4, 6
+        BZ      hunt                    ; another gear's short address
+        ANDI    r3, 63                  ; A >> 1 - 64
+        CMPI    r3, 16                  ; C = not a group
+        BC      ngrp
+        LDI     r4, 1
+        SHL     r4, r4, r3              ; group G's bit
+        TEST    r4, r6
+        BZ      hunt                    ; not a member
+        JMP     mine
+ngrp:   CMPI    r3, 63
+        BZ      mine                    ; broadcast
+        CMPI    r3, 62
+        BNZ     hunt                    ; a special command
+        LDI     r4, NOADDR              ; unaddressed: only without an address
+        TEST    r4, r7
+        BZ      hunt
+
+; ----------------------------------------------------- addressed to this gear
+mine:   MOV     r4, r0
+        SHLI    r4, 8
+        SHRI    r4, 8                   ; the data byte
+        MOV     r3, r0
+        SHRI    r3, 8
+        ANDI    r3, 1                   ; S
+        BNZ     cmd
+        LDI     r3, 255                 ; direct arc power
+        CMP     r4, r3
+        BZ      report                  ; MASK: no change
+        MOV     r5, r4                  ; 0 off, 1..254 (inside MIN and MAX)
+        JMP     report
+
+; Commands (r4). The queries leave the answer in r3 and go to reply.
+cmd:    TEST    r4, r4
+        BZ      off                     ; 0x00 OFF
+        CMPI    r4, 5
+        BZ      rmax                    ; 0x05 RECALL MAX LEVEL
+        CMPI    r4, 6
+        BZ      rmin                    ; 0x06 RECALL MIN LEVEL
+        MOV16   r3, 0x90                ; QUERY STATUS
+        CMP     r4, r3
+        BZ      qstat
+        INC     r3                      ; 0x91 QUERY CONTROL GEAR PRESENT
+        CMP     r4, r3
+        BZ      qyes
+        MOV16   r3, 0xA0                ; QUERY ACTUAL LEVEL
+        CMP     r4, r3
+        BZ      qlev
+        MOV16   r3, 0xC0                ; QUERY GROUPS 0-7
+        CMP     r4, r3
+        BZ      qg0
+        INC     r3                      ; 0xC1 QUERY GROUPS 8-15
+        CMP     r4, r3
+        BZ      qg1
+        MOV16   r1, UNKNOWN             ; not implemented: not acted on
+        JMP     report
+off:    LDI     r5, 0
+        JMP     report
+rmax:   LDI     r5, MAXL
+        JMP     report
+rmin:   LDI     r5, MINL
+        JMP     report
+qstat:  LDI     r3, 0
+        TEST    r5, r5
+        BZ      qs1
+        LDI     r3, 4                   ; lamp on
+qs1:    LDI     r4, NOADDR
+        AND     r4, r4, r7
+        OR      r3, r3, r4              ; bit 6: no short address
+        JMP     reply
+qyes:   LDI     r3, 255
+        JMP     reply
+qlev:   MOV     r3, r5
+        JMP     reply
+qg0:    MOV     r3, r6
+        SHLI    r3, 8
+        SHRI    r3, 8
+        JMP     reply
+qg1:    MOV     r3, r6
+        SHRI    r3, 8
+
+; ---------------------------------------------------- the backward frame
+; SR = the start bit and the byte, CNT 9; the first edge ANSWER ticks after
+; the end of the forward frame (r2), re-anchored there with SETD 0.
+reply:  SHLI    r3, 7
+        MOV16   r4, 0x8000
+        OR      r3, r3, r4
+        .csr    BE_CFG, CFG, r4         ; also clears HALF and FIRST (6.9.1)
+        LDSR    r3
+        LDI     r4, 9
+        CSRW    CNT, r4
+        MOV16   r4, ANSWER
+        ADD     r4, r4, r2
+        CSRW    TD, r4
+        WAITD   0                       ; the settling time
+        SETD    0
+        SHO                             ; the start bit's first half
+btx:    WAITD   HALF
+        SHO                             ; a second half
+        WAITD   HALF
+        SHO                             ; a first half: the bit leaves SR and
+        BNZ     btx                     ; Z = (CNT == 0) after the 9th
+        WAITD   HALF
+        SHO                             ; the last second half
+        WAITD   HALF
+        SETP    TX, 0                   ; the stop condition: released
+        MOV16   r1, REPLIED
+
+; ------------------------------------------------------------- the report
+; A report goes out only if OUTQ has room for its first word; the host
+; takes whole reports, so then it has room for both.
+report: OR      r1, r1, r5              ; word B
+        MOV     r3, r7
+        SHRI    r3, 15
+        SHLI    r3, 10                  ; DROPPED, from r7's bit 15
+        OR      r1, r1, r3
+        SETD    0                       ; TD reached: the WAITB is a test
+        WAITB   OUTQ_NF, T
+        BT      drop
+        PUSH    r0                      ; word A
+        PUSH    r1                      ; word B
+        SHLI    r7, 1                   ; DROPPED is told: clear bit 15
+        SHRI    r7, 1
+        JMP     hunt
+drop:   MOV16   r3, 0x8000
+        OR      r7, r7, r3
+        JMP     hunt
+
+; ------------------------------------------------------------ the decoder
+; rxframe: decodes one frame from its start bit's falling edge, whose NOW
+; is in r2, by the time between edges (header). Returns r0 the bits, the
+; newest in bit 0 (the start bit included), r1 their count, plus 32 for a
+; violation, and r2 the end of the last bit (its mid-bit edge plus a
+; half-bit for a frame that ends on a 1). r4 is the phase: 1 at a bit
+; boundary, 0 at the middle of a bit, where the level after the edge is
+; the bit. A violation returns at once; the caller waits the line out.
+rxframe: LDI    r0, 0
+        LDI     r1, 0
+        LDI     r4, 1                   ; the start bit's first edge: a boundary
+redge:  SETD    TEND
+        WAITE   RX, ANY, T
+        BT      rquiet                  ; no edge for TEND ticks
+        CSRR    r3, NOW
+        SUB     r3, r3, r2              ; the interval in ticks
+        ADD     r2, r2, r3              ; r2 = this edge
+        CMPI    r3, HMIN                ; C = (r3 >= 5)
+        BNC     rviol
+        CMPI    r3, DMIN                ; C = (r3 >= 11)
+        BC      rdbl
+        XORI    r4, 1                   ; a half-bit: the phase flips
+        BZ      rbit                    ; now mid-bit: a bit
+        JMP     redge                   ; now at a boundary: none
+rdbl:   CMPI    r3, TEND
+        BC      rviol                   ; 22 or more
+        TEST    r4, r4                  ; a double half-bit from mid-bit to
+        BNZ     rviol                   ; mid-bit only; from a boundary: violation
+rbit:   SHLI    r0, 1
+        JP      RX, 0, rb0              ; the level after a mid-bit edge
+        INC     r0
+rb0:    INC     r1
+        JMP     redge
+rquiet: JP      RX, 0, rviol            ; held low: no stop condition
+        TEST    r4, r4
+        BNZ     rend                    ; at a boundary: the last bit ended here
+        ADDI    r2, HALF                ; mid-bit: it ends a half-bit later
+rend:   RET
+rviol:  ORI     r1, 32                  ; no frame length matches
+        RET

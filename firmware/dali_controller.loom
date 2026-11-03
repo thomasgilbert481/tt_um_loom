@@ -1,0 +1,241 @@
+; dali_controller.loom
+;
+; Decisions (2026-11-03): IEC 62386-101 was not available; the figures
+; come from Renesas R01AN4653 and Microchip TB3200, which cite edition
+; 2.0. Two figures found in no public source (the 12.4 ms answer window
+; and the 13.5 to 14.7 ms forward-frame spacing) are marked UNCHECKED in
+; tools/protomodels/dali.py and must be checked against the standard.
+;
+; A DALI application controller (IEC 62386-101 and -102, the building
+; lighting bus): it sends the forward frames the host asks for, listens for
+; the control gear's backward frame when one is expected, and reports it.
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): DALI is in no design
+; document. Hardware reused: the M2 core (pins, deadlines, timed waits,
+; NOW, the FIFOs) and the bit engine's Manchester encoder (slice A,
+; SEMANTICS 6.9.1, ENC = 2), built for the Manchester loopback of L3-MANCH
+; at 2 Mbit/s and here run at 1200 bit/s, eight ticks a half-bit. No
+; hardware knows DALI: the start bit, the 17-bit frame split over two loads
+; of SR, the stop condition, the settling times before and after a frame,
+; the listening window for the backward frame and its decoding are
+; firmware. The decoding does not use SHI: SHI samples on the thread's
+; fixed tick grid, and a DALI receiver must take half-bits from 333.3 to
+; 500 us (-20 % to +20 %) inside one frame. It times every edge with NOW
+; instead and classifies each interval, as the standard's receiver tables
+; do (half-bit, double half-bit, violation, stop condition).
+;
+; Pins: TX = OUT0 to a DALI interface's transmit input, RX = IN0 from its
+; receive output. Polarity: TX = 1 pulls the bus low (it switches the
+; interface's shorting transistor on), TX = 0 releases it; RX is the bus
+; level, 1 = high (idle, about 16 V on the wire), 0 = low. TX is active
+; high so that a chip in reset or halted (PIN_OUT resets to 0) leaves the
+; bus free: a bus held low for long is a system failure to every gear. The
+; engine's INV bit makes the inversion; an interface with other polarities
+; changes CFG, the two SETP TX lines and the JP and WAITE levels on RX.
+; Every bit the controller sends comes back on RX (the bus is a wired AND).
+;
+; Line code (62386-101): bi-phase, a 1 is low then high and a 0 high then
+; low, most significant bit first; that is IEEE 802.3's convention, which
+; the engine's ENC = 2 sends as it is. Forward frame: start bit (1), address
+; byte, data byte, then the stop condition (the bus high). Backward frame:
+; start bit and 8 bits.
+;
+; Host command (INQ[0]), two words per frame:
+;   word 1   bit 0 R: a backward frame is expected (a query); other bits
+;            are ignored
+;   word 2   the forward frame: bits 15:8 the address byte, 7:0 the data
+;            or command byte
+; Result (OUTQ[0]), two words per frame, always:
+;   status   bits 7:0 the backward frame's byte (with bit 8); bit 8 BACK, a
+;            valid backward frame; bit 9 FRAMING, something started in the
+;            window but was no valid backward frame (a violation, or not 8
+;            bits: two gears answering at once look like this, and 102 reads
+;            it as "yes"); bit 10 NONE, nothing started in the window. All
+;            zero when R was 0.
+;   settle   the ticks from the end of the forward frame's last bit to the
+;            backward frame's first edge (0 when none), Te/8 each.
+;
+; Timing, every figure from 62386-101 ed.2.0 (see firmware/README.md for
+; the sources and which figures were not checked against the standard):
+;   transmit  half-bit 8 ticks, exactly 416.7 us at the rate below (the
+;             transmitter's limits are 366.7 to 466.7 us); every edge is
+;             one slot after its tick (the second load of SR is made
+;             between the two halves of the 16th bit, off the edges).
+;   listen    from the end of the forward frame's last bit for 238 ticks (12.4 ms,
+;             the receiver's settling window for a backward frame) for its
+;             start bit, then the frame is decoded edge by edge.
+;   settle    before every forward frame the bus must have been high, with
+;             no edge, for 260 ticks (13.54 ms) since the end of the
+;             previous frame, its own or a gear's: the priority-1 settling
+;             time between frames is 13.5 to 14.7 ms, and 2.4 ms is the
+;             least after a backward frame. A gear answering late is waited
+;             out this way, never talked over.
+;
+; Decoding, in ticks of Te/8 (Te = the nominal half-bit, 416.7 us): an
+; interval of 5 to 10 measured ticks is a half-bit, 11 to 21 a double
+; half-bit, anything else a violation; no edge for 22 ticks with the bus
+; high ends the frame. With one tick of quantisation that takes every
+; half-bit from 260 to 570 us and every double half-bit from 570 to
+; 1140 us, so the receiver's whole accept range (333.3 to 500, 666.7 to
+; 1000 us) is inside, and the grey zones are split; 1200 us and more is a
+; violation, as table 19 requires.
+;
+; Rate: the host writes TICK_INT and TICK_FRAC before RUN (the M2
+; convention): Te/8 = 52.08 us, at 50 MHz TICK_INT 2604, TICK_FRAC 43
+; (2604.17 clocks; half-bit 416.67 us). Every time in the program is in
+; ticks, so a faster tick runs the same frames faster (the RTL tests use
+; TICK 25). The deadline pairs are proved for ticks of 16 clocks or more
+; (.tick below); 16 is also what lets the decoding loop (at most 16 slots
+; from an edge back to its WAITE) finish before the shortest half-bit the
+; classification takes (5 ticks). A slower tick only adds margin.
+;
+; Memory: 108 words of thread 0's quarter (0x000..0x06B), no data memory.
+; Runs beside dali_gear on thread 1.
+;
+; Weaker than a dedicated DALI controller: one priority (13.5 ms between
+; frames, priority 1) and no collision detection or multi-master
+; arbitration (the 62386-101 ed.2.0 multi-master rules): it assumes it is
+; the only controller on the bus; no 24-bit frames (62386-103 input
+; devices); "send twice" configuration commands are the host's two
+; commands, 13.5 ms apart, well inside the 100 ms the standard allows.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .tick   16                      ; the fastest tick supported (header)
+        .equ    CFG = (1 << 7) | (2 << 3) | (1 << 1)    ; INV, ENC Manchester, MSB first
+        .equ    HALF = 8                ; ticks per half-bit
+        .equ    HMIN = 5                ; a half-bit: 5 .. 10 ticks
+        .equ    DMIN = 11               ; a double half-bit: 11 .. 21 ticks
+        .equ    TEND = 22               ; no edge for this long: the frame ends
+        .equ    LISTEN = 238            ; 12.4 ms: the backward-frame window
+        .equ    SETTLE = 260            ; 13.54 ms of quiet bus before a frame
+        .equ    BACK = 0x100            ; status bits
+        .equ    FRAMING = 0x200
+        .equ    NONE = 0x400
+
+; Registers: r0 bits received, r1 bits counted, r2 the last edge's NOW,
+; r3 an interval or scratch, r4 the decoder's phase or scratch, r5 the
+; forward frame, r6 the command flags, r7 the settling ticks.
+
+start:  SETP    TX, 0                   ; idle: the bus high
+        .csr    BE_PINS, pin(TX), r4    ; out = TX (the engine reads no pin)
+        CSRR    r2, NOW                 ; the first frame settles from here
+
+; ---------------------------------------- the settling time, then a command
+; r2 is the end of the last frame on the bus. Wait until SETTLE ticks after
+; it with no edge and the bus high; every edge on the way starts it again.
+quiet:  MOV16   r3, SETTLE
+        ADD     r3, r3, r2
+        CSRW    TD, r3
+        WAITE   RX, ANY, T
+        BNT     qedge                   ; an edge: the bus is not free yet
+        JP      RX, 1, cmd              ; quiet and high: free
+qedge:  CSRR    r2, NOW                 ; (or held low: wait on from now)
+        JMP     quiet
+
+cmd:    POP     r6                      ; word 1: R in bit 0
+        POP     r5                      ; word 2: the forward frame
+        LDI     r7, 0                   ; the settling ticks, if a reply comes
+
+; -------------------------------------------------------- the forward frame
+; SR first holds the start bit and the frame's bits 15:1, CNT 16, then the
+; frame's bit 0 alone. Each half-bit is one SHO a slot after its tick.
+        MOV     r3, r5
+        SHRI    r3, 1
+        MOV16   r4, 0x8000              ; the start bit, a 1
+        OR      r3, r3, r4
+        .csr    BE_CFG, CFG, r4         ; also clears HALF and FIRST (6.9.1)
+        LDSR    r3
+        LDI     r4, 16
+        CSRW    CNT, r4
+        MOV     r4, r5                  ; the frame's bit 0, for the second load
+        SHLI    r4, 15
+        SETD    1
+        WAITD   0                       ; the start bit starts on a tick
+        SHO                             ; its first half
+ftx:    WAITD   HALF
+        SHO                             ; a second half
+        WAITD   HALF
+        SHO                             ; a first half: the bit leaves SR and
+        BNZ     ftx                     ; Z = (CNT == 0) after the 16th
+        LDSR    r4                      ; SR is empty: the last bit, which the
+        LDI     r3, 1                   ; second half (FIRST) does not need
+        CSRW    CNT, r3
+        WAITD   HALF
+        SHO
+        WAITD   HALF
+        SHO                             ; the last bit
+        WAITD   HALF
+        SHO
+        WAITD   HALF
+        SETP    TX, 0                   ; the stop condition: the bus high
+        CSRR    r2, NOW                 ; the end of the last bit (a slot ago)
+
+; ------------------------------------------------------ the backward frame
+        ANDI    r6, 1                   ; R; the status is 0 without it
+        BZ      report
+        MOV16   r3, LISTEN
+        ADD     r3, r3, r2
+        CSRW    TD, r3                  ; the end of the window
+        WAITE   RX, FALL, T             ; a start bit, or the window is over
+        BT      none
+        CSRR    r3, NOW                 ; (the decoder's own read latency)
+        SUB     r7, r3, r2              ; the settling ticks
+        MOV     r2, r3                  ; the decoder times from this edge
+        CALL    rxframe
+        CMPI    r1, 9                   ; the start bit and 8 bits, no violation
+        BNZ     bad
+        SHLI    r0, 8                   ; the byte alone
+        SHRI    r0, 8
+        MOV16   r6, BACK
+        OR      r6, r6, r0
+        JMP     report
+bad:    MOV16   r6, FRAMING
+        JMP     report
+none:   MOV16   r6, NONE                ; (r2 stays the end of the forward frame)
+report: PUSH    r6
+        PUSH    r7
+        JMP     quiet
+
+; ------------------------------------------------------------ the decoder
+; rxframe: decodes one frame from its start bit's falling edge, whose NOW
+; is in r2, by the time between edges (header). Returns r0 the bits, the
+; newest in bit 0 (the start bit included), r1 their count, plus 32 for a
+; violation, and r2 the end of the last bit (its mid-bit edge plus a
+; half-bit for a frame that ends on a 1). r4 is the phase: 1 at a bit
+; boundary, 0 at the middle of a bit, where the level after the edge is
+; the bit. A violation returns at once; the caller waits the line out.
+rxframe: LDI    r0, 0
+        LDI     r1, 0
+        LDI     r4, 1                   ; the start bit's first edge: a boundary
+redge:  SETD    TEND
+        WAITE   RX, ANY, T
+        BT      rquiet                  ; no edge for TEND ticks
+        CSRR    r3, NOW
+        SUB     r3, r3, r2              ; the interval in ticks
+        ADD     r2, r2, r3              ; r2 = this edge
+        CMPI    r3, HMIN                ; C = (r3 >= 5)
+        BNC     rviol
+        CMPI    r3, DMIN                ; C = (r3 >= 11)
+        BC      rdbl
+        XORI    r4, 1                   ; a half-bit: the phase flips
+        BZ      rbit                    ; now mid-bit: a bit
+        JMP     redge                   ; now at a boundary: none
+rdbl:   CMPI    r3, TEND
+        BC      rviol                   ; 22 or more
+        TEST    r4, r4                  ; a double half-bit from mid-bit to
+        BNZ     rviol                   ; mid-bit only; from a boundary: violation
+rbit:   SHLI    r0, 1
+        JP      RX, 0, rb0              ; the level after a mid-bit edge
+        INC     r0
+rb0:    INC     r1
+        JMP     redge
+rquiet: JP      RX, 0, rviol            ; held low: no stop condition
+        TEST    r4, r4
+        BNZ     rend                    ; at a boundary: the last bit ended here
+        ADDI    r2, HALF                ; mid-bit: it ends a half-bit later
+rend:   RET
+rviol:  ORI     r1, 32                  ; no frame length matches
+        RET
