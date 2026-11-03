@@ -1,0 +1,232 @@
+; modbus_client.loom
+;
+; Decisions (2026-11-03): to fit beside the server (502 of 512 words in
+; all) the client does not check a response's parity bit; stop bits and
+; the CRC are checked. TX and DE must be OUT pins.
+;
+; A Modbus RTU client (master) on an RS-485 half-duplex bus: it sends the
+; requests the host gives it with their CRC appended, waits for the
+; response up to a host-set timeout, finds the response's end by the 3.5-
+; character silence, checks its CRC, and hands the response, or what went
+; wrong, to the host. RX comes from the RO output of an RS-485 transceiver,
+; TX goes to its DI input and DE to its driver enable.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035), the partner of
+; modbus_server.loom (whose header explains the CRC: the bit engine's CRC
+; unit on the preset built for USB's CRC16, fed by SHO and SHI). It needs the
+; M2 core (pins, deadlines, timed waits, the FIFOs), LD/ST of slice B
+; (SEMANTICS 6.11) for the request buffer and the bit engine in manual mode
+; (SEMANTICS 6.9). No hardware knows Modbus or a UART: the characters, the
+; parity, the CRC's byte order, the response timeout, the silences and the
+; DE turn-around are all firmware.
+;
+; Specifications: "MODBUS over Serial Line Specification and Implementation
+; Guide V1.02" (SL) and "MODBUS Application Protocol Specification V1.1b3"
+; (AP), as in modbus_server.loom; tools/protomodels/modbus.py is the model.
+;
+; Pins: RX = IN1, TX = OUT2 (idle high: mark), DE = OUT3 (1 = drive the bus).
+; All three move with the assembler's --pin, TX and DE to OUT pins only (to fit
+; the quarter there is no OEP: a BIDIR pin would need its OE set by the host).
+; The server's pins are IN0, OUT0 and OUT1, so the two can share one bus.
+;
+; Settings: four words of data memory that the host loads with the image,
+; before RUN (the same as modbus_server's, plus the timeout):
+;     0x155   the parity mask: 0x0FF even, 0x1FF odd, 0x100 none
+;     0x156   T15, t1.5 in ticks (132 at 19200 baud or slower, SL 2.5.1.1)
+;     0x157   T35, t3.5 in ticks (308 at 19200 baud or slower)
+;     0x158   the response timeout in ticks, 1 .. 32767, from the end of
+;             the request's last stop bit to the response's first start bit
+;             (SL 2.4.1 leaves its value to the system; at 19200 baud 32767
+;             ticks are 0.53 s)
+; Rate: eight ticks a bit, TICK_INT/TICK_FRAC as for modbus_server; the
+; pairs are proved for ticks of 8 clocks or more.
+;
+; Host command (INQ[3]), per request:
+;     word 1     n, the request's length without the CRC, 2 .. 39 bytes
+;     n words    the bytes, one per word in bits 7:0: the server's address
+;                (0 for a broadcast), the function code, the data
+; Result (OUTQ[3]), per request:
+;     bytes      one word per byte of the response, CRC included, in bits
+;                7:0, pushed as it arrives; a byte that finds OUTQ full is
+;                dropped (the count below still counts it, so the host sees
+;                the loss)
+;     status     bit 15 set, after the response:
+;                bits 7:0  bytes received (modulo 256), the CRC included
+;                bit 8     timeout: no start bit came in time (no bytes)
+;                bit 9     CRC error, or fewer than 4 bytes
+;                bit 10    framing error: a stop bit was low
+;                bit 11    a silence over t1.5 inside the response
+;                bit 13    broadcast: sent, no response awaited (SL 2.1)
+; A response is good when bits 14:8 are all zero. Matching it to the request
+; (address, function code) is the host's job, as is the turn-around delay
+; after a broadcast (SL 2.4.1) and the silence of t3.5 before a request that
+; follows a timeout; after a response, the 3.5-character silence that ended
+; it is already behind the next request.
+;
+; Weaker than the server: the parity bit of a response is not checked (its
+; stop bit is). That costs nothing a CRC-16 does not catch, since a byte
+; with a wrong data bit fails the CRC and a wrong parity bit alone leaves
+; the data right, and it saves the 8 words that let the client fit its
+; quarter next to the server.
+;
+; Memory: thread 3's quarter, 0x180 .. 0x1FF, and data at 0x155 .. 0x17F
+; (the settings, then the request buffer of 39 bytes, the longest request
+; the server's 16-register table can take). The image need not load the
+; buffer.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 3
+        .pins   RX = IN1, TX = OUT2, DE = OUT3
+        .tick   8                       ; the shortest tick the pairs are proved for
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    CCFG = 0x155            ; the settings; r1 holds this address
+        .equ    MODE = 0
+        .equ    T15W = 1
+        .equ    T35W = 2
+        .equ    TMOW = 3
+        .equ    BUFO = 4                ; the request buffer, from CCFG + 4
+        .equ    TMOF = 0x01             ; status bits 15:8, built in r3 7:0
+        .equ    CRCF = 0x02
+        .equ    FERRF = 0x04
+        .equ    GAPF = 0x08
+        .equ    BCASTF = 0x20
+        .equ    MARK = 0x80             ; bit 15: a status word
+
+; Registers: r0 a byte or scratch, r1 CCFG, r2 a pointer or the bytes
+; received, r3 the status, r4 T15 + OVS / 2, r5 T35 - T15, r6 the parity
+; mask, r7 a count or the timeout.
+
+start:  SETP    TX, 1                   ; mark
+        SETP    DE, 0                   ; listen
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0x200           ; NRZ, LSB first, CRC_EN
+        .csr    CRC_POLY, 0x8005        ; usb16
+        .csr    CRC_INIT, 0xFFFF
+        MOV16   r1, CCFG
+        LD      r6, r1, MODE
+        LD      r4, r1, T15W
+        LD      r5, r1, T35W
+        SUB     r5, r5, r4
+        ADDI    r4, OVS / 2             ; timed from the middle of a stop bit
+
+; ---------------------------------------------------------------- request
+next:   POP     r7                      ; n
+        MOV     r2, r1
+        ADDI    r2, BUFO
+        MOV     r3, r7
+get:    POP     r0
+        ST      r0, r2, 0
+        INC     r2
+        DJNZ    r3, get
+; Sent as modbus_server sends a response: DE one bit ahead, the characters
+; back to back, the CRC low byte first (SL 2.5.1.2), DE off at the end of
+; the last stop bit.
+        CRCI
+        SETD    1
+        WAITD   1
+        SETP    DE, 1
+        SUB     r2, r2, r7              ; back to the first byte
+txb:    LD      r0, r2, 0
+        INC     r2
+        CALL    txbyte
+        DJNZ    r7, txb
+        STCRC   r0
+        REV     r0, r0                  ; the Modbus CRC
+        MOV     r3, r0
+        SHLI    r0, 8
+        SHRI    r0, 8
+        CALL    txbyte
+        MOV     r0, r3
+        SHRI    r0, 8
+        CALL    txbyte
+        WAITD   OVS                     ; the end of the last stop bit
+        SETP    DE, 0
+        LDI     r3, MARK
+        LDI     r2, 0
+        CRCI
+        LD      r0, r1, BUFO            ; the address
+        TEST    r0, r0
+        BNZ     answer
+        ORI     r3, BCASTF              ; broadcast: no response (SL 2.1)
+        JMP     report
+
+; --------------------------------------------------------------- response
+; The first start bit must come within the timeout of the request's last
+; stop bit; after that the response is received like a request in
+; modbus_server, but every byte goes to OUTQ as it arrives.
+answer: LD      r7, r1, TMOW
+        CSRR    r0, TD
+        ADD     r0, r0, r7
+        CSRW    TD, r0                  ; the request's end + the timeout
+        WAITP   RX, 0, T
+        BNT     char
+        ORI     r3, TMOF
+        JMP     report
+char:   SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 1, ferr             ; high again: not a start bit
+        LDI     r0, 8
+        CSRW    CNT, r0
+bit:    WAITD   OVS
+        SHI                             ; a data bit into SR and the CRC
+        BNZ     bit
+        STSR    r0
+        SHRI    r0, 8                   ; the byte
+        INC     r2
+        WAITB   OUTQ_NF, T              ; TD has passed: T = 1 only if OUTQ is full
+        BT      stopb                   ; full: the byte is dropped
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r0
+stopb:  WAITD   2 * OVS                 ; the stop bit (the parity bit is not sampled)
+        JP      RX, 0, ferr
+gap:    CSRR    r0, TD
+        ADD     r0, r0, r4
+        CSRW    TD, r0                  ; the stop bit's end + t1.5
+        WAITP   RX, 0, T
+        BNT     char
+        CSRR    r0, TD
+        ADD     r0, r0, r5
+        CSRW    TD, r0                  ; the stop bit's end + t3.5
+        WAITP   RX, 0, T
+        BT      done                    ; t3.5 of silence: the response is complete
+        ORI     r3, GAPF
+        JMP     char
+ferr:   ORI     r3, FERRF               ; a low stop bit, or a glitch
+        WAITP   RX, 1
+        SETD    0
+        JMP     gap
+done:   CMPI    r2, 4
+        BNC     cbad
+        STCRC   r0
+        TEST    r0, r0                  ; a frame that ends with its CRC leaves 0
+        BZ      report
+cbad:   ORI     r3, CRCF
+report: SWAP    r3, r3
+        OR      r3, r3, r2
+        PUSH    r3                      ; the host takes it when it likes
+        JMP     next
+
+; txbyte: one character of the byte in r0 (bits 15:8 zero), its start bit
+; OVS ticks after TD; the parity is worked out first and kept in C, which
+; LDI, CSRW, WAITD, SETP, SHO and BNZ all leave alone.
+txbyte: LDSR    r0
+        AND     r0, r0, r6
+        XOR     r0, r0, r6
+        PAR     r0, r0                  ; C = the parity bit (or 1: a stop bit)
+        LDI     r0, 8
+        CSRW    CNT, r0
+        WAITD   OVS
+        SETP    TX, 0                   ; start bit
+tbit:   WAITD   OVS
+        SHO                             ; a data bit, LSB first, into the CRC
+        BNZ     tbit
+        BC      tone
+        WAITD   OVS
+        SETP    TX, 0
+        JMP     tstop
+tone:   WAITD   OVS
+        SETP    TX, 1
+tstop:  WAITD   OVS
+        SETP    TX, 1                   ; the stop bit
+        RET

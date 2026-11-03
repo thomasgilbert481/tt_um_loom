@@ -1,0 +1,431 @@
+; modbus_server.loom
+;
+; Decisions (2026-11-03): a request with a good CRC but a length its
+; function code does not allow is answered with exception 03 (illegal
+; data value), not dropped. Settings (parity, the 1.5 and 3.5 character
+; limits in ticks, address) are loaded with the image in data memory.
+;
+; A Modbus RTU server (slave) on an RS-485 half-duplex bus: it finds frames
+; by their silent intervals, checks the CRC and the address, answers read
+; holding registers (03), write single register (06) and write multiple
+; registers (16) from a 16-register table in data memory, sends exception
+; responses 01, 02 and 03, executes broadcasts without answering them, and
+; reports every frame it sees to the host. RX comes from the RO output of an
+; RS-485 transceiver, TX goes to its DI input and DE to its driver enable.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, timed waits, the FIFOs), LD/ST of slice B (SEMANTICS 6.11,
+; built for the I2C EEPROM's array) and the bit engine in manual mode
+; (SEMANTICS 6.9): SHI samples each data bit and SHO sends it, and the CRC
+; unit, set to the preset built for USB's data CRC16 (poly 0x8005, init
+; 0xFFFF, isa.yaml crc_presets usb16), computes Modbus's CRC-16 on the bits
+; as they cross the pin. Bits go LSB first, so the register holds the
+; bit-reversal of the reflected CRC that Modbus defines (polynomial 0xA001
+; reflected, init 0xFFFF): REV turns it into the Modbus CRC, and Modbus does
+; not invert it where USB does. A received frame that ends with its own CRC
+; leaves the register 0. No hardware knows Modbus or even a UART: the 11-bit
+; characters with their parity, the 1.5- and 3.5-character silences, the
+; frame buffer, the address and function code checks, the register table,
+; the exceptions and the DE turn-around are all firmware.
+;
+; Specifications: "MODBUS over Serial Line Specification and Implementation
+; Guide V1.02" (SL below) and "MODBUS Application Protocol Specification
+; V1.1b3" (AP). tools/protomodels/modbus.py is the reference model written
+; from them, and quotes the figures this header uses.
+;
+; Pins: RX = IN0, TX = OUT0 (idle high: mark), DE = OUT1 (1 = drive the bus).
+; All three move with the assembler's --pin.
+;
+; Character (SL 2.5.1): a start bit, 8 data bits LSB first, a parity bit and
+; a stop bit, 11 bits. Even parity is the default; odd parity, or no parity
+; with a second stop bit instead (still 11 bits), are the host's choice. The
+; receiver checks the parity bit (or the first stop bit) and the stop bit;
+; a character that fails either spoils its frame.
+;
+; Settings: four words of data memory that the host loads with the image,
+; before RUN, like the register table (INQ[0] is never read):
+;     0x151    the parity, as the mask the program uses (below): 0x0FF even,
+;              0x1FF odd, 0x100 none (two stop bits)
+;     0x152    T15, t1.5 in ticks: 132 at 19200 baud or slower (1.5 characters
+;              of 88 ticks), 750 us in ticks above 19200 (SL 2.5.1.1)
+;     0x153    T35, t3.5 in ticks: 308 at 19200 baud or slower, 1750 us in
+;              ticks above it. T15 < T35 < 32768 - T15.
+;     0x154    the server's address, 1 .. 247 (SL 2.2)
+; Rate: eight ticks a bit. The host sets TICK_INT/TICK_FRAC to one eighth of
+; a bit before RUN: at 50 MHz, 19200 baud is TICK_INT 325, TICK_FRAC 133
+; (325.52 clocks, under 0.001 % fast); 9600 baud TICK_INT 651, TICK_FRAC 11. The
+; deadline pairs are proved for ticks of 8 clocks or more (.tick below), so
+; the fastest rate is 781250 baud (tools/tests/test_fw_modbus.py runs the RTL
+; there, with SL's fixed timers scaled to its character time).
+;
+; Report (OUTQ[0]), one word per frame seen on the bus, after the reply:
+;     bits 7:0   the function code (0 when the frame was dropped)
+;     bits 10:8  the exception code sent (0: a normal response, or none)
+;     bit 11     broadcast (address 0): executed, not answered
+;     bit 12     CRC error, or fewer than 4 bytes: dropped
+;     bit 13     parity or framing error in a character: dropped
+;     bit 14     a silence over t1.5 inside the frame: dropped (SL 2.5.1.1)
+;     bit 15     for another address: ignored
+; A report is dropped, not waited for, when OUTQ is full: the receiver never
+; stalls. For a broadcast, bits 10:8 hold the exception that was not sent.
+;
+; Timing.
+;   - Receive: each sample is OVS / 2 ticks into its bit, give or take one
+;     tick (the start edge is seen within a tick and about 12 clocks), so at
+;     8 ticks a bit a sender 3 % fast or slow is understood (tested at 19200
+;     baud); from about 4 % it depends on where the start edges fall in a
+;     tick. The silences are timed from the middle of each stop bit plus
+;     half a bit, on the stop bit's own deadline, so to within a tick: a
+;     silence over T15 + 1 ticks always spoils the frame, one under T15 - 1
+;     never does, and the frame ends T35 ticks after its last stop bit.
+;   - Respond: the response starts after the frame end, so never less than
+;     t3.5 after the request (SL 2.5.1.1), plus the time the request takes
+;     to check: DE rises 300 to 1,200 clocks after the frame end (06 and a
+;     one-register 03 the shortest, 16 registers of 03 or 16 the longest).
+;   - Turn-around: DE rises one bit before the first start bit and falls at
+;     the end of the last stop bit (no RS-485 timing is set by SL: its
+;     section 3.3 leaves the driver to the transceiver). The characters of a
+;     response go back to back, with no silence at all between them.
+;
+; Data memory (SEMANTICS 6.11), not loaded by the image except the table:
+;     0x118 .. 0x127   the 16 holding registers, 0 .. 15. The host loads
+;                      them with the image and reads them back through IMEM.
+;                      Sixteen because the memory is shared with the code of
+;                      both programs (SEMANTICS 6.11): enough for every path of 03, 06
+;                      and 16, including the quantity and address limits.
+;     0x128 .. 0x150   the frame buffer, 41 bytes: the longest request the
+;                      table can take (16 with 16 registers, 9 + 32 bytes).
+;                      Longer frames are counted and checked but not stored.
+;     0x151 .. 0x154   the settings: the parity mask, T15, T35, the address
+; Memory: 271 words of code, 0x000 .. 0x10E, spilling over thread 1's
+; quarter and into thread 2's: only thread 0 may be started, except
+; modbus_client on thread 3, whose code is 0x180 .. 0x1FF and whose data is
+; 0x155 .. 0x17F, so the two run together.
+;
+; Weaker than a dedicated Modbus UART: the 3.5-character end of frame costs
+; the receiver nothing, but the checks after it (up to 1,200 clocks) are
+; done while the line is not watched, so a request that follows another
+; within that time, which SL allows to a client only after a response or a
+; turn-around delay, would lose its first character. A break of more than
+; 2^15 ticks wraps NOW in the silence timer.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0, TX = OUT0, DE = OUT1
+        .tick   8                       ; the shortest tick the pairs are proved for
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    REGS = 0x118            ; the register table, 16 words
+        .equ    NREGS = 16
+        .equ    BUF = 0x128             ; the frame buffer, one byte per word
+        .equ    CFG = 0x151             ; the buffer ends here: 41 bytes
+        .equ    MODE = 0                ; CFG + 0: the parity mask (r6 below)
+        .equ    T15W = 1                ; CFG + 1: T15
+        .equ    T35W = 2                ; CFG + 2: T35
+        .equ    ME = 3                  ; CFG + 3: the server's address
+        .equ    CHERR = 0x01            ; frame status while receiving: a bad
+        .equ    GAPF = 0x02             ; character, a silence over t1.5
+
+; Registers while receiving: r0 the byte, r1 scratch, r2 the buffer pointer
+; (counts on past the end), r3 the frame status, r4 T15 + OVS / 2, r5
+; T35 - T15 (both worked out from the settings), r6 the parity mask, r7 scratch. The parity mask is 0x0FF for
+; even parity, 0x1FF for odd, 0x100 for none: the parity bit is
+; PAR((byte & r6) ^ r6), which is 1 without parity, the first stop bit.
+
+start:  SETP    TX, 1                   ; mark
+        OEP     TX, 1
+        SETP    DE, 0                   ; the driver off: listen
+        OEP     DE, 1
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0x200           ; NRZ, LSB first, CRC_EN
+        .csr    CRC_POLY, 0x8005        ; usb16: x^16 + x^15 + x^2 + 1
+        .csr    CRC_INIT, 0xFFFF
+        .csr    INGRP, (1 << 5) | pin(RX)   ; IN reads RX into bit 0
+        MOV16   r1, CFG
+        LD      r4, r1, T35W
+        ADDI    r4, OVS / 2
+
+; SL 2.5.1.1, figure 14: after power-up the line must be idle for t3.5
+; before a frame is taken. Any low restarts the count.
+sync:   WAITP   RX, 1
+        CSRR    r1, NOW
+        ADD     r1, r1, r4              ; NOW + T35 + OVS / 2
+        CSRW    TD, r1
+        WAITP   RX, 0, T
+        BNT     sync
+
+; ---------------------------------------------------------------- receive
+; One frame: characters until a silence of t3.5. Like uart_rx, WAITP finds
+; a start bit (a level, so one that comes while the last character is being
+; booked is not lost) and SETD 0 anchors on it; the samples are taken by the
+; SHI, IN or JP right after each WAITD, OVS / 2 ticks into the start bit and
+; OVS apart. After each stop bit's sample TD is set to the end of that stop
+; bit plus t1.5, and a start bit is waited for with a timeout there: a
+; timeout opens the window to t3.5, in which a character spoils the frame
+; (SL 2.5.1.1, figure 14) and a second timeout ends it.
+hunt:   MOV16   r1, CFG
+        LD      r6, r1, MODE
+        LD      r4, r1, T15W
+        LD      r5, r1, T35W
+        SUB     r5, r5, r4
+        ADDI    r4, OVS / 2             ; timed from the middle of a stop bit
+        CRCI
+        MOV16   r2, BUF
+        LDI     r3, 0
+        WAITP   RX, 0                   ; a frame's first start bit
+        JMP     char
+glitch: ORI     r3, CHERR               ; spoils the frame; on an idle line it
+        JMP     gap                     ; leaves no byte and is not reported
+char:   SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 1, glitch           ; high again: not a start bit
+        LDI     r1, 8
+        CSRW    CNT, r1
+bit:    WAITD   OVS
+        SHI                             ; a data bit into SR and the CRC
+        BNZ     bit
+        STSR    r0
+        SHRI    r0, 8                   ; the byte (SR 15:8)
+        MOV16   r7, CFG
+        CMP     r2, r7                  ; C = the buffer is full
+        BC      nost
+        ST      r0, r2, 0
+nost:   INC     r2
+        WAITD   OVS                     ; the parity bit, or the first stop bit
+        IN      r1
+        SHLI    r1, 8
+        XOR     r1, r1, r6
+        AND     r7, r0, r6
+        XOR     r1, r1, r7
+        PAR     r1, r1                  ; C = 1: the bit is not PAR((byte & r6) ^ r6)
+        BNC     stop
+        ORI     r3, CHERR
+stop:   WAITD   OVS                     ; the stop bit
+        JP      RX, 0, ferr
+gap:    CSRR    r1, TD
+        ADD     r1, r1, r4
+        CSRW    TD, r1                  ; the stop bit's end + t1.5
+        WAITP   RX, 0, T
+        BNT     char                    ; a character in time
+        CSRR    r1, TD
+        ADD     r1, r1, r5
+        CSRW    TD, r1                  ; the stop bit's end + t3.5
+        WAITP   RX, 0, T
+        BT      done                    ; t3.5 of silence: the frame is complete
+        ORI     r3, GAPF                ; a character after t1.5: the frame is NOK
+        JMP     char
+ferr:   ORI     r3, CHERR               ; the stop bit was low
+        WAITP   RX, 1                   ; wait out a break
+        SETD    0
+        JMP     gap                     ; and time the silence from the rise
+
+; ------------------------------------------------------------- the frame
+; Registers from here: r1 BUF, r7 the frame's length in bytes, r3 the report.
+done:   MOV16   r1, BUF
+        SUB     r7, r2, r1              ; bytes received, the CRC included
+        BZ      hunt                    ; none: a glitch on an idle line
+        SHLI    r3, 13                  ; CHERR to bit 13, GAPF to bit 14
+        BNZ     toreport                ; dropped
+        CMPI    r7, 4
+        BNC     crcbad                  ; no room for an address, a function and a CRC
+        STCRC   r0
+        TEST    r0, r0                  ; a frame that ends with its CRC leaves 0
+        BZ      crcok
+crcbad: LDIH    r3, 0x10                ; bit 12 (r3 was 0)
+toreport:
+        JMP     report
+crcok:  LD      r3, r1, 1               ; the report: the function code
+        LD      r0, r1, 0               ; the address
+        MOV16   r2, CFG
+        LD      r2, r2, ME
+        TEST    r0, r0
+        BZ      bcast
+        CMP     r0, r2
+        BZ      mine
+        LDIH    r3, 0x80                ; bit 15: another server's frame
+        JMP     report
+bcast:  LDIH    r3, 0x08                ; bit 11: broadcast, never answered
+
+; AP 6.3, 6.6, 6.12 and 7: an unknown function is exception 01; a bad
+; quantity, byte count or length 03; a register outside the table 02.
+mine:   LD      r0, r1, 1
+        CMPI    r0, 3
+        BZ      known
+        CMPI    r0, 6
+        BZ      known
+        CMPI    r0, 16
+        BZ      known
+        LDI     r0, 1                   ; ILLEGAL FUNCTION
+        JMP     exc
+known:  CMPI    r7, 8
+        BNC     e3                      ; every request of the three has 8 bytes or more
+        LD      r2, r1, 2               ; r2 = bytes 2:3, the first register
+        LD      r4, r1, 3
+        SWAP    r2, r2
+        OR      r2, r2, r4
+        LD      r4, r1, 4               ; r4 = bytes 4:5, a quantity or a value
+        LD      r5, r1, 5
+        SWAP    r4, r4
+        OR      r4, r4, r5
+        LDI     r5, NREGS
+        CMPI    r0, 6
+        BZ      fc06
+        CMPI    r0, 3
+        BNZ     fc16
+
+; Read holding registers (AP 6.3): 8 bytes, quantity 1 .. 125, all of them
+; in the table. The response replaces the request in the buffer: address,
+; function, byte count, then each register high byte first (AP 4.2).
+fc03:   CMPI    r7, 8
+        BNZ     e3
+        TEST    r4, r4
+        BZ      e3                      ; quantity 0
+        LDI     r0, 125
+        CMP     r0, r4                  ; C = quantity <= 125
+        BNC     e3
+        CMP     r2, r5                  ; C = first >= 16
+        BC      e2
+        ADD     r0, r2, r4
+        CMP     r5, r0                  ; C = first + quantity <= 16
+        BNC     e2
+        MOV16   r6, REGS
+        ADD     r6, r6, r2              ; the first register's word
+        MOV     r0, r4
+        SHLI    r0, 1
+        ST      r0, r1, 2               ; the byte count
+        MOV     r2, r1
+        ADDI    r2, 3
+rd:     LD      r0, r6, 0
+        INC     r6
+        MOV     r5, r0
+        SHRI    r5, 8
+        ST      r5, r2, 0
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r2, 1
+        ADDI    r2, 2
+        DJNZ    r4, rd
+        SUB     r7, r2, r1              ; the response's length
+        JMP     reply
+
+; Write single register (AP 6.6): 8 bytes, the register in the table; the
+; response echoes the request.
+fc06:   CMPI    r7, 8
+        BNZ     e3
+        CMP     r2, r5
+        BC      e2
+        MOV16   r6, REGS
+        ADD     r6, r6, r2
+        ST      r4, r6, 0
+        JMP     echo
+
+; Write multiple registers (AP 6.12): quantity 1 .. 123, byte count twice
+; the quantity, 9 + byte count bytes, all registers in the table; the
+; response is the request's first six bytes.
+fc16:   TEST    r4, r4
+        BZ      e3
+        LDI     r0, 123
+        CMP     r0, r4                  ; C = quantity <= 123
+        BNC     e3
+        MOV     r0, r4
+        SHLI    r0, 1                   ; 2 N
+        LD      r6, r1, 6
+        CMP     r6, r0
+        BNZ     e3                      ; the byte count is not 2 N
+        ADDI    r0, 9
+        CMP     r7, r0
+        BNZ     e3                      ; the length is not 9 + 2 N
+        CMP     r2, r5
+        BC      e2
+        ADD     r0, r2, r4
+        CMP     r5, r0
+        BNC     e2
+        MOV16   r6, REGS
+        ADD     r6, r6, r2
+        MOV     r2, r1
+        ADDI    r2, 7
+wr:     LD      r0, r2, 0
+        LD      r5, r2, 1
+        SWAP    r0, r0
+        OR      r0, r0, r5
+        ST      r0, r6, 0
+        INC     r6
+        ADDI    r2, 2
+        DJNZ    r4, wr
+echo:   LDI     r7, 6
+        JMP     reply
+
+e2:     LDI     r0, 2                   ; ILLEGAL DATA ADDRESS
+        JMP     exc
+e3:     LDI     r0, 3                   ; ILLEGAL DATA VALUE
+exc:    ST      r0, r1, 2               ; AP 7: address, function | 0x80, code
+        SWAP    r0, r0
+        OR      r3, r3, r0              ; the code in bits 10:8 of the report
+        LD      r0, r1, 1
+        LDI     r2, 0x80
+        OR      r0, r0, r2
+        ST      r0, r1, 1
+        LDI     r7, 3
+reply:  MOV     r0, r3
+        SHLI    r0, 5                   ; C = bit 11 of the report
+        BC      report                  ; a broadcast is never answered
+
+; ---------------------------------------------------------------- respond
+; r7 bytes from BUF, then the CRC, low byte first (SL 2.5.1.2), back to
+; back. DE rises on a tick boundary one bit before the first start bit and
+; falls at the end of the last stop bit; every edge is the instruction after
+; the WAITD that times it, so all of them land the same 4 to 7 clocks after
+; their ticks.
+        MOV16   r0, CFG
+        LD      r6, r0, MODE
+        CRCI
+        SETD    1
+        WAITD   1
+        SETP    DE, 1                   ; drive the bus
+        MOV     r2, r1
+txb:    LD      r0, r2, 0
+        INC     r2
+        CALL    txbyte
+        DJNZ    r7, txb
+        STCRC   r0
+        REV     r0, r0                  ; the Modbus CRC (header)
+        MOV     r4, r0
+        SHLI    r0, 8
+        SHRI    r0, 8
+        CALL    txbyte                  ; CRC low byte
+        MOV     r0, r4
+        SHRI    r0, 8
+        CALL    txbyte                  ; CRC high byte
+        WAITD   OVS                     ; the end of the last stop bit
+        SETP    DE, 0                   ; release the bus
+
+report: WAITB   OUTQ_NF, T              ; TD has passed: T = 1 only if OUTQ is full
+        BT      rehunt                  ; full: the report is dropped
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r3
+rehunt: JMP     hunt
+
+; txbyte: one character of the byte in r0 (bits 15:8 zero), its start bit
+; OVS ticks after TD. The data bits go through SHO, so into the CRC; the
+; parity bit and the stop bit are SETPs, so not. The parity is worked out
+; first and kept in C, which LDI, CSRW, WAITD, SETP, SHO and BNZ leave alone.
+txbyte: LDSR    r0
+        AND     r0, r0, r6
+        XOR     r0, r0, r6
+        PAR     r0, r0                  ; C = the parity bit (or 1: a stop bit)
+        LDI     r0, 8
+        CSRW    CNT, r0
+        WAITD   OVS
+        SETP    TX, 0                   ; start bit
+tbit:   WAITD   OVS
+        SHO                             ; a data bit, LSB first, into the CRC
+        BNZ     tbit
+        BC      tone
+        WAITD   OVS
+        SETP    TX, 0
+        JMP     tstop
+tone:   WAITD   OVS
+        SETP    TX, 1
+tstop:  WAITD   OVS
+        SETP    TX, 1                   ; the stop bit
+        RET
