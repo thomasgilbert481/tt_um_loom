@@ -1,0 +1,327 @@
+; dcc_decoder.loom
+;
+; Decisions (2026-11-03): one cell of S-9.1 table 2.1 (the maximum of an
+; unstretched 0 half-bit) could not be read from the posted PDF's text,
+; so no check depends on it; dcc_station.loom sends exactly 100 us, which
+; meets every reading of it.
+;
+; NMRA DCC decoder (the receiving side of the model-railway track signal) on
+; IN0, delivering the packets for its address, broadcasts and resets to the
+; host through OUTQ[1], and counting the packets it drops.
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; DCC. The program timestamps every edge with the timed edge wait (`WAITE
+; RX, ANY, T`, SEMANTICS 6.4), built for PS/2 and the bit-banged receivers,
+; and the tick counter (`CSRR NOW`, SEMANTICS 4), and keeps its window
+; table, its address, its counters and the packet in data memory (LD/ST,
+; SEMANTICS 6.11, built for the EEPROM emulation). What the firmware does
+; that no hardware does: the half-bit classification against S-9.1's
+; receive windows, the 1-bit symmetry check, the preamble hunt, the bit
+; pairing, the byte framing and the error-detection byte. It needs the
+; FIFOs (PUSH) and data memory, nothing else: no bit engine, no latch.
+;
+; Pin: RX = IN0, the track signal through an optocoupler or a comparator,
+; logic level. Polarity does not matter (S-9.1 note 3: a decoder cannot know
+; which rail is which), so every edge counts and a half-bit is the time
+; between two edges.
+;
+; Windows (S-9.1, the posted draft of 2026-06-16, Table 2.1 and Table 2 of
+; section 2.2; figures as tools/protomodels/dcc.py cites them). A decoder
+; must accept a 1 half-bit of tr1 = 52 .. 64 us, a 0 half-bit of tr0 = 90 ..
+; 10000 us (this covers the stretched 0s of section 2.1), and a 1 whose two
+; halves differ by up to tr1d = 6 us. The program accepts each window
+; widened by M = 1 us at both ends (2 us for the difference, measured from
+; two edges), more than its measurement error (below), so every half the
+; standard says must be accepted is, and every half more than 2 us outside
+; is refused:
+;   a 1 half    51 .. 65 us        102 .. 130 ticks
+;   a 0 half    89 .. 10001 us     178 .. 20002 ticks (the top is a timeout)
+;   a 1         halves differing by 8 us or less    16 ticks
+; Between 65 and 89 us a half-bit is neither. A preamble is 20 or more 1
+; halves in a row, 10 complete 1s whatever the phase (S-9.2 section A: a
+; decoder must not accept fewer than 10 and must not require more than 12);
+; the packet start bit is the first 0 half after it, and its second half
+; must be a 0 half too, which fixes the pairing of halves into bits. The
+; 1-bit difference is checked from the start bit on (in the preamble the
+; pairing is not yet known). The packet end bit's two halves count towards
+; the next preamble (S-9.2 note 3).
+;
+; A packet (S-9.2 section A) is then bytes of 8 bits, MSB first, each
+; followed by a separator bit: 0 another byte, 1 the packet end bit. It is
+; dropped and counted when a bit is outside the windows (a half of neither
+; class, a 1 and a 0 half paired, or a 1's halves too unequal), when it has
+; fewer than 3 or more than 6 bytes (format), or when the XOR of all its
+; bytes, the error-detection byte included, is not 0 (S-9.2 section B).
+; After a drop the program hunts for the next preamble (S-9.2 section C).
+;
+; Tick (set by the host before RUN): one tick is 0.5 us, TICK = f_clk / 2
+; MHz: 50 MHz TICK_INT 25; 48 MHz TICK_INT 24; 8 MHz (the RTL tests)
+; TICK_INT 4. A deadline must lie less than 2^15 ticks ahead (SEMANTICS 4,
+; reached()), which is what keeps the tick from being finer: 10001 us is
+; 20002 ticks. Measurement error: each edge is seen 2 to 5 clocks after it
+; reaches the pad (synchroniser and slot grid) and NOW is read a fixed slot
+; later, so a half-bit is measured to within 3 clocks plus one tick: 0.56 us
+; at 50 MHz, 0.875 us at 8 MHz. It stays under M = 1 us from 6 MHz up.
+; Processing: WAITE sees an edge only if it is waiting when the edge comes
+; (PREV_PINS follows the pin in every slot, SEMANTICS 6.4), so the work
+; after one edge must be done before the next. The longest path from a
+; WAITE that saw an edge to the next WAITE, counted by hand from the
+; listing (LD and ST two slots), is 80 slots: the report, made after the
+; edge that follows the packet end bit (`report`). After the end bit's last
+; edge it is 52 slots, inside a packet 43. With the edge seen up to 5
+; clocks late, 80 slots fit in the shortest half accepted, 51 us, from
+; 6.4 MHz up (325 clocks). The program takes the clock from 8 MHz up.
+;
+; Size: 177 words, 0x080 .. 0x130: it spills 49 words into thread 2's
+; quarter, so thread 2 must not be started with this image (the listing
+; says so). dcc_station (thread 0, 0x000 .. 0x068) fits beside it.
+;
+; Host interface (thread 1). Before RUN the host writes the decoder's
+; address into the data word `addr` (an IMEM write; the first byte of a
+; packet is compared with it, so 1 .. 127 is a baseline address and 192 ..
+; 231 the first byte of a long address, RP-9.2.1). Packets whose first byte
+; is 0 (broadcasts and the reset packet, S-9.2 section B) are delivered
+; whatever the address. Results (FIFO space read, thread 1), per packet:
+;   status word: bit 15 = 1, bits 11:8 n, the bytes without the error byte
+;       (2 .. 5), bits 7:0 the first byte; then
+;   ceil((n - 1) / 2) data words, the bytes after the first, the earlier in
+;       bits 15:8 (bits 7:0 are 0 in the last word when n is even).
+; The status word is pushed only if OUTQ has room for it (a non-blocking
+; test); with OUTQ full the packet is counted as lost. Its data words, at
+; most two, are pushed blocking: a host that keeps a report's worth of room
+; (empties OUTQ once a packet, about 5 ms) never stalls them. A stall long
+; enough to miss an edge loses that packet's successor at worst: the next
+; preamble resynchronises the program.
+; Counters (data words, read by the host with the threads halted; 16 bits,
+; wrapping): `cok` packets received whole (any address), `cxor` dropped for
+; the error byte, `cbit` dropped for a bit outside the windows, `cfmt`
+; dropped for their length, `clost` whole packets not reported for a full
+; OUTQ. Idle packets are received whole and counted in `cok`, never reported.
+;
+; Registers: r0 the time of the last edge (NOW), r1 the class of a half or
+; a bit, and scratch; r2 the length of a half; r3 the first half of a bit,
+; and scratch; r4 the byte being received; r5 halves or bits left; r6 the
+; XOR of the bytes; r7 the address of the data table `tab`.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   RX = IN0
+        .tick   4                       ; 0.5 us at 8 MHz, the slowest clock (header)
+        .equ    K1LO  = 0               ; table offsets: shortest 1 half, ticks
+        .equ    K1HI  = 1               ;   longest 1 half
+        .equ    K0LO  = 2               ;   shortest 0 half
+        .equ    KTMO  = 3               ;   longest 0 half: the timeout
+        .equ    ADDR  = 4               ; the decoder's address (host-set)
+        .equ    NB    = 5               ; bytes received in this packet
+        .equ    COK   = 6               ; counters
+        .equ    CXOR  = 7
+        .equ    CBIT  = 8
+        .equ    CFMT  = 9
+        .equ    CLOST = 10
+        .equ    BUF   = 11              ; the packet, a byte a word, 6 words
+        .equ    DMAX  = 16              ; the largest 1-bit half difference, ticks
+        .equ    PRE   = 20              ; 1 halves for a preamble
+        .equ    NBMAX = 6               ; bytes in a packet, the error byte included
+
+start:  MOV16   r7, tab
+        CSRR    r0, NOW
+        LD      r1, r7, KTMO
+        ADD     r1, r1, r0
+        CSRW    TD, r1                  ; the first timeout
+
+; ------------------------------------------------------------ the preamble
+; r5 counts the 1 halves in a row (it saturates at 63).
+hunt:   LDI     r5, 0
+hloop:  CALL    half                    ; r1: 0 a 0 half, 1 a 1 half, 2 neither
+        CMPI    r1, 1                   ; Z = a 1 half, C = (r1 >= 1)
+        BZ      h1
+        BC      hunt                    ; neither: start again
+        CMPI    r5, PRE                 ; a 0 half: after a preamble?
+        BNC     hunt                    ; no
+        CALL    half                    ; the start bit's second half
+        TEST    r1, r1
+        BNZ     hunt                    ; not a 0 half: no start bit
+        JMP     packet
+h1:     CMPI    r5, 63
+        BC      hloop
+        ADDI    r5, 1
+        JMP     hloop
+
+; ------------------------------------------------------------ the packet
+packet: LDI     r6, 0                   ; XOR of the bytes
+        LDI     r4, 0
+        ST      r4, r7, NB              ; no byte yet
+byte:   LDI     r5, 8
+        LDI     r4, 0
+bitl:   CALL    bit                     ; r1: the bit, or 2 outside the windows
+        CMPI    r1, 2
+        BZ      ebit
+        SHLI    r4, 1
+        OR      r4, r4, r1
+        DJNZ    r5, bitl
+        XOR     r6, r6, r4
+        LD      r1, r7, NB
+        CMPI    r1, NBMAX               ; C = six bytes already
+        BC      efmt
+        ADD     r3, r1, r7
+        ST      r4, r3, BUF             ; buf[NB] = the byte
+        ADDI    r1, 1
+        ST      r1, r7, NB
+        CALL    bit                     ; the separator
+        CMPI    r1, 2
+        BZ      ebit
+        TEST    r1, r1
+        BZ      byte                    ; 0: a data byte follows
+        LD      r1, r7, NB              ; 1: the packet end bit
+        CMPI    r1, 3
+        BNC     eshort                  ; fewer than 3 bytes
+        TEST    r6, r6
+        BNZ     exor                    ; the error-detection byte is wrong
+        LD      r1, r7, COK
+        ADDI    r1, 1
+        ST      r1, r7, COK
+        LD      r3, r7, BUF             ; the first byte
+        TEST    r3, r3
+        BZ      report                  ; 0: a broadcast or the reset packet
+        LD      r1, r7, ADDR
+        CMP     r3, r1
+        BZ      report                  ; this decoder's address
+        LDI     r5, 2                   ; the end bit's halves start a preamble
+        JMP     hloop
+
+; The report is made after the next edge, so that the work after the end
+; bit's last edge and the work after the next one each fit in a half-bit
+; (header, Processing). That edge closes the first half of the next
+; preamble: its class is kept in r6 and counted once the report is out.
+report: CALL    half
+        MOV     r6, r1                  ; the class of the half, for the hunt
+        SETD    0                       ; TD = NOW: the WAITB below is a test
+        WAITB   OUTQ_NF, T
+        BT      elost
+        LD      r3, r7, BUF             ; the first byte
+        LD      r1, r7, NB
+        SUBI    r1, 1                   ; n, the error byte not counted
+        SHLI    r1, 8
+        OR      r1, r1, r3              ; the first byte
+        LDI     r2, 0
+        LDIH    r2, 0x80
+        OR      r1, r1, r2              ; bit 15: a status word
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ (SEMANTICS 6.7)"
+        PUSH    r1
+        LD      r5, r7, NB
+        SUBI    r5, 2                   ; bytes after the first, 1 .. 4
+        MOV     r3, r7
+        ADDI    r3, BUF + 1
+dw:     LD      r4, r3, 0               ; the earlier byte
+        SHLI    r4, 8
+        ADDI    r3, 1
+        DEC     r5
+        BZ      dpush                   ; no later byte
+        LD      r1, r3, 0
+        OR      r4, r4, r1
+        ADDI    r3, 1
+        DEC     r5
+dpush:  PUSH    r4                      ; blocks only if the host let OUTQ fill
+        TEST    r5, r5
+        BNZ     dw
+        JMP     rearm
+
+; Drops: count, re-arm the timeout (a report's SETD replaced it), hunt.
+elost:  LDI     r2, CLOST
+        CALL    count
+rearm:  LD      r3, r7, KTMO
+        ADD     r3, r3, r0
+        CSRW    TD, r3                  ; the timeout from the last edge again
+        CMPI    r6, 1                   ; the half after the end bit a 1 half?
+        BNZ     hunt                    ; no: no preamble has started
+        LDI     r5, 3                   ; yes: it and the end bit's two
+        JMP     hloop
+ebit:   LDI     r2, CBIT
+        JMP     edrop
+efmt:   LDI     r2, CFMT                ; too long: dropped inside the packet
+edrop:  CALL    count
+        JMP     hunt
+eshort: LDI     r2, CFMT                ; dropped at a good end bit, which
+        JMP     eend                    ;   counts towards the next preamble
+exor:   LDI     r2, CXOR
+eend:   CALL    count
+        LDI     r5, 2
+        JMP     hloop
+
+; count: the counter at tab + r2 goes up by one. Clobbers r1, r3.
+count:  ADD     r3, r7, r2
+        LD      r1, r3, 0
+        ADDI    r1, 1
+        ST      r1, r3, 0
+        RET
+
+; ------------------------------------------------------------ one bit
+; bit: two halves, the pairing fixed by the start bit. r1 = 1 for two 1
+; halves differing by DMAX ticks or less, 0 for two 0 halves, 2 otherwise
+; (returned at the first half that settles it). Clobbers r2, r3.
+bit:    CALL    half
+        CMPI    r1, 1                   ; Z = a 1 half, C = (r1 >= 1)
+        BZ      bone
+        BC      bret                    ; neither: r1 = 2
+        CALL    half                    ; a 0 half: the second must be one too
+        TEST    r1, r1
+        BZ      bret                    ; r1 = 0: a 0
+        JMP     bbad
+bone:   MOV     r3, r2                  ; the first half's length
+        CALL    half
+        CMPI    r1, 1
+        BNZ     bbad
+        SUB     r3, r3, r2              ; first - second, C = (first >= second)
+        BC      bpos
+        NEG     r3, r3
+bpos:   CMPI    r3, DMAX + 1            ; C = (difference > DMAX)
+        BC      bbad
+        RET                             ; r1 = 1
+bbad:   LDI     r1, 2
+bret:   RET
+
+; ------------------------------------------------------------ one half
+; half: wait for the next edge or the timeout (TD), and classify the time
+; since the last edge: r1 = 1 a 1 half, 0 a 0 half, 2 neither (a timeout
+; included); r2 its length in ticks; r0 the new edge's time; TD re-armed
+; from it. Nothing else is touched (bit keeps a half in r3).
+half:   WAITE   RX, ANY, T              ; an edge, or T = 1 at the timeout
+        CSRR    r1, NOW                 ; its time, a fixed slot after it
+        SUB     r2, r1, r0              ; the length (mod 2^16)
+        MOV     r0, r1
+        LD      r1, r7, KTMO
+        ADD     r1, r1, r0              ; r0 is this edge
+        CSRW    TD, r1                  ; the next timeout, from this edge
+        BT      hbad                    ; the line stopped: neither
+        LD      r1, r7, K1LO
+        CMP     r2, r1                  ; C = (length >= shortest 1)
+        BNC     hbad                    ; too short for anything
+        LD      r1, r7, K1HI
+        CMP     r1, r2                  ; C = (longest 1 >= length)
+        BC      hone
+        LD      r1, r7, K0LO
+        CMP     r2, r1                  ; C = (length >= shortest 0)
+        BNC     hbad                    ; between the windows
+        LDI     r1, 0
+        RET
+hone:   LDI     r1, 1
+        RET
+hbad:   LDI     r1, 2
+        RET
+
+; ------------------------------------------------------------ data
+; The window table in 0.5 us ticks (header), then the host's and the
+; program's words. The host writes `addr`; it reads the counters halted.
+tab:    .word   102                     ; K1LO  51 us   (tr1 min 52 - M)
+        .word   130                     ; K1HI  65 us   (tr1 max 64 + M)
+        .word   178                     ; K0LO  89 us   (tr0 min 90 - M)
+        .word   20002                   ; KTMO  10001 us (tr0 max 10000 + M)
+addr:   .word   3                       ; the address; 3 is the usual factory one
+nb:     .word   0
+cok:    .word   0
+cxor:   .word   0
+cbit:   .word   0
+cfmt:   .word   0
+clost:  .word   0
+buf:    .word   0, 0, 0, 0, 0, 0

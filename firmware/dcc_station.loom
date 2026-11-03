@@ -1,0 +1,205 @@
+; dcc_station.loom
+; NMRA DCC command station (model-railway track signal) on OUT0, fed by the
+; host through INQ[0]: packets from the host, idle packets in between.
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; DCC. The program uses one piece of hardware built for another job: the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016), built
+; so that WS2812 pulses land on the exact clock, with the integer tick
+; divider (SEMANTICS 4) built for UART rates. What the firmware does that no
+; hardware does: the half-bit coding of 1s and 0s, the preamble, start,
+; separator and end bits, the error-detection byte, the idle packets that
+; keep the stream continuous, and the settable preamble. It needs the FIFOs
+; (POP, WAITB INQ_NE), the latch and data memory (LD/ST, SEMANTICS 6.11, for
+; the packet buffer), nothing else: no bit engine.
+;
+; Wire format (NMRA S-9.1, the posted draft of 2026-06-16, and S-9.2, July
+; 2004; figures as tools/protomodels/dcc.py cites them). The line is a
+; bipolar square wave; every bit is two half-bits of opposite polarity
+; (S-9.1 section 2). A 1 has two halves of t1 = 58 us, sent 55 .. 61 us
+; with the two halves differing by at most t1d = 3 us; a 0 has two halves
+; of t0 = 100 us, sent 95 us or more (S-9.1 Table 2.1). This program sends
+; every half of a 1 as exactly 58 ticks and every half of a 0 as exactly 100
+; ticks, so the halves of a bit never differ. It sends no stretched 0s:
+; S-9.1 section 2.1 makes them optional for a command station and asks for
+; them off by default. A packet (S-9.2 section A) is a preamble of 1s (a
+; command station sends at least 14), a 0 packet start bit, then bytes MSB
+; first, each followed by a separator bit (0: a data byte follows, 1: the
+; packet end bit), the last byte being the error-detection byte, the XOR of
+; all the others (S-9.2 section B). S-9.2 section C asks for packets
+; repeated as often as possible: with nothing to send this program sends
+; idle packets (FF 00 FF, S-9.2 section B), so the stream never stops.
+;
+; Booster drive: ONE polarity pin, DCC = OUT0. The track's bipolar wave is
+; made by the booster's H-bridge from a single direction input (an LMD18200
+; or similar takes DIR, and most DCC boosters take one TTL signal). A
+; differential pair would need two pins switching on the same clock edge:
+; the latch holds one pin write (SEMANTICS 6.10), and a second, ordinary
+; SETP lands one or more slots later, which on a two-input bridge means
+; both inputs equal for a moment (shoot-through or a short brake). The bit
+; engine's DIFF output (SEMANTICS 6.9.1) switches both pins at one edge but
+; on the 4-clock slot grid, not on the tick: a booster that needs two
+; inputs can take OUT0 and an external inverter. One pin, on the exact
+; clock edge of its tick, is the better signal.
+;
+; Tick (set by the host before RUN): one tick is 1 us, TICK_INT = f_clk /
+; 1 MHz, TICK_FRAC 0: 50 at 50 MHz, 48 at 48 MHz, 8 at the 8 MHz of the
+; RTL tests. Every edge is `SETP DCC, v, D` and the WAITD that lands it, so
+; it changes the pad on the exact clock edge of its tick (SEMANTICS 6.10
+; rule 1): each half-bit is exactly 58 or 100 us of the board clock, at any
+; clock whose MHz is a whole number. The schedule is proved for ticks of 4
+; clocks or more (.tick 4), any clock from 4 MHz up.
+;
+; Host command format (FIFO space, thread 0). Nothing is pushed to OUTQ.
+;   packet header, bit 15 = 0: bits 10:8 n, the number of bytes in the
+;       packet without the error byte (1 .. 5; S-9.2's baseline packets have
+;       2, RP-9.2.1's longest 5), bits 7:0 the first byte (the address).
+;       n = 0, 6 or 7 makes the word ignored. Bits 14:11 are ignored.
+;   packet bytes: ceil((n - 1) / 2) words after the header, two bytes each,
+;       the earlier byte in bits 15:8 (the last word's bits 7:0 are ignored
+;       when n is even). The program appends the error byte.
+;   preamble word, bit 15 = 1: bits 7:0 the preamble length P in bits, from
+;       the next packet on. P below 14 is taken as 14 (S-9.2 section A); the
+;       reset value is 14. Bits 14:8 are ignored.
+; A host pushes a packet's words together (one FIFO-space write). The
+; program takes at most one word per preamble bit, so a 5-byte packet is
+; taken in 3 of the 14 bits; if the packet is not complete when the
+; preamble has run its P bits, the preamble is extended a bit at a time
+; until it is (a longer preamble is still a valid one). With INQ empty when
+; the preamble ends, an idle packet is sent. The packet end bit is not
+; counted as a preamble bit (S-9.2 note 3 allows it; not counting is the
+; safer reading), so at least P full 1s separate two packets.
+;
+; Repetition, the 5 ms between packets to one address and the 20 ms after
+; a reset packet (S-9.2 sections B and C) are the host's: the program sends
+; what it is given, in order.
+;
+; Registers: r0 the byte being sent, r1 bits left in it (bytes still to
+; fetch while in the preamble), r2 bytes in the packet, r3 the error byte
+; (scratch while fetching), r4 the preamble length P, r5 the word taken,
+; r6 the buffer pointer, r7 preamble bits left.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   DCC = OUT0
+        .tick   4                       ; the shortest tick the schedule is proved for
+        .equ    T1   = 58               ; half of a 1, us (S-9.1 Table 2.1, t1 nominal)
+        .equ    T0   = 100              ; half of a 0, us (t0 nominal)
+        .equ    PMIN = 14               ; preamble bits, at least (S-9.2 section A)
+        .equ    NMAX = 5                ; bytes in a packet, the error byte not counted
+
+start:  SETP    DCC, 0
+        LDI     r4, PMIN
+        SETD    8                       ; anchor the schedule
+        SETP    DCC, 1, D               ; stage the first rise
+        WAITD   T1                      ; it lands: the first bit starts
+
+; ------------------------------------------------------------ the preamble
+; Each pass sends one 1 (CALL one returns with TD just reached, at the
+; start of the next bit) and then takes at most one word from INQ, while a
+; packet is wanted: none taken yet (r2 = 0) or bytes still due (r1 > 0).
+pkt:    MOV     r7, r4                  ; P preamble bits
+        LDI     r2, 0                   ; no packet header taken yet
+        LDI     r1, 0                   ; no bytes due
+pre:    CALL    one
+        TEST    r1, r1
+        BNZ     fetch                   ; bytes of a packet still due
+        TEST    r2, r2
+        BNZ     pnext                   ; a whole packet is in: take nothing
+fetch:  WAITB   INQ_NE, T               ; a word? (a test: TD is reached)
+        BT      pnext
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r5                      ; one slot: it cannot stall
+        TEST    r1, r1
+        BNZ     cont                    ; the next two bytes of the packet
+        ADD     r3, r5, r5              ; C = bit 15
+        BC      setpre                  ; a preamble word
+        MOV     r3, r5                  ; a packet header: n = bits 10:8
+        SHRI    r3, 8
+        ANDI    r3, 7                   ; Z = (n == 0)
+        BZ      pnext                   ; n = 0: ignored
+        CMPI    r3, NMAX + 1            ; C = (n > 5)
+        BC      pnext                   ; ignored
+        MOV     r2, r3                  ; n bytes
+        MOV16   r6, buf
+        ST      r5, r6, 0               ; the first byte (bits 15:8 sent never)
+        ADDI    r6, 1
+        SUBI    r3, 1                   ; bytes still due, Z = (none)
+        MOV     r1, r3
+        JMP     pnext
+cont:   MOV     r3, r5                  ; the earlier byte in bits 15:8
+        SHRI    r3, 8
+        ST      r3, r6, 0
+        ADDI    r6, 1
+        DJNZ    r1, clo                 ; another byte due: it is bits 7:0
+        JMP     pnext
+clo:    ST      r5, r6, 0               ; bits 15:8 are dropped when it is sent
+        ADDI    r6, 1
+        DEC     r1
+        JMP     pnext
+setpre: MOV     r3, r5                  ; P = bits 7:0
+        SHLI    r3, 8
+        SHRI    r3, 8
+        CMPI    r3, PMIN                ; C = (P >= 14)
+        BC      setp1
+        LDI     r3, PMIN
+setp1:  MOV     r4, r3                  ; from the next packet on
+pnext:  DJNZ    r7, pre                 ; P bits sent?
+        TEST    r1, r1
+        BNZ     more                    ; a packet still arriving: one more 1
+        TEST    r2, r2
+        BNZ     send
+        MOV16   r6, idlepk              ; nothing to send: an idle packet
+        LDI     r2, 2
+        JMP     send0
+more:   LDI     r7, 1
+        JMP     pre
+
+; ------------------------------------------------------------ the packet
+; r6 points at the n bytes, r2 = n. The error byte is sent after them.
+send:   MOV16   r6, buf
+send0:  CALL    zero                    ; the packet start bit
+        LDI     r3, 0                   ; the error byte, XOR of the bytes
+        ADDI    r2, 1                   ; bytes to send, the error byte included
+byte:   CMPI    r2, 1
+        BZ      ebyte
+        LD      r0, r6, 0               ; the next byte, in bits 7:0
+        ADDI    r6, 1
+        XOR     r3, r3, r0              ; bits 15:8 are never sent
+        JMP     b8
+ebyte:  MOV     r0, r3
+b8:     SHLI    r0, 8                   ; the byte in bits 15:8, MSB first
+        LDI     r1, 8
+bits:   SHLI    r0, 1                   ; C = this bit
+        BC      b1
+        CALL    zero
+        JMP     bn
+b1:     CALL    one
+bn:     DJNZ    r1, bits
+        DEC     r2                      ; Z = (that was the error byte)
+        BZ      pend
+        CALL    zero                    ; the data byte start bit (separator)
+        JMP     byte
+pend:   CALL    one                     ; the packet end bit
+        JMP     pkt
+
+; ------------------------------------------------------------ one bit
+; Entered at the start of a bit, its first edge (a rise) just landed and TD
+; on it. Lands the middle edge and the next bit's first edge, then returns
+; with TD on that, the start of the next bit: the caller has a whole first
+; half (58 or 100 ticks) to decide the next bit before it CALLs again.
+one:    SETP    DCC, 0, D               ; stage the middle edge
+        WAITD   T1                      ; it lands T1 after the start
+        SETP    DCC, 1, D               ; stage the next bit's first edge
+        WAITD   T1
+        RET
+zero:   SETP    DCC, 0, D
+        WAITD   T0
+        SETP    DCC, 1, D
+        WAITD   T0
+        RET
+
+; ------------------------------------------------------------ data
+idlepk: .word   0xFF, 0x00              ; the idle packet (S-9.2 section B)
+buf:    .word   0, 0, 0, 0, 0           ; the packet from the host, a byte a word
