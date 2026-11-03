@@ -1,0 +1,179 @@
+; mdio_manager.loom
+;
+; Decisions (2026-11-03): IEEE 802.3 clause 22.3.4 figures are cited by
+; clause and cross-checked against the Microchip LAN8742A datasheet; they
+; are marked unchecked in tools/protomodels/mdio.py. At 2.5 MHz the
+; manager reads PHYs that answer within 240 ns (the standard allows 300):
+; a tick of 24 (2.08 MHz) covers the full 300 ns.
+;
+; An MDIO manager (the station management entity of IEEE 802.3 clause 22,
+; the "MAC side" of the Ethernet PHY management bus): read and write
+; frames on MDC and MDIO, clause 22 and clause 45 alike, with MDC at a
+; rate the host sets, up to 2.5 MHz at 50 MHz.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): MDIO is in no design document.
+; The program uses:
+;   - the bit engine in manual mode (SHO, SHI, SEMANTICS 6.9), built for the
+;     shift registers of SPI, UART and CAN: SHO puts the next frame bit on
+;     MDIO and SHI shifts the PHY's bit in, one slot each, MSB first;
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: MDIO is open drain
+;     with a pull-up on the board, so the manager only pulls it low or lets
+;     it go, and a released line is a 1 (the preamble, the idle state and
+;     the first turnaround bit of a read are all "released");
+;   - the deadline schedule (WAITD), so one MDC period is one tick that the
+;     host chooses and the deadline checker proves at the shortest one.
+; What the firmware does that no hardware does: the frame (preamble, start,
+; op code, the two addresses, the turnaround, the data), the choice of who
+; drives MDIO in each part of it, MDC itself, and the turnaround check.
+;
+; Pins: MDC = OUT0 (push-pull, idles low), MDIO = BIDIR0 (open drain,
+; OD_MASK set with a read-modify-write so other threads' bits survive,
+; and checked after it: two threads that start together and do their
+; read-modify-writes in step would otherwise each write over the other's
+; bit, which the first version of these programs did in the together test).
+;
+; Memory: thread 0's quarter (.imem 512), 0x000..0x07F; the PHY program,
+; mdio_phy.loom, moved to thread 1 fits beside it.
+;
+; Frames (802.3 clause 22.2.4.5 and its table of the frame format, and
+; clause 45.3 for clause 45; tools/protomodels/mdio.py lists the sources
+; and what was checked against which). Every frame is
+;     PRE (32 ones) ST (2) OP (2) PHYAD (5) REGAD (5) TA (2) DATA (16)
+; and the program does not interpret ST or OP beyond one bit: OP[1], bit 13
+; of the command word, says who drives TA and DATA. Clause 22 has ST = 01,
+; OP 10 read and 01 write; clause 45 has ST = 00, OP 00 address, 01 write,
+; 11 read and 10 read-increment (PRTAD and DEVAD in place of PHYAD and
+; REGAD). In both, OP[1] = 1 exactly when the PHY drives the data. So the
+; same program makes every clause 45 frame too; the host builds the word.
+;
+; Host command format (FIFO space, thread 0):
+;     word 1   bits 15:2 ST, OP, PHYAD, REGAD as they go on the wire, MSB
+;              first; bits 1:0 are ignored (the program makes TA)
+;     word 2   only when OP[1] = 0 (the manager drives the data): DATA
+; Results (FIFO space read):
+;     OP[1] = 1 (a read): two words, DATA as sampled, then the status
+;     OP[1] = 0 (a write, a clause 45 address): one word, the status, 0
+; Status: bit 0 the PHY did not pull MDIO low in the second turnaround bit
+; (no PHY answered: DATA is then 0xFFFF, the pull-up); bit 1 something
+; pulled MDIO low in the first turnaround bit, when nobody may drive it.
+; A read with status 0 is a read the PHY answered.
+;
+; Rate. One tick is one MDC period, set by the host in TICK_INT before RUN;
+; the schedule is proved for 20 clocks or more (.tick below), which is
+; 2.5 MHz at 50 MHz, the fastest MDC clause 22.3.4 allows (period at least
+; 400 ns). Every bit is one turn of the same five-slot loop
+;     SHO or SHI ; SETP MDC, 1 ; WAITD 1 ; SETP MDC, 0 ; DJNZ
+; so MDC is high from its rise to the slot after the WAITD, at least 2
+; slots (8 clocks, 160 ns: clause 22.3.4's minimum high time, met exactly
+; at the fastest rate) and low for 3 slots (12 clocks, 240 ns, minimum
+; 160 ns) plus whatever a slower tick adds to the high phase. MDIO changes
+; one slot before the rise (SHO): set-up 4 clocks (80 ns, minimum 10 ns)
+; and hold P - 4 clocks (minimum 10 ns). Between the parts of a frame, and
+; between frames, MDC pauses low (SETD 1): clause 22.2.2.13 makes MDC
+; aperiodic, with no maximum high or low time.
+;
+; Reading, and the one weakness. The manager must sample the PHY's bit at
+; the rise, and the PHY may take 0 to 300 ns from the previous rise to put
+; it out (clause 22.3.4). SHI reads the pad through the two-flop
+; synchroniser (SEMANTICS 3) one slot before the SETP that raises MDC, so
+; the sample is the pad as it was 8 clocks before the rise (the SHI in X
+; cycle x reads the pad of cycle x - 2; the SETP in x + 4 raises MDC from
+; cycle x + 6), P - 8 clocks after the previous rise. At 50 MHz that covers
+; the full 300 ns from TICK_INT 24 (2.08 MHz) up (a tick that is not a
+; multiple of 4 clocks dithers, SEMANTICS 2, so its shortest period is the
+; multiple of 4 below it: TICK_INT 23 reads like 20); at TICK_INT 20 (2.5 MHz)
+; it covers PHYs whose clock-to-output is at most 240 ns (12 clocks; the
+; tests sweep it). A dedicated manager samples at the
+; edge itself. Writes are compliant at every proved rate.
+;
+; Registers: r0 the command word, r1 the bit count of a loop, r2 the write
+; data, r5 OP[1] test scratch, r6 the status, r7 the .csr scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   MDC = OUT0, MDIO = BIDIR0
+        .tick   20                      ; the shortest MDC period proved
+        .equ    PRE = 32                ; preamble bits (clause 22.2.4.5.1)
+        .equ    HDR = 14                ; ST, OP and the two addresses
+        .equ    TA_OK = 2               ; a read's TA as sampled: Z (1) then 0
+
+start:  LDI     r6, 1 << pin(MDIO)
+odset:  CSRR    r5, OD_MASK             ; MDIO open drain: read-modify-write
+        OR      r5, r5, r6
+        CSRW    OD_MASK, r5
+        NOP                             ; then check, once any other thread
+        NOP                             ; doing the same at the same time has
+        CSRR    r5, OD_MASK             ; written (its CSRR saw ours or did
+        TEST    r5, r6                  ; not; if not, its write lands by
+        BZ      odset                   ; now): ours lost, do it again
+        SETP    MDIO, 1                 ; released: the bus idles high
+        SETP    MDC, 0                  ; MDC idles low
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, NRZ
+        .csr    BE_PINS, (pin(MDIO) << 5) | pin(MDIO)
+
+; ------------------------------------------------------------- one frame
+cmd:    POP     r0                      ; ST, OP, PHYAD, REGAD
+        MOV     r5, r0
+        SHLI    r5, 3                   ; C = OP[1]: the PHY drives the data
+        BC      frame
+        POP     r2                      ; the manager drives it: the data word
+frame:  LDI     r1, PRE
+        CALL    recv                    ; preamble: 32 cycles, MDIO released
+        SHRI    r0, 2
+        SHLI    r0, 2
+        ORI     r0, 2                   ; TA = 10, sent only when we drive it
+        LDSR    r0
+        LDI     r1, HDR
+        CALL    send                    ; ST OP PHYAD REGAD, MSB first
+        MOV     r5, r0
+        SHLI    r5, 3                   ; C = OP[1] again
+        BC      rd
+
+; The manager drives TA (1 then 0) and the data, then lets go: idle.
+        LDI     r1, 2
+        CALL    send                    ; TA, from bits 1:0 of the command
+        LDSR    r2
+        LDI     r1, 16
+        CALL    send                    ; DATA, MSB first
+        SETP    MDIO, 1                 ; release after the last rise
+        LDI     r6, 0
+        JMP     done
+
+; The PHY drives: release MDIO for the turnaround and sample 18 bits.
+rd:     SETP    MDIO, 1
+        LDI     r1, 2
+        CALL    recv                    ; TA: Z, then the PHY's 0
+        STSR    r6
+        ANDI    r6, 3
+        XORI    r6, TA_OK               ; 0 when the TA was right
+        LDI     r1, 16
+        CALL    recv                    ; DATA, MSB first
+        STSR    r0
+        PUSH    r0                      ; blocks while OUTQ is full: MDC waits
+done:   PUSH    r6
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; send, recv: r1 MDC cycles, each a rise and a fall. On entry MDC is low; on
+; exit it is low again, after a fall, and MDIO holds the last bit sent (send)
+; or is released (recv). The SETD 1 at the top pauses MDC for one tick.
+; send puts the bit on MDIO one slot before the rise (set-up 4 clocks);
+; recv samples MDIO one slot before the rise (the pad 8 clocks before it).
+; Both loops are five slots from WAITD to WAITD: 20 clocks, the .tick.
+; ---------------------------------------------------------------------------
+send:   SETD    1
+s_bit:  SHO                             ; MDIO = SR[15], open drain
+        SETP    MDC, 1                  ; the PHY samples here
+        WAITD   1                       ; one tick per MDC period
+        SETP    MDC, 0
+        DJNZ    r1, s_bit
+        RET
+
+recv:   SETD    1
+r_bit:  SHI                             ; SR = {SR[14:0], MDIO}
+        SETP    MDC, 1                  ; the PHY puts out its next bit after this
+        WAITD   1
+        SETP    MDC, 0
+        DJNZ    r1, r_bit
+        RET

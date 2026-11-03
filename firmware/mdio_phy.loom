@@ -1,0 +1,231 @@
+; mdio_phy.loom
+; An MDIO PHY (the managed end of the IEEE 802.3 clause 22 management bus):
+; 32 sixteen-bit registers at a PHY address the host sets, answering clause
+; 22 reads, accepting writes, ignoring frames for other addresses, and
+; reporting every write to the host. MDC up to 2.5 MHz at 50 MHz.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): MDIO is in no design document.
+; The program uses:
+;   - the bit engine in manual mode (SHO, SHI, SEMANTICS 6.9), built for the
+;     shift registers of SPI, UART and CAN: SHI takes the address bits in,
+;     SHO puts the register's sixteen bits out, MSB first, one slot each;
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the PHY only pulls
+;     MDIO low or lets it go;
+;   - the data memory (LD, ST, SEMANTICS 6.11), built for device emulation
+;     (the 24C02 of i2c_slave_eeprom.loom): the register file is 32 words
+;     of thread 3's quarter, which the host loads and dumps over IMEM;
+;   - WAITE on the MDC input, built for edge-triggered receivers.
+; What the firmware does that no hardware does: preamble and start
+; detection, the address match, who drives MDIO in each part of the frame,
+; the turnaround, the register file and the write reports.
+;
+; Pins: MDC = IN0 (an input: the manager owns the clock), MDIO = BIDIR1
+; (open drain, OD_MASK set with a read-modify-write and checked, as in
+; mdio_manager.loom: two threads starting together race). The board supplies
+; the pull-up on MDIO.
+;
+; Memory: thread 0's quarter (.imem 512) for the code, and the register
+; file at 0x180..0x19F (register n is word 0x180 + n). Moved to thread 1
+; (0x080) it fits beside mdio_manager.loom on thread 0.
+;
+; Host command: one word, the PHY address (bits 4:0), before anything else;
+; the program waits for it after RUN. Results: one report per write frame
+; to this address, two words: the register number (0..31), then the data
+; written, pushed as soon as the last data bit is in. The word itself is
+; stored at the next MDC rise (the first of the next preamble), so an MDIO
+; read always finds it, but a host IMEM dump made while MDC is stopped
+; after a write may still show the old word: the report is the record.
+; If OUTQ is full the report waits, and the PHY misses the next frame's
+; preamble (it answers frames again once the host has popped).
+;
+; Frames (802.3 clause 22.2.4.5): PRE (32 ones) ST (01) OP (10 read, 01
+; write) PHYAD (5) REGAD (5) TA (2) DATA (16), MSB first. The PHY counts 32
+; ones on MDIO with 32 MDC rises (22.2.4.5.1: it "shall observe" them; no
+; preamble suppression), then waits for the 0 of ST. ST = 00 (clause 45), OP
+; 00 or 11, or another PHYAD: the PHY ignores the rest of the frame and
+; hunts for the next preamble. On a read it drives TA's second bit low and
+; then the 16 data bits, and lets go after the manager's last rise.
+; A write to any register just stores the word (no reset bit, no read-only
+; bits: a plain register file the host reads back with IMEM).
+;
+; Timing (clause 22.3.4; tools/protomodels/mdio.py gives the sources). The
+; program follows MDC with WAITE MDC, RISE, so it has no tick and no
+; deadline pair. With the synchroniser (pin_in is the pad at edge x - 1,
+; SEMANTICS 3) a rise at edge e is seen in an X cycle in e+2 .. e+5:
+;     a bit the PHY drives (SETP or SHO the slot after the WAITE) changes
+;     the pad 8 to 11 clocks after the rise: 160 to 220 ns at 50 MHz,
+;     inside the 0 to 300 ns clock-to-output window;
+;     a bit the PHY samples (JP or SHI the slot after the WAITE) is the pad
+;     4 to 7 clocks after the rise. That is the weakness: 802.3 lets the
+;     manager change MDIO 10 ns after the rise, and this PHY needs it held
+;     8 clocks (160 ns at 50 MHz). A manager that changes MDIO at the fall
+;     of MDC (the usual way, and mdio_manager.loom's: P - 4 clocks) is fine
+;     at every rate up to 2.5 MHz. A dedicated PHY samples at the edge.
+; Budget: a WAITE must be issued before the rise it waits for is seen, so
+; between the slot after one WAITE and the next WAITE there are at most
+; three slots of other work at 2.5 MHz (20 clocks a bit, our worst case of
+; seeing a rise at e+5). Each loop's last bit is unrolled for that reason:
+; the address match, and on a read the register address, are three slots
+; each. The read's LD (two slots) runs between the TA rise and the first
+; data rise; a write's report (two PUSHes) runs right after its last
+; data bit. After a frame the next preamble's first bits are counted
+; while the PHY re-arms (a write's ST runs there), so frames may follow
+; each other with no gap.
+;
+; Registers: r0 the address scratch, r1 PHYAD bit count, r2 data (0 while
+; hunting, for LDSR), r3 preamble count, r4 the PHY address, r5 0x180,
+; r6 REGAD bit count, then the register's word on a write, r7 the data
+; bit count and the .csr scratch before r7 is first set.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   MDC = IN0, MDIO = BIDIR1
+        .equ    PRE = 32                ; preamble ones (clause 22.2.4.5.1)
+        .equ    REGS = 0x180            ; the register file, thread 3's quarter
+
+start:  LDI     r6, 1 << pin(MDIO)
+odset:  CSRR    r5, OD_MASK             ; MDIO open drain: read-modify-write
+        OR      r5, r5, r6
+        CSRW    OD_MASK, r5
+        NOP                             ; then check, once any other thread
+        NOP                             ; doing the same at the same time has
+        CSRR    r5, OD_MASK             ; written (its CSRR saw ours or did
+        TEST    r5, r6                  ; not; if not, its write lands by
+        BZ      odset                   ; now): ours lost, do it again
+        SETP    MDIO, 1                 ; released
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, NRZ
+        .csr    BE_PINS, (pin(MDIO) << 5) | pin(MDIO)
+        POP     r4                      ; the PHY address from the host
+        ANDI    r4, 31
+        MOV16   r5, REGS
+
+; Hunt for a preamble: 32 ones, each with its MDC rise. A 0 starts the
+; count again (pre0 is one slot, so the next rise is not missed).
+cold:   LDI     r1, 4                   ; PHYAD bits before the unrolled one
+        LDI     r6, 4                   ; REGAD bits likewise
+        LDI     r7, 16                  ; data bits
+        LDI     r2, 0
+pre0:   LDI     r3, PRE
+pre:    WAITE   MDC, RISE
+        JP      MDIO, 0, pre0
+        DJNZ    r3, pre
+armed:  WAITE   MDC, RISE               ; more ones: still the preamble
+        JP      MDIO, 1, armed
+        WAITE   MDC, RISE               ; that 0 was ST[1]; this is ST[0]
+        JP      MDIO, 0, cold           ; ST = 00: clause 45, not for this PHY
+        WAITE   MDC, RISE               ; OP[1]
+        JP      MDIO, 0, op_wr          ; OP[1] = 0: a write
+        JMP     op_rd                   ; OP[1] = 1: a read
+op_wr:  WAITE   MDC, RISE               ; OP[0]: 01 is a write
+        JP      MDIO, 0, cold           ; OP = 00: not clause 22
+        LDSR    r2                      ; SR = 0 for the address
+
+; ---------------------------------------------------------------- write
+w_ad:   WAITE   MDC, RISE               ; PHYAD
+        SHI
+        DJNZ    r1, w_ad
+        WAITE   MDC, RISE               ; PHYAD[0]
+        SHI
+        STSR    r0
+        CMP     r0, r4
+        BNZ     cold                    ; another PHY's frame: ignore it
+w_rg:   WAITE   MDC, RISE               ; REGAD
+        SHI
+        DJNZ    r6, w_rg
+        WAITE   MDC, RISE               ; REGAD[0]
+        SHI
+        STSR    r0
+        ANDI    r0, 31                  ; the register number, for the report
+        OR      r6, r0, r5              ; its word
+        WAITE   MDC, RISE               ; TA[1]: the manager drives 1
+w_d:    WAITE   MDC, RISE               ; TA[0] (0, not checked), then DATA
+        SHI                             ; D15 .. D1; TA[0] leaves SR's top
+        DJNZ    r7, w_d
+        WAITE   MDC, RISE               ; D0
+        SHI
+        STSR    r2
+        PUSH    r0                      ; the report at once: register, data
+        PUSH    r2
+; The next preamble may start at once: count its first four ones while the
+; word is stored (before any later frame can read it) and the PHY re-arms.
+        WAITE   MDC, RISE
+        JP      MDIO, 0, w_ab
+        ST      r2, r6, 0
+        WAITE   MDC, RISE
+        JP      MDIO, 0, t_wc
+        LDI     r1, 4
+        LDI     r6, 4
+        WAITE   MDC, RISE
+        JP      MDIO, 0, t_wc
+        LDI     r7, 16
+        LDI     r2, 0
+        WAITE   MDC, RISE
+        JP      MDIO, 0, t_wp
+        LDI     r3, PRE - 4
+        JMP     pre
+w_ab:   ST      r2, r6, 0               ; a 0 there: not a preamble, but the
+        JMP     cold                    ; write still lands
+t_wc:   JMP     cold                    ; trampolines: JP reaches 31 words
+t_wp:   JMP     pre0
+
+; ----------------------------------------------------------------- read
+op_rd:  WAITE   MDC, RISE               ; OP[0]: 10 is a read
+        JP      MDIO, 1, t_wc           ; OP = 11: not clause 22
+        LDSR    r2                      ; SR = 0 for the address
+r_ad:   WAITE   MDC, RISE               ; PHYAD
+        SHI
+        DJNZ    r1, r_ad
+        WAITE   MDC, RISE               ; PHYAD[0]
+        SHI
+        STSR    r0
+        CMP     r0, r4
+        BNZ     cold                    ; another PHY's frame: ignore it
+r_rg:   WAITE   MDC, RISE               ; REGAD
+        SHI
+        DJNZ    r6, r_rg
+        WAITE   MDC, RISE               ; REGAD[0]
+        SHI
+        STSR    r0
+        ANDI    r0, 31
+        OR      r0, r0, r5              ; the register's word
+        WAITE   MDC, RISE               ; TA[1]: nobody drives MDIO
+        SETP    MDIO, 0                 ; TA[0]: the PHY's 0
+        LD      r2, r0, 0
+        LDSR    r2
+r_d:    WAITE   MDC, RISE               ; after each rise the next bit:
+        SHO                             ; D15 .. D0, open drain
+        DJNZ    r7, r_d
+        WAITE   MDC, RISE               ; the manager samples D0
+        SETP    MDIO, 1                 ; let go: idle
+        WAITE   MDC, RISE               ; re-arm over the next preamble's first ones
+        JP      MDIO, 0, t_rc
+        LDI     r1, 4
+        LDI     r6, 4
+        WAITE   MDC, RISE
+        JP      MDIO, 0, t_rc
+        LDI     r7, 16
+        LDI     r2, 0
+        WAITE   MDC, RISE
+        JP      MDIO, 0, t_rp
+        LDI     r3, PRE - 3
+        JMP     pre
+t_rc:   JMP     cold                    ; trampolines: JP reaches 31 words
+t_rp:   JMP     pre0
+
+; ---------------------------------------------------------------------------
+; The register file: 32 words in thread 3's quarter, which no thread runs
+; from. Registers 0 and 1 hold typical reset values (clause 22.2.4.1 and
+; 22.2.4.2): control 0x1140 (auto-negotiation enabled, full duplex, speed
+; select bits 6 and 13 = 10, 1000 Mb/s), status 0x7909 (10 and 100 Mb/s
+; abilities, extended status, auto-negotiation ability, extended
+; capability; bit 6, preamble suppression, is 0: this PHY needs the
+; preamble). Registers 2 and 3, the PHY identifier, hold 0x4C4F 0x4F4D
+; ("LOOM", not a registered OUI). The host loads its own image over IMEM.
+; ---------------------------------------------------------------------------
+        .thread 3
+        .org    REGS
+regs:   .word   0x1140, 0x7909, 0x4C4F, 0x4F4D, 0x0000, 0x0000, 0x0000, 0x0000
+        .word   0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+        .word   0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+        .word   0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
