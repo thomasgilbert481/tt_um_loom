@@ -1,0 +1,428 @@
+; bridge_wiegand_uart.loom
+;
+; Decisions (2026-11-03): thread 1 fills its quarter, so there is no
+; count of dropped cards: a leading ! on the next line says that some
+; were. The 34-bit layout is HID H10306 as commonly published, not checked
+; against HID's document.
+;
+; A Wiegand-to-UART bridge: thread 0 is a Wiegand panel (the receiver of an
+; access-control door controller) that reads 26-bit and 34-bit cards and
+; checks their parities; thread 1 sends each card as one ASCII line at
+; 115200 baud 8N1, as an access-control reader's serial output does. No
+; host in the loop: the host loads the image, sets the two ticks and starts
+; both threads; nothing is read from or written to the FIFOs afterwards.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; Wiegand or for this bridge. It uses the M2 core: the timed waits (WAITP
+; ... T, SEMANTICS 6.4, built for PS/2 and I2C timeouts) and the tick
+; restart (a CSRW TICK_INT, section 4, built for the UART, CAN and
+; Manchester receivers' hard synchronisation) for the Wiegand pulses, as in
+; firmware/wiegand_panel.loom; the deadline-latched pin write (SETP ... D,
+; 6.10, built so that firmware edges land on the exact tick) for the UART
+; bits; and LD/ST to data memory (6.11, built so device emulators can keep
+; a register file) for the card queue between the threads. What the
+; firmware does that no hardware does: watching two lines at once, the bit
+; count, the frame end, the glitch and both-low checks, both parities, the
+; queue, the hexadecimal and decimal formatting and the UART framing.
+; Weaker than a dedicated panel: the lines are polled (a fall is seen 2 to
+; 26 clocks after the pad), and both-low is checked at three points of a
+; pulse, not continuously (wiegand_panel.loom's header).
+;
+; Pins: D0 = IN0, D1 = IN1 (thread 0, inputs idle high through the panel's
+; pull-ups, never driven); TX = OUT0 (thread 1, idle high); READ = OUT1
+; (thread 0: high from the first fall of a frame until the frame's record
+; is queued or dropped, for a reader LED; the tests time thread 0 by it).
+;
+; ------------------------------------------------------------- the line
+; One line a card, in arrival order:
+;     'W', NN, ' ', HEX, ' ', SS, CR, LF          e.g. "W26 0A1B2C3 OK\r\n"
+;   NN   the bit count, two decimal digits (63 means 63 or more);
+;   HEX  the raw frame, parity bits included, as ceil(min(N, 48) / 4)
+;        upper-case hex digits, right-aligned (26 bits: 7, 34 bits: 9), so
+;        the host can decode any card format;
+;   SS   "LE" a line error (both lines low at once, or a line held low for
+;        255 ticks: the bits are suspect); else "OV" more than 48 bits (the
+;        last 48 are shown); else for 26 and 34 bits "OK" or "PE" (a parity
+;        is wrong); else "--" (no parity is defined for that length).
+;   A '!' in place of the 'W' says the queue was full and one or more cards
+;   were dropped between the previous line and this one.
+; ASCII because an access-control reader's serial output is read by people
+; and by terminal-grade software; hexadecimal because it needs no division
+; and keeps the bridge format-agnostic. A frame of glitches only (N = 0) is
+; noise and gives no line. 26 bits: 16 characters, 1.39 ms at 115200 baud;
+; 34 bits: 18, 1.56 ms.
+;
+; Parities (bits numbered from 1 in transmission order): 26 bits (H10301),
+; bit 1 even over 1 .. 13, bit 26 odd over 14 .. 26; 34 bits (H10306 as
+; widely published), bit 1 even over 1 .. 17, bit 34 odd over 18 .. 34.
+;
+; ------------------------------------------- the queue (SEMANTICS 6.11)
+; A ring of Q = 8 records of four words: the status (below), then the last
+; 48 bits as three words, most significant first, right-aligned (the
+; layout wiegand_panel.loom pushes). Two shared counts, free-running mod
+; 2^16, each written by one thread only: WR (thread 0, records published)
+; and RD (thread 1, records taken).
+;   thread 0  at a frame's end: LD WR, LD RD; if WR - RD >= Q the card is
+;             dropped and the next queued record carries LOST; else ST the
+;             four words into slot WR mod Q, then ST WR + 1 (the publish).
+;   thread 1  LD WR until it differs from RD; format the line from slot
+;             RD mod Q into the line buffer; ST RD + 1 (the slot is free
+;             again); send the line.
+; No record is torn: thread 0 stores into a slot only when the RD it read
+; (current or older, so never ahead of the truth) shows thread 1 has
+; finished with it, and thread 1 loads a slot only after it saw the publish
+; that followed the slot's four stores. Each LD and ST is one access at one
+; edge of the one memory port (6.11), so no word is half written and the
+; accesses are ordered in time. Neither thread waits for the other: thread 0
+; never waits on RD (a full queue drops the card) and thread 1 waits only
+; while the queue is empty, never inside a record. LD/ST take two of a
+; thread's own slots whatever the others do (6.11) and the barrel gives
+; each thread every fourth clock (SEMANTICS 2), so the Wiegand timing does
+; not depend on the UART traffic nor the UART timing on the cards.
+; Capacity: Q cards waiting plus the one on the wire. At 115200 baud a line
+; takes under 1.6 ms and SIA AC-01's shortest 26-bit card with the default
+; 25 ms frame end is over 30 ms apart from the next, so the queue matters
+; when the UART is slower (9600 baud: 16.7 ms a line), not at the rate here.
+;
+; Status word: bits 5:0 N (saturating at 63); bits 10:8 LONG, BOTH, GLITCH
+; (wiegand_panel.loom's flags); bit 11 P (N is 26 or 34: the parities were
+; checked); bit 12 LOST; bit 13 PERR (a parity is wrong).
+;
+; ------------------------------------------------------------- the rates
+; Thread 0's tick is set by the host, as for wiegand_panel.loom: 5 us
+; (TICK_INT 250 at 50 MHz) is the suggested one, TICK_INT 16 or more. The
+; glitch threshold is 2 ticks, the stuck-line limit 255, the frame end END
+; ticks of quiet: an image word (below), 5000 by default (25 ms at 5 us),
+; patched by the host before RUN for a reader known to be faster.
+; Thread 1's tick is one UART bit: TICK_INT 434, TICK_FRAC 8 at 50 MHz
+; (115200.4 baud). Every bit is a SETP ... D landing on its tick, so the
+; edges are exact to the clock at any rate; the pairs are proved for ticks
+; of 40 clocks or more (.tick below).
+;
+; Memory (.imem 512): thread 0's code in its quarter, thread 1's in its
+; own, and the data in thread 2's: WR 256, RD 257, END 258, the queue at
+; 264 .. 295, the line buffer at 296 .. 316 (21 words, one framed character
+; each). Thread 3's quarter is free for another program.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   D0 = IN0, D1 = IN1, READ = OUT1, TX = OUT0
+        .equ    SHARED = 256            ; WR, RD, END
+        .equ    QUEUE = SHARED + 8      ; Q records of four words
+        .equ    Q = 8
+        .equ    LINE = QUEUE + 4 * Q    ; thread 1's line buffer
+        .equ    G = 2                   ; glitch threshold, ticks
+        .equ    LMAX = 255              ; a pulse this long: the line is stuck
+        .equ    F_GLITCH = 1            ; r5 flags, bits 8 .. 13 of the status
+        .equ    F_BOTH = 2
+        .equ    F_LONG = 4
+        .equ    F_P = 8
+        .equ    F_LOST = 16
+        .equ    F_PERR = 32
+        .equ    NMAX = 63               ; the count saturates here
+
+; ============================================ thread 0: the Wiegand panel
+; wiegand_panel.loom's receiver, its PUSH replaced by the queue.
+; r0, r1, r2 the last 48 bits (the newest in r2 bit 0); r3 N; r4 scratch;
+; r5 the flags (bits 2:0 LONG, BOTH, GLITCH; bit 4 LOST, kept across
+; frames; P and PERR set at the end), then the status; r6 the frame-end
+; deadline, then scratch; r7 SHARED.
+        .thread 0
+        .tick   16                      ; TICK_INT 16 or more (header)
+start:  MOV16   r7, SHARED
+        LDI     r5, 0
+
+; A new frame: wait for idle lines, then for the first fall (untimed).
+fresh:  WAITP   D0, 1
+        WAITP   D1, 1
+        LDI     r0, 0
+        LDI     r1, 0
+        LDI     r2, 0
+        LDI     r3, 0
+hunt:   JP      D0, 0, f0
+        JP      D1, 0, f1
+        JMP     hunt
+
+; Between pulses: the next fall, or END ticks of quiet ends the frame.
+poll:   JP      D0, 0, f0
+        JP      D1, 0, f1
+        CSRR    r4, NOW
+        SUB     r4, r4, r6              ; NOW - deadline
+        SHLI    r4, 1                   ; C = bit 15: negative, not reached
+        BC      poll
+        JMP     fend
+
+; A fall on D0: a 0, if it is a pulse.
+f0:     CSRR    r4, TICK_INT
+        CSRW    TICK_INT, r4            ; restart the grid at the fall
+        SETP    READ, 1
+        JP      D1, 0, both
+        SETD    G
+        WAITP   D0, 1, T
+        BNT     glitch                  ; released within G ticks
+        JP      D1, 0, both
+        SETD    LMAX
+        WAITP   D0, 1, T
+        BT      long
+        JP      D1, 0, both
+        LDI     r4, 0
+        JMP     shift
+
+; Both lines low: the pulse is not counted. Wait for both to be released,
+; each within the stuck limit, and go on with the frame.
+both:   ORI     r5, F_BOTH
+        SETD    LMAX
+        WAITP   D0, 1, T
+        BT      long
+        SETD    LMAX
+        WAITP   D1, 1, T
+        BT      long
+        JMP     again
+
+; A fall on D1: a 1.
+f1:     CSRR    r4, TICK_INT
+        CSRW    TICK_INT, r4
+        SETP    READ, 1
+        JP      D0, 0, both
+        SETD    G
+        WAITP   D1, 1, T
+        BNT     glitch
+        JP      D0, 0, both
+        SETD    LMAX
+        WAITP   D1, 1, T
+        BT      long
+        JP      D0, 0, both
+        LDI     r4, 1
+
+; Shift the bit in r4 into r0:r1:r2 at r2 bit 0, count it, set the frame end.
+shift:  SHLI    r0, 1
+        SHLI    r1, 1
+        BNC     s1
+        ORI     r0, 1
+s1:     SHLI    r2, 1
+        BNC     s2
+        ORI     r1, 1
+s2:     OR      r2, r2, r4
+        CMPI    r3, NMAX
+        BZ      again                   ; saturated
+        INC     r3
+again:  CSRR    r6, NOW
+        LD      r4, r7, 2               ; END, from the image
+        ADD     r6, r6, r4              ; the frame ends at NOW + END
+        JMP     poll
+
+glitch: ORI     r5, F_GLITCH            ; the line is high again: go on
+        JMP     again
+
+long:   ORI     r5, F_LONG              ; the frame ends here
+
+; The frame is over: the status word, the parities, the queue.
+fend:   TEST    r3, r3
+        BNZ     f_st
+        ANDI    r5, F_LOST              ; glitches only: no record
+        JMP     done
+f_st:   CMPI    r3, 26
+        BZ      p26
+        CMPI    r3, 34
+        BNZ     f_q                     ; no parity for this length
+
+; The parity of a span is the parity of the XOR of the words that hold it
+; (PAR: C = the XOR of 16 bits). r4 gets the even span, r6 the odd one.
+; 34 bits: even over frame bits 33:17 = r0 1:0 and r1 15:1, odd over 16:0
+; = r1 0 and r2.
+p34:    MOV     r4, r1
+        SHRI    r4, 1
+        MOV     r6, r0
+        ANDI    r6, 3
+        XOR     r4, r4, r6
+        MOV     r6, r1
+        ANDI    r6, 1
+        XOR     r6, r6, r2
+        JMP     p_chk
+; 26 bits: even over frame bits 25:13 = r1 9:0 and r2 15:13, odd over 12:0.
+p26:    MOV     r4, r2
+        SHRI    r4, 13
+        XOR     r4, r4, r1
+        MOV     r6, r2
+        SHLI    r6, 3
+p_chk:  PAR     r4, r4
+        BC      p_bad                   ; C = 1: the even parity is wrong
+        PAR     r6, r6
+        BC      p_ok                    ; C = 1: the odd parity is right
+p_bad:  ORI     r5, F_PERR
+p_ok:   ORI     r5, F_P
+f_q:    SHLI    r5, 8                   ; the flags to 13:8
+        OR      r5, r5, r3              ; N in 5:0
+
+; The queue: drop the card if it is full, else store it and publish.
+queue:  LD      r4, r7, 0               ; WR (this thread's own count)
+        LD      r3, r7, 1               ; RD (thread 1's; never ahead)
+        SUB     r3, r4, r3              ; records waiting
+        CMPI    r3, Q
+        BC      full                    ; C = (waiting >= Q)
+        MOV     r3, r4
+        ANDI    r3, Q - 1
+        SHLI    r3, 2
+        ADD     r3, r3, r7              ; the slot, less QUEUE - SHARED
+        ST      r5, r3, 8               ; the status
+        ST      r0, r3, 9               ; bits 47:32
+        ST      r1, r3, 10              ; bits 31:16
+        ST      r2, r3, 11              ; bits 15:0
+        INC     r4
+        ST      r4, r7, 0               ; WR + 1: published
+        LDI     r5, 0                   ; LOST is reported
+        JMP     done
+full:   LDI     r5, F_LOST              ; dropped: tell the next line
+done:   SETP    READ, 0
+        JMP     fresh
+
+        .org    SHARED
+        .word   0                       ; WR
+        .word   0                       ; RD
+        .word   5000                    ; END: 25 ms at a 5 us tick
+
+; ================================================ thread 1: queue to UART
+; r0 the character, r1 where the next character of the line goes (then the
+; line's end), r2 a count or a digit index, r3 the slot (less QUEUE -
+; SHARED), then where the next character to send is, r4 the status, then
+; scratch, then the next character, r5 RD, r7 SHARED.
+        .thread 1
+        .tick   40                      ; the shortest tick the pairs are proved for
+start1: SETP    TX, 1                   ; idle
+        MOV16   r7, SHARED
+        LD      r5, r7, 1               ; RD, from the image
+
+; Wait for a record, then build its line.
+idle:   LD      r0, r7, 0               ; WR
+        CMP     r0, r5
+        BZ      idle                    ; the queue is empty
+        MOV     r3, r5
+        ANDI    r3, Q - 1
+        SHLI    r3, 2
+        ADD     r3, r3, r7
+        LD      r4, r3, 8               ; the status
+        MOV16   r1, LINE
+        LDI     r0, 'W'
+        MOV     r2, r4
+        SHLI    r2, 4                   ; C = bit 12, LOST
+        BNC     l_w
+        LDI     r0, '!'
+l_w:    CALL    put
+
+; NN: tens by repeated subtraction (SUBI: C = (r2 >= 10) before it).
+        MOV     r2, r4
+        ANDI    r2, NMAX
+        LDI     r0, '0' - 1
+tens:   INC     r0
+        SUBI    r2, 10
+        BC      tens
+        CALL    put
+        MOV     r0, r2
+        ADDI    r0, 10 + '0'            ; the units, from r2 - 10
+        CALL    put
+        LDI     r0, ' '
+        CALL    put
+
+; HEX: ceil(min(N, 48) / 4) digits, the most significant first; digit d
+; is bits 4(d mod 4) + 3 .. of the word d / 4 above the low one.
+        MOV     r2, r4
+        ANDI    r2, NMAX
+        CMPI    r2, 49
+        BC      h_48                    ; more than 48 bits: the last 48
+        ADDI    r2, 3
+        JMP     h_n
+h_48:   LDI     r2, 48 + 3
+h_n:    SHRI    r2, 2                   ; the digit count, 1 or more
+hex:    DEC     r2
+        MOV     r0, r2
+        SHRI    r0, 2
+        NEG     r0, r0
+        ADD     r0, r0, r3
+        LD      r0, r0, 11              ; the word (offset 11: the low word)
+        MOV     r4, r2
+        ANDI    r4, 3
+        SHLI    r4, 2
+        SHR     r0, r0, r4
+        ANDI    r0, 15
+        CMPI    r0, 10
+        BNC     h_dig                   ; 0 .. 9
+        ADDI    r0, 'A' - '0' - 10
+h_dig:  ADDI    r0, '0'
+        CALL    put
+        TEST    r2, r2
+        BNZ     hex
+        LDI     r0, ' '
+        CALL    put
+
+; SS: LE, OV, then OK / PE for 26 and 34 bits, else --.
+        LD      r4, r3, 8               ; the status again
+        MOV     r0, r4
+        SHRI    r0, 9
+        ANDI    r0, 3                   ; LONG, BOTH
+        BZ      s_ov
+        LDI     r0, 'L'
+        LDI     r2, 'E'
+        JMP     s_put
+s_ov:   MOV     r0, r4
+        ANDI    r0, NMAX
+        CMPI    r0, 49
+        BNC     s_par                   ; 48 bits or fewer
+        LDI     r0, 'O'
+        LDI     r2, 'V'
+        JMP     s_put
+s_par:  MOV     r0, r4
+        SHRI    r0, 11
+        ANDI    r0, 5                   ; PERR (bit 2 here), P (bit 0)
+        BZ      s_none
+        CMPI    r0, 1
+        BNZ     s_pe
+        LDI     r0, 'O'
+        LDI     r2, 'K'
+        JMP     s_put
+s_pe:   LDI     r0, 'P'
+        LDI     r2, 'E'
+        JMP     s_put
+s_none: LDI     r0, '-'
+        LDI     r2, '-'
+s_put:  CALL    put
+        MOV     r0, r2
+        CALL    put
+        LDI     r0, '\r'
+        CALL    put
+        LDI     r0, '\n'
+        CALL    put
+        INC     r5
+        ST      r5, r7, 1               ; RD + 1: the slot is free again
+
+; Send the line, 8N1, LSB first, characters back to back. Bit i is staged
+; with SETP ... D and lands on the tick its WAITD waits for (6.10).
+        MOV16   r3, LINE
+        LD      r4, r3, 0
+        INC     r3
+        SETD    0                       ; re-anchor after the idle wait
+        WAITD   1                       ; on a tick edge: the start bit is whole
+chr:    MOV     r0, r4
+        LDI     r2, 8
+        SETP    TX, 0, D                ; the start bit
+        WAITD   1
+bit:    SHRI    r0, 1                   ; C = the bit
+        BC      one
+        SETP    TX, 0, D
+        JMP     nxt
+one:    SETP    TX, 1, D
+nxt:    WAITD   1
+        DJNZ    r2, bit
+        SETP    TX, 1, D                ; the stop bit
+        CMP     r3, r1
+        BZ      last
+        LD      r4, r3, 0               ; the next character
+        INC     r3
+        WAITD   1
+        JMP     chr
+last:   WAITD   1
+        WAITD   1                       ; the last stop bit lasts a whole bit
+        JMP     idle
+
+put:    ST      r0, r1, 0
+        INC     r1
+        RET

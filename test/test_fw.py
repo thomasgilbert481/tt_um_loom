@@ -77,6 +77,7 @@ from tools.tests import test_fw_sdi12                             # noqa: E402
 from tools.tests import test_fw_quadrature                        # noqa: E402
 from tools.tests import test_fw_mdio                              # noqa: E402
 from tools.tests import test_fw_audio                             # noqa: E402
+from tools.tests import test_fw_bridge_wiegand_uart               # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
@@ -89,7 +90,7 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_bridge_uart_dmx, test_fw_four_at_once_d035,
            test_fw_hot_swap, test_fw_dali, test_fw_ir_rc, test_fw_dcc,
            test_fw_modbus, test_fw_sdi12, test_fw_quadrature,
-           test_fw_mdio, test_fw_audio)
+           test_fw_mdio, test_fw_audio, test_fw_bridge_wiegand_uart)
 
 
 def _make(scenario):
