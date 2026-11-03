@@ -1,0 +1,284 @@
+; ir_rc_rx.loom
+;
+; Decisions (2026-11-03): no Philips document was reachable, so the
+; frame timings cite SB-Projects' descriptions; tolerances are from the
+; Vishay TSOP382.. datasheet (doc. 82491 rev. 2.1). For RC-5 the 14 bits
+; are reported as received (the address/command split did not fit the
+; quarter): the host splits them. The edge-wait dead time (at most 62 us
+; at 50 MHz) is below the shortest valid pulse (305 us), so no good frame
+; is lost; a too-short pulse is reported only at 50 MHz.
+;
+; Philips RC-5 and RC-6 mode 0 infrared receiver on IN0, for the output of a
+; demodulating receiver module (a Vishay TSOP38236: low while a 36 kHz burst
+; is present), delivering frames and errors to the host through OUTQ[0].
+; One build takes both: the first mark of a frame tells which.
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; infrared or for bi-phase codes of this kind; the bit engine's Manchester
+; decoder samples a bit cell at a fixed rate and cannot follow RC-6's leader
+; and double-length trailer. The program times every mark and space with the
+; edge wait (`WAITE ... ANY, T`, SEMANTICS 6.4) against a `SETD` deadline,
+; built for the timeouts of PS/2 and I2C, and reads the thread's tick
+; counter (`CSRR NOW`) at each confirmed edge. What the firmware does that
+; no hardware does: telling the two protocols apart, the pulse windows below,
+; the glitch filter, bi-phase decoding by pulse length in both senses, the
+; RC-6 leader, start, mode and trailer checks, and the frame report. It needs
+; the FIFOs (PUSH) and nothing else: no bit engine, no latch.
+;
+; Pin: RX = IN0, idle high (the module's output, with its own pull-up).
+;
+; Result format (FIFO space read, thread 0). Bits 15:14 give the kind:
+;   frame:  two words.
+;           word 1  bits 15:14 = 01; bit 13 RC-6; bit 12 T, the toggle (RC-5
+;                   T, the RC-6 trailer bit); bits 11:0 zero.
+;           word 2  the bits as received. RC-6: bits 15:8 the address, 7:0 the
+;                   command. RC-5: bits 13:0 S1 S2 T A4..A0 C5..C0 (S1 = 1;
+;                   extended RC-5's command bit 6 is the inverse of S2).
+;   error:  one word, bits 15:14 = 11. Bits 13:8 h, the halves taken
+;           before the fault, or up to the half that broke a pair for a
+;           bi-phase fault (RC-5 half-bits from S1's first, 1..28; RC-6
+;           units after the leader mark, the leader space's two included,
+;           0..46); bit 6 RC-6 (a first mark too long for any leader counts
+;           as RC-6, h = 0); bits 2:0 the fault: 1 a pulse outside every
+;           window, or a frame running on past its last half; 2 a timeout
+;           (the line stopped changing, or a first mark 3.1 ms or longer);
+;           3 a bi-phase violation (a bit's two halves equal, or an RC-6
+;           leader space or trailer half not two equal units); 4 RC-6 start
+;           and mode bits other than 1 000.
+; A report is never split: the program blocks on a full OUTQ. The host
+; tells a repeat (key held) from a new key press by the toggle, as RC-5 and
+; RC-6 intend; the receiver does not keep the last frame.
+;
+; Tick (set by the host before RUN): one tick is 1/16 of the RC-6 unit, one
+; carrier period, 27.78 us.
+;   50 MHz: TICK_INT 1388, TICK_FRAC 228 (1388.890625 clocks, +1.1 ppm).
+;   1.728 MHz (the RTL tests): TICK_INT 48, TICK_FRAC 0 (exact).
+; TICK_INT must be 16 or more (the glitch filter, below, is TICK_INT / 2 - 3
+; slots). The program reads TICK_INT once at start.
+;
+; Protocol and windows. Lengths are counted in ticks between confirmed
+; edges. The first mark after an idle line: under 16 ticks (444 us) noise,
+; ignored; 16 .. 79 RC-5 (S1's lit half, or with S2's when S2 = 0: 889 or
+; 1778 us); 80 .. 111 the RC-6 leader (2.667 ms); 112 or more an error.
+; After that each mark and space must be n = 1, 2 or 3 halves (RC-5 half-bit
+; q = 32 ticks, 889 us; RC-6 unit q = 16 ticks, 444 us), accepted when its
+; length lies in [n - 1/2, n + 1/2) q:
+;   RC-6  1 unit  222 .. 667 us   2  667 .. 1111   3  1111 .. 1556 us
+;   RC-5  1 half  444 .. 1333 us  2  1333 .. 2222 (3 halves: a violation)
+; The decision points are midway between legal lengths, as wide as a
+; pulse-length decoder can make them. The receiver module takes the first
+; 5 ticks of them: its output pulse is the burst length -5/f0 .. +5/f0
+; (139 us at 36 kHz; Vishay TSOP382.., TSOP384.., document 82491 rev. 2.1,
+; figure 1 note 3, which names the TSOP38236 "best choice" for RC-5 and
+; RC-6), and the count is good to one tick. That leaves +-55 us (12 % of
+; a unit) for the transmitter's own error in RC-6 and +-277 us (31 %) in
+; RC-5. A frame is over when its last half is in; a last half that is dark
+; is taken when the line has been high TMO = 80 ticks (2.22 ms).
+;
+; Glitch filter. An edge counts only if the new level is still there 2 ticks
+; (55.6 us, two carrier periods) later: a shorter pulse of either level is
+; ignored and the wait goes on against the same deadline. The module never
+; outputs a valid pulse that short: it needs bursts of 10 cycles (278 us)
+; and the shortest output pulse in a frame is 444 - 139 = 305 us. A pulse
+; longer than the filter but outside its window is an error. Every
+; confirmed edge is the filter's delay after the real one, so lengths are
+; unchanged.
+;
+; Halves and bits. Each pulse adds n halves of its level; two halves make a
+; bit, which must have a transition in the middle (RC-5: dark-lit is 1;
+; RC-6: lit-dark is 1). RC-6 numbers its halves from the leader space:
+; halves 1-2 the leader space, 3-10 start and mode (checked as 1 000), 11-14
+; the trailer (two equal pairs; T is the first), 15-46 the 16 data bits.
+; RC-5 numbers from 19 (S1's dark first half, which an idle line hides) to
+; 46, so the RC-6 positions are never met. A stuck mark at the last half is
+; caught as a bi-phase violation (h = 28 RC-5, 46 RC-6).
+;
+; Measurement and dead time. WAITE sees an edge 2 to 5 clocks after it, but
+; only an edge that comes while it waits. After each confirmed edge the
+; program works for up to 81 slots (the IN to the next WAITE, a 3-half pulse)
+; before it waits again: 324 clocks, 6.5 us at 50 MHz but 187.5 us on the
+; 1.728 MHz board of the RTL tests. With the filter's 2 ticks that is a dead
+; time after every edge (62 us at 50 MHz, 243 us at 1.728 MHz) in which a
+; further edge is not seen, so a pulse that short acts as a glitch. Both are
+; under the shortest pulse a TSOP38236 gives in a frame (305 us, above),
+; so no valid frame is lost; a too-short pulse can only be reported as too
+; short (fault 1) when it outlasts the dead time.
+;
+; Registers: r0 halves to add, then the report; r1 bits 3:0 the shift that
+; turns a length into half-halves (3 RC-6, 4 RC-5; bit 0 = RC-6), bit 4
+; the level being measured (1 a mark), bit 5 the RC-6 T; r2 the bits; r3 the
+; pending first half (2 + level) or 0; r4 halves so far; r5 the glitch
+; filter in slots; r6 NOW at the last confirmed edge; r7 lengths and scratch.
+;
+; Size: 127 words, thread 0's quarter; moved to thread 1 it fits beside
+; ir_rc_tx.loom (128 words) in 0x080..0x0FF.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   48                      ; TICK_INT 16 or more (header)
+        .equ    TMO   = 80              ; ticks: a pulse inside a frame ends by then
+        .equ    LTMO  = 112             ; ticks: the longest first mark (RC-6 leader)
+        .equ    END   = 46              ; halves: a whole frame (RC-5 counts from 18)
+        .equ    E_WIN   = 1             ; fault codes
+        .equ    E_TMO   = 2
+        .equ    E_BIPH  = 3
+        .equ    E_HDR   = 4
+
+start:  CSRR    r5, TICK_INT
+        SHRI    r5, 1                   ; P / 2 slots = 2 ticks: the glitch filter,
+        SUBI    r5, 3                   ; less the 3 other slots before the IN
+        .csr    INGRP, (1 << 5) | 8     ; IN reads RX (IN0, index 8) into bit 0
+
+; Hunt: an idle (high) line, then a confirmed mark. Its length tells the
+; protocol, in ticks of 1/16 RC-6 unit (len / 8 is compared):
+;   16 .. 47 RC-5, one half-bit;  48 .. 79 RC-5, two;  80 .. 111 RC-6 leader.
+hunt:   WAITP   RX, 1
+        LDI     r1, 3                   ; s = 3, a space: classify in RC-6 units
+        LDI     r4, 0                   ; no half received: h = 0 in an error
+h2:     SETD    255                     ; re-armed every 255 ticks
+        CALL    wend
+        BT      h2                      ; no mark yet
+        SETD    LTMO
+        CALL    wend                    ; the first mark
+        BT      etmo                    ; longer than any leader
+        MOV     r0, r7
+        SHRI    r0, 3
+        CMPI    r0, 2
+        BNC     hunt                    ; under 444 us: noise, ignored
+        LDI     r2, 0
+        CMPI    r0, 10
+        BC      rc6
+        LDI     r1, 4                   ; RC-5: s = 4, classify in half-bits
+        LDI     r4, 19                  ; S1's dark first half, pending
+        LDI     r3, 2
+        JMP     cls                     ; one lit half, or two (S2 = 0)
+
+; RC-6: the leader space is taken as two dark halves that must be equal,
+; as the trailer's are (levels 1 and 2).
+rc6:    LDI     r3, 0                   ; nothing pending
+
+; A frame's pulses. Each lasts n = 1, 2 or 3 halves (RC-5 half-bits of
+; 32 ticks, RC-6 units of 16): len / q in [n - 1/2, n + 1/2).
+body:   CALL    wend
+        BT      tmo
+cls:    SHR     r7, r7, r1              ; k = len / (q / 2)
+        ADDI    r7, 1
+        SHRI    r7, 1                   ; n
+        MOV     r0, r7
+        SUBI    r7, 1
+        CMPI    r7, 3
+        BC      ewin                    ; n = 0 or n > 3: outside every window
+
+; put: r0 halves of the level of the pulse that has just ended (the
+; inverse of r1 bit 4), paired into bits. r3 = 2 + the first half of a pair,
+; or 0.
+put:    NOT     r7, r1
+        SHRI    r7, 4
+        ANDI    r7, 1                   ; L: 1 lit
+        ADDI    r4, 1
+        TEST    r3, r3
+        BNZ     pair
+        ORI     r7, 2
+        MOV     r3, r7                  ; the first half, pending
+        JMP     pnext
+pair:   XOR     r3, r3, r7              ; 3: the halves differ, 2: equal
+        CMPI    r4, 2
+        BZ      trl12                   ; RC-6 leader space
+        CMPI    r4, 12
+        BZ      trl                     ; RC-6 trailer, first half
+        CMPI    r4, 14
+        BZ      trl12                   ; and second half
+        CMPI    r3, 3
+        BNZ     ebiph
+        XOR     r7, r7, r1
+        ANDI    r7, 1                   ; RC-5: the bit is L; RC-6: the first half
+        ADD     r2, r2, r2
+        OR      r2, r2, r7
+        CMPI    r4, 10
+        BNZ     pclr
+        CMPI    r2, 8                   ; RC-6 start 1, mode 000
+        BNZ     ehdr
+pclr:   LDI     r3, 0
+pnext:  DJNZ    r0, put
+        CMPI    r4, END
+        BZ      done
+        BNC     body                    ; more to come
+        JMP     ewin                    ; a frame too long
+trl:    SHLI    r7, 5
+        OR      r1, r1, r7              ; T, in r1 bit 5
+trl12:  CMPI    r3, 2                   ; a trailer half is two equal units
+        BNZ     ebiph
+        JMP     pclr
+
+; A timeout: the end of a frame whose last half is dark, or an error.
+tmo:    CMPI    r4, END - 1
+        BNZ     etmo
+        ORI     r1, 16                  ; so that put takes a dark half
+        LDI     r0, 1
+        JMP     put
+
+; A whole frame: report a status word, then the bits as received: RC-6
+; the address and the command (r2); RC-5 S1 S2 T A4..A0 C5..C0 (r2 bits 13:0).
+; The toggle T is r1 bit 5 for RC-6, r2 bit 11 for RC-5.
+done:   MOV     r0, r1
+        ANDI    r0, 1                   ; RC-6
+        BNZ     d6
+        MOV     r7, r2
+        SHRI    r7, 11
+        JMP     dt
+d6:     MOV     r7, r1
+        SHRI    r7, 5
+dt:     ANDI    r7, 1                   ; T
+        ADD     r0, r0, r0
+        OR      r0, r0, r7
+        ORI     r0, 4                   ; 01, RC-6, T in bits 15:12
+        SHLI    r0, 12
+        PUSH    r0                      ; blocks while OUTQ is full
+        PUSH    r2
+        JMP     hunt
+
+; Errors: bits 15:14 = 11, 13:8 the halves received, 6 RC-6, 2:0 the fault.
+ebiph:  LDI     r0, E_BIPH
+        JMP     err
+ehdr:   LDI     r0, E_HDR
+        JMP     err
+etmo:   LDI     r0, E_TMO
+        JMP     err
+ewin:   LDI     r0, E_WIN
+err:    MOV     r7, r1
+        ANDI    r7, 1                   ; RC-6
+        BNZ     e6
+        SUBI    r4, 18                  ; RC-5 counts its halves from 18
+e6:     SHLI    r7, 6
+        OR      r0, r0, r7
+        LDI     r7, 0xC0
+        OR      r4, r4, r7
+        SHLI    r4, 8                   ; 11, then h
+        OR      r0, r0, r4
+        PUSH    r0
+        JMP     hunt
+
+; wend: wait for the end of the pulse being measured (r1 bit 4: 1 a mark,
+; RX low; 0 a space, RX high) through the glitch filter, or for TD.
+; T = 1: TD came first. T = 0: RX changed and the new level held for 2
+; ticks (r5 + 3 slots); r7 = the pulse's length in ticks (NOW at this
+; confirmation less NOW at the last one, r6, which becomes this one); TD is
+; set TMO ticks on and r1 bit 4 flipped. A level that does not hold is a
+; glitch, and the wait goes on against the same TD.
+wend:   WAITE   RX, ANY, T
+        BT      wr
+        MOV     r7, r5
+wd:     DJNZ    r7, wd
+        IN      r7                      ; RX in bit 0
+        SHLI    r7, 4
+        XOR     r7, r7, r1
+        ANDI    r7, 16                  ; 0: RX is the level that ends the pulse
+        BNZ     wend                    ; the old level is back: a glitch
+        CSRR    r7, NOW
+        SUB     r7, r7, r6
+        ADD     r6, r6, r7              ; r6 = NOW
+        SETD    TMO
+        XORI    r1, 16
+wr:     RET

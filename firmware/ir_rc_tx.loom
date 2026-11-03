@@ -1,0 +1,252 @@
+; ir_rc_tx.loom
+;
+; Decisions (2026-11-03): the RC-6 mode 0 repeat period of 240 units
+; (106.7 ms) is from no published source and is marked unchecked in
+; tools/protomodels/ir_rc.py.
+;
+; Philips RC-5 and RC-6 mode 0 infrared transmitter on OUT0, fed by the host
+; through INQ[0]; the protocol is chosen per frame.
+;
+; Written on 2026-11-02, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; infrared, and its bit engine's Manchester encoder (SEMANTICS 6.9.1) does
+; not help: it sends one bit per SHO at the pin, while here every half-bit
+; is 16 or 32 carrier periods. The program makes the 36 kHz carrier itself,
+; as ir_nec_tx.loom makes NEC's 38 kHz, with two pieces of hardware built for
+; other jobs: the deadline-latched pin write (`SETP pin, v, D`, SEMANTICS
+; 6.10, D-016), built so that WS2812 pulses land on the exact clock, and the
+; fractional tick divider (TICK_FRAC, SEMANTICS 4), built for UART rates.
+; What the firmware does that no hardware does: the carrier, both bi-phase
+; codes (of opposite sense), the RC-6 leader and double-length trailer, the
+; toggle bit and the repeat grid. It needs the FIFOs (POP, WAITB INQ_NE) and
+; the latch, nothing else.
+;
+; Pin: LED = OUT0, push-pull, high = LED on, through a transistor. Idle low.
+;
+; Host command format (FIFO space, thread 0):
+;   frame:  word 1  bit 15 = 0; bit 14 RC6 (0: RC-5); bits 7:0 the command.
+;                   RC-5 sends bits 5:0 and, as the inverted second start
+;                   bit, bit 6 (extended RC-5; 0 gives the classic S2 = 1);
+;                   bit 7 is ignored. RC-6 sends bits 7:0.
+;           word 2  the address: RC-5 bits 4:0, RC-6 bits 7:0.
+;   repeat: one word with bit 15 set: the last frame again, same toggle.
+; Bits 13:8 of word 1 are ignored. Nothing is ever pushed to OUTQ.
+;
+; The toggle bit (RC-5 T, the RC-6 trailer bit) flips with every frame
+; (two words) and stays with every repeat word: a host pushes one frame per
+; key press and one repeat word per period while the key is held. The first
+; frame after reset has T = 0.
+;
+; Wire format. Times from SB-Projects, "RC-5" and "RC-6" (sbprojects.net,
+; knowledge/ir, read 2026-11-02); Philips's own documents could not be
+; reached. One unit is 16 carrier periods, 444.4 us at 36 kHz.
+;   RC-5: 14 bits, most significant first: S1 = 1, S2, T, 5 address bits,
+;     6 command bits. Each half-bit is 2 units (32 periods, 888.9 us); a 0
+;     is carrier then dark, a 1 dark then carrier. A frame is 56 units
+;     (24.9 ms) from S1's first half, which is dark, to the end of the last.
+;   RC-6 mode 0: a leader of 6 units of carrier and 2 dark, the start bit 1,
+;     mode bits 000, the trailer bit T with 2-unit halves, 8 address and 8
+;     command bits, most significant first, each half 1 unit; a 1 is carrier
+;     then dark, the opposite of RC-5. A frame is 52 units (23.1 ms).
+; Consecutive lit halves are one burst of carrier, unbroken.
+;
+; Repeats. A frame that starts at S (RC-5: the start of S1's first half; RC-6:
+; the leader's first rise) is followed by the next at S + 256 units (113.8 ms,
+; SB-Projects' 114 ms, 0.2 % short; 64 bit times) for RC-5 or S + 240 units
+; (106.7 ms) for RC-6, if a word is in INQ LEAD ticks (185 us) before then.
+; The RC-6 period is UNCHECKED: SB-Projects gives only the 6-unit
+; signal-free time after a frame, which 240 units meets by far (QUESTIONS.md).
+; A repeat word or a frame (both words) is sent at that slot; with INQ
+; empty then the chain ends and the next frame starts as soon as it comes. A
+; repeat word outside a chain is dropped (no frame to repeat). A frame whose
+; address word is late starts when it arrives. The period follows the
+; protocol of the frame just sent.
+;
+; Tick (set by the host before RUN, the M2 convention): one tick is a third
+; of a carrier period, TICK = f_clk / 108 kHz.
+;   50 MHz: TICK_INT 462, TICK_FRAC 247: 462.96484375 clocks (ideal
+;     462.96296). Carrier period 3 ticks = 1388.89 clocks: 35,999.85 Hz,
+;     -4.1 ppm. The high time is 462 or 463 clocks, the period 1388 or 1389.
+;   1.728 MHz (the RTL tests): TICK_INT 16, TICK_FRAC 0: exactly 36 kHz.
+; The deadline schedule is proved for ticks of 16 clocks or more (.tick).
+;
+; Duty 1/3, as ir_nec_tx: high one tick, low two (SB-Projects gives 1/3 or
+; 1/4 for RC-5 and 25 to 50 % for RC-6).
+;
+; Timing. Every carrier edge is `SETP LED, v, D` and the WAITD that lands it,
+; on the exact clock edge of its tick. A unit is 48 ticks; a lit unit is 16
+; rises, a dark unit 16 WAITD 3. Throughout, TD is held two ticks before the
+; start of the next half-bit, so a lit half's first WAITD 2 lands its rise
+; there. The carrier loops test their count between the two edges of a
+; period, so the last fall leads straight on: the tightest path, from a half's
+; last fall to the next half's first rise, is 7 slots in 2 ticks (4 clocks of
+; slack at 16 clocks a tick).
+;
+; Registers: r0 bit 0 the toggle, bit 1 RC-6 (kept for repeats); r1 the
+; payload (RC-5: S1 S2 0 A C in bits 13:0 with T added per frame; RC-6:
+; address and command); r2 carrier periods per half; r3 the RC-6 levels and
+; word 1 as popped; r4 the address word, the level count, then the gap
+; count; r5 the bits on the wire now; r6 bits left; r7 scratch and counts.
+;
+; Size: 128 words, the whole of thread 0's quarter.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   LED = OUT0
+        .tick   16                      ; the shortest tick the schedule is proved for
+        .equ    LEAD  = 20              ; ticks between the INQ test and a start
+        .equ    G5    = 256 - 56        ; RC-5: units from a frame's end to the next start
+        .equ    G6    = 240 - 52        ; RC-6: the same
+        .equ    LSPACE = 96             ; the RC-6 leader space, 2 units, in ticks
+
+start:  SETP    LED, 0                  ; LED off
+        LDI     r0, 1                   ; toggle 1: the first frame flips it to 0
+
+; Idle: no chain. Wait for a frame; drop a repeat word.
+idle:   POP     r3                      ; blocks while INQ is empty
+        ADD     r7, r3, r3              ; C = bit 15: REPEAT
+        BC      idle                    ; no frame before it: dropped
+late:   POP     r4                      ; the address word (blocks until queued)
+        SETD    LEAD                    ; re-anchor after the unbounded POPs
+
+; A new frame from r3 (word 1) and r4 (word 2): flip the toggle, keep the
+; protocol in r0 bit 1 and the payload in r1, for repeats.
+newkey: XORI    r0, 1
+        ANDI    r0, 1                   ; the toggle, bit 0
+        MOV     r7, r3
+        SHLI    r7, 2                   ; C = bit 14: RC6
+        BNC     new5
+        ORI     r0, 2                   ; RC-6
+        MOV     r1, r4
+        SHLI    r1, 8                   ; the address byte
+        LDI     r7, 0xFF
+        AND     r7, r7, r3
+        OR      r1, r1, r7              ; and the command byte
+        JMP     frame
+new5:   MOV     r1, r4                  ; RC-5: S1 S2 0 A4..A0 C5..C0
+        ANDI    r1, 0x1F                ; the address
+        SHLI    r1, 6
+        MOV     r7, r3
+        ANDI    r7, 0x3F                ; command bits 5:0
+        OR      r1, r1, r7
+        NOT     r7, r3
+        SHRI    r7, 6
+        ANDI    r7, 1                   ; S2 = the inverse of command bit 6
+        ORI     r7, 2                   ; S1 = 1 above it
+        SHLI    r7, 12
+        OR      r1, r1, r7
+
+; A frame from r0 and r1, entered with TD LEAD ticks before its start S.
+frame:  CMPI    r0, 2                   ; C = (r0 >= 2): RC-6
+        BC      rc6
+        MOV     r5, r0
+        SHLI    r5, 11                  ; T in bit 11
+        OR      r5, r5, r1
+        SHLI    r5, 2                   ; 14 bits, left-aligned
+        NOT     r5, r5                  ; RC-5 sense: a 1 is space, then mark
+        LDI     r6, 14
+        LDI     r2, 32                  ; carrier periods in a half-bit
+        WAITD   LEAD - 2                ; TD two ticks before S
+        JMP     bits
+
+; RC-6 mode 0. The leader, then 12 one-unit levels (start 1, mode 000 and
+; the trailer T with its two-unit halves: 1001 0101 TT~T~T), then the 16
+; address and command bits.
+rc6:    LDI     r3, 0x30                ; T = 0: 0011
+        MOV     r7, r0
+        SHRI    r7, 1                   ; C = T
+        BNC     t0
+        LDI     r3, 0xC0                ; T = 1: 1100
+t0:     LDIH    r3, 0x95                ; 1001 0101: start and mode
+        LDI     r4, 12
+        MOV     r5, r1
+        LDI     r6, 16
+        LDI     r2, 16                  ; carrier periods in a unit
+        LDI     r7, 96                  ; the leader: 6 units of carrier
+        WAITD   LEAD - 2
+lead:   SETP    LED, 1, D
+        WAITD   2                       ; the rise lands here
+        SETP    LED, 0, D
+        DJNZ    r7, leadc
+        WAITD   1                       ; the last fall
+        WAITD   LSPACE                  ; the leader space
+
+; lev: r4 levels from the top of r3, each r2 carrier periods (a 1) or as
+; long dark (a 0). Entered with TD two ticks before a level's start.
+lev:    SHLI    r3, 1                   ; C = this level
+        BC      levm
+        MOV     r7, r2
+levs:   DJNZ    r7, levsc
+        WAITD   3                       ; the space's last carrier period
+        DJNZ    r4, lev
+        JMP     bits
+levsc:  WAITD   3
+        JMP     levs
+leadc:  WAITD   1
+        JMP     lead
+levm:   MOV     r7, r2
+levmr:  SETP    LED, 1, D
+        WAITD   2
+        SETP    LED, 0, D
+        DJNZ    r7, levmc
+        WAITD   1
+        DJNZ    r4, lev
+        JMP     bits
+levmc:  WAITD   1
+        JMP     levmr
+
+; bits: r6 bi-phase bits from the top of r5, a 1 as mark then space, each
+; half r2 carrier periods (lit or dark). Entered with TD two ticks before a
+; bit's start; leaves for the gap with TD two ticks before the frame's end.
+bits:   SHLI    r5, 1                   ; C = this bit
+        BNC     b0
+        MOV     r7, r2                  ; a 1: mark, then space
+b1m:    SETP    LED, 1, D
+        WAITD   2
+        SETP    LED, 0, D
+        DJNZ    r7, b1mc
+        WAITD   1
+        MOV     r7, r2
+b1s:    DJNZ    r7, b1sc
+        WAITD   3
+        DJNZ    r6, bits
+        JMP     done
+b1mc:   WAITD   1
+        JMP     b1m
+b1sc:   WAITD   3
+        JMP     b1s
+b0mc:   WAITD   1
+        JMP     b0m
+b0sc:   WAITD   3
+        JMP     b0s
+b0:     MOV     r7, r2                  ; a 0: space, then mark
+b0s:    DJNZ    r7, b0sc
+        WAITD   3
+        MOV     r7, r2
+b0m:    SETP    LED, 1, D
+        WAITD   2
+        SETP    LED, 0, D
+        DJNZ    r7, b0mc
+        WAITD   1
+        DJNZ    r6, bits
+
+; The gap to the next start, S + the period: 256 units for RC-5, 240 for
+; RC-6. Entered with TD two ticks before the frame's end.
+done:   LDI     r4, G5 - 1
+        CMPI    r0, 2                   ; C = RC-6
+        BNC     gl
+        LDI     r4, G6 - 1
+gl:     WAITD   48
+        DJNZ    r4, gl
+        WAITD   48 + 2 - LEAD           ; LEAD ticks before the next start
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      idle                    ; nothing queued: the chain ends
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r3
+        ADD     r7, r3, r3              ; C = bit 15: REPEAT
+        BC      frame                   ; the same frame and toggle again
+        WAITB   INQ_NE, T               ; the address word queued as well?
+        BT      late                    ; not yet: the frame starts when it comes
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r4
+        JMP     newkey
