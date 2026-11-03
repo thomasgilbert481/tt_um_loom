@@ -1,0 +1,268 @@
+; quad_decoder.loom
+; A quadrature encoder interface: x4 decoding of an incremental encoder's
+; two channels A and B, a 16-bit signed position count, the direction of
+; the last count, an error count for invalid transitions (both channels
+; changing at once), and the index pulse Z latching the count. The host
+; reads a three-word report on request or at a period it sets.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as an
+; interface Loom was not designed for (D-035). A quadrature encoder is not
+; a serial protocol at all: there is no frame, no bit and no clock, only two
+; levels whose order of change is the information. Nothing in Loom was
+; built for it: there is no counter, no edge detector on two pins and no
+; direction logic in hardware. The program uses:
+;   - JP on input pins (SEMANTICS 6.2), built for the bit-banged receivers
+;     to test a line inside a loop: here the whole decoder is a state
+;     machine whose state is the program counter, one two-instruction poll
+;     loop per quadrature state, so a transition costs no table lookup;
+;   - ST to the data memory (6.11, D-027), built for device emulation (the
+;     24C02 of i2c_slave_eeprom.loom): the count lives in a memory word the
+;     host thread reads, so the decoder thread never touches the FIFOs and
+;     never blocks;
+;   - the shared flags SFLAGS (6.5), built for thread-to-thread signalling:
+;     flag 0 carries the direction, flag 1 is a sticky "index seen" that the
+;     host thread takes with the atomic test-and-clear of WAITS (6.4);
+;   - the timed WAITB INQ_NE, T (6.4), built for receivers that must poll
+;     the host without blocking: the host thread waits for a command or for
+;     its report deadline, whichever comes first.
+; What the firmware does that no hardware does: the x4 decode, the count,
+; the direction, the invalid-transition check, the index latch, and the
+; report. Two threads cooperate: thread 0 decodes, thread 1 answers the
+; host, and they share nothing but three memory words and two flags.
+; Weaker than a dedicated peripheral (an STM32 timer in encoder mode or a
+; dsPIC QEI, both of which count on every edge of the timer clock): the
+; channels are polled, so the edge rate is limited (below), there is no
+; input filter, and "both changed at once" means "both found changed when
+; the decoder next looks", so two legal edges closer than the decoder's
+; sampling interval are counted as one invalid transition, not as two
+; counts. The report is three memory words read one after the other while
+; the decoder runs, so the count and the index latch in one report can be
+; a few clocks apart (each word is itself consistent).
+;
+; Pins: A = IN0, B = IN1, Z = IN2 (optional; an undriven IN2 reads 0).
+; Inputs only; the program drives nothing.
+;
+; Counting rules (x4, from the STM32 encoder-mode and dsPIC QEI rules cited
+; in tools/protomodels/quadrature.py): every edge of A and of B counts.
+; With the state written AB, the forward sequence (A leads B) is
+; 00 -> 10 -> 11 -> 01 -> 00, and each step counts +1; the reverse sequence
+; counts -1. A step that changes both channels (00 <-> 11, 10 <-> 01) is
+; invalid: the count is unchanged, the error count goes up by one, and the
+; decoder follows the new state. Direction is that of the last count.
+; Index: Z is taken to be gated with A = B = 0, as the HEDS-5540's index is
+; (see the model): while the decoder is in state 00 and sees Z high, it
+; latches the count once and sets the index flag; it latches again only
+; after leaving 00 and coming back with Z high.
+;
+; Host commands (FIFO space, thread 1), one word each:
+;     0x0000            READ: push a report now
+;     0x4000            ZERO: the count reads 0 from now on (an offset is
+;                       kept; the decoder's own count runs on)
+;     0x8000 | P        PERIOD: P = 1..0x7FFF pushes a report every P ticks
+;                       of thread 1 (TICK_INT set by the host, default one
+;                       clock); P = 0 stops the periodic reports
+; Other values are taken as the command their bits 15:14 name.
+; Report (FIFO space read, thread 1), three words:
+;     word 0   COUNT, signed 16-bit, minus the ZERO offset
+;     word 1   STATUS: bit 0 DIR (1: the last count was -1, B leads A),
+;              bit 1 IDX (an index was latched since the previous report),
+;              bits 15:2 the invalid-transition count modulo 2^14
+;     word 2   INDEX, the count at the latest index, minus the ZERO offset
+; OUTQ holds four words, one report: a host that does not read keeps
+; thread 1 waiting in PUSH (and periodic reports are then late, then sent
+; back to back), but thread 0 keeps counting whatever the host does.
+;
+; How fast the edges may come (slot arithmetic, SEMANTICS 2 and 3). Thread 0
+; has an X cycle every 4 clocks. A pad change first sampled at edge e is
+; seen by X cycles from e + 1 on (the two-flop synchroniser). Each state's
+; poll loop is two JPs, one per channel, so each channel is sampled every
+; 8 clocks (12 in state 00, whose loop also samples Z): an edge is found
+; 1 to 8 clocks (1 to 12 in 00) after it is first visible. From the X cycle
+; that finds an edge, the step costs:
+;     the other channel checked (invalid?)     +4
+;     count +1 or -1                           +8
+;     ST of the count (two slots)              +12, +16
+;     SIG or CLR of DIR                        +20
+;     JMP (every -1 step, and 01 -> 00)        +24
+; and the new state's loop then samples its first channel at +24 or +28
+; and its second at +28 or +32. The channel that changes next is sampled
+; at +24 for the +1 steps 00->10, 10->11, 11->01, at +28 for 01->00, and at
+; +32 for every -1 step. So the decoder is ready for the next edge at most
+; 32 clocks (8 slots) after it found the last one, whatever the direction
+; and wherever it reverses, and it follows every edge if each edge comes at
+; least 32 clocks after the previous one: the lag behind the pads then
+; never grows, and the check of the other channel (+4) never sees the next
+; edge early. An index visit costs 24 clocks more once (the latch: Z
+; sampled, ST, SIG, the Z-less loop), which the 32-clock spacing absorbs.
+; At 50 MHz that is 640 ns per edge: 1.56 M counts/s, a 390 kHz signal on
+; each channel with ideal 90-degree phasing. The HEDS-5540 is specified to
+; 100 kHz with a 45-degree minimum state width (1.25 us, 62 clocks; see the
+; model), within the limit with a factor of two to spare. The test module
+; measures the limit (test_decoder_edge_rate_limit, _sweep): at 32 clocks
+; per edge every edge is counted in both directions, with an index every
+; 8 counts and at all four offsets against the slot grid; at 31 clocks
+; -1 steps fall behind and are reported as invalid transitions. +1 steps
+; alone hold down to 25 clocks (the average of their 24, 24, 24, 28) and
+; fail at 24, but a reversal can come at any time, so 32 is the limit.
+;
+; Registers, thread 0: r0 the count; r1 the error count; r3 zero; r7 the
+; data base. Thread 1: r0 the command; r1..r3 scratch; r4 the period P
+; (0: off); r5 the ZERO offset; r6 the next report time; r7 the data base.
+; Flags: SFLAGS bit 0 DIR, bit 1 IDX (sticky). Memory (.imem 512): thread 0
+; is 76 words from 0x000, the three data words are 0x07D..0x07F, thread 1
+; is 47 words from 0x080; 126 words in all, so threads 2 and 3 are free
+; (quad_generator.loom runs on thread 2 beside it). Neither thread has a
+; WAITD: the decoder keeps no schedule and thread 1's only deadline is a
+; timeout, so the deadline checker has no pair to prove (as for
+; wiegand_panel.loom).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   A = IN0, B = IN1, Z = IN2
+        .equ    DATA = 0x07D            ; data words, the end of thread 0's quarter
+        .equ    CNT = 0                 ; offsets from DATA
+        .equ    ERR = 1
+        .equ    IDX = 2
+        .equ    F_DIR = 0               ; SFLAGS bits
+        .equ    F_IDX = 1
+
+        .thread 0
+start:  LDI     r0, 0
+        LDI     r1, 0
+        LDI     r3, 0
+        LDI     r7, DATA
+        ST      r0, r7, CNT
+        ST      r0, r7, ERR
+        ST      r0, r7, IDX
+        CLR     F_DIR
+        CLR     F_IDX
+        JP      A, 1, st1x              ; enter the loop of the state found
+        JP      B, 0, S00
+        JMP     S01
+st1x:   JP      B, 0, S10
+        JMP     S11
+
+; State 00. The only state that looks at Z (a third slot in its loop).
+S00:    JP      A, 1, a00
+        JP      B, 1, b00
+        JP      Z, 0, S00
+        ST      r0, r7, IDX             ; Z high in 00: latch the count
+        SIG     F_IDX
+S00n:   JP      A, 1, a00               ; latched: no Z until 00 is left
+        JP      B, 0, S00n
+b00:    JP      A, 1, e11               ; B rose (00 -> 01): -1
+        SUBI    r0, 1
+        ST      r0, r7, CNT
+        SIG     F_DIR
+        JMP     S01
+e11:    ADDI    r1, 1                   ; both changed: invalid, now in 11
+        ST      r1, r7, ERR
+        JMP     S11
+a00:    JP      B, 1, e11               ; A rose (00 -> 10): +1
+        ADDI    r0, 1
+        ST      r0, r7, CNT
+        CLR     F_DIR
+
+; State 10.
+S10:    JP      B, 1, b10
+        JP      A, 1, S10
+a10:    JP      B, 1, e01               ; A fell (10 -> 00): -1
+        SUBI    r0, 1
+        ST      r0, r7, CNT
+        SIG     F_DIR
+        JMP     S00
+e01:    ADDI    r1, 1                   ; invalid, now in 01
+        ST      r1, r7, ERR
+        JMP     S01
+b10:    JP      A, 0, e01               ; B rose (10 -> 11): +1
+        ADDI    r0, 1
+        ST      r0, r7, CNT
+        CLR     F_DIR
+
+; State 11.
+S11:    JP      A, 0, a11
+        JP      B, 1, S11
+b11:    JP      A, 0, e00               ; B fell (11 -> 10): -1
+        SUBI    r0, 1
+        ST      r0, r7, CNT
+        SIG     F_DIR
+        JMP     S10
+e00:    ADDI    r1, 1                   ; invalid, now in 00
+        ST      r1, r7, ERR
+        JMP     S00
+a11:    JP      B, 0, e00               ; A fell (11 -> 01): +1
+        ADDI    r0, 1
+        ST      r0, r7, CNT
+        CLR     F_DIR
+
+; State 01.
+S01:    JP      B, 0, b01
+        JP      A, 0, S01
+a01:    JP      B, 0, e10               ; A rose (01 -> 11): -1
+        SUBI    r0, 1
+        ST      r0, r7, CNT
+        SIG     F_DIR
+        JMP     S11
+e10:    ADDI    r1, 1                   ; invalid, now in 10
+        ST      r1, r7, ERR
+        JMP     S10
+b01:    JP      A, 1, e10               ; B fell (01 -> 00): +1
+        ADDI    r0, 1
+        ST      r0, r7, CNT
+        CLR     F_DIR
+        JMP     S00
+
+        .org    DATA                    ; loaded by the image, rewritten at start
+        .word   0, 0, 0
+
+; Thread 1: the host's side. Waits for a command, or with a period set for
+; a command or the report deadline r6, whichever comes first.
+        .thread 1
+host:   LDI     r7, DATA
+        LDI     r4, 0
+        LDI     r5, 0
+idle:   POP     r0                      ; no period: wait for a command
+        JMP     cmd
+hwait:  CSRW    TD, r6                  ; the report deadline
+        WAITB   INQ_NE, T
+        BT      due
+        POP     r0                      ; INQ_NE was seen: it does not wait
+cmd:    MOV     r1, r0
+        SHRI    r1, 14                  ; bits 15:14: the command
+        BZ      read
+        CMPI    r1, 1
+        BZ      zero
+        SHLI    r0, 1                   ; PERIOD: P = bits 14:0
+        SHRI    r0, 1
+        MOV     r4, r0
+        BZ      idle                    ; P = 0: periodic reports off
+        CSRR    r6, NOW
+        ADD     r6, r6, r4              ; the first report P ticks from now
+        JMP     hwait
+zero:   LD      r5, r7, CNT             ; the offset: the count now
+        JMP     next
+read:   CALL    report
+next:   CMPI    r4, 0
+        BZ      idle
+        JMP     hwait
+due:    ADD     r6, r6, r4              ; the next deadline, no drift
+        CALL    report
+        JMP     hwait
+
+; Push one report: COUNT, STATUS, INDEX.
+report: LD      r1, r7, CNT
+        SUB     r1, r1, r5
+        PUSH    r1
+        LD      r2, r7, ERR
+        SHLI    r2, 2                   ; errors in bits 15:2
+        CSRR    r3, SFLAGS
+        ANDI    r3, 1                   ; DIR in bit 0
+        OR      r2, r2, r3
+        SETD    0                       ; TD reached: the WAITS is a test
+        WAITS   F_IDX, T                ; take IDX and clear it, atomically
+        BT      noidx
+        ORI     r2, 2
+noidx:  PUSH    r2
+        LD      r1, r7, IDX
+        SUB     r1, r1, r5
+        PUSH    r1
+        RET

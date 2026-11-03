@@ -1,0 +1,212 @@
+; quad_generator.loom
+;
+; Decisions (2026-11-03): the step period is in clocks, not ticks, so the
+; deadline checker can prove it. SETD 2, not 1, before the first staged
+; edge: with SETD 1 the first edge landed one period early although the
+; checker proved the interval (open tools question, QUESTIONS item 5 of
+; W-007; the checker was not changed).
+;
+; An incremental-encoder simulator: from the host, a step period and a
+; signed step count; the program drives the encoder's two channels A and B
+; in quadrature, one edge per step (x4 steps), and the index Z once every
+; N steps, then reports its position. A test source for a motor-control
+; board's encoder input, and for quad_decoder.loom.
+;
+; Written on 2026-11-03, after the hardware was complete (D-032), as an
+; interface Loom was not designed for (D-035). Nothing in Loom was built for
+; it: there is no quadrature or step generator in hardware. The program
+; uses:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for clock-exact bit edges of the serial transmitters (UART, CAN,
+;     DShot): every A and B edge lands on the exact clock of its tick,
+;     whatever the period;
+;   - the tick divider and its restart (a CSRW TICK_INT clears ACC,
+;     SEMANTICS 4), built for baud rates: here the step period is the tick,
+;     so one WAITD 1 per step and the host's period takes effect at once;
+;   - OUT through a one-pin OUTGRP (6.3), built for parallel buses: Z is
+;     written from a register, so the index decision needs no second
+;     branch after the edge.
+; What the firmware does that no hardware does: the Gray sequence in both
+; directions, the step count, the index position and the report.
+; Weaker than a dedicated peripheral: the deadline latch holds one pin
+; write, so only A and B are clock-exact; Z is an ordinary write in the
+; slot after the A/B edge it goes with and lags that edge by 6 to 9 clocks
+; (the WAITD completes 0 to 3 clocks after its tick, then one slot and the
+; pad register), measured by the tests. The shortest step period is 40
+; clocks (below), and the period is a whole number of clocks: TICK_FRAC is
+; left at 0, so speeds are 1/P of the clock, not continuous.
+;
+; Pins: A = OUT0, B = OUT1, Z = OUT2, push-pull outputs, low at start.
+;
+; The sequence (the counting rules of tools/protomodels/quadrature.py, the
+; same as quad_decoder.loom's): with the state written AB and the phase
+; ph = position mod 4, ph 0 is 00, 1 is 10, 2 is 11, 3 is 01. A step +1
+; (A leads B) goes 00 -> 10 -> 11 -> 01 -> 00, a step -1 the other way;
+; each step changes exactly one channel. Z is high while the position is
+; in the index state 00 of the index cycle, as the HEDS-5540's index is
+; gated with A and B low: it rises with the edge into 00 and falls with
+; the edge out of it (each 6 to 9 clocks late, above).
+;
+; Host commands (FIFO space, thread 0):
+;     P, S          a move: P = 1..0x7FFF the step period in clocks (values
+;                   below 40 are raised to 40), then S, a signed 16-bit
+;                   step count (S > 0: +1 steps, S < 0: -1 steps, 0: none).
+;                   The first edge comes 3 periods after the command is
+;                   taken (the SETD 2 anchor plus the first WAITD 1), then
+;                   one edge every P clocks exactly. At the end the program
+;                   pushes its position, signed 16-bit (0 at start), and
+;                   takes the next command; the pins hold their levels.
+;     0x8000 | N    the index: Z every N steps, N = 4..0x7FFC (bits 1:0
+;                   are ignored: an index belongs to a whole cycle of four
+;                   steps); N = 0 turns Z off. The index is placed at phase
+;                   0 of the cycle the generator is in when it takes the
+;                   command, so before any move it is at position 0, then
+;                   at every multiple of N. No reply.
+; A move runs to its end: the program reads INQ only between moves.
+;
+; Timing. The tick is the step period (CSRW TICK_INT, P), so every step is
+; SETP pin, v, D (staged) then WAITD 1, and the staged edge lands on the
+; tick at the exact clock (6.10 rule 1). `.tick 40` is the shortest period
+; the firmware allows, and the deadline checker proves every pair at it: the
+; longest interval is the -1 step out of 00 (8 slots after the WAITD that
+; ends the step before it: Z low, the cycle count down with its wrap, the
+; next step staged) and the +1 step into 00 (9 slots: the index decision
+; before the edge), 36 clocks of 40. A longer period only adds slack. The
+; first step's pair starts at the SETD 2 after the command and is proved
+; the same way. Why 2 and not 1: a staged write lands on the thread's next
+; deadline, and until the first WAITD 1 advances TD that is the SETD's own.
+; The longest path from the SETD to that WAITD is 17 slots (68 clocks, the
+; dispatch to the +1 step into 00), so with SETD 1 and P = 40 the SETD's
+; deadline (one tick, 40 clocks) passed first and the first edge came one
+; period early, with a gap of two periods after it (found by
+; test_generator_periods_and_resume; the deadline checker proves the WAITD
+; on time but does not look at that). SETD 2 gives at least 78 clocks.
+; At 50 MHz the shortest period is 0.8 us per edge, 1.25 M
+; steps/s, a 312.5 kHz signal on each channel.
+;
+; Registers: r0 the position; r1 the steps left; r2 the cycle number within
+; the index interval (0..M-1); r3 the command word; r4 M = N / 4; r5 the
+; next Z level and scratch; r6 the phase; r7 1 if the index is on, else 0.
+;
+; Memory: 106 words from 0x000, thread 0's quarter (.imem 512). Moved to
+; thread 2 (0x100) it runs beside quad_decoder.loom (threads 0 and 1,
+; 126 words), the bench wiring OUT0..OUT2 to IN0..IN2.
+;
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   A = OUT0, B = OUT1, Z = OUT2
+        .tick   40                      ; the shortest step period (header)
+        .equ    PMIN = 40
+
+start:  LDI     r0, 0
+        LDI     r2, 0
+        LDI     r4, 0
+        LDI     r6, 0
+        LDI     r7, 0
+        SETP    A, 0
+        SETP    B, 0
+        SETP    Z, 0
+        .csr    OUTGRP, (1 << 5) | 18, r5 ; OUT writes one pin: OUT2 = Z
+
+cmd:    POP     r3
+        MOV     r5, r3
+        SHRI    r5, 15
+        BNZ     index
+        CMPI    r3, PMIN                ; C = (P >= PMIN)
+        BC      pok
+        LDI     r3, PMIN
+pok:    POP     r1                      ; S
+        ADD     r0, r0, r1              ; the position at the end of the move
+        ADDI    r1, 0
+        BZ      done                    ; S = 0: nothing to do
+        CSRW    TICK_INT, r3            ; one tick per step, the grid restarted
+        SETD    2                       ; the anchor: past the dispatch (header)
+        MOV     r5, r1
+        SHRI    r5, 15
+        BNZ     back
+        CMPI    r6, 1                   ; +1 steps from the phase we are in
+        BZ      F1
+        CMPI    r6, 2
+        BZ      F2
+        CMPI    r6, 3
+        BZ      F3
+
+; +1 steps. Each block stages its edge, waits for its tick, then counts.
+F0:     SETP    A, 1, D                 ; 00 -> 10
+        WAITD   1
+        SETP    Z, 0                    ; Z ends with state 00
+        DJNZ    r1, F1
+        LDI     r6, 1
+        JMP     done
+F1:     SETP    B, 1, D                 ; 10 -> 11
+        WAITD   1
+        DJNZ    r1, F2
+        LDI     r6, 2
+        JMP     done
+F2:     SETP    A, 0, D                 ; 11 -> 01
+        WAITD   1
+        DJNZ    r1, F3
+        LDI     r6, 3
+        JMP     done
+F3:     SETP    B, 0, D                 ; 01 -> 00: a new cycle
+        LDI     r5, 0
+        ADDI    r2, 1
+        CMP     r2, r4
+        BNZ     f3a
+        LDI     r2, 0                   ; the index cycle: Z if the index is on
+        MOV     r5, r7
+f3a:    WAITD   1
+        OUT     r5                      ; Z rises with the edge into 00
+        DJNZ    r1, F0
+        LDI     r6, 0
+        JMP     done
+
+; -1 steps.
+back:   NEG     r1, r1                  ; |S|; -32768 gives 32768, as DJNZ wants
+        CMPI    r6, 1
+        BZ      B1
+        CMPI    r6, 2
+        BZ      B2
+        CMPI    r6, 3
+        BZ      B3
+B0:     SETP    B, 1, D                 ; 00 -> 01: the cycle before
+        WAITD   1
+        SETP    Z, 0
+        SUBI    r2, 1                   ; C = 0: it was 0, wrap to M - 1
+        BC      b0a
+        MOV     r2, r4
+        SUBI    r2, 1
+b0a:    DJNZ    r1, B3
+        LDI     r6, 3
+        JMP     done
+B3:     SETP    A, 1, D                 ; 01 -> 11
+        WAITD   1
+        DJNZ    r1, B2
+        LDI     r6, 2
+        JMP     done
+B2:     SETP    B, 0, D                 ; 11 -> 10
+        WAITD   1
+        DJNZ    r1, B1
+        LDI     r6, 1
+        JMP     done
+B1:     SETP    A, 0, D                 ; 10 -> 00
+        LDI     r5, 0
+        CMPI    r2, 0
+        BNZ     b1a
+        MOV     r5, r7                  ; the index cycle
+b1a:    WAITD   1
+        OUT     r5
+        DJNZ    r1, B0
+        LDI     r6, 0
+
+done:   PUSH    r0                      ; the move is over: report the position
+        JMP     cmd
+
+index:  SHLI    r3, 1                   ; M = bits 14:2 of the word
+        SHRI    r3, 3
+        MOV     r4, r3
+        LDI     r7, 0
+        BZ      inone                   ; N = 0: no index
+        LDI     r7, 1
+inone:  LDI     r2, 0                   ; the index cycle is the current one
+        JMP     cmd
