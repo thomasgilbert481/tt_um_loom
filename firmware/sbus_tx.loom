@@ -1,0 +1,183 @@
+; sbus_tx.loom
+; A Futaba S.BUS transmitter: what a radio-control receiver sends to a
+; flight controller, or a trainer port to a servo decoder. Frames of 16
+; channels go out on OUT0 at a fixed period, built from a channel table
+; in data memory that the host loads (and may rewrite at any time).
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): S.BUS is in no design
+; document. It uses the M2 core (pins, deadlines), the thread's bit engine
+; in manual mode (SHO, SEMANTICS 6.9, built for the synchronous serial
+; programs) with its INV bit (BE_CFG bit 7) and CNT as the bit counter,
+; PAR (6.1) for the parity bit, and LD/ST to data memory (6.11, built so
+; device emulators can keep a register file). No hardware knows S.BUS or
+; even a UART: the 8E2 framing, the parity, the 11-bit channel packing,
+; the frame layout and the frame period are firmware.
+;
+; The frame (secondary sources, tools/protomodels/sbus.py names them): 25
+; bytes of 8E2 at 100000 baud, the line inverted (idle low, a start bit
+; high): 0x0F; 22 bytes holding channels 1 .. 16, 11 bits each, LSB first
+; (channel k is bits 11k .. 11k + 10 of the 176-bit little-endian field);
+; the flags byte; 0x00. Each byte goes out as start (high), the 8 data
+; bits LSB first, the even-parity bit, two stop bits (low), with no idle
+; time between bytes: a frame is 300 bits, 3 ms. SHO inverts every level
+; it writes (BE_CFG.INV), so the pin needs no external inverter; the
+; idle level is the inverted 1 the last stop bit leaves.
+;
+; Rate: one tick a bit. The host sets TICK_INT/TICK_FRAC to a bit before
+; RUN: 100000 baud at 50 MHz is TICK_INT 500, TICK_FRAC 0 (500 clocks,
+; a multiple of 4, so every edge lands the same 4 clocks after its tick
+; and the bits are exactly 500 clocks). The deadline pairs are proved for
+; a tick of 128 clocks or more (.tick below; the tests run at 128).
+;
+; The period. Frames start PERIOD ticks apart, exactly: PERIOD is a word
+; the host loads (data memory, below), 1400 at load: 14 ms at 100000
+; baud, the normal rate; 700 is 7 ms, the high-speed rate (PX4 gives 7 ms
+; as the minimum spacing; the 14 ms figure is not in any of the sources
+; checked and is marked unchecked there). A frame is 300 ticks and the
+; next is built in the idle time after it, two ticks a byte, so PERIOD
+; values under 352 are raised to 352. The program reads PERIOD at the end
+; of each frame, so a new value applies from the next gap.
+;
+; Building. After each frame the next one is built in a frame buffer FB,
+; one byte every two idle ticks: an even tick makes the byte (0x0F, the
+; next 8 bits of the channel field, the flags word's low byte, 0x00), the
+; odd tick after it makes the 12-bit pattern the bit engine shifts out,
+; start bit first: bit 0 = 0, bits 8:1 the byte, bit 9 its even parity,
+; bits 11:10 = 1. The channels are read once each, as their bytes are
+; built, over the 50 ticks after a frame: every frame holds one value of
+; each channel (each a single word), and a channel rewritten while a
+; frame is being built goes out in that frame or the next. Channel words
+; above 2047 are taken mod 2048 (bits 15:11 are ignored).
+;
+; Data memory (thread 3's quarter; the host writes it through IMEM space):
+;     0x180 .. 0x18F  CHT, channels 1 .. 16 (11 bits), 992 at load: the
+;                     centre (EdgeTX's SBUS_CHAN_CENTER)
+;     0x190  FLAGT    the flags byte, low 8 bits (bit 0 ch17, bit 1 ch18,
+;                     bit 2 frame lost, bit 3 failsafe), 0 at load
+;     0x191  PERIOD   ticks from frame to frame, 1400 at load
+;     0x192 .. 0x1AA  FB, the next frame's 25 patterns (no image needed)
+;
+; Pins: TX = OUT0 (to the S.BUS input of a flight controller or servo
+; decoder, 3.3 V logic). Runs on thread 1 (code 0x080 ..), so that it can
+; share an image with sbus_rx.loom on thread 0 (code 0x000 .., data
+; 0x100 ..), as the tests do with OUT0 wired to IN0.
+;
+; Weaker than a dedicated peripheral: nothing at this rate. The first
+; frame goes out 52 ticks after RUN (the first build), and while the host
+; rewrites the channel table, the frame being built may hold some old
+; and some new channels; a host that needs all of them to change in one
+; frame rewrites the table in the gap after a build (PERIOD - 350 ticks)
+; or accepts a one-frame mix.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   TX = OUT0
+        .equ    CHT = 0x180             ; data memory (header)
+        .equ    FLAGT = CHT + 16
+        .equ    PERW = FLAGT + 1
+        .equ    FB = PERW + 1
+        .equ    FRAME = 300             ; ticks a frame takes: 25 bytes of 12 bits
+        .equ    MINIDLE = 52            ; the build's 50 ticks and two spare
+        .equ    STEPS = 50              ; build half-steps, two a byte
+
+; Registers: r0 the byte, then its pattern; r1 where in FB; r2 the next
+; channel; r3 the channel bits not yet sent, r4 how many; r5 the ticks
+; (or bytes) left; r6 the build's half-step; r7 scratch.
+        .thread 1
+        .tick   128                     ; the shortest tick the pairs are proved for
+        .csr    BE_PINS, pin(TX)        ; SHO writes TX
+        .csr    BE_CFG, 0x80            ; INV: the line is inverted; NRZ, LSB first
+        SETP    TX, 0                   ; idle: low (an inverted 1)
+        LDI     r5, MINIDLE - 1         ; the first build, then the first frame
+        LDI     r6, 0
+        SETD    1                       ; anchor the schedule a tick ahead
+        JMP     idle
+
+; --------------------------------------------------------------- a frame
+frame:  MOV16   r1, FB
+        LDI     r5, 25
+byte:   LD      r0, r1, 0               ; the next pattern
+        INC     r1
+        LDSR    r0
+        LDI     r7, 12
+        CSRW    CNT, r7                 ; twelve bits
+bit:    WAITD   1                       ; the bit's tick
+        SHO                             ; every edge: the slot after its WAITD
+        BNZ     bit                     ; Z after the twelfth
+        DJNZ    r5, byte
+        MOV16   r7, PERW                ; the gap: PERIOD - 300 ticks, at least 52
+        LD      r5, r7, 0
+        MOV16   r7, FRAME + MINIDLE
+        CMP     r5, r7
+        BC      plong
+        MOV     r5, r7
+plong:  MOV16   r7, FRAME + 1         ; the last gap tick is the WAITD after count
+        SUB     r5, r5, r7
+        LDI     r6, 0
+
+; -------------------------------------------------------- the gap: build
+; One tick per pass. Half-steps 0 .. 49 build byte r6 / 2: an even one
+; makes the byte in r0, the odd one after it its pattern, into FB.
+idle:   WAITD   1
+        CMPI    r6, STEPS
+        BC      count                   ; built
+        MOV     r7, r6
+        ANDI    r7, 1
+        BNZ     pat
+        MOV     r7, r6
+        SHRI    r7, 1                   ; the byte's index
+        BZ      b0
+        CMPI    r7, 23
+        BZ      b23
+        BC      b24
+        CMPI    r4, 8                   ; bytes 1 .. 22
+        BC      held                    ; 8 bits or more held: no channel needed
+        LD      r7, r2, 0               ; the next channel
+        INC     r2
+        SHLI    r7, 5
+        SHRI    r7, 5                   ; 11 bits
+        MOV     r0, r7
+        SHL     r0, r0, r4
+        OR      r0, r0, r3              ; the held bits, then the channel's
+        LDI     r3, 8
+        SUB     r3, r3, r4
+        SHR     r3, r7, r3              ; the channel's bits not in this byte
+        ADDI    r4, 3                   ; n + 11 - 8
+        JMP     next
+held:   MOV     r0, r3
+        SHRI    r3, 8
+        SUBI    r4, 8
+        JMP     next
+b0:     LDI     r0, 0x0F                ; the start byte; the field starts
+        LDI     r3, 0
+        LDI     r4, 0
+        MOV16   r2, CHT
+        MOV16   r1, FB
+        JMP     next
+b23:    MOV16   r7, FLAGT
+        LD      r0, r7, 0               ; the flags (low byte, below)
+        JMP     next
+b24:    LDI     r0, 0                   ; the end byte
+        JMP     next
+pat:    SHLI    r0, 8
+        SHRI    r0, 8                   ; the byte
+        PAR     r7, r0                  ; C = its parity: the even-parity bit
+        LDI     r7, 0
+        LDIH    r7, 0x0C                ; the stop bits (LDI, LDIH keep C)
+        BNC     peven
+        LDIH    r7, 0x0E                ; and the parity bit
+peven:  SHLI    r0, 1                   ; the start bit, 0
+        OR      r0, r0, r7
+        ST      r0, r1, 0
+        INC     r1
+next:   INC     r6
+count:  DJNZ    r5, idle
+        WAITD   1                       ; the gap's last tick: nothing is built in it
+        JMP     frame
+
+; The table, its flags and the period, as the header gives them.
+        .org    CHT
+        .word   992, 992, 992, 992, 992, 992, 992, 992
+        .word   992, 992, 992, 992, 992, 992, 992, 992
+        .word   0                       ; FLAGT
+        .word   1400                    ; PERIOD: 14 ms at 100000 baud

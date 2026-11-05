@@ -1,0 +1,286 @@
+; sbus_rx.loom
+; A Futaba S.BUS receiver: the serial bus a radio-control receiver sends to
+; a flight controller or a servo decoder. Frames come in on IN0, their 16
+; channels are unpacked into a table in data memory and a status word per
+; frame goes to the host through OUTQ[0].
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): S.BUS is in no design
+; document. It uses the M2 core (pins, deadlines, a timed WAITP for the
+; inter-frame gap, a FIFO for the status words), the thread's bit engine
+; in manual mode (SHI, SEMANTICS 6.9, built for the synchronous serial
+; programs) with its INV bit (BE_CFG bit 7, "invert the pin sense",
+; ARCHITECTURE 8.1), PAR (6.1) for the parity bit, and LD/ST to data
+; memory (6.11, built so device emulators can keep a register file). No
+; hardware knows S.BUS or even a UART: the 8E2 framing, the parity and
+; stop-bit checks, frame sync on the gap, the 11-bit channel unpacking,
+; the flags and the counters are firmware.
+;
+; S.BUS has no public formal standard. Every figure here is from public
+; decoder and encoder source, a secondary source (tools/protomodels/sbus.py
+; names the files and lines): 100000 baud, 8 data bits, even parity, two
+; stop bits, the line inverted (idle low, a start bit high); a frame is 25
+; bytes: 0x0F, 22 bytes holding 16 channels of 11 bits LSB first, a flags
+; byte (bit 0 channel 17, bit 1 channel 18, bit 2 frame lost, bit 3
+; failsafe) and an end byte 0x00. Frames come every 14 ms, or every 7 ms
+; in the receivers' high-speed mode, and nothing in a frame marks its
+; start except the silence before it (PX4: "frame boundaries by the
+; inter-frame delay").
+;
+; The inversion: Loom's pads have no inversion, so it is done inside the
+; chip, and a real board needs no inverter between the receiver and IN0
+; (the usual hex inverter or transistor on a flight controller is not
+; fitted). SHI inverts the samples it shifts in (BE_CFG.INV); the WAITP
+; and JP that find the start bit and test the stop bits are written for
+; the inverted levels (start bit: wait for IN0 = 1; a stop bit is good when
+; IN0 = 0). A frame from a receiver that sends S.BUS uninverted (some do,
+; as an option) is not received: assemble with INV = 0 and the levels of
+; the WAITP and JP swapped for that.
+;
+; Rate: 8 ticks a bit. The host sets TICK_INT/TICK_FRAC to an eighth of a
+; bit before RUN: 100000 baud at 50 MHz is 62 + 128/256 (62.5 clocks a
+; tick). The deadline pairs are proved for ticks of 16 clocks or more
+; (.tick below; the tests run at 16, 128 clocks a bit). Sampling is
+; uart_rx.loom's slow entry: WAITP finds the start bit, SETD 0 anchors on
+; it, the samples sit within -P + 12 .. +12 clocks of mid-bit (P the
+; tick): -50 .. +12 clocks of a 500-clock bit at 100000 baud.
+;
+; A byte: the start bit must still be high at its middle (else it was a
+; glitch); SHI takes the 8 data bits and the parity bit (CNT = 9, LSB
+; first, so SR 15:7 holds them); PAR gives the parity of all nine, which
+; must be even; each stop bit is sampled at its middle and must be low.
+; The byte is booked between the parity sample and the second stop
+; sample, so the start-bit wait is back 9 slots after the last stop
+; sample, well inside the half bit (4 ticks) a back-to-back byte leaves.
+;
+; Frame sync. After each byte's second stop bit TD is set to the end of
+; that bit plus GAPB bit times and the next start bit is waited for with a
+; timeout there. A timeout is a gap: the frame, if any, has ended and the
+; next byte is a frame's first. GAPB = 48 bits (480 us at 100000 baud):
+; Betaflight restarts a frame when 5 byte times (600 us) pass from one
+; byte's arrival to the next, that is 48 bit times of idle after a byte;
+; the shortest gap between frames is 4 ms (7 ms period, 3 ms frame), so
+; any GAPB from about 12 to 390 bits would do. The receiver starts out of
+; sync and takes no frame until it has seen a gap first, so starting it in
+; the middle of a frame cannot misframe the bytes.
+;
+; A frame is the bytes between two gaps. It is good when it is exactly 25
+; bytes, every byte had even parity and two low stop bits, the first is
+; 0x0F and the last 0x00. Bytes 1 .. 22 are unpacked as they arrive into
+; the staging table STG (channel k is bits 11k .. 11k + 10 of the 176-bit
+; little-endian field), byte 23 is the flags. The frame is decided right
+; after the 25th byte's second stop bit: a good frame whose failsafe bit
+; is clear has STG copied into CH; a failsafe frame leaves CH as it was
+; (the receiver's failsafe values are not taken; the last good channels
+; are held, as Betaflight does with a failsafe frame). Bytes after the
+; 25th, before the next gap, are ignored; such a frame stays good.
+;
+; Status (OUTQ[0]), one word per frame, if OUTQ has room (else the word is
+; dropped; the counters below keep everything):
+;     a good frame  bit 15 = 0, bits 7:0 the flags byte, bits 14:8 the
+;                   count of frames with the frame-lost bit, mod 128
+;     a bad frame   bit 15 = 1, bits 4:0 why: 0x01 a parity error, 0x02 a
+;                   stop bit high, 0x04 the first byte not 0x0F, 0x08 the
+;                   last not 0x00, 0x10 a gap before the 25th byte (a
+;                   short frame; it is not decided before the gap)
+; A glitch on an idle line makes no word.
+;
+; Data memory (thread 2's quarter; the host reads it through IMEM space):
+;     0x100 .. 0x10F  STG, the frame being received (channels 1 .. 16)
+;     0x110 .. 0x11F  CH, the last good frame's channels, 11 bits, 0 at load
+;     0x120  FLAGS    the last good frame's flags byte (failsafe ones too)
+;     0x121  GOOD     frames that updated CH        (16-bit counters,
+;     0x122  LOST     good frames with frame lost    0 at load)
+;     0x123  FSAFE    good frames with failsafe (CH held)
+;     0x124  BAD      frames rejected
+;
+; Pins: RX = IN0, from the receiver's S.BUS output (3.3 V logic).
+;
+; Weaker than a dedicated S.BUS UART: none in practice at this rate (a
+; byte is 6000 clocks; the thread uses under 60 slots of the 1500 it gets
+; per byte). Reception stops while a stop bit is held high (a break), as
+; uart_rx's does; the frame is reported bad when the line returns.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0
+        .equ    OVS = 8                 ; ticks a bit
+        .equ    GAPB = 48               ; bit times of idle that end a frame
+        .equ    GAPT = GAPB * OVS + OVS / 2     ; from the middle of a stop bit
+        .equ    STG = 0x100             ; data memory (header)
+        .equ    CH = STG + 16
+        .equ    FLAGSW = CH + 16        ; FLAGS, GOOD, LOST, FSAFE, BAD
+        .equ    DONE = 25               ; r1 after the 25th byte
+        .equ    DISC = 26               ; r1 while ignoring bytes until a gap
+        .equ    PERR = 0x01             ; r2, the reasons a frame is bad
+        .equ    SERR = 0x02
+        .equ    HDR = 0x04
+        .equ    FTR = 0x08
+        .equ    SHORT = 0x10
+
+; Registers: r0 the nine bits, r1 the byte's position (0 .. 24, DONE,
+; DISC), r2 the reasons, r3 the unpacking accumulator (the flags byte from
+; byte 23 on), r4 the bits it holds, r5 where the next channel goes, r6
+; and r7 scratch (r7 holds the byte while it is booked).
+        .thread 0
+        .tick   16                      ; the shortest tick the pairs are proved for
+        .csr    BE_PINS, pin(RX) << 5   ; SHI reads RX
+        .csr    BE_CFG, 0x80            ; INV: the line is inverted; NRZ, LSB first
+        LDI     r1, DISC                ; out of sync until a gap
+        LDI     r2, 0
+        SETD    0                       ; the gap timer runs from here
+        JMP     gapw
+
+glitch: JMP     gapw                    ; no byte; the gap timer restarts
+hunt:   WAITP   RX, 1                   ; a frame's first start bit (high)
+char:   SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 0, glitch           ; low again: not a start bit
+        LDI     r0, 9
+        CSRW    CNT, r0                 ; 8 data bits and the parity bit
+bit:    WAITD   OVS                     ; the middle of the next bit
+        SHI                             ; sample, inverted; Z on the ninth
+        BNZ     bit
+        STSR    r0
+        SHRI    r0, 7                   ; bits 7:0 the byte, bit 8 the parity bit
+        PAR     r7, r0                  ; C = 1: odd parity
+        BNC     pok
+        ORI     r2, PERR
+pok:    SHLI    r7, 8
+        SHRI    r7, 8                   ; r7 = the byte
+        CMPI    r1, DISC
+        BC      stop1                   ; ignoring until a gap
+        TEST    r1, r1
+        BZ      head
+        CMPI    r1, 23
+        BZ      flagb
+        BC      foot                    ; 24
+
+; Bytes 1 .. 22: the byte goes above the bits held; once 11 or more are
+; held the low 11 are a channel, stored after the first stop sample, and
+; the byte's bits not yet used are kept (16-bit safe: at most 10 bits are
+; held before a byte, so the byte's own top bits are taken from r7, not
+; from above bit 15).
+unp:    MOV     r6, r7
+        SHL     r6, r6, r4              ; the byte above the bits held
+        OR      r3, r3, r6
+        ADDI    r4, 8
+        INC     r1
+        WAITD   OVS                     ; the middle of the first stop bit
+        JP      RX, 1, serr             ; high: a stop bit is 0
+        CMPI    r4, 11
+        BNC     stop2                   ; under 11 bits: no channel yet
+        SHLI    r3, 5
+        SHRI    r3, 5                   ; the channel, 11 bits
+        ST      r3, r5, 0
+        INC     r5
+        SUBI    r4, 11                  ; the bits left over
+        LDI     r6, 8
+        SUB     r6, r6, r4              ; 11 - the bits held before the byte
+        SHR     r3, r7, r6              ; the byte's bits not yet used
+        JMP     stop2
+serr:   ORI     r2, SERR                ; a stop bit was high
+        WAITP   RX, 0                   ; wait out a break
+        SETD    0
+        JMP     tail
+
+head:   CMPI    r7, 0x0F                ; byte 0
+        BZ      hok
+        ORI     r2, HDR
+hok:    LDI     r3, 0                   ; the channels start
+        LDI     r4, 0
+        MOV16   r5, STG
+        INC     r1
+        JMP     stop1
+flagb:  MOV     r3, r7                  ; byte 23 (176 bits: r3 is empty)
+        INC     r1
+        JMP     stop1
+foot:   TEST    r7, r7                  ; byte 24
+        BZ      fok
+        ORI     r2, FTR
+fok:    INC     r1                      ; DONE
+
+stop1:  WAITD   OVS                     ; the middle of the first stop bit
+        JP      RX, 1, serr
+stop2:  WAITD   OVS                     ; the middle of the second
+        JP      RX, 1, serr
+tail:   CMPI    r1, DONE
+        BNZ     gapw
+        JMP     pub                     ; the 25th byte: decide the frame
+gapw:   MOV16   r6, GAPT
+        CSRR    r7, TD
+        ADD     r7, r7, r6
+        CSRW    TD, r7                  ; the stop bit's end + GAPB bits
+        WAITP   RX, 1, T                ; the next start bit, or a gap
+        BNT     char                    ; a byte in time
+        CMPI    r1, DONE                ; a gap: DISC (DONE never waits here)
+        BC      sync
+        TEST    r1, r1
+        BZ      sync                    ; no byte since the last gap
+        ORI     r2, SHORT
+        CALL    bad
+sync:   LDI     r1, 0                   ; the next byte is a frame's first
+        LDI     r2, 0
+        JMP     hunt
+
+
+; The published table and the counters, zero at load (STG needs no
+; image: every word is stored before it is read). The frame's code
+; follows them in thread 2's quarter, which this program does not start:
+; thread 0's quarter holds the byte and the gap code (header, words).
+        .org    CH
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0           ; FLAGS, GOOD, LOST, FSAFE, BAD
+
+; ------------------------------------------------------------ the frame
+; After the 25th byte's second stop sample (or the break that followed
+; it). TD is that sample's deadline, or the SETD after the break, and is
+; reached: the WAITB below is a test, and gapw times the gap from TD, so
+; the slots spent here do not move it.
+pub:    LDI     r1, DISC                ; bytes until the gap are ignored
+        TEST    r2, r2
+        BZ      good
+        CALL    bad
+        JMP     gapw
+good:   MOV16   r6, FLAGSW
+        ST      r3, r6, 0               ; FLAGS
+        LDI     r7, 8
+        TEST    r3, r7
+        BNZ     fsafe                   ; failsafe: CH is held
+        MOV16   r5, STG
+        LDI     r4, 16
+copy:   LD      r7, r5, 0
+        ST      r7, r5, 16              ; CH = STG + 16
+        INC     r5
+        DJNZ    r4, copy
+        LD      r7, r6, 1
+        INC     r7
+        ST      r7, r6, 1               ; GOOD
+        JMP     lost
+fsafe:  LD      r7, r6, 3
+        INC     r7
+        ST      r7, r6, 3               ; FSAFE
+lost:   LD      r7, r6, 2
+        LDI     r4, 4
+        TEST    r3, r4
+        BZ      rep                     ; no frame lost
+        INC     r7
+        ST      r7, r6, 2               ; LOST
+rep:    SHLI    r7, 9
+        SHRI    r7, 1                   ; LOST mod 128, in bits 14:8
+        OR      r7, r7, r3              ; the flags byte in bits 7:0
+        WAITB   OUTQ_NF, T              ; TD is reached: T = 1 only if OUTQ is full
+        BT      pdone                   ; full: the word is dropped
+        PUSH    r7                      ; cannot stall: OUTQ had room
+pdone:  JMP     gapw
+
+; A bad frame: BAD + 1 and the reasons, with bit 15, to OUTQ if it has
+; room. Called with TD reached (above, and at a gap's timeout).
+bad:    MOV16   r6, FLAGSW
+        LD      r7, r6, 4
+        INC     r7
+        ST      r7, r6, 4               ; BAD
+        LDIH    r2, 0x80                ; bit 15 (r2 is under 256)
+        WAITB   OUTQ_NF, T
+        BT      bret
+        PUSH    r2
+bret:   RET

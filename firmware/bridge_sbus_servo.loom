@@ -1,0 +1,376 @@
+; bridge_sbus_servo.loom
+; An S.BUS-to-servo decoder: thread 0 receives Futaba S.BUS on IN0 (as
+; firmware/sbus_rx.loom does) and threads 1 and 2 drive 14 hobby-servo
+; outputs from its channels 1 .. 14, one 1000 .. 2000 us pulse per servo
+; every 20 ms. No host in the loop: the host loads the image, sets the
+; three ticks and starts the threads; afterwards it may read OUTQ[0] (the
+; status words of sbus_rx) and the counters, and need not.
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): neither S.BUS nor servo
+; pulses is in any design document. Thread 0 uses what sbus_rx.loom uses
+; (SHI with BE_CFG.INV, PAR, a timed WAITP for the frame gap, LD/ST);
+; threads 1 and 2 use OUT through an OUTGRP pin group (SEMANTICS 6.3,
+; built for parallel buses: here one write ends one pulse and starts the
+; next) and the deadline register written at run time (CSRW TD, 6.6,
+; built so a receiver can time a silence) for pulse widths longer than
+; the 255 ticks a WAITD holds. Data memory (6.11) carries the channels
+; from thread 0 to threads 1 and 2. No hardware knows either protocol or
+; the bridge: S.BUS framing and unpacking, the scaling to microseconds,
+; the servo frame and the failsafe behaviour are firmware.
+;
+; Outputs: 14, the pin budget. A pin group is up to 16 consecutive pin
+; indices and the writable pads are two runs, BIDIR0 .. 7 (indices 0 .. 7)
+; and OUT0 .. 5 (16 .. 21); IN0 is the S.BUS input, so the 14 writable pads
+; are all used. Thread 1 drives channels 1 .. 8 on BIDIR0 .. 7 (push-pull,
+; PIN_OE set), thread 2 channels 9 .. 14 on OUT0 .. 5, so the slot budget
+; is not what limits it (each thread uses about 30 slots a pulse of the
+; 12500 a 1 ms pulse leaves it). Each thread pulses its servos one after
+; the other, as a classic PPM receiver's decoder does: a servo frame of
+; 8 pulses is at most 8 x 2012 us = 16.1 ms, inside the 20 ms period;
+; a ninth would fit (18.1 ms), there is no ninth pin.
+;
+; Pulse width (secondary sources, tools/protomodels/sbus.py): Betaflight's
+; S.BUS scaling, w = 880 + 5 * raw / 8 us, with raw clamped to Betaflight's
+; S.BUS digital range 173 .. 1812, so w runs 988 .. 2012 us and the centre
+; (992) is 1500 us; PX4 and ArduPilot map 200 .. 1800 to 1000 .. 2000 us,
+; the same slope. The division rounds down: whole microseconds. The servo
+; frame is 20 ms, the 50 Hz of an analogue servo (a common RC figure; not
+; checked against a servo datasheet here, so marked unchecked).
+;
+; Timing. Threads 1 and 2 tick once a microsecond: the host sets
+; TICK_INT 50 (50 MHz) on both. A pulse of w ticks starts at a deadline
+; D: one OUT raises its pin (and lowers the one before), then WAITD 200
+; (the next pulse's width is computed in those 200 ticks) and the rest of
+; the width is set by writing TD = D + w - 1 for a final WAITD 1. Every
+; edge is the second slot after its WAITD completes, so every pulse is w
+; ticks to within the 0 .. 3 clocks of the slot grid (SEMANTICS 2): at 50
+; clocks a tick, w us +- 60 ns. The pairs are proved for ticks of 16
+; clocks or more (.tick below; the tests run the servos at 16, with the
+; servo frame shortened through FRAMEW).
+;
+; Before the first good frame there are no pulses (most receivers send
+; none until they have a link); the servo threads look again every 1000
+; ticks (1 ms). After it, each servo frame uses the channels as they are
+; when each pulse's width is computed, at the start of the pulse before
+; (the first one's at the end of the frame before's last pulse).
+; Failsafe: a frame with its failsafe bit set does not change CH (thread
+; 0, as in sbus_rx), and no frame at all changes nothing, so the servos
+; hold their last pulses for as long as the link is lost. A receiver that
+; sends its own failsafe positions as ordinary frames (failsafe bit clear)
+; moves the servos there, as it would without the bridge.
+;
+; Rates: thread 0 at an eighth of an S.BUS bit, 62 + 128/256 at 50 MHz
+; (sbus_rx.loom); threads 1 and 2 at 50 (1 us). Thread 0's code and
+; behaviour are sbus_rx.loom's, with the data memory moved (below).
+;
+; Data memory (thread 3's quarter, which no thread runs):
+;     0x180 .. 0x18F  STG; 0x190 .. 0x19F CH; 0x1A0 FLAGS; 0x1A1 GOOD;
+;     0x1A2 LOST; 0x1A3 FSAFE; 0x1A4 BAD: as sbus_rx.loom, 0x80 higher
+;     0x1A5 ..        thread 0's frame code (as sbus_rx.loom's at 0x125)
+;     0x1F0  FRAMEW   the servo frame in ticks, 20000 at load (20 ms)
+;     0x1F1 .. 0x1F4  the servo threads' groups: first channel's address,
+;                     servo count, for thread 1 then thread 2
+; Code: thread 0 at 0x000, the servo code in thread 1's quarter, thread
+; 2's four words at 0x100 (it sets its pin group and jumps into thread
+; 1's code; both run the same instructions at the same tick, so thread
+; 1's deadline analysis is the proof for both).
+;
+; Pins: RX = IN0 (S.BUS from the receiver); servo signals BIDIR0 .. 7
+; (channels 1 .. 8) and OUT0 .. 5 (channels 9 .. 14), 3.3 V push-pull,
+; low between pulses.
+;
+; Decided at integration (2026-11-05): end byte 0x00 only (S.BUS, not
+; S.BUS2); a failsafe frame holds the last good channels; servo scaling is
+; Betaflight's 5 * raw / 8 + 880 us; the 14 ms frame period and the 20 ms
+; servo frame are unchecked, and both are host-set. The bridge's thread 2
+; runs thread 1's servo code, so its timing rests on thread 1's proof (same
+; code, same tick).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0
+        .pins   SV0 = BIDIR0, SV8 = OUT0  ; the two servo groups' first pins
+        .equ    OVS = 8                 ; ticks a bit
+        .equ    GAPB = 48               ; bit times of idle that end a frame
+        .equ    GAPT = GAPB * OVS + OVS / 2     ; from the middle of a stop bit
+        .equ    STG = 0x180             ; data memory (header)
+        .equ    CH = STG + 16
+        .equ    FLAGSW = CH + 16        ; FLAGS, GOOD, LOST, FSAFE, BAD
+        .equ    DONE = 25               ; r1 after the 25th byte
+        .equ    DISC = 26               ; r1 while ignoring bytes until a gap
+        .equ    PERR = 0x01             ; r2, the reasons a frame is bad
+        .equ    SERR = 0x02
+        .equ    HDR = 0x04
+        .equ    FTR = 0x08
+        .equ    SHORT = 0x10
+
+; Registers: r0 the nine bits, r1 the byte's position (0 .. 24, DONE,
+; DISC), r2 the reasons, r3 the unpacking accumulator (the flags byte from
+; byte 23 on), r4 the bits it holds, r5 where the next channel goes, r6
+; and r7 scratch (r7 holds the byte while it is booked).
+; ================================================ thread 0: S.BUS in
+; sbus_rx.loom's thread, unchanged but for STG.
+        .thread 0
+        .tick   16                      ; the shortest tick the pairs are proved for
+        .csr    BE_PINS, pin(RX) << 5   ; SHI reads RX
+        .csr    BE_CFG, 0x80            ; INV: the line is inverted; NRZ, LSB first
+        LDI     r1, DISC                ; out of sync until a gap
+        LDI     r2, 0
+        SETD    0                       ; the gap timer runs from here
+        JMP     gapw
+
+glitch: JMP     gapw                    ; no byte; the gap timer restarts
+hunt:   WAITP   RX, 1                   ; a frame's first start bit (high)
+char:   SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 0, glitch           ; low again: not a start bit
+        LDI     r0, 9
+        CSRW    CNT, r0                 ; 8 data bits and the parity bit
+bit:    WAITD   OVS                     ; the middle of the next bit
+        SHI                             ; sample, inverted; Z on the ninth
+        BNZ     bit
+        STSR    r0
+        SHRI    r0, 7                   ; bits 7:0 the byte, bit 8 the parity bit
+        PAR     r7, r0                  ; C = 1: odd parity
+        BNC     pok
+        ORI     r2, PERR
+pok:    SHLI    r7, 8
+        SHRI    r7, 8                   ; r7 = the byte
+        CMPI    r1, DISC
+        BC      stop1                   ; ignoring until a gap
+        TEST    r1, r1
+        BZ      head
+        CMPI    r1, 23
+        BZ      flagb
+        BC      foot                    ; 24
+
+; Bytes 1 .. 22: the byte goes above the bits held; once 11 or more are
+; held the low 11 are a channel, stored after the first stop sample, and
+; the byte's bits not yet used are kept (16-bit safe: at most 10 bits are
+; held before a byte, so the byte's own top bits are taken from r7, not
+; from above bit 15).
+unp:    MOV     r6, r7
+        SHL     r6, r6, r4              ; the byte above the bits held
+        OR      r3, r3, r6
+        ADDI    r4, 8
+        INC     r1
+        WAITD   OVS                     ; the middle of the first stop bit
+        JP      RX, 1, serr             ; high: a stop bit is 0
+        CMPI    r4, 11
+        BNC     stop2                   ; under 11 bits: no channel yet
+        SHLI    r3, 5
+        SHRI    r3, 5                   ; the channel, 11 bits
+        ST      r3, r5, 0
+        INC     r5
+        SUBI    r4, 11                  ; the bits left over
+        LDI     r6, 8
+        SUB     r6, r6, r4              ; 11 - the bits held before the byte
+        SHR     r3, r7, r6              ; the byte's bits not yet used
+        JMP     stop2
+serr:   ORI     r2, SERR                ; a stop bit was high
+        WAITP   RX, 0                   ; wait out a break
+        SETD    0
+        JMP     tail
+
+head:   CMPI    r7, 0x0F                ; byte 0
+        BZ      hok
+        ORI     r2, HDR
+hok:    LDI     r3, 0                   ; the channels start
+        LDI     r4, 0
+        MOV16   r5, STG
+        INC     r1
+        JMP     stop1
+flagb:  MOV     r3, r7                  ; byte 23 (176 bits: r3 is empty)
+        INC     r1
+        JMP     stop1
+foot:   TEST    r7, r7                  ; byte 24
+        BZ      fok
+        ORI     r2, FTR
+fok:    INC     r1                      ; DONE
+
+stop1:  WAITD   OVS                     ; the middle of the first stop bit
+        JP      RX, 1, serr
+stop2:  WAITD   OVS                     ; the middle of the second
+        JP      RX, 1, serr
+tail:   CMPI    r1, DONE
+        BNZ     gapw
+        JMP     pub                     ; the 25th byte: decide the frame
+gapw:   MOV16   r6, GAPT
+        CSRR    r7, TD
+        ADD     r7, r7, r6
+        CSRW    TD, r7                  ; the stop bit's end + GAPB bits
+        WAITP   RX, 1, T                ; the next start bit, or a gap
+        BNT     char                    ; a byte in time
+        CMPI    r1, DONE                ; a gap: DISC (DONE never waits here)
+        BC      sync
+        TEST    r1, r1
+        BZ      sync                    ; no byte since the last gap
+        ORI     r2, SHORT
+        CALL    bad
+sync:   LDI     r1, 0                   ; the next byte is a frame's first
+        LDI     r2, 0
+        JMP     hunt
+
+
+; The published table and the counters, zero at load (STG needs no
+; image: every word is stored before it is read). Thread 0's frame code
+; follows them in thread 3's quarter, which no thread runs.
+        .org    CH
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0           ; FLAGS, GOOD, LOST, FSAFE, BAD
+
+; ------------------------------------------------------------ the frame
+; After the 25th byte's second stop sample (or the break that followed
+; it). TD is that sample's deadline, or the SETD after the break, and is
+; reached: the WAITB below is a test, and gapw times the gap from TD, so
+; the slots spent here do not move it.
+pub:    LDI     r1, DISC                ; bytes until the gap are ignored
+        TEST    r2, r2
+        BZ      good
+        CALL    bad
+        JMP     gapw
+good:   MOV16   r6, FLAGSW
+        ST      r3, r6, 0               ; FLAGS
+        LDI     r7, 8
+        TEST    r3, r7
+        BNZ     fsafe                   ; failsafe: CH is held
+        MOV16   r5, STG
+        LDI     r4, 16
+copy:   LD      r7, r5, 0
+        ST      r7, r5, 16              ; CH = STG + 16
+        INC     r5
+        DJNZ    r4, copy
+        LD      r7, r6, 1
+        INC     r7
+        ST      r7, r6, 1               ; GOOD
+        JMP     lost
+fsafe:  LD      r7, r6, 3
+        INC     r7
+        ST      r7, r6, 3               ; FSAFE
+lost:   LD      r7, r6, 2
+        LDI     r4, 4
+        TEST    r3, r4
+        BZ      rep                     ; no frame lost
+        INC     r7
+        ST      r7, r6, 2               ; LOST
+rep:    SHLI    r7, 9
+        SHRI    r7, 1                   ; LOST mod 128, in bits 14:8
+        OR      r7, r7, r3              ; the flags byte in bits 7:0
+        WAITB   OUTQ_NF, T              ; TD is reached: T = 1 only if OUTQ is full
+        BT      pdone                   ; full: the word is dropped
+        PUSH    r7                      ; cannot stall: OUTQ had room
+pdone:  JMP     gapw
+
+; A bad frame: BAD + 1 and the reasons, with bit 15, to OUTQ if it has
+; room. Called with TD reached (above, and at a gap's timeout).
+bad:    MOV16   r6, FLAGSW
+        LD      r7, r6, 4
+        INC     r7
+        ST      r7, r6, 4               ; BAD
+        LDIH    r2, 0x80                ; bit 15 (r2 is under 256)
+        WAITB   OUTQ_NF, T
+        BT      bret
+        PUSH    r2
+bret:   RET
+
+; ======================================= threads 1 and 2: servo pulses
+; Registers: r0 the group's pattern for the next OUT (one bit: that
+; servo's pulse; 0: all low), r1 the next channel's address, r2 servos
+; left in this frame, r3 the current pulse's width less 201, r4 the servo
+; frame's start (a TD value), r5 the next pulse's width less 201, r6 and
+; r7 scratch (r7: the next frame's start less 1, while it is waited for).
+        .equ    FRAMEW = 0x1F0          ; data memory (header)
+        .equ    PRM = FRAMEW + 1        ; thread 1: CH, 8; thread 2: CH + 8, 6
+        .equ    GOODW = FLAGSW + 1
+        .equ    POLL = 1000             ; ticks between looks before the first frame
+        .equ    WLO = 173               ; Betaflight's S.BUS digital range
+        .equ    WHI = 1812
+        .equ    WOFF = 880 - 201        ; w - 201: the WAITD 200 and the WAITD 1
+
+        .thread 1
+        .tick   16                      ; the shortest tick the pairs are proved for
+        .csr    OUTGRP, (8 << 5) | pin(SV0)     ; BIDIR0 .. 7
+        .csr    PIN_OE, 0xFF            ; driven, push-pull (only this thread uses them)
+svgo:   LDI     r0, 0                   ; no pulse: the first pass sets the frame up
+        LDI     r2, 1                   ; and counts as a frame without pulses
+        SETD    1
+        WAITD   1                       ; anchor
+        CSRR    r4, TD                  ; the first "frame" starts here
+
+pulse:  OUT     r0                      ; this pulse up, the one before down
+        TEST    r0, r0
+        BZ      ftail                   ; all down: the frame's pulses are done
+        MOV     r3, r5
+        SHLI    r0, 1                   ; the next servo
+        DEC     r2
+        BZ      plast
+        CALL    width                   ; r5: the next pulse
+        JMP     pwait
+plast:  LDI     r0, 0                   ; after the last: all low
+pwait:  WAITD   200
+        CSRR    r7, TD
+        ADD     r7, r7, r3
+        CSRW    TD, r7                  ; D + w - 1
+        WAITD   1                       ; D + w
+        JMP     pulse
+
+; At the end of a frame's last pulse (or of a frame without pulses): the
+; frame that ended took FRAMEW ticks if it had pulses (r2 counted down to
+; 0), POLL if not; the next one is set up in the 100 ticks after the last
+; pulse and starts where this one ends, r4, exactly.
+ftail:  MOV16   r6, FRAMEW
+        LD      r6, r6, 0
+        TEST    r2, r2
+        BZ      fadv                    ; it had pulses
+        MOV16   r6, POLL
+fadv:   ADD     r4, r4, r6              ; the next frame's start
+        CSRR    r7, TID
+        SHLI    r7, 1
+        MOV16   r6, PRM - 2
+        ADD     r6, r6, r7
+        LD      r1, r6, 0               ; the group's first channel
+        LD      r2, r6, 1               ; and its servo count
+        MOV16   r6, GOODW
+        LD      r6, r6, 0
+        TEST    r6, r6
+        BZ      tnone                   ; no good frame yet: no pulses
+        LDI     r0, 1
+        CALL    width                   ; r5: the first pulse
+        JMP     tnext
+tnone:  LDI     r0, 0                   ; r2 stays the servo count: no pulses
+tnext:  MOV     r7, r4
+        DEC     r7
+        WAITD   100
+        CSRW    TD, r7
+        WAITD   1                       ; the frame starts
+        JMP     pulse
+
+; r5 = the width less 201 of the channel at r1, and r1 + 1: raw clamped
+; to WLO .. WHI, then 880 + 5 * raw / 8.
+width:  LD      r5, r1, 0
+        INC     r1
+        LDI     r6, WLO
+        CMP     r5, r6
+        BC      wlo
+        MOV     r5, r6                  ; under 173
+wlo:    MOV16   r6, WHI
+        CMP     r6, r5
+        BC      whi
+        MOV     r5, r6                  ; over 1812
+whi:    MOV     r6, r5
+        SHLI    r6, 2
+        ADD     r5, r5, r6
+        SHRI    r5, 3                   ; 5 * raw / 8 (5 * 1812 fits 16 bits)
+        MOV16   r6, WOFF
+        ADD     r5, r5, r6
+        RET
+
+        .thread 2
+        .csr    OUTGRP, (6 << 5) | pin(SV8)     ; OUT0 .. 5
+        JMP     svgo                    ; thread 1's code, at the same tick
+
+        .thread 1
+        .org    FRAMEW
+        .word   20000                   ; FRAMEW: 20 ms
+        .word   CH, 8                   ; thread 1: channels 1 .. 8
+        .word   CH + 8, 6               ; thread 2: channels 9 .. 14
