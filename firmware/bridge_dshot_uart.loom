@@ -1,0 +1,451 @@
+; bridge_dshot_uart.loom
+; A bidirectional-DShot telemetry bridge: thread 0 drives bidirectional
+; DShot600 to an ESC on BIDIR0, repeating a host-set throttle, and decodes
+; each eRPM reply; thread 2 prints one ASCII line per reply on OUT0, 8N1,
+; as a telemetry logger or a serial terminal reads it. No host in the loop:
+; the host loads the image, sets the two ticks, starts threads 0 and 2 and
+; pushes two words to thread 0 (the interval and the throttle); nothing is
+; read back, and the stream runs from then on by itself.
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; DShot or for this bridge. Thread 0 is firmware/dshot_bidir.loom (read its
+; header: the frame, the turnaround, the reply window, the sampling grid)
+; with its OUTQ push replaced by a queue in data memory: it uses the
+; deadline-latched pin write (SETP ... D, SEMANTICS 6.10, built so that
+; firmware edges land on the exact tick), the timed wait (WAITP ... T, 6.4,
+; built for PS/2 and I2C timeouts), the bit engine's NRZI decoder (6.9.1,
+; built for USB) for the reply's line code, and the instruction memory read
+; as data (LD/ST, 6.11, built so device emulators can keep a register file)
+; for the 5b/4b table and the hand-off. Thread 2 is firmware/uart_tx.loom's
+; transmitter with the line buffer of bridge_wiegand_uart.loom. What the
+; firmware does that no hardware does: all of DShot (as dshot_bidir.loom),
+; the queue between the threads, the drop count, the hexadecimal formatting
+; and the UART framing.
+; Weaker than a dedicated receiver (dshot_bidir.loom's header): the reply is
+; sampled mid-bit on Loom's clock, not resynchronised on its edges, so the
+; ESC's reply rate may be off by -1.5 % to +2.5 % at DShot600 (50 MHz).
+;
+; Pins: DLINE = BIDIR0 (thread 0; the board's pull-up holds it high while
+; released, as for dshot_bidir.loom); TX = OUT0 (thread 2, idle high).
+;
+; ------------------------------------------------------------- the lines
+; One line a frame sent, in order, seven characters:
+;     'E', ' ', VVV, CR, LF       e.g. "E FFF\r\n" (a stopped motor)
+;   VVV  the reply's 12-bit telemetry value eeem mmmm mmmm (Betaflight's
+;        rawValue, decodeTelemetryPacket) as three upper-case hex digits:
+;        for an eRPM frame the period is m << e microseconds; for an
+;        Extended DShot Telemetry frame (bit 8 = 0 with e odd) a type and a
+;        value. Hexadecimal and the raw value because it is lossless (EDT
+;        frames pass through), needs no division (eRPM = 60e6 / period
+;        would), and is the field Betaflight itself keeps.
+;   "! NRP\r\n"  no reply in the window; "! GCR\r\n" a 5-bit code that is
+;        not GCR; "! CRC\r\n" a telemetry checksum that does not XOR to 0xF
+;        (dshot_bidir.loom's 0x8001, 0x8002, 0x8003).
+;   "D NNNN\r\n" (eight characters) NNNN replies were dropped (below) just
+;        before the line that follows, four hex digits: the D line sits
+;        exactly where the gap is in the log.
+; Seven characters are 70 us at 1 Mbaud and 608 us at 115200 baud.
+;
+; ------------------------------------------- the queue (SEMANTICS 6.11)
+; A ring of Q = 8 two-word records: the word dshot_bidir.loom pushes (bits
+; 11:0 the value, or 0x8001 .. 0x8003), then the count of the replies
+; dropped just before it. Three shared words, each written by one thread
+; only: WR (thread 0, records published, mod 2^16), LOST (thread 0, the
+; replies dropped since the last record) and RD (thread 2, records taken).
+; The protocol is bridge_wiegand_uart.loom's:
+;   thread 0  after each reply: LD WR, LD RD; if WR - RD >= Q, ST LOST + 1
+;             (the reply is dropped and counted); else ST the word and LOST
+;             into slot WR mod Q, ST LOST = 0, then ST WR + 1 (the publish).
+;   thread 2  LD WR until it differs from RD; LD the slot's two words, ST
+;             RD + 1 (the slot is free again); if the count is not 0 send
+;             its D line; format and send the record's line.
+; No record is torn: thread 0 stores into a slot only when the RD it read
+; (current or older, so never ahead of the truth) shows thread 2 has
+; finished with it, and thread 2 loads a slot only after it saw the publish
+; that followed the slot's stores. Neither thread waits for the other:
+; thread 0 never waits on RD (a full queue drops) and thread 2 waits only
+; while the queue is empty. LD/ST take two of a thread's own slots whatever
+; the others do (6.11) and the barrel gives each thread every fourth clock
+; (SEMANTICS 2), so the DShot timing does not depend on the UART traffic,
+; nor the UART timing on the replies.
+;
+; Overrun. Replies faster than lines are dropped at the queue and counted,
+; never back-pressured: the motor's frame stream must not stall for a
+; logger. Q replies wait, plus the line on the wire. The count travels with
+; the next record that finds room, so the log shows each gap where it is,
+; with its size, and every reply is either printed or counted.
+;
+; ------------------------------------------------------------- the rates
+; Thread 0's tick is 1/20 of a DShot bit, as for dshot_bidir.loom: DShot600
+; at 50 MHz is TICK_INT 4, TICK_FRAC 43 (4.168 clocks); at 48 MHz 4, 0.
+; The frame rate is the host's: the interval word (dshot_tx.loom's format,
+; 0x8000 | I bit periods) then a frame word; the stream repeats the throttle
+; every I bits until the host sends another word. The rate chosen for the
+; bridge is I = 75, 8 kHz at DShot600 (125 us), the usual bidirectional
+; loop rate. The queue hand-off adds 22 slots (88 clocks, about a bit) to
+; thread 0's reply path. Measured on the model (2026-11-04, 48 and 50 MHz,
+; the reply 30 us after the frame), the grid never slips for I >= 60
+; (dshot_bidir.loom measured the same way: I >= 59; its header estimates
+; 54, without the gap loop's catch-up after a reply, where every WAITD BIT
+; already passed still takes two slots, about 0.1 bit each). The test
+; module runs I = 60.
+; Thread 2's tick is one UART bit: 1 Mbaud is TICK_INT 50 at 50 MHz (48 at
+; 48 MHz), exact to the clock; 115200 baud is 434 + 8/256 (115200.4 baud).
+; At 1 Mbaud a seven-character line takes 70 us, and starts 652 clocks
+; (13.6 us at 48 MHz, measured) after its reply's last bit (decode, queue,
+; formatting), so every reply of the 8 kHz stream is printed; at 115200 baud
+; a line takes 608 us, so the 8 kHz stream overruns: once the queue is
+; full about one reply in five is printed and the rest are counted, the
+; each gap costing one D line (694 us) on the wire.
+; 115200 baud keeps up to about 1.6 kHz.
+; Every bit is a SETP ... D landing on its tick (6.10), so the UART's own
+; rate error is that of the tick (0 at 1 Mbaud, +0.0004 % at 115200), far
+; inside an 8N1 receiver's tolerance (Analog
+; Devices/Maxim application note 2141 is the usual citation, about +-2 %
+; per side for 16x-oversampling receivers; not checked here). The pairs
+; are proved for ticks of 40 clocks or more (thread 2's .tick).
+;
+; Memory (.imem 512): thread 0's code at 0 .. 0x0AC (173 words: 19 words
+; more than dshot_bidir.loom, so it runs 45 words into thread 1's quarter and
+; thread 1 must not be started), the shared words at 0x0E0 (WR, RD, LOST),
+; the queue at 0x0E8 .. 0x0F7, thread 2's line buffer at 0x0F8 .. 0x0FF;
+; thread 2's code and letter table at 0x100 .. 0x16E (111 words, in its
+; quarter); 287 words in all; thread 3's quarter (0x180 ..) is free for
+; another program.
+;
+; Host interface: TICK_INT/TICK_FRAC of threads 0 and 2, RUN of 0 and 2,
+; then INQ[0]: an interval word and a frame word (dshot_tx.loom's formats;
+; a later word changes the throttle or the rate). OUTQ is not used.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   DLINE = BIDIR0, TX = OUT0
+        .equ    SHARED = 0xE0           ; WR, RD, LOST
+        .equ    QUEUE = SHARED + 8      ; Q two-word records
+        .equ    Q = 8
+        .equ    LINE = QUEUE + 2 * Q    ; thread 2's line buffer, 8 words
+
+; ================================= thread 0: bidirectional DShot600
+; dshot_bidir.loom, its OUTQ push replaced by the queue (report, below).
+; Registers as there; at report r1, r5, r6 and r7 are free again.
+        .thread 0
+        .tick   4                       ; the shortest tick the schedule is proved for
+        .equ    BIT  = 20               ; ticks per frame bit (MOTOR_BITLENGTH)
+        .equ    T0H  = 7                ; low pulse of a 0 (MOTOR_BIT_0)
+        .equ    T1H  = 14               ; low pulse of a 1 (MOTOR_BIT_1)
+        .equ    T0L  = BIT - T0H        ; 13
+        .equ    T1L  = BIT - T1H        ; 6
+        .equ    PREP = 3                ; bits before a start spent fetching
+        .equ    IMIN = 16 + 1 + PREP    ; 20: the shortest interval
+        .equ    PREPT = PREP * BIT      ; 60 ticks
+        .equ    RBIT = BIT * 4 / 5      ; 16 ticks per reply bit (5/4 rate)
+        .equ    FIRST = 6               ; first sample: FIRST + RBIT after the fall
+        .equ    WIN  = 36 * BIT         ; reply window, 720 ticks from the release
+        .equ    CFG  = 0x0A             ; BE_CFG: DIR = 1 (MSB first), ENC = NRZI
+        .equ    LATE = 8                ; ticks past a fetch deadline that slip the grid
+
+        JMP     start                   ; the reset vector
+; GCR 5b/4b, indexed by s = ~code & 31 (what SHI's NRZI decode gives): the
+; nibble, or 0x10 for a code GCR does not use (Betaflight's decode[32]).
+; s = 0..22 is code 31..9; s >= 23 (codes 0..8) is never GCR.
+gcr:    .word   0x10, 0xC, 0x4, 0x10, 0x1, 0x8, 0x0, 0x10   ; codes 1F..18
+        .word   0x7, 0x6, 0x5, 0x10, 0x3, 0x2, 0x10, 0x10   ; codes 17..10
+        .word   0xF, 0xE, 0xD, 0x10, 0xB, 0xA, 0x9          ; codes 0F..09
+
+start:  SETP    DLINE, 1                ; the inverted line idles high,
+        OEP     DLINE, 0                ;   released: the pull-up holds it
+        .csr    BE_PINS, pin(DLINE) << 5 ; SHI samples DLINE
+        LDI     r4, 0                   ; I = 0: one-shot until told otherwise
+        LDI     r2, 0
+
+; Idle: as dshot_tx.loom.
+idle:   POP     r5                      ; blocks while INQ is empty
+        SETD    0                       ; re-anchor after the unbounded POP
+        ADD     r6, r5, r5              ; C = bit 15, r6 = bits 14:0 << 1
+        BNC     newf                    ; a frame word
+        SHRI    r6, 1                   ; I, Z = (I == 0)
+        MOV     r4, r6
+        BZ      idle
+        CMPI    r4, IMIN
+        BC      idle
+        LDI     r4, IMIN
+        JMP     idle
+
+; The fetch point of a stream: TD is PREP bits before the next start and
+; has just been reached, unless the reply ran late: then the grid slips.
+fetch:  CSRR    r6, NOW
+        CSRR    r5, TD
+        SUB     r6, r6, r5              ; ticks past the deadline (mod 2^16)
+        CMPI    r6, LATE                ; C = (late by LATE ticks or more)
+        BNC     prep
+        SETD    0                       ; slip: the next start is PREPT from now
+prep:   WAITB   INQ_NE, T               ; a word? (a test, not a wait)
+        BT      again                   ; INQ empty: repeat the last frame
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r5                      ; one slot: it cannot stall
+        ADD     r6, r5, r5              ; C = bit 15
+        BNC     newf                    ; a frame word: send it at this start
+        SHRI    r6, 1                   ; an interval word
+        MOV     r4, r6
+        BZ      idle                    ; I = 0: the stream stops here
+        CMPI    r4, IMIN
+        BC      again
+        LDI     r4, IMIN
+again:  MOV     r5, r2                  ; the packet to repeat
+
+; A frame from the packet in r5 bits 11:0, as dshot_tx.loom, with the
+; checksum inverted.
+newf:   SHLI    r5, 4                   ; packet << 4: bits 15:12 drop out
+        MOV     r0, r5                  ; the frame, checksum still 0
+        SHRI    r5, 4                   ; v = the 12-bit packet
+        MOV     r2, r5                  ; keep it for a repeat,
+        SHRI    r2, 1                   ;   with the telemetry bit cleared
+        SHLI    r2, 1
+        MOV     r6, r5                  ; v ^ v >> 4 ^ v >> 8, as dshot_tx
+        SHRI    r6, 4
+        XOR     r6, r6, r5
+        SHRI    r6, 4
+        XOR     r6, r6, r5
+        ANDI    r6, 15
+        XORI    r6, 15                  ; inverted: bidirectional DShot
+        OR      r0, r0, r6              ; the 16-bit frame
+        LDI     r1, 16
+        OEP     DLINE, 1                ; drive the line (high, as it idles)
+        SETP    DLINE, 0, D             ; stage the first bit's fall
+        WAITD   PREPT                   ; it lands on the frame start
+
+; bit is entered at the fall that starts a bit (it has just landed): r0
+; holds the bits not yet sent, r1 how many are left, this one included. The
+; fall at each period boundary does not depend on the bit, so the bit's
+; value is looked at only after it.
+bit:    SETP    DLINE, 1, D             ; stage the end of the low pulse
+        SHLI    r0, 1                   ; C = this bit
+        BC      one
+        WAITD   T0H                     ; 7 ticks low; the rise lands here
+        DJNZ    r1, zn                  ; more bits in the frame?
+        WAITD   T0L                     ; no: the end of the last period
+        JMP     rx
+zn:     SETP    DLINE, 0, D             ; stage the next fall
+        WAITD   T0L                     ; it lands on the period boundary
+        JMP     bit
+one:    WAITD   T1H                     ; 14 ticks low
+        DJNZ    r1, on
+        WAITD   T1L
+        JMP     rx
+on:     SETP    DLINE, 0, D
+        WAITD   T1L                     ; 6 ticks high
+        JMP     bit
+
+; ------------------------------------------------------------ the reply
+; TD is the end of the frame's 16th bit period, S + 16 bits.
+rx:     OEP     DLINE, 0                ; release: the ESC answers on this line
+        CSRR    r3, TD                  ; keep the frame grid
+        .csr    BE_CFG, CFG             ; also LVL = 0: the reply's first bit
+        CSRR    r6, NOW                 ; the reply window: TD = NOW + WIN,
+        MOV16   r5, WIN                 ;   longer than SETD's 255 ticks
+        ADD     r6, r6, r5
+        CSRW    TD, r6
+        WAITP   DLINE, 0, T             ; the first fall, or the window closes
+        BT      norep
+        SETD    FIRST                   ; the sampling grid starts at the fall
+        LDI     r5, 4                   ; four 5-bit codes
+        LDI     r7, 0                   ; bit 4: a code that is not GCR
+rxq:    LDI     r1, 5
+rxb:    WAITD   RBIT                    ; the middle of the next line bit
+        SHI                             ; SR <= SR << 1 | ~(GCR bit)
+        DJNZ    r1, rxb
+        STSR    r6
+        ANDI    r6, 31                  ; s = ~code, the last five bits
+        CMPI    r6, 23                  ; codes 0..8 are not GCR
+        BC      nogcr
+        LD      r6, r6, gcr             ; the nibble, or 0x10
+rxn:    OR      r7, r7, r6              ; collect bit 4; keep sampling to the
+        SHLI    r0, 4                   ;   end, so the line is the ESC's
+        OR      r0, r0, r6              ;   until its reply is over
+        DJNZ    r5, rxq
+        ANDI    r7, 16
+        BNZ     badc                    ; a code was not GCR
+        MOV     r6, r0                  ; the four nibbles must XOR to 0xF:
+        SHRI    r6, 8
+        XOR     r6, r6, r0              ;   bytes
+        MOV     r1, r6
+        SHRI    r1, 4
+        XOR     r6, r6, r1              ;   nibbles
+        ANDI    r6, 15
+        CMPI    r6, 15
+        BNZ     badsum
+        SHRI    r0, 4                   ; eeem mmmm mmmm
+        JMP     report
+nogcr:  LDI     r6, 16                  ; flag it, and go on sampling
+        JMP     rxn
+norep:  LDI     r0, 1                   ; 0x8001: no reply
+        JMP     err
+badc:   LDI     r0, 2                   ; 0x8002: not a GCR code
+        JMP     err
+badsum: LDI     r0, 3                   ; 0x8003: bad checksum
+err:    LDIH    r0, 0x80
+; The hand-off (header): publish the word in r0 with the count of the
+; replies dropped since the last record, or drop it and count it.
+report: MOV16   r7, SHARED
+        LD      r5, r7, 0               ; WR (this thread's own count)
+        LD      r6, r7, 1               ; RD (thread 2's; never ahead)
+        SUB     r6, r5, r6              ; records waiting
+        CMPI    r6, Q
+        BC      full                    ; C = (waiting >= Q)
+        MOV     r6, r5
+        ANDI    r6, Q - 1
+        SHLI    r6, 1                   ; two words a record
+        ADD     r6, r6, r7              ; the slot, less QUEUE - SHARED
+        ST      r0, r6, QUEUE - SHARED  ; the word
+        LD      r1, r7, 2               ; LOST: dropped just before it
+        ST      r1, r6, QUEUE - SHARED + 1
+        LDI     r1, 0
+        ST      r1, r7, 2               ; LOST = 0: it is told
+        INC     r5
+        ST      r5, r7, 0               ; WR + 1: published
+        JMP     rxdone
+full:   LD      r5, r7, 2               ; LOST + 1: dropped and counted
+        INC     r5
+        ST      r5, r7, 2
+rxdone: SETD    0                       ; an anchor; TD is put back next
+        CSRW    TD, r3                  ; back on the frame grid, S + 16 bits
+
+; ------------------------------------------------------------ the gap
+; As dshot_tx.loom. After a reply the WAITDs catch up to the grid at once.
+gap:    OR      r3, r4, r4              ; r3 = I, Z = (I == 0)
+        BNZ     gap1
+        JMP     idle                    ; I = 0: one-shot (BZ cannot reach idle)
+gap1:   SUBI    r3, 16 + PREP           ; I >= IMIN, so r3 >= 1
+glp:    WAITD   BIT
+        DJNZ    r3, glp
+        JMP     fetch                   ; TD = S + (I - PREP) bits
+
+        .org    SHARED
+        .word   0                       ; WR
+        .word   0                       ; RD
+        .word   0                       ; LOST
+
+; ================================================ thread 2: queue to UART
+; r0 the character, r1 where the next character of the line goes (then the
+; line's end), r2 a digit count, r3 the slot, then scratch, then where the
+; next character to send is, r4 the drop count or the word, then the next
+; character, r5 RD, r6 the record's word, r7 SHARED.
+        .thread 2
+        .tick   40                      ; the shortest tick the pairs are proved for
+start2: SETP    TX, 1                   ; idle
+        MOV16   r7, SHARED
+        LD      r5, r7, 1               ; RD, from the image
+
+; Wait for a record and take it: its word and its drop count.
+idle2:  LD      r0, r7, 0               ; WR
+        CMP     r0, r5
+        BZ      idle2                   ; the queue is empty
+        MOV     r3, r5
+        ANDI    r3, Q - 1
+        SHLI    r3, 1
+        ADD     r3, r3, r7
+        LD      r6, r3, QUEUE - SHARED  ; the word
+        LD      r4, r3, QUEUE - SHARED + 1      ; replies dropped before it
+        INC     r5
+        ST      r5, r7, 1               ; RD + 1: the slot is free again
+        TEST    r4, r4
+        BZ      eline
+; The count of the replies dropped just before this record, four hex digits.
+        MOV16   r1, LINE
+        LDI     r0, 'D'
+        CALL    put
+        LDI     r0, ' '
+        CALL    put
+        LDI     r2, 4
+        CALL    hexn
+        JMP     crlf                    ; then sent, then back at eline
+; The record's line.
+eline:  MOV16   r1, LINE
+        MOV     r4, r6
+        SHLI    r6, 1                   ; C = bit 15: an error word
+        BC      errl
+        LDI     r0, 'E'
+        CALL    put
+        LDI     r0, ' '
+        CALL    put
+        LDI     r2, 3                   ; VVV, bits 11:0
+        CALL    hexn
+        JMP     crlf
+; An error word 0x8001 .. 0x8003: its three letters from the table.
+errl:   LDI     r0, '!'
+        CALL    put
+        LDI     r0, ' '
+        CALL    put
+        ANDI    r4, 3                   ; 1, 2, 3
+        MOV     r3, r4
+        ADD     r3, r3, r4
+        ADD     r3, r3, r4              ; 3 * code
+        MOV16   r2, etab - 3
+        ADD     r3, r3, r2
+        LD      r0, r3, 0
+        CALL    put
+        LD      r0, r3, 1
+        CALL    put
+        LD      r0, r3, 2
+        CALL    put
+crlf:   LDI     r0, '\r'
+        CALL    put
+        LDI     r0, '\n'
+        CALL    put
+
+; Send the line, 8N1, LSB first, characters back to back, as in
+; bridge_wiegand_uart.loom: bit i is staged with SETP ... D and lands on the
+; tick its WAITD waits for (6.10).
+        MOV16   r3, LINE
+        LD      r4, r3, 0
+        INC     r3
+        SETD    0                       ; re-anchor after the idle wait
+        WAITD   1                       ; on a tick edge: the start bit is whole
+chr:    MOV     r0, r4
+        LDI     r2, 8
+        SETP    TX, 0, D                ; the start bit
+        WAITD   1
+bit2:   SHRI    r0, 1                   ; C = the bit
+        BC      one2
+        SETP    TX, 0, D
+        JMP     nxt2
+one2:   SETP    TX, 1, D
+nxt2:   WAITD   1
+        DJNZ    r2, bit2
+        SETP    TX, 1, D                ; the stop bit
+        CMP     r3, r1
+        BZ      last
+        LD      r4, r3, 0               ; the next character
+        INC     r3
+        WAITD   1
+        JMP     chr
+last:   WAITD   1
+        WAITD   1                       ; the last stop bit lasts a whole bit
+        MOV16   r0, LINE + 8            ; a D line ends here (eight characters):
+        CMP     r1, r0
+        BZ      eline                   ;   its record's line next
+        JMP     idle2
+
+; hexn: r2 hex digits of r4, the most significant first, into the line.
+hexn:   DEC     r2
+        MOV     r3, r2
+        SHLI    r3, 2
+        SHR     r0, r4, r3
+        ANDI    r0, 15
+        CMPI    r0, 10
+        BNC     h_dig                   ; 0 .. 9
+        ADDI    r0, 'A' - '0' - 10
+h_dig:  ADDI    r0, '0'
+        CALL    put                     ; the second level of the return stack
+        TEST    r2, r2
+        BNZ     hexn
+        RET
+
+put:    ST      r0, r1, 0
+        INC     r1
+        RET
+
+; The error lines' letters, three words a code (0x8001, 0x8002, 0x8003).
+etab:   .word   'N', 'R', 'P'           ; no reply in the window
+        .word   'G', 'C', 'R'           ; a code that is not GCR
+        .word   'C', 'R', 'C'           ; a checksum that does not XOR to 0xF
