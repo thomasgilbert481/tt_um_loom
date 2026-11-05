@@ -1,0 +1,203 @@
+; hx711_host.loom
+; An HX711 host: reads the Avia Semiconductor HX711 24-bit load-cell ADC
+; over its two-wire interface (PD_SCK and DOUT), chooses the channel and
+; gain of the next conversion by the number of clock pulses, and powers
+; the converter down and wakes it on a host command.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the HX711 interface is in no
+; Loom design document, and it is not SPI. The clock count after the 24
+; data bits (25, 26 or 27 pulses) selects the next conversion's input, and
+; a clock held high for more than 60 us powers the chip down. The program
+; uses:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for the clock-exact bit edges of the serial transmitters: every
+;     PD_SCK edge lands on the exact clock of its tick, so the high and low
+;     times are exactly one tick each, whatever the tick;
+;   - the bit engine's shift register in manual mode (SHI, SEMANTICS 6.9),
+;     built for the synchronous serial programs (SPI, JTAG, SWD): one SHI a
+;     bit, and its CNT counts the 24 bits, so the bit loop needs no
+;     general register for the count;
+;   - the timed wait (WAITP ... T, 6.4) for the ready timeout.
+; What the firmware does that no hardware does: the ready wait and its
+; timeout, the 24-bit frame split across two registers, the gain pulses,
+; the check that DOUT went back high, the sign extension, the power-down
+; and wake, and the reply. Weaker than a dedicated peripheral: PD_SCK high
+; and low are always equal (one tick each), and the shortest tick the
+; deadline schedule is proved for is 24 clocks (below), 0.48 us at 50 MHz,
+; above the datasheet's 0.2 us minimum.
+;
+; Source: Avia Semiconductor, "HX711 24-Bit Analog-to-Digital Converter
+; (ADC) for Weigh Scales" (no revision date in the copy used), sections
+; "Serial Interface" and "Reset and Power-Down", Table 3 (input channel
+; and gain selection), Fig. 2 and the timing table under it (T1..T4),
+; Fig. 3 (power down). As read there:
+;   - DOUT is high while no data is ready, PD_SCK should then be low; DOUT
+;     low means data is ready. 25 to 27 positive PD_SCK pulses shift the
+;     data out, one bit a pulse, MSB first; the 25th pulse pulls DOUT high.
+;   - Table 3: 25 pulses select channel A gain 128, 26 channel B gain 32,
+;     27 channel A gain 64 for the next conversion (unchecked in part: the
+;     table's cells did not survive text extraction; Fig. 2 and the
+;     description agree, except that Fig. 2 labels the 27-pulse case
+;     "CH.B, Gain:64", which the description contradicts: channel A has
+;     gains 128 and 64, channel B 32).
+;   - T1, DOUT falling to PD_SCK rising, at least 0.1 us; T2, PD_SCK
+;     rising to DOUT ready, at most 0.1 us; T3, PD_SCK high, 0.2 to 50 us
+;     (1 typical); T4, PD_SCK low, at least 0.2 us (1 typical).
+;   - PD_SCK high for more than 60 us: power down (Fig. 3); low again:
+;     reset, and the input is channel A, gain 128.
+;   - Data: 24-bit two's complement, 800000h to 7FFFFFh (saturating).
+;
+; Pins: PD_SCK = OUT0 (push-pull, low at start), DOUT = IN0.
+;
+; Host commands (INQ[0]):
+;     0x0000 | S    READ. S, bits 1:0, is the input of the next conversion:
+;                   0 channel A gain 128 (25 pulses), 1 channel B gain 32
+;                   (26), 2 channel A gain 64 (27); 3 is taken as 0. Waits
+;                   for DOUT low (with the timeout), clocks out 24 bits
+;                   and S + 1 more pulses, and replies.
+;     0x4000 | N    the ready timeout: N units of 128 ticks, 1..0x3FFF
+;                   (0 is taken as 1). Default 0x3FFF. No reply.
+;     0x8000        power down: PD_SCK high, held until the wake command.
+;                   The host keeps it there for more than 60 us before it
+;                   wakes it, or the chip does not power down. No reply.
+;     0x8001        wake: PD_SCK low; the chip resets to channel A gain
+;                   128, and the next READ's reading is of that input.
+;                   No reply.
+; Reply to every READ (OUTQ[0]), three words:
+;     status        bits 3:0 the error: 0 none, 1 timeout (DOUT never went
+;                   low; no pulse was sent), 2 powered down (no pulse was
+;                   sent), 3 DOUT still low after the 25th pulse (no
+;                   device, or a stuck line: the reading is not to be
+;                   trusted); bits 9:8 the input the reading was converted
+;                   with (S of the READ before, 0 after start or a wake)
+;     high          bits 23:16 of the reading, sign-extended to 16 bits
+;     low           bits 15:0 of the reading
+; The two words hold the reading as a 32-bit two's-complement number. With
+; errors 1 and 2 both are 0.
+;
+; Timing. One tick is PD_SCK's high time and also its low time, set by the
+; host before RUN (the M2 convention): TICK_INT 50, 1 us, the datasheet's
+; typical, at 50 MHz; T3 allows 10 to 2500 clocks there, and the schedule
+; is proved for 24 or more (.tick). Each edge is a staged write landing on
+; its tick (6.10 rule 1), so high and low are exact to the clock. DOUT is
+; sampled by the SHI one slot after the WAITD of the falling edge, so the
+; host reads each bit at the end of its high time, PD_SCK high plus about
+; two clocks, which leaves a device the whole high time for T2. The first
+; rise comes 3 ticks after the X cycle that sees DOUT low (SETD 2, then a
+; WAITD 1), T1 many times over. The ready wait polls in 128-tick pieces.
+;
+; Registers: r0 bits 23:16 (then the high word), r1 bits 15:0, r2 the bit
+; or timeout count, r3 the command and the pulse count, r4 the timeout in
+; units, r5 the status, r6 the input of the conversion in progress, r7 1
+; while powered down (and .csr scratch at start).
+;
+; Deadline proof at .tick 24: the longest intervals are the last bit of
+; each loop into the next loop's rise (SHI, the branch out, STSR or MOV,
+; the staged rise, its WAITD: 5 slots, 20 clocks); every other bit is 4
+; slots in the low phase and 2 in the high. The SETD 2 path to the first
+; WAITD is 5 slots, 20 clocks, shorter than the SETD's own deadline (at
+; least one tick plus one clock away at 24), so the first rise is staged
+; for the WAITD's deadline and not the SETD's (as quad_generator.loom).
+;
+; Memory: 91 words from 0x000, thread 0's quarter (.imem 512).
+;
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   SCK = OUT0, DOUT = IN0
+        .tick   24                      ; the shortest tick proved (header)
+        .equ    UNIT = 128              ; ticks per timeout unit
+
+start:  SETP    SCK, 0
+        .csr    BE_PINS, (pin(DOUT) << 5) | pin(SCK) ; SHI reads DOUT (clobbers r7)
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first (clobbers r7)
+        LDI     r6, 0                   ; channel A, gain 128 after reset
+        LDI     r7, 0                   ; powered up
+        MOV16   r4, 0x3FFF              ; the default timeout
+
+cmd:    POP     r3
+        MOV     r5, r3
+        SHRI    r5, 15
+        BNZ     power                   ; 0x8000, 0x8001
+        MOV     r5, r3
+        SHRI    r5, 14
+        BNZ     tmo                     ; 0x4000 | N
+        ANDI    r3, 3                   ; READ: S
+        CMPI    r3, 3
+        BNZ     selok
+        LDI     r3, 0                   ; 3 is taken as 0
+selok:  LDI     r0, 0
+        LDI     r1, 0
+        MOV     r5, r6
+        SHLI    r5, 8                   ; status: the input of this reading
+        TEST    r7, r7
+        BZ      up
+        ORI     r5, 2                   ; powered down: no pulse
+        JMP     reply
+up:     LDSR    r0                      ; SR = 0: bits 15:8 clean after 8 SHIs
+        INC     r3                      ; S + 1 pulses after the 24 bits
+        MOV     r2, r4
+wl:     SETD    UNIT                    ; a piece of the ready wait
+        WAITP   DOUT, 0, T
+        BNT     got                     ; DOUT low: data ready
+        DJNZ    r2, wl
+        ORI     r5, 1                   ; timeout: no pulse
+        JMP     reply
+
+; The read. Every edge is staged and lands on its tick; SHI samples DOUT
+; one slot after the falling edge's WAITD.
+got:    SETD    2                       ; anchor: 2, so the staged rise waits for the WAITD
+        LDI     r2, 8
+        LDI     r0, 24
+        CSRW    CNT, r0                 ; CNT counts all 24 bits
+b1:     SETP    SCK, 1, D               ; bits 23..16
+        WAITD   1
+        SETP    SCK, 0, D
+        WAITD   1
+        SHI
+        DJNZ    r2, b1
+        STSR    r0                      ; bits 23:16 in r0[7:0]
+b2:     SETP    SCK, 1, D               ; bits 15..0
+        WAITD   1
+        SETP    SCK, 0, D
+        WAITD   1
+        SHI
+        BNZ     b2                      ; Z: CNT reached 0
+        MOV     r2, r3
+gp:     SETP    SCK, 1, D               ; pulses 25 .. 25 + S
+        WAITD   1
+        SETP    SCK, 0, D
+        WAITD   1
+        DJNZ    r2, gp
+        STSR    r1                      ; bits 15:0 (no SHI since the last bit)
+        MOV     r6, r3
+        DEC     r6                      ; S: the input now converting
+        JP      DOUT, 1, signx          ; the 25th pulse pulled DOUT high
+        ORI     r5, 3
+signx:  MOV     r2, r0
+        SHRI    r2, 7
+        BZ      reply                   ; positive: bits 15:8 are 0
+        LDI     r2, 0
+        LDIH    r2, 0xFF
+        OR      r0, r0, r2              ; negative: sign-extend bits 23:16
+reply:  PUSH    r5
+        PUSH    r0
+        PUSH    r1
+        JMP     cmd
+
+power:  ANDI    r3, 1
+        BNZ     wake
+        SETP    SCK, 1                  ; power down: high until the wake
+        LDI     r7, 1
+        JMP     cmd
+wake:   SETP    SCK, 0                  ; the chip resets: channel A, gain 128
+        LDI     r7, 0
+        LDI     r6, 0
+        JMP     cmd
+
+tmo:    SHLI    r3, 2                   ; N = bits 13:0
+        SHRI    r3, 2
+        BNZ     tset
+        LDI     r3, 1                   ; 0 is taken as 1
+tset:   MOV     r4, r3
+        JMP     cmd

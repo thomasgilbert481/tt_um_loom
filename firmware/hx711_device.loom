@@ -1,0 +1,250 @@
+; hx711_device.loom
+; An HX711 emulation: a device on the HX711's two-wire interface (PD_SCK
+; in, DOUT out) that answers with readings the host sets, one per input
+; (channel A gain 128, channel B gain 32, channel A gain 64), honours the
+; pulse count of each read for the next conversion's input, reports which
+; input each reading was, and powers down on a long PD_SCK high. A test
+; source for HX711 host firmware, hx711_host.loom among it.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the HX711 interface is in no
+; Loom design document, and it is not SPI (the clock count after the data
+; selects the next input, and a long clock high powers the chip down). The
+; program uses:
+;   - the bit engine's shift register in manual mode (SHO, SEMANTICS 6.9),
+;     built for the synchronous serial programs: one SHO a bit puts the
+;     next bit on DOUT, and CNT counts the 24 bits;
+;   - LD/ST of slice B (6.11), built for the I2C EEPROM's array: the three
+;     host-set readings live in six words of the instruction memory;
+;   - the timed waits (WAITP ... T, 6.4) and a CSRW TD that puts a saved
+;     deadline back (6.6), so one deadline register times both the
+;     conversion and the 60 us power-down watchdog;
+;   - the FIFOs for the readings in and the reports out.
+; What the firmware does that no hardware does: the ready/busy line, the
+; 24-bit frame across two loads of the 16-bit shift register, the pulse
+; count and the input it selects, the conversion time, the power-down
+; detection and the reset after it.
+;
+; Weaker than the chip. (1) DOUT follows a PD_SCK rise 9 to 12 clocks
+; later (13 to 16 for bit 15, the one after the shift register is
+; reloaded): the WAITP sees the rise through the pad synchroniser and
+; the slot grid, then one SHO and the pad register. The datasheet's T2 is
+; at most 0.1 us, 5 clocks at 50 MHz, so this device needs a host that
+; samples DOUT at least 16 clocks (0.32 us at 50 MHz) after the rise, as
+; hosts that sample at the end of the high time or after the fall do,
+; and hx711_host.loom does. (2) Each bit is six slots, so PD_SCK needs a
+; period of at least 24 clocks (0.48 us at 50 MHz; the datasheet allows
+; 0.4 us), and high and low at least 10 clocks each, the datasheet's 0.2
+; us at 50 MHz (measured in the tests). (3) The conversion time is a
+; host-set number of ticks from the end of the read's pulses to DOUT
+; low, not the chip's free-running 10 or 80 samples/s: the RTL budget
+; cannot hold 100 ms. (4) No settling: a reading is ready one conversion
+; time after a read or a wake, where the chip needs four (Table 2,
+; settling time). (5) Pulses 26 and 27 are caught at the bit loop's pace
+; only if each comes within GAP = 64 ticks of the fall before it (64 us at
+; a 1 us tick; T3's 50 us maximum high plus any low under 14 us fits); a
+; later one, and a 28th, are counted by the conversion loop, which needs a
+; PD_SCK period of about 60 clocks to see them (the tests' 28-pulse host
+; runs at 100). The read's pulses end at the first gap, and the conversion
+; time is counted from there.
+;
+; Source: Avia Semiconductor, "HX711 24-Bit Analog-to-Digital Converter
+; (ADC) for Weigh Scales", sections "Serial Interface" and "Reset and
+; Power-Down", Table 3, Fig. 2 and the timing table under it, Fig. 3;
+; the facts used are listed in hx711_host.loom's header. What this device
+; takes for the cases the datasheet leaves open:
+;   - pulses before DOUT goes low (while converting) count with the read's
+;     pulses 25 to 27, so they make the count wrong, and a count other
+;     than 25, 26 or 27 ("should not be less than 25 or more than 27",
+;     a "serial communication error") selects channel A gain 128, the
+;     reset input, and is reported as an error;
+;   - a high of more than PD ticks powers it down at any point, in a read
+;     or not; PD = 60 ticks, 60 to 61 us at the suggested 1 us tick; the
+;     datasheet's 50 us maximum high never does;
+;   - DOUT keeps its level while powered down (the datasheet does not
+;     say); on the return low the device resets (input A/128), drives
+;     DOUT high and converts.
+;
+; Pins: PD_SCK = IN1, DOUT = OUT1 (push-pull, high at start). Run beside
+; hx711_host.loom (thread 0: PD_SCK = OUT0, DOUT = IN0), the bench wiring
+; OUT0 to IN1 and OUT1 to IN0.
+;
+; Rate: the host's PD_SCK times the bits; the tick (host-set, the M2
+; convention; TICK_INT 50, 1 us, at 50 MHz) times the conversion and the
+; power-down watchdog only. There are no deadline pairs.
+;
+; Host commands (INQ[1]), taken at the end of every conversion, before
+; DOUT goes low, so a reading set now is served from the next one:
+;     0x8000 | I << 12 | H, L   the reading for input I (0 A/128, 1 B/32,
+;                   2 A/64; 3 is ignored): H its bits 23:16, then a second
+;                   word L its bits 15:0. Push the two together. The
+;                   readings are 0 after load.
+;     0x4000 | N    the conversion time: N ticks, 0..0x3FFF (0: DOUT low
+;                   at once). Default CONV0 = 100.
+; Reports (OUTQ[1]), one each time a reading is made ready (DOUT low):
+;     bits 1:0      the input this reading is of (the selection of the read
+;                   before it, 0 after start or a wake)
+;     bits 12:8     that read's pulse count, bits 4:0 of it (25 after
+;                   start or a wake: the count that selects A/128)
+;     bit 15        the count was not 25, 26 or 27 (input A/128 taken)
+;     0x4000        alone: the device has powered down (on the long high)
+; A report that finds OUTQ full is dropped.
+;
+; Registers: r0 scratch and the report; r1 the bit count and table
+; address; r2 the saved deadline and scratch; r3 bits 15:0 of the reading;
+; r4 the pulse count; r5 the input now converting; r6 the conversion
+; time; r7 the error bit (and .csr scratch at start).
+;
+; Memory: thread 1's quarter (.imem 512): 118 words of code from 0x080 to
+; 0x0F5 and the six reading words at 0x0FA. With hx711_host.loom (91 words
+; from 0x000) the pair fits threads 0 and 1 and leaves 2 and 3 free.
+;
+;
+; Decided at integration (2026-11-05): Fig. 2's "CH.B, Gain:64" for 27 pulses is read
+; as channel A, gain 64, as Table 3 and the text say; the conversion time is
+; host-set (the real 10 or 80 samples/s do not fit an RTL run); the device
+; changes DOUT 9 to 16 clocks after a PD_SCK rise, not within 0.1 us, and
+; needs a PD_SCK period of 24 clocks or more: stated limits of a firmware
+; device, met by hx711_host and by any host that samples late in the high.
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   SCK = IN1, DOUT = OUT1
+        .tick   50                      ; 1 us at 50 MHz (no pairs: timeouts only)
+        .equ    PD = 60                ; ticks of high that power it down
+        .equ    CONV0 = 100             ; the default conversion time, ticks
+        .equ    GAP = 64                ; ticks of low that end a read's pulses
+        .equ    TBL = 0x0FA             ; 6 words: H << 8, L for inputs 0..2
+
+start:  .csr    BE_PINS, pin(DOUT)      ; SHO drives DOUT (clobbers r7)
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first (clobbers r7)
+        LDI     r6, CONV0
+reset:  SETP    DOUT, 1                 ; busy
+        LDI     r5, 0                   ; channel A, gain 128
+        LDI     r4, 25                  ; as though 25 pulses had chosen it
+
+; Converting: DOUT high until TD. A rise counts a pulse; while it is high
+; TD is the watchdog, then the conversion's deadline goes back.
+convst: CSRR    r2, NOW
+        ADD     r2, r2, r6
+        CSRW    TD, r2                  ; the conversion ends at NOW + r6
+conv:   WAITP   SCK, 1, T
+        BT      done
+        INC     r4                      ; a pulse
+        CSRR    r2, TD
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown
+        CSRW    TD, r2                  ; (if it passed, the next WAITP ends at once)
+        JMP     conv
+
+; The conversion is over: the input it was of, the report, the commands.
+done:   LDI     r7, 0
+        MOV     r5, r4
+        SUBI    r5, 25                  ; C = (count >= 25); 25, 26, 27 -> 0, 1, 2
+        BNC     bad
+        CMPI    r5, 3                   ; C = (count >= 28)
+        BNC     rpt
+bad:    LDI     r5, 0                   ; a wrong count: A/128 ...
+        LDIH    r7, 0x80                ; ... and the error bit
+rpt:    MOV     r0, r4
+        ANDI    r0, 31
+        SHLI    r0, 8
+        OR      r0, r0, r5
+        OR      r0, r0, r7
+        CALL    report                  ; leaves TD = NOW, so the WAITB below only tests
+drain:  WAITB   INQ_NE, T
+        BT      load
+        POP     r0
+        MOV     r1, r0
+        SHRI    r1, 15
+        BNZ     setr
+        SHLI    r0, 2                   ; 0x4000 | N
+        SHRI    r0, 2
+        MOV     r6, r0                  ; (N = 0: DOUT low at once)
+        JMP     drain
+setr:   MOV     r1, r0
+        SHRI    r1, 12
+        ANDI    r1, 3                   ; I
+        SHLI    r0, 8                   ; H << 8
+        POP     r3                      ; L (pushed with the first word)
+        CMPI    r1, 3
+        BZ      drain                   ; I = 3: ignored
+        SHLI    r1, 1
+        LDI     r2, TBL
+        ADD     r1, r1, r2
+        ST      r0, r1, 0
+        ST      r3, r1, 1
+        JMP     drain
+
+; Ready: the reading of input r5 loaded, DOUT low, then the 24 bits. Each
+; bit is the rise (WAITP), the SHO that puts it on DOUT, the watchdog for
+; the high, the fall: six slots. CNT counts 24, r1 the first 8.
+load:   MOV     r1, r5
+        SHLI    r1, 1
+        LDI     r2, TBL
+        ADD     r1, r1, r2
+        LD      r0, r1, 0               ; bits 23:16, in SR's top byte
+        LDSR    r0
+        LD      r3, r1, 1               ; bits 15:0, loaded after bit 16
+        LDI     r0, 24
+        CSRW    CNT, r0
+        LDI     r1, 8
+        LDI     r4, 25                  ; the count, as pulse 25 will make it
+        SETP    DOUT, 0                 ; ready
+b1:     WAITP   SCK, 1                  ; bits 23..16
+        SHO
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown
+        DJNZ    r1, b1
+        WAITP   SCK, 1                  ; bit 15: SR reloaded first
+        LDSR    r3
+        SHO
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown
+b3:     WAITP   SCK, 1                  ; bits 14..0
+        SHO
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown
+        BNZ     b3                      ; Z from the SHO: CNT reached 0
+; Pulses 25 to 27, at the bit loop's pace (six slots a pulse): each block
+; waits GAP ticks for its rise; a gap ends the read with the count so far.
+        WAITP   SCK, 1                  ; pulse 25: DOUT back high
+        SETP    DOUT, 1
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown
+        SETD    GAP
+        WAITP   SCK, 1, T               ; pulse 26?
+        BT      c25
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown
+        SETD    GAP
+        WAITP   SCK, 1, T               ; pulse 27?
+        BT      c26
+        SETD    PD
+        WAITP   SCK, 0, T
+        BT      pdown                   ; any more are counted while converting
+c27:    INC     r4                      ; r4 is 25 from `load`
+c26:    INC     r4
+c25:    JMP     convst
+
+; PD_SCK high for PD ticks: powered down until it falls, then a reset.
+pdown:  LDI     r0, 0
+        LDIH    r0, 0x40
+        CALL    report
+        WAITP   SCK, 0
+        JMP     reset
+
+; Push r0 if OUTQ has room, else drop it. Never blocks.
+report: SETD    0
+        WAITB   OUTQ_NF, T
+        BT      rfull
+        PUSH    r0
+rfull:  RET
+
+        .org    TBL
+        .word   0, 0, 0, 0, 0, 0        ; the readings (host-set)
