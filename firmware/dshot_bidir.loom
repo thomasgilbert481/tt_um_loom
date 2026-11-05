@@ -75,6 +75,11 @@
 ; comes and the window runs out, 72 for a reply that starts at the very
 ; end of the window. 8 kHz (I = 75) and slower, the usual bidirectional
 ; rates, never slip.
+; Measured on the golden model (2026-11-04, 48 and 50 MHz, the reply 30 us
+; after the frame), the grid slips below I = 59, not 54: the estimate leaves
+; out the gap loop's catch-up, where each WAITD BIT already passed still
+; takes its slot and the DJNZ another, 8 clocks or about 0.1 bit a period
+; (at I = 57, 48 MHz, frames come 59.3 bits apart).
 ;
 ; Words. 154 words: the 23-word GCR table sits right after the reset
 ; vector, so that LD's 5-bit offset reaches it with no base register (the
