@@ -1,0 +1,193 @@
+; ir_sirc_tx.loom
+; Sony SIRC infrared transmitter (12, 15 and 20 bit) on OUT0, fed by the host
+; through INQ[0].
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names SIRC.
+; Nothing in Loom was built for infrared: there is no PWM and no carrier
+; generator. The program makes the 40 kHz carrier itself, as ir_nec_tx.loom
+; makes NEC's 38 kHz, with two pieces of hardware built for other jobs: the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016), built
+; so that WS2812 pulses land on the exact clock, and the fractional tick
+; divider (TICK_FRAC, SEMANTICS 4), built for UART rates. SIRC is coded on
+; the width of the mark, where NEC codes the space and RC-5 is bi-phase; that
+; is only a different count of carrier cycles here. What the firmware does
+; that no hardware does: the carrier, the mark-width code, the three frame
+; lengths with their field packing, the repeat count and the 45 ms grid. It
+; needs the FIFOs (POP, WAITB INQ_NE) and the latch, nothing else.
+;
+; Pin: LED = OUT0, push-pull, high = LED on, through a transistor (a pad
+; cannot drive an IR LED's 50..100 mA itself). Idle low: the LED is off.
+;
+; Host command format (FIFO space, thread 0), two words per command:
+;   word 1  bits 6:0 the command; bits 9:8 the length: 0 = 12 bit, 1 = 15,
+;           2 = 20, 3 = reserved (the command is dropped, nothing is sent);
+;           bits 15:12 R, the repeats: the frame goes out 1 + R times (1..16).
+;           Bits 11:10 and 7 are ignored.
+;   word 2  bits 7:0 the address: 12 and 20 bit send bits 4:0, 15 bit sends
+;           bits 7:0; bits 15:8 the extended byte (20 bit only, else ignored).
+; Nothing is ever pushed to OUTQ.
+;
+; Wire format. No public Sony specification exists. Figures from
+; SB-Projects, "Sony SIRC protocol" (sbprojects.net/knowledge/ir/sirc.php,
+; read 2026-11-05) and the Linux kernel's ir-sony-decoder.c (read
+; 2026-11-05): a 40 kHz carrier, duty 1/4 or 1/3; unit T = 600 us; a header
+; mark of 4T and a space of T; then the bits, least significant first, each
+; a mark of T (0) or 2T (1) and a space of T: the 7-bit command, then the
+; 5-bit address (12 bit), the 8-bit address (15 bit) or the 5-bit address
+; and the 8-bit extended field (20 bit). Frames repeat every 45 ms start to
+; start while a key is held. Here a mark of k units is 24k whole carrier
+; periods (T = 24 periods at 40 kHz), so every mark starts on the T grid.
+;
+; Repeats and the 45 ms grid. A frame that starts at S (the header's first
+; rise) is followed by the next one at S + 75 T (45.0 ms) exactly: the same
+; frame while repeats are left, else the next command if both its words are
+; in INQ LEAD ticks before that slot. With INQ empty then, the chain ends and
+; the next command starts as soon as it comes. A command whose second word is
+; late starts when that word arrives. The longest frame (20 bit, all ones) is
+; 64 T to the end of its last mark, so a frame never runs into its slot, and
+; the dark time after its last mark is at least 11 T (6.6 ms), more than the
+; 10 T trailer the Linux decoder asks for.
+;
+; Tick (set by the host before RUN, the M2 convention: the clock is the
+; board's): one tick is a third of a carrier period, TICK = f_clk / 120 kHz.
+;   50 MHz: TICK_INT 416, TICK_FRAC 171: 416.66796875 clocks (ideal
+;     416.6667, +3.1 ppm). Carrier period 3 ticks = 1250.0 clocks: 39,999.9 Hz.
+;     Ticks fall on clock edges: a high is 416 or 417 clocks, a period 1250 or
+;     1251, every edge within one clock (20 ns) of the ideal grid.
+;   1.92 MHz (the RTL tests): TICK_INT 16, TICK_FRAC 0: exactly 40 kHz.
+; The deadline schedule is proved for ticks of 16 clocks or more (.tick).
+;
+; Duty 1/3 (SB-Projects allows 1/4 or 1/3): high one tick, low two.
+;
+; Envelope. T = 72 ticks. A mark of k units is 24k carrier cycles; measured
+; from its first rise to its last fall it lasts 72k - 2 ticks (16.7 us less
+; than k T: the last cycle's dark two thirds belong to the space), and the
+; space after it is 72m + 2 ticks for m units. Mark starts are exact.
+;   header mark  96 cycles   2.4 ms    bit 1 mark  48 cycles  1.2 ms
+;   bit 0 mark   24 cycles   0.6 ms    space       72 ticks    0.6 ms
+;
+; Timing. Each carrier edge is `SETP LED, v, D` and the WAITD that lands it,
+; on the exact clock edge of its tick (SEMANTICS 6.10 rule 1). The burst loop
+; is a subroutine, as in ir_nec_tx: SETP 1 D, WAITD 2 (the rise), SETP 0 D,
+; WAITD 1 (the fall), DJNZ. TD is held two ticks before the next unit-grid
+; point between marks, so a space of m units is one WAITD 72m, and the next
+; bit's bookkeeping runs in the space before that WAITD.
+;
+; Registers: r0 word 1 (its repeat count counted down), r1 word 2, then the
+; bits after the command packed as they go out, r2 the bits on the wire now,
+; r3 carrier cycles, r4 data bits left, r5 units from the next grid point to
+; the next start, r6 the number of bits after the command (5, 8 or 13), r7
+; scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   LED = OUT0
+        .tick   16                      ; the shortest tick the schedule is proved for
+        .equ    U     = 72              ; ticks per unit T (600 us)
+        .equ    CYC0  = 24              ; carrier cycles in a 1 T mark
+        .equ    CYC1  = 48              ; 2 T
+        .equ    HCYC  = 96              ; the 4 T header
+        .equ    START = 75              ; units from one start to the next (45 ms)
+        .equ    HUNITS = 5              ; header mark and space
+        .equ    LEAD  = 12              ; ticks between the INQ test and a start
+
+start:  SETP    LED, 0                  ; LED off
+
+; Idle: no chain. Wait for both words of a command.
+idle:   POP     r0                      ; blocks while INQ is empty
+late:   POP     r1                      ; the second word (blocks until queued)
+        SETD    LEAD                    ; re-anchor after the unbounded POPs
+
+; A new command: pack the bits after the command into r1, their count in r6.
+; Entered with TD LEAD ticks before the start.
+prep:   MOV     r7, r0
+        SHRI    r7, 8
+        ANDI    r7, 3                   ; the length code; Z: 12 bit
+        BZ      l12
+        CMPI    r7, 1
+        BZ      l15
+        CMPI    r7, 2
+        BNZ     idle                    ; 3, reserved: dropped
+        MOV     r7, r1                  ; 20 bit: address 4:0, extended 12:5
+        SHRI    r7, 3
+        MOV16   r6, 0x1FE0
+        AND     r7, r7, r6              ; the extended byte, in bits 12:5
+        ANDI    r1, 0x1F
+        OR      r1, r1, r7
+        LDI     r6, 13
+        JMP     frame
+l15:    LDI     r6, 0xFF                ; 15 bit: the 8-bit address
+        AND     r1, r1, r6
+        LDI     r6, 8
+        JMP     frame
+l12:    ANDI    r1, 0x1F                ; 12 bit: the 5-bit address
+        LDI     r6, 5
+
+; A frame. Entered with TD LEAD ticks before its start (from prep, or from
+; the gap below for a repeat); the header's first rise lands on that start.
+frame:  MOV     r2, r0
+        SHLI    r2, 9
+        SHRI    r2, 9                   ; the 7-bit command, first on the wire
+        MOV     r4, r6
+        ADDI    r4, 7                   ; data bits: 12, 15 or 20
+        LDI     r5, START - HUNITS + 1  ; units from the header's end to the next start
+        LDI     r3, HCYC
+        WAITD   LEAD - 2                ; the burst loop's WAITD 2 lands the start
+        CALL    burst                   ; the 2.4 ms header
+        JMP     space                   ; then its space, T, as a bit's
+
+; The data bits, least significant first. Entered with TD two ticks before
+; this bit's mark, r3 its carrier cycles; r4 counts the bits left, this one
+; included. (`burst` is the only subroutine: the deadline checker follows a
+; RET back to every CALL of its subroutine (loomasm README, limitation 3),
+; so a second one made paths that do not exist.)
+bits:   CALL    burst                   ; the mark; back at its last fall
+        DEC     r4
+        BZ      gap                     ; the last: its space is the gap's
+        CMP     r4, r6
+        BNZ     space
+        MOV     r2, r1                  ; the command is out: the rest follows
+space:  DEC     r5                      ; this space
+        LDI     r3, CYC0                ; the next bit's mark: r3 its cycles,
+        DEC     r5                      ; r5 less its units
+        SHRI    r2, 1                   ; C = the next bit
+        BNC     sp0
+        LDI     r3, CYC1                ; a 1: 2 T
+        DEC     r5
+sp0:    WAITD   U                       ; the space, T
+        JMP     bits
+
+; The carrier: r3 cycles, each a rise, one tick high, two ticks low. Entered
+; with TD two ticks before the first rise; returns with TD at the last fall,
+; two ticks before the unit-grid point at the mark's end.
+burst:  SETP    LED, 1, D
+        WAITD   2                       ; the rise lands here
+        SETP    LED, 0, D
+        WAITD   1                       ; the fall, one tick later
+        DJNZ    r3, burst
+        RET
+
+; The gap to the next start, S + 45 ms. Entered two ticks before the grid
+; point G at the last mark's end, r5 = the units from G to the next start
+; (11 or more).
+gap:    DEC     r5                      ; the last unit is waited below
+gl:     WAITD   U
+        DJNZ    r5, gl
+        WAITD   U + 2 - LEAD            ; LEAD ticks before the next start
+        MOV     r7, r0
+        SHRI    r7, 12                  ; repeats left; Z: none
+        BZ      chain
+        LDI     r7, 0
+        LDIH    r7, 0x10
+        SUB     r0, r0, r7              ; one repeat fewer
+        JMP     frame                   ; the same frame on the slot
+chain:  WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      idle                    ; nothing queued: the chain ends
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0
+        WAITB   INQ_NE, T               ; the second word queued as well?
+        BT      late                    ; not yet: the frame starts when it comes
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r1
+        JMP     prep                    ; its header lands on the start

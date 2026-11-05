@@ -1,0 +1,248 @@
+; ir_sirc_rx.loom
+; Sony SIRC infrared receiver (12, 15 and 20 bit) on IN0, for the output of a
+; demodulating receiver module (a TSOP38240 or alike: low while a 40 kHz
+; burst is present), delivering frames and errors to the host through OUTQ[0].
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names SIRC.
+; Nothing in Loom was built for infrared. As ir_nec_rx.loom does, the program
+; measures every mark and space with the timed waits (`WAITP ... T` against a
+; `SETD` deadline, SEMANTICS 6.4), built for the timeouts of PS/2 and I2C
+; clock stretching, and restarts its tick generator on every edge it accepts
+; (a `CSRW TICK_INT` clears ACC, SEMANTICS 4), the hard synchronisation built
+; for the UART, CAN and Manchester receivers. What the firmware does that no
+; hardware does: pulse-width decoding (SIRC codes the mark, where NEC codes
+; the space), the windows below, the glitch filter, and finding the frame
+; length (12, 15 or 20 bits) from the frame's end, since nothing on the wire
+; announces it. It needs the FIFOs (PUSH) and nothing else.
+;
+; Pin: RX = IN0, idle high (the module's output; it has its own pull-up).
+;
+; Result format (FIFO space read, thread 0). Bits 15:14 give the kind:
+;   frame:  two words, in the layout ir_sirc_tx.loom takes.
+;           word 1  bits 6:0 the command; bits 9:8 the length: 0 = 12 bit,
+;                   1 = 15, 2 = 20; bits 15:14 = 01, the rest 0.
+;           word 2  12 bit: the 5-bit address; 15 bit: the 8-bit address;
+;                   20 bit: the 5-bit address in 4:0, the extended byte in 15:8.
+;   error:  one word, bits 15:14 = 11. Bits 12:8 n, the data bits received
+;           whole before it (0..20); bit 3 in the header; bit 2 a space (0: a
+;           mark); bits 1:0 the fault: 1 out of its window (too short, or
+;           between two windows), 2 too long (a timeout: the line stopped
+;           changing), 3 the length: the frame ended after n bits, n not 12,
+;           15 or 20, or a 21st bit began (n = 20).
+; Every frame is reported, repeats included: a held key gives one report per
+; 45 ms, and the host, which has them all, decides what a repeat is.
+; A report is never split: the program blocks on a full OUTQ, which a host
+; must empty within about 4 ms (the dark time left before the next header).
+; Nothing is read from INQ.
+;
+; Wire format: SB-Projects, "Sony SIRC protocol" (sbprojects.net/knowledge/
+; ir/sirc.php) and the Linux kernel's ir-sony-decoder.c, both read
+; 2026-11-05; no public Sony specification exists. Unit T = 600 us; a header
+; mark of 4T and a space of T; each bit a mark of T (0) or 2T (1) and a space
+; of T, least significant first; 7 command bits, then 5 address bits (12
+; bit), 8 (15 bit), or 5 and 8 extended bits (20 bit). Frames start 45 ms
+; apart, which leaves at least 10 T of dark time after the last mark (the
+; Linux decoder's minimum trailer).
+;
+; Tick (set by the host before RUN, the M2 convention): one tick is T/16,
+; 37.5 us.
+;   50 MHz: TICK_INT 1875, TICK_FRAC 0 (exact).
+;   1.92 MHz (the RTL tests): TICK_INT 72, TICK_FRAC 0 (exact).
+; TICK_INT must be 64 or more (the glitch filter and the restart latency,
+; below, are fractions of a tick). The program reads TICK_INT once at start.
+;
+; Windows, in ticks (16 to the unit) from the edge that opened the pulse:
+;   header mark  4T   64 t   44 .. 84   +-25 % and 4 ticks (1.65 .. 3.15 ms)
+;   header space  T   16 t    8 .. 24   (300 .. 900 us)
+;   mark, a 0     T   16 t    8 .. 24
+;   mark, a 1    2T   32 t   24 .. 40   (900 us .. 1.5 ms)
+;   space         T   16 t    8 .. 24   another bit follows
+;                             24 .. 64  an error (between the windows)
+;                            64 or more the frame has ended
+; The threshold between a 0 and a 1 is 1.5 T (900 us), the midpoint. The
+; receiver module's error is additive, not proportional: its output pulse is
+; the burst length -5/f0 .. +5/f0, +-125 us at 40 kHz (Vishay TSOP382..,
+; TSOP384.. datasheet, document 82491 rev. 2.1, figure 1 note 3, the figure
+; ir_nec_rx.loom uses; the 40 kHz part TSOP38240 is in that family). The
+; midpoint gives both widths the same 300 us of margin, 2.4 times that error;
+; the Linux decoder's windows (+-T/2 around T and 2T) meet at the same
+; point. The 4 ticks (150 us) on the header are for the module too. A space
+; ends the frame at 4 T (2.4 ms): longer than any space inside a frame can
+; be with the module's error (T + 125 us), and well short of the 10 T dark
+; time a frame is followed by, so the report goes out at least 4 ms before
+; the next header can start. On an idle line a low pulse shorter than a
+; header is noise and is ignored silently; every other violation ends the
+; frame with an error word, and the receiver then waits for the line to be
+; idle (high) again.
+;
+; Glitch filter, edge restarts, deadline chain and measurement error: as in
+; ir_nec_rx.loom. An edge counts only if the new level is still there 2 ticks
+; (75 us) later; a pulse of either level shorter than that is ignored and the
+; wait it interrupted goes on against the same deadline. A confirmed edge
+; restarts the tick grid, so each window is measured from the edge that
+; opened it plus the filter's 2 ticks, which the deadlines take off (W =
+; window - G). Each pulse is measured to within about 30 clocks (0.6 us at
+; 50 MHz, 16 us at 1.92 MHz). There is no `WAITD` in the program, so the
+; deadline checker has no pair to prove; `.tick` records the shortest tick
+; the header allows.
+;
+; Registers: r0 the item being measured (error bits 3:2), then the result;
+; r1 the weight of the next bit; r2 the command once its 7 bits are in; r3
+; the bits being collected (the command, then the rest); r4 data bits
+; received; r5 the glitch-filter delay in slots; r6 = TICK_INT for the
+; restarts; r7 the delay counter and scratch.
+;
+; Decided at integration (2026-11-05): no public Sony specification exists;
+; SB-Projects and the Linux decoder are the sources, and the 40 kHz receiver
+; module's figures are taken from the 38 kHz TSOP datasheet family,
+; unchecked. The transmitter sends 1 + R frames as the host asks and
+; enforces no minimum (a host emulating a remote should send R >= 2). A mark
+; of k units is 24k whole carrier periods, keeping mark starts on the T
+; grid. The receiver ends a frame at a 4 T space, which the 45 ms grid
+; leaves unambiguous.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   64                      ; TICK_INT 64 or more (header)
+        .equ    G     = 2               ; glitch filter, ticks
+        .equ    HMMIN = 44 - G          ; header mark window, minus the filter
+        .equ    HMMAX = 84 - G
+        .equ    MMIN  = 8 - G           ; a T mark or space
+        .equ    MMAX  = 24 - G          ; and the 0/1 threshold, 1.5 T
+        .equ    M1MAX = 40 - G          ; a 2T mark
+        .equ    SEND  = 64 - G          ; a space this long ends the frame
+        .equ    I_HDR = 8               ; item bits of an error word
+        .equ    I_SPACE = 4
+        .equ    E_WIN  = 1              ; fault bits
+        .equ    E_LONG = 2
+        .equ    E_LEN  = 3
+
+start:  CSRR    r6, TICK_INT            ; P, kept for the restarts
+        MOV     r5, r6
+        SHRI    r5, 1                   ; P / 2 slots = 2 ticks: the glitch filter,
+        SUBI    r5, 4                   ; less the 4 other slots of wlow / whigh
+
+; Hunt for a header: an idle (high) line first, then a confirmed mark.
+hunt:   WAITP   RX, 1
+h2:     SETD    255                     ; re-armed every 255 ticks
+        CALL    wlow
+        BT      h2                      ; no mark yet
+        LDI     r4, 0                   ; no data bit yet: n = 0 in an error
+        LDI     r0, I_HDR
+        SETD    HMMIN                   ; the header mark, 44 .. 84 ticks
+        CALL    whigh
+        BNT     hunt                    ; too short for a header: noise, ignored
+        SETD    HMMAX - HMMIN
+        CALL    whigh
+        BT      elong                   ; too long
+        SETD    MMIN                    ; the header space, 8 .. 24 ticks
+        ORI     r0, I_SPACE
+        LDI     r1, 1                   ; the weight of bit 0
+        LDI     r3, 0
+        CALL    wlow
+        BNT     ewin                    ; too short
+        SETD    MMAX - MMIN
+        CALL    wlow
+        BT      elong                   ; too long
+
+; A data bit's mark: 8 .. 24 ticks is a 0, 24 .. 40 a 1. Entered at its
+; confirmed start.
+mark:   LDI     r0, 0                   ; a mark (bits 3:2 clear)
+        SETD    MMIN
+        CALL    whigh
+        BNT     ewin                    ; too short
+        SETD    MMAX - MMIN
+        CALL    whigh
+        LDI     r7, 0                   ; (LDI leaves T alone)
+        BNT     space                   ; a 0
+        SETD    M1MAX - MMAX
+        CALL    whigh
+        BT      elong                   ; too long
+        MOV     r7, r1                  ; a 1
+
+; The space after it. The deadline is set first, at the mark's confirmed
+; end; the bit is filed while it runs. The first 7 bits are the command.
+space:  SETD    MMIN
+        OR      r3, r3, r7
+        SHLI    r1, 1
+        INC     r4                      ; this bit is whole
+        CMPI    r4, 7
+        BNZ     sp1
+        MOV     r2, r3                  ; the command is in; the rest from bit 0
+        LDI     r3, 0
+        LDI     r1, 1
+sp1:    LDI     r0, I_SPACE
+        CALL    wlow
+        BNT     ewin                    ; too short
+        SETD    MMAX - MMIN
+        CALL    wlow
+        BNT     sep                     ; another bit follows
+        SETD    SEND - MMAX
+        CALL    wlow
+        BNT     ewin                    ; between the two windows
+        JMP     done                    ; 4 T of dark: the frame has ended
+sep:    CMPI    r4, 20
+        BNZ     mark
+        JMP     elen                    ; a 21st bit
+
+; The frame has ended after r4 bits: 12, 15 or 20 is a frame.
+done:   CMPI    r4, 12
+        BZ      f12
+        CMPI    r4, 15
+        BZ      f15
+        CMPI    r4, 20
+        BNZ     elen
+        MOV     r0, r3                  ; 20 bit: the extended byte (bits 12:5
+        SHLI    r0, 3                   ; of the rest) to 15:8
+        LDI     r7, 0
+        LDIH    r7, 0xFF
+        AND     r0, r0, r7
+        ANDI    r3, 0x1F                ; the address
+        OR      r3, r3, r0
+        LDI     r7, 2
+        JMP     rep
+f15:    LDI     r7, 1
+        JMP     rep
+f12:    LDI     r7, 0
+rep:    MOV     r0, r2                  ; the 7-bit command
+        LDIH    r0, 0x40                ; a frame
+        SWAP    r7, r7                  ; the length code to 9:8
+        OR      r0, r0, r7
+        PUSH    r0                      ; blocks while OUTQ is full
+        PUSH    r3
+        JMP     hunt
+
+; Errors: r0 holds the item; n = r4 data bits were received whole.
+elen:   ORI     r0, E_LEN
+        JMP     err
+ewin:   ORI     r0, E_WIN
+        JMP     err
+elong:  ORI     r0, E_LONG
+err:    LDIH    r0, 0xC0
+        MOV     r7, r4
+        SWAP    r7, r7                  ; n to 12:8
+        OR      r0, r0, r7
+        PUSH    r0
+        JMP     hunt                    ; which waits for an idle line first
+
+; wlow / whigh: wait until RX is low / high or TD is reached, through the
+; glitch filter. T = 1: TD came first. T = 0: the new level held for r5
+; slots (2 ticks). A level that does not hold is a glitch, and the wait goes
+; on against the same TD. A confirmed edge restarts the tick grid (CSRW
+; TICK_INT clears ACC), exactly 2 ticks after the WAITP that saw it.
+wlow:   WAITP   RX, 0, T
+        BT      wlr
+        MOV     r7, r5
+wld:    DJNZ    r7, wld
+        JP      RX, 1, wlow             ; high again: a glitch
+        CSRW    TICK_INT, r6            ; the next window starts here
+wlr:    RET
+whigh:  WAITP   RX, 1, T
+        BT      whr
+        MOV     r7, r5
+whd:    DJNZ    r7, whd
+        JP      RX, 0, whigh            ; low again: a glitch
+        CSRW    TICK_INT, r6
+whr:    RET
