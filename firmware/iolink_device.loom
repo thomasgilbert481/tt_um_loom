@@ -1,0 +1,397 @@
+; iolink_device.loom
+; An IO-Link device (IEC 61131-9, the IO-Link Interface and System
+; Specification v1.1.3) at the logic level, behind a PHY such as the
+; MAX14827A or TIOL111, at the COM2 rate: TX drives the PHY's transmit
+; input, TXEN its driver enable, RX reads its receiver output, all three at
+; UART levels (1 idle and stop, 0 the start bit; the PHY inverts to C/Q).
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): IO-Link is in no design
+; document. It needs the M2 core and two pieces of hardware built for
+; other things: the bit engine's manual mode (SEMANTICS 6.9, built as the
+; generic shift register of every serial protocol), which here shifts the
+; eleven bits of each 8E1 character in and out, and LD/ST of slice B
+; (6.11, built for the I2C EEPROM's array), which here holds Direct
+; Parameter page 1 and the messages. No hardware knows IO-Link: the
+; wake-up detection, the even parity, the M-sequence layout, the checksum
+; with its seed and its compression, the response time tA and the page are
+; all firmware. A real device's PHY detects the wake-up request by its
+; current pulse; behind a logic-level PHY that does not report it, this
+; program takes a 0 on RX whose length lies in a host-set window as the
+; wake-up (weaker: see the README section).
+;
+; Pins: TX = OUT2, TXEN = OUT3, RX = IN1 (beside iolink_master's pins).
+;
+; Host words (INQ[2]): first three words of configuration, then process data.
+;   config  bits 1:0 n_in, the PD octets the device sends in a TYPE_2 reply
+;           (0..2); bits 3:2 n_out, the PD octets it expects from the master
+;           in a TYPE_2 message (0..2)
+;   wmin    the shortest 0 taken as a wake-up request, in ticks
+;   wmax    the longest, in ticks (TWU is 75 to 85 us, Table 10: at COM2
+;           with 16 ticks a bit, 46 to 52 ticks; 40 and 64 leave margin)
+;   PD in   any time after: PD0 in bits 15:8, PD1 in bits 7:0 (PD0 alone
+;           when n_in = 1). Each TYPE_2 reply takes the next word queued
+;           when the master's message has ended, or repeats the last one
+;           when none is.
+; Direct Parameter page 1 (B.1.1, Table B.1: VendorID at 0x07..0x08,
+; DeviceID at 0x09..0x0B, MinCycleTime at 0x02, ...) is the 16 words at
+; PAGE, one octet each, which the host sets in the image before RUN.
+;
+; Result (OUTQ[2]):
+;   0x8000 | width   a wake-up request was accepted (its length in ticks)
+;   status, per master message: bits 7:0 MC; bit 8 checksum error; bit 9
+;           parity error; bit 10 framing error; bit 11 incomplete (an
+;           octet did not start within t1); bit 12 an M-sequence type
+;           other than 0 or 2; bit 13 the device replied
+;   then, for a message it replied to: the PD out word (PD0 in 15:8, PD1 in
+;   7:0) if it had PD out, and the OD octet if it was a write.
+; The host must drain OUTQ within an M-sequence cycle: a PUSH that stalls
+; holds the device off the line.
+;
+; Behaviour (Annex A). A message is MC, CKT, the n_out PD octets for TYPE_2,
+; and OD for a write (MC bit 7 = 0); its octets must follow each other with
+; t1 <= 1 bit time (A.3.3), the next start bit within 2.5 bit times of the
+; previous stop bit's middle. A message with a parity, framing or checksum
+; error, or an unknown type, gets no reply (A.4). Otherwise the reply's first
+; start bit goes out tA = 5.5 bit times after the end of the message's last
+; stop bit (1 to 10, A.3.5; the time the checks and the reply take at the
+; fastest tick, see TW1 and TW2), with its octets back to back (t2 = 0, A.3.4):
+; OD for a read, then for TYPE_2 the n_in PD octets, then CKS with the
+; Event flag and PD status 0 ("valid", A.1.5). A read of the page channel
+; at 0x00..0x0F returns the page's octet; any other read returns 0, as
+; A.1.2 has it for what a device does not implement (page 2, the process
+; and diagnosis channels, ISDU: no ISDU and no Events are implemented). A
+; write of the page channel at 0x00..0x0F goes into the page (MasterCommand,
+; MasterCycleTime); other writes are ignored, and every write is reported.
+; There is no fallback to SIO and no new wake-up while in COM2: once woken
+; the device stays in COM2 until it is reset.
+;
+; Rate: sixteen ticks a bit, the host writes TICK_INT and TICK_FRAC before
+; RUN (COM2 at 50 MHz: 81 + 97/256). The deadline pairs are proved for
+; ticks of 10 clocks or more (.tick).
+;
+; Memory: thread 2's code from 0x100 runs into thread 3's quarter (see the
+; README row, up to 0x1F3), with its 16-word message and settings block at
+; 0x0E0 and the page at 0x0F0..0x0FF, in thread 1's quarter after
+; iolink_master's code (which ends below 0x0E0); iolink_master's buffer at
+; 0x1F5 is not touched, so the two load and run together. Threads 1 and 3
+; must not be started.
+;
+; Decided at integration (2026-11-05): with no wake-up output from the PHY
+; the device takes a host-set 0 on RX in its startup state as the WURQ and
+; does not look for a new one once woken; the master drives the level
+; opposite to what it reads. TYPE_0 and TYPE_2_x only; ISDU, Events, the
+; SIO fallback and the COM3/COM2/COM1 search are not implemented (the host
+; runs the search). A message with a UART or checksum error gets no reply
+; and is reported to the host (A.4).
+
+        .imem   512
+        .thread 2
+        .pins   TX = OUT2, TXEN = OUT3, RX = IN1
+        .tick   10                      ; the fastest tick supported (header)
+        .equ    CKERR = 1               ; status flags, in r5 (bits 13:8 of
+        .equ    PARERR = 2              ; the status word)
+        .equ    FRAMING = 4
+        .equ    SHORT = 8
+        .equ    BADTYPE = 16
+        .equ    REPLIED = 32
+        .equ    TW1 = 40                ; ticks for the checks, from the
+        .equ    TW2 = 40                ; last stop bit's middle, then for
+                                        ; the reply: tA = TW1 + TW2 + 8
+        .equ    DBUF = 0x0E0            ; 0..4 the message, 8..11 the reply
+        .equ    WMIN = 12               ; offsets in DBUF: the settings
+        .equ    WMAX = 13
+        .equ    PDIN = 14               ; the last PD in word
+        .equ    CFG = 15
+        .equ    PAGE = 0x0F0
+
+; Registers: r0 an octet, r1 a count, r2 a deadline, r3 MC, r4 the
+; checksum, r5 the status, r6 n_out or a pointer, r7 a pointer.
+
+start:  SETP    TX, 1                   ; idle level
+        SETP    TXEN, 0                 ; released
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0               ; LSB first, NRZ
+        MOV16   r7, DBUF
+        POP     r0
+        ST      r0, r7, CFG
+        POP     r0
+        ST      r0, r7, WMIN
+        POP     r0
+        ST      r0, r7, WMAX
+
+; --------------------------------------------------- the wake-up request
+; A 0 on RX from wmin to wmax ticks long (5.3.3.3: the master drives the
+; line opposite to its level for TWU). Anything else is ignored.
+wake:   WAITP   RX, 1                   ; the line idle
+        WAITP   RX, 0                   ; a 0 starts
+        SETD    0
+        CSRR    r0, TD                  ; its start
+        LD      r1, r7, WMAX
+        ADD     r1, r1, r0
+        CSRW    TD, r1
+        WAITP   RX, 1, T                ; its end, or wmax ticks
+        BT      wake                    ; too long (wake waits for the 1)
+        CSRR    r1, NOW
+        SUB     r1, r1, r0              ; its length
+        LD      r2, r7, WMIN
+        CMP     r1, r2
+        BNC     wake                    ; too short
+        MOV16   r2, 0x8000
+        OR      r1, r1, r2
+        PUSH    r1                      ; accepted, with its length
+
+; --------------------------------------------------- the master's message
+; MC, CKT, then by the type in CKT the PD out octets (TYPE_2) and OD (a
+; write), each stored at r7 and XORed into r4 from the seed 0x52 (A.1.6).
+; One inline loop, not a subroutine: the deadline checker follows a RET
+; to every CALL of the thread, which would join the octet loop to the
+; checksum's. r1 counts the octets still to come, r2 holds the tick by
+; which the next start bit must come: 2.5 bit times after the middle of
+; the previous stop bit (t1 <= 1). The bit engine shifts the nine bits
+; b0..b7 and the parity bit in.
+msg:    MOV16   r7, DBUF
+        LD      r6, r7, CFG
+        SHRI    r6, 2                   ; n_out
+        LDI     r5, 0
+        LDI     r4, 0x52
+        LDI     r1, 2                   ; MC and CKT
+        WAITP   RX, 0                   ; a start bit: the message begins
+        SETD    0
+        CSRR    r2, TD                  ; a glitch here times out at once
+        JMP     rxs
+rxo:    CSRW    TD, r2
+        WAITP   RX, 0, T                ; a start bit, or the deadline
+        BT      short
+        SETD    0
+rxs:    WAITD   8                       ; the middle of the start bit
+        JP      RX, 1, rxo              ; the line is 1 again: a glitch
+        LDI     r0, 9
+        CSRW    CNT, r0
+rxb:    WAITD   16                      ; the middle of the next bit
+        SHI
+        BNZ     rxb
+        STSR    r0
+        SHRI    r0, 7                   ; b0..b7 in 7:0, the parity bit in 8
+        PAR     r0, r0                  ; even parity: C = 0
+        BNC     rxp
+        ORI     r5, PARERR
+rxp:    SHLI    r0, 8
+        SHRI    r0, 8                   ; the octet
+        WAITD   16                      ; the middle of the stop bit
+        JP      RX, 1, rxf
+        ORI     r5, FRAMING
+rxf:    ST      r0, r7, 0
+        INC     r7
+        XOR     r4, r4, r0
+        CSRR    r2, TD
+        ADDI    r2, 40                  ; the next start bit's deadline
+        DJNZ    r1, rxo
+        MOV16   r3, DBUF + 2
+        CMP     r7, r3
+        BNZ     check                   ; past the CKT: the message is in
+        MOV16   r3, DBUF
+        LD      r3, r3, 0               ; MC
+        MOV     r1, r3
+        SHLI    r1, 9                   ; C = MC bit 7: a read
+        LDI     r1, 0
+        BC      mrd
+        LDI     r1, 1                   ; a write: OD
+mrd:    SHRI    r0, 6                   ; r0 = CKT: the M-sequence type
+        BZ      mt0
+        CMPI    r0, 2
+        BZ      mt2
+        ORI     r5, BADTYPE
+        JMP     mt0
+mt2:    ADD     r1, r1, r6              ; TYPE_2: the PD out octets
+mt0:    TEST    r1, r1
+        BNZ     rxo
+        JMP     check
+
+short:  MOV16   r3, DBUF
+        CMP     r7, r3
+        BZ      msg                     ; a glitch on the idle line
+        ORI     r5, SHORT               ; part of a message: reported
+        JMP     check
+; ------------------------------------------------------------ the checks
+; Any error: no reply. Then CKT's checksum bits, taken back out of r4,
+; must equal the compressed XOR (A.1.6).
+check:  MOV16   r3, DBUF
+        LD      r3, r3, 0               ; MC
+        TEST    r5, r5
+        BNZ     report
+        MOV16   r6, DBUF
+        LD      r0, r6, 1               ; CKT
+        MOV     r6, r0
+        ANDI    r6, 63
+        XOR     r0, r4, r6
+        CALL    ck6
+        WAITD   TW1                     ; an anchor: ck6 is called twice
+        CMP     r0, r6
+        BZ      good
+        ORI     r5, CKERR
+        JMP     report
+
+; ------------------------------------------------------------- the reply
+; Built at DBUF + 8 (r6), XORed into r4 from the seed. r7, the message's
+; end, is kept at DBUF + 6 for the report.
+good:   MOV16   r1, DBUF
+        ST      r7, r1, 6
+        MOV16   r6, DBUF + 8
+        LDI     r4, 0x52
+        MOV     r0, r3
+        SHLI    r0, 9                   ; C = MC bit 7
+        BNC     wr
+        LDI     r0, 0                   ; a read: OD
+        MOV     r1, r3
+        SHRI    r1, 4
+        CMPI    r1, 0x0A                ; read, page channel, 0x00..0x0F
+        BNZ     od0
+        MOV     r1, r3
+        ANDI    r1, 15
+        MOV16   r2, PAGE
+        ADD     r1, r1, r2
+        LD      r0, r1, 0               ; the page's octet
+od0:    ST      r0, r6, 0
+        INC     r6
+        XOR     r4, r4, r0
+        JMP     pd
+wr:     MOV     r1, r3
+        SHRI    r1, 4
+        CMPI    r1, 0x02                ; write, page channel, 0x00..0x0F
+        BNZ     pd
+        MOV     r1, r7
+        DEC     r1
+        LD      r0, r1, 0               ; OD, the message's last octet
+        MOV     r1, r3
+        ANDI    r1, 15
+        MOV16   r2, PAGE
+        ADD     r1, r1, r2
+        ST      r0, r1, 0               ; into the page
+; TYPE_2: the n_in PD octets of the next PD in word queued, else the last.
+pd:     MOV16   r1, DBUF
+        LD      r0, r1, 1
+        SHRI    r0, 6                   ; the type
+        BZ      cks
+        LD      r2, r1, CFG
+        ANDI    r2, 3                   ; n_in
+        BZ      cks
+        LD      r0, r1, PDIN
+        WAITB   INQ_NE, T               ; a test: TD is in the past
+        BT      pdl
+        .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ[2]"
+        POP     r0
+        ST      r0, r1, PDIN
+pdl:    MOV     r1, r0                  ; unrolled: a loop here would have
+        SHRI    r1, 8                   ; no anchor for the deadline check
+        ST      r1, r6, 0               ; PD0
+        INC     r6
+        XOR     r4, r4, r1
+        CMPI    r2, 1
+        BZ      cks
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r6, 0               ; PD1
+        INC     r6
+        XOR     r4, r4, r0
+cks:    MOV     r0, r4                  ; CKS: Event 0, PD status 0 (valid)
+        CALL    ck6
+        ST      r0, r6, 0
+        INC     r6
+
+; Send it tA = TW1 + TW2 + 8 = 88 ticks, 5.5 bit times, after the end of
+; the message's last stop bit (A.3.5: 1 to 10): the driver one bit before, octets back to back, each
+; bit from the bit engine one slot after its tick.
+        MOV16   r7, DBUF + 8
+        SUB     r1, r6, r7              ; octets
+        WAITD   TW2                     ; one bit before the first start bit
+        SETP    TXEN, 1
+txo:    LD      r0, r7, 0
+        PAR     r0, r0                  ; C = the even parity bit
+        BC      tp1
+        LDIH    r0, 2                   ; bit 9: the stop bit
+        JMP     tfr
+tp1:    LDIH    r0, 3                   ; bit 8: the parity bit
+tfr:    SHLI    r0, 1                   ; bit 0: the start bit
+        LDSR    r0
+        LDI     r0, 11
+        CSRW    CNT, r0
+tb:     WAITD   16                      ; the bit starts
+        SHO
+        BNZ     tb
+        INC     r7
+        DJNZ    r1, txo
+        WAITD   16                      ; the end of the last stop bit
+        SETP    TXEN, 0                 ; released
+        ORI     r5, REPLIED
+
+; ------------------------------------------------------------- the report
+report: MOV     r0, r5
+        SHLI    r0, 8
+        OR      r0, r0, r3
+        PUSH    r0                      ; the status
+        MOV     r0, r5
+        ANDI    r0, REPLIED
+        BNZ     rpd
+        JMP     msg
+rpd:    MOV16   r6, DBUF
+        LD      r0, r6, 1
+        SHRI    r0, 6
+        BZ      rod                     ; TYPE_0: no PD
+        LD      r1, r6, CFG
+        SHRI    r1, 2                   ; n_out
+        BZ      rod
+        LD      r0, r6, 2               ; PD0
+        SHLI    r0, 8
+        CMPI    r1, 1
+        BZ      rpo
+        LD      r2, r6, 3               ; PD1
+        OR      r0, r0, r2
+rpo:    PUSH    r0                      ; the PD out word
+rod:    MOV     r0, r3
+        SHLI    r0, 9                   ; C = MC bit 7: a read
+        BC      rend
+        LD      r1, r6, 6
+        DEC     r1
+        LD      r0, r1, 0
+        PUSH    r0                      ; the OD a write carried
+rend:   JMP     msg
+
+; ck6: r0 = the 6-bit checksum of the octet in r0, compressed as A.1.6
+; equation (A.1) has it (iolink_master.loom has the derivation). Uses r1,
+; r2 and r4.
+ck6:    LDI     r1, 0x55
+        MOV     r2, r0
+        SHRI    r2, 1
+        AND     r2, r2, r1              ; o: c1, c3, c5, c7 in 0, 2, 4, 6
+        AND     r0, r0, r1              ; e: c0, c2, c4, c6
+        XOR     r4, r0, r2              ; D0, D1, D2, D3 in 0, 2, 4, 6
+        MOV     r1, r4
+        SHRI    r1, 1
+        OR      r4, r4, r1
+        ANDI    r4, 0x33
+        MOV     r1, r4
+        SHRI    r1, 2
+        OR      r4, r4, r1
+        ANDI    r4, 15                  ; D3..D0
+        PAR     r0, r0                  ; C = D4
+        BNC     d4
+        ORI     r4, 16
+d4:     PAR     r2, r2                  ; C = D5
+        BNC     d5
+        ORI     r4, 32
+d5:     MOV     r0, r4
+        RET
+
+; The message and settings block, and Direct Parameter page 1 (Table B.1),
+; as data in thread 3's quarter. The page below is an example the host
+; overwrites in the image: MinCycleTime 0x17 (time base 0.1 ms, 23: the
+; 2.3 ms of Table A.11 for COM2; B.1.3, Table B.3), M-sequence capability
+; 0x00 (no ISDU, OPERATE code 0, PREOPERATE TYPE_0; B.1.4), RevisionID 0x11
+; (B.1.5), ProcessDataIn 0x08 (8 bits, TYPE_2_1; B.1.6), VendorID 0x0102,
+; DeviceID 0x030405.
+        .org    DBUF
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .org    PAGE
+        .word   0x00, 0x00, 0x17, 0x00, 0x11, 0x08, 0x00, 0x01
+        .word   0x02, 0x03, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00
