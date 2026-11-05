@@ -1,0 +1,315 @@
+; mil1553_bc.loom
+; A MIL-STD-1553B bus controller (BC). Written on 2026-11-04, after the
+; hardware was complete (D-032), as a protocol Loom was not designed for
+; (D-035): 1553 is in no design document.
+;
+; Hardware used, and what it was built for:
+;   - the bit engine's Manchester encoder and decoder (ENC = 2, D-026, built
+;     for a generic IEEE 802.3 Manchester line), inverted with INV so that a
+;     1 is high then low as 1553 has it (4.3.3.3.2);
+;   - the engine's DIFF output (built for USB's D+/D-), so TXA and TXB are
+;     written at the same edge and are never both high;
+;   - OUT on a two-pin OUTGRP for the sync, which is not Manchester;
+;   - the tick restart (SEMANTICS 4, a TICK_INT write clears ACC, used by the
+;     Manchester and UART receivers) to re-time the receiver on every word;
+;   - LD/ST (data memory, D-027) for the message buffer, since the FIFOs hold
+;     four words and a 1553 message up to 33.
+; What firmware does that no hardware does: the sync waveforms, odd parity
+; (PAR), sync validation and word timing on receive, the message sequence,
+; the no-response timeout and the intermessage gap.
+;
+; Pins (push-pull, one transceiver): TXA = OUT0, TXB = OUT1 (to the
+; transceiver's TX and TX-bar inputs; both low = not driving); RXA = IN0,
+; RXB = IN1 (its RX and RX-bar outputs: RXA high while the bus is positive,
+; RXB high while it is negative, both low when it is quiet).
+;
+; Rate: the host writes TICK_INT before RUN: one tick is half a bit, 25 at a
+; 50 MHz clock and 24 at 48 MHz. The deadline checker proves every pair at
+; 24 (6 slots per half-bit), so 25 is proved too. Only at 48 MHz is every
+; edge on its grid: at 50 MHz edges are 0 to 3 clocks late of their ticks
+; (SEMANTICS 2), so successive zero crossings are 24 or 28 clocks apart
+; instead of 25 (-20 / +60 ns against the +-25 ns of 4.5.2.1.1.2). A
+; receiver accepts +-150 ns (4.5.2.1.2.1), so the words are read correctly
+; either way; a compliant transmitter needs the 48 MHz clock.
+;
+; Words (4.3.3.4, 4.3.3.5): 20 bit times, a 3-bit sync (command and status:
+; positive 1.5 bits then negative; data: the inverse), 16 bits MSB first,
+; odd parity. Command word: RT address 15:11, T/R 10 (1 = RT transmits),
+; subaddress/mode 9:5 (0 or 31 = mode command), word count/mode code 4:0
+; (word count 0 = 32 words; mode codes 16..31 carry one data word).
+;
+; Host words.
+;   INQ[0]:  a command word, then, if the RT receives (T/R = 0), its data
+;            words (word count of them; one for a mode code 16..31). The BC
+;            pops all of them before the message starts.
+;   OUTQ[0]: a result word, then the k words it announces: the status word
+;            and any data words, in bus order.
+;   Result:  bits 15:8 k, the words received (status included); bit 0 no
+;            response (no status sync within 15 us); bit 1 invalid response
+;            (a word failed validation, or more words than expected: k
+;            counts the valid ones before it); bit 2 word count (a clean
+;            response with k other than expected); bit 3 the status word's
+;            RT address is not the commanded one. 0 with k as expected is a
+;            good message.
+;
+; Message timing (the RT side is mil1553_rt.loom):
+;   - command and data words go out back to back, no gap (4.3.3.6.1);
+;   - no-response timeout: the status sync must start within 30 ticks of
+;     the last parity bit's mid-bit crossing, 15 us (at least 14 us,
+;     4.3.3.9; a status mid-sync up to 16.5 us late is still taken);
+;   - intermessage gap: at least 6 ticks of DLY after the message, plus the
+;     host's time, plus 5 ticks to the next command's mid-sync: >= 5.5 us
+;     (at least 4 us, 4.3.3.7). After an invalid response the BC first waits
+;     for 2 us with no edge on RXA, so it never talks over a terminal.
+;   - broadcast (RT address 31) receive commands: no status is expected by
+;     the standard (4.3.3.6.7); this BC expects one, so it reports "no
+;     response" for them, which the host reads as the normal outcome.
+;
+; Receive (the shared word engine at 0x100, `rxm`): a free hunt for the
+; status sync (RXA rise, still high two ticks later, the fall before four,
+; low for two ticks after it), then 36 half-bit samples on a tick grid
+; restarted at the mid-sync crossing, then, for each contiguous data word,
+; a check of its sync's first half (RXB high, RXA low) and a grid restart
+; at its mid-sync crossing. A word is valid when its sync is, every bit has
+; its mid-bit transition (the decoder's T) and its parity is odd (4.4.1.1).
+;
+; Memory: 512-word build. Thread 0's quarter holds the BC (0x000); the
+; shared word engine (txm, rxm) and the 34-word message buffer are in
+; thread 2's quarter at 0x100, the buffer in thread 3's at 0x180, so
+; threads 2 and 3 must not be started.
+; mil1553_rt.loom carries the same engine at the same address, word for
+; word (tools/tests/test_fw_mil1553.py checks it), so the two programs load
+; together and threads 0 and 1 share one copy of it.
+;
+; Registers: r7 = TICK_INT (for the receiver's grid restarts); r4 the
+; command word and r5 the expected word count across a message; the
+; engine uses r0..r3 and r6.
+;
+; Decided at integration (2026-11-05): an RT that receives an invalid data
+; word sets ME and suppresses its status (4.4.3.6), ME going out in the next
+; status; 48 MHz is the recommended clock (at 50 MHz the zero crossings miss
+; +-25 ns, while every word still decodes); the word engine is carried in
+; both programs so that they load together; ME/BCR are cleared after every
+; status, mode codes 2 and 18 included (simpler than 4.3.3.5.4). Paragraph
+; numbers were cited from memory, not re-read in the PDF: unchecked.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RXA = IN0, RXB = IN1
+        .equ    CFG = (2 << 3) | (1 << 1) | (1 << 7) | (1 << 10)
+                                        ; Manchester, MSB first, INV, DIFF
+        .equ    PINS = (8 << 5) | 16    ; in = IN0 (RXA), out = OUT0 (TXA)
+        .equ    GRP = (2 << 5) | 16     ; OUT writes OUT0 (TXA) and OUT1 (TXB)
+        .equ    BUF = 0x180             ; message buffer, 34 words (thread 3's quarter)
+
+; ------------------------------------------------------------ the BC
+        .thread 0
+        .tick   24                      ; 48 MHz, the tighter of the two rates
+        .csr    BE_CFG, CFG, r1
+        .csr    BE_PINS, PINS, r1
+        .csr    OUTGRP, GRP, r1
+        LDI     r1, 0
+        OUT     r1                      ; TXA = TXB = 0: not driving
+        CSRR    r7, TICK_INT            ; P, for the receiver's restarts
+
+next:   POP     r4                      ; the command word
+        MOV16   r0, BUF
+        MOV     r5, r4
+        ANDI    r5, 31                  ; word count / mode code
+        MOV     r1, r4
+        SHRI    r1, 5
+        ANDI    r1, 31                  ; subaddress / mode
+        BZ      mode
+        CMPI    r1, 31
+        BZ      mode
+        CMPI    r5, 0
+        BNZ     tr
+        LDI     r5, 32                  ; word count 0 is 32 words
+        BRA     tr
+mode:   SHRI    r5, 4                   ; mode codes 16..31 carry one word
+tr:     MOV     r1, r4                  ; r5 = n, the data words
+        SHRI    r1, 10
+        ANDI    r1, 1                   ; T/R
+        BNZ     xmit
+        MOV     r2, r0                  ; BC to RT: pop the n words
+        MOV     r6, r5
+        CMPI    r6, 0
+        BZ      rdy
+pl:     POP     r1
+        ST      r1, r2, 0
+        INC     r2
+        DJNZ    r6, pl
+rdy:    MOV     r6, r5                  ; send the command and n words,
+        INC     r6
+        LDI     r5, 1                   ; expect the status word
+        BRA     send
+xmit:   LDI     r6, 1                   ; RT to BC: send the command,
+        INC     r5                      ; expect the status and n words
+
+send:   MOV     r1, r4
+        LDI     r2, 1                   ; a command sync
+        SETD    1
+        CALL    txm                     ; returns as the bus is released
+        SETD    29                      ; no-response timeout: 15 us after
+                                        ; the last parity mid-bit crossing
+        MOV16   r0, BUF
+        MOV     r6, r5                  ; at most the expected words
+        CALL    rxm
+
+        LDI     r3, 0                   ; result flags (LDI keeps C and T)
+        BC      rok
+        LDI     r3, 1                   ; no response
+        BT      rk
+        LDI     r3, 2                   ; invalid response
+quiet:  SETD    4                       ; wait for 2 us with no edge
+        WAITE   RXA, ANY, T
+        BNT     quiet
+        BRA     rk
+rok:    MOV16   r1, BUF
+        LD      r2, r1, 0               ; the status word
+        XOR     r2, r2, r4
+        SHRI    r2, 11                  ; Z = the commanded RT address
+        BZ      rcnt
+        ORI     r3, 8
+rcnt:   SUB     r2, r0, r1
+        CMP     r2, r5
+        BZ      rk
+        ORI     r3, 4                   ; not the expected word count
+rk:     MOV16   r1, BUF
+        SUB     r6, r0, r1              ; k
+        MOV     r2, r6
+        SWAP    r2, r2                  ; k << 8
+        OR      r3, r3, r2
+        PUSH    r3
+        CMPI    r6, 0
+        BZ      gap
+pk:     LD      r2, r1, 0
+        PUSH    r2
+        INC     r1
+        DJNZ    r6, pk
+gap:    DLY     6                       ; the intermessage gap
+        JMP     next
+
+; ---------------------------------------------------------------------------
+; The word engine: txm and rxm. The same words in mil1553_bc.loom and
+; mil1553_rt.loom, at the same address, so the two load together and threads
+; 0 and 1 share it. Tick = half a bit; r7 = TICK_INT; RXA = IN0, RXB = IN1.
+; ---------------------------------------------------------------------------
+        .org    0x100
+
+; txm: send r1 with a sync r2 (1: command/status, TXA high first; 2: data),
+; then r6 - 1 more words from memory at r0, r0 + 1, ... with data syncs.
+; r6 >= 1. The sync's first half starts at TD + 1 tick; returns as TXA and
+; TXB go low at the end of the last parity bit, with TD on that tick. The
+; next word's LD reads one word past the last (the buffer has a spare).
+txm:    WAITD   1                       ; sync, first half (3 ticks)
+        OUT     r2
+        PAR     r3, r1                  ; C = XOR of the 16 bits
+        LDI     r3, 0                   ; LDI keeps C
+        BC      txp
+        LDIH    r3, 0x80                ; even: the parity bit is 1 (odd parity)
+txp:    LDSR    r1
+        LDI     r1, 16
+        CSRW    CNT, r1                 ; 16 data bits
+        XORI    r2, 3                   ; the sync's other polarity
+        WAITD   3                       ; sync, second half: the mid-sync
+        OUT     r2                      ; zero crossing
+        XORI    r2, 3
+        LD      r1, r0, 0               ; the next word (two slots)
+        INC     r0
+        WAITD   2
+txl:    WAITD   1                       ; bits 1..16 (SEMANTICS 6.9.1)
+        SHO                             ; first half: the bit leaves SR
+        WAITD   1
+        SHO                             ; second half; Z = (CNT == 0)
+        BNZ     txl
+        LDSR    r3                      ; the parity bit, a 17th
+        WAITD   1
+        SHO
+        LDI     r2, 2                   ; the next word has a data sync
+        WAITD   1
+        SHO
+        DJNZ    r6, txm
+        LDI     r2, 0
+        WAITD   1
+        OUT     r2                      ; TXA = TXB = 0: the bus is released
+        RET
+
+; rxm: receive a message: a word with a command/status sync (a free hunt),
+; then every data word that follows it with no gap, stored from r0 on.
+; r6 = the most words to take (the first included); TD = the hunt's timeout.
+; Returns r0 = one past the last valid word, and
+;   C = 1, T = 0: the line went quiet after a valid word (a clean end);
+;   C = 0, T = 1: no sync before TD;
+;   C = 0, T = 0: an invalid word, or a word beyond r6.
+; A clean end returns two ticks after the last parity bit's mid-bit
+; crossing, with TD on that tick (j = 38 of the last word's grid).
+; (The exits sit around the body because JP reaches only -32..+31 words.)
+rxto:   TEST    r0, r0                  ; C = 0, T stays 1
+        RET
+rxbad:  .csr    BE_CFG, CFG, r2         ; HALF = 0 for the next word (6.9.1)
+        LDI     r2, 0
+        CSRW    FLAGS, r2               ; C = 0, T = 0
+        SETD    255                     ; nothing after an error is timed
+                                        ; until the caller re-anchors
+        RET
+rxm:    WAITE   RXA, RISE, T            ; R: a command/status sync starts?
+        BT      rxto
+        CSRW    TICK_INT, r7            ; the grid starts at R
+        SETD    0
+        WAITD   2                       ; R + 2 ticks: still high (a
+        JP      RXA, 0, rxbad           ; Manchester level lasts <= 2 ticks)
+        SETD    2
+        WAITE   RXA, FALL, T            ; M, the mid-sync crossing, before
+        BT      rxbad                   ; R + 4 ticks
+        CSRW    TICK_INT, r7            ; the grid starts at M
+        SETD    0
+        WAITD   1                       ; j = 1, 2: the sync's negative half
+        JP      RXA, 1, rxbad
+        WAITD   1
+        JP      RXA, 1, rxbad
+rxw:    LDI     r2, 16
+        CSRW    CNT, r2
+rxl:    WAITD   1                       ; bits 1..16: j = 3 .. 34
+        SHI                             ; first half: kept
+        WAITD   1
+        SHI                             ; second half: the bit; T if it
+        BNZ     rxl                     ; equals the first half
+        STSR    r1                      ; the 16 bits
+        MOV     r3, r1
+        SHRI    r3, 15                  ; bit 15, which the parity shift drops
+        WAITD   1                       ; parity: j = 35, 36
+        SHI
+        WAITD   1
+        SHI
+        BT      rxbad                   ; a bit with no mid-bit transition
+        STSR    r2                      ; {bits 14:0, parity}
+        XOR     r3, r3, r2
+        PAR     r3, r3                  ; C = parity of all 17 bits
+        BNC     rxbad                   ; even: a parity error
+        ST      r1, r0, 0
+        INC     r0
+        WAITD   2                       ; j = 38: a data sync's first half?
+        JP      RXB, 0, rxend           ; RXB low: the line is quiet
+        JP      RXA, 1, rxbd2
+        DJNZ    r6, rxn
+rxbd2:  BRA     rxbad                   ; (or one word too many)
+rxend:  CMPI    r2, 0                   ; C = 1 (T is 0: the WAITE cleared
+        RET                             ; it and BT saw no violation)
+rxn:    SETD    3                       ; M' is due at j = 40: give up at 41
+        WAITE   RXA, RISE, T
+        BT      rxbd2
+        CSRW    TICK_INT, r7            ; the grid starts at M'
+        SETD    0
+        WAITD   1                       ; j = 1, 2: the sync's positive half
+        JP      RXA, 0, rxbd2
+        WAITD   1
+        JP      RXA, 0, rxbd2
+        BRA     rxw
+
+; ------------------------------------------------------- the message buffer
+; The status word and up to 32 data words received, or the data words to
+; send; one spare word for txm's look-ahead LD. Zeros, so that every word
+; an LD can reach was loaded.
+        .org    BUF
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
