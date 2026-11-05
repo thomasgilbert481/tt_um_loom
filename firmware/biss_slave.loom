@@ -1,0 +1,240 @@
+; biss_slave.loom
+; An absolute position encoder answering BiSS-C or SSI: the slave end of
+; biss_master.loom, for a bench or a demo without a real encoder. MA (the
+; master's clock) comes in on one pin, SLO (the data) goes out on another;
+; on a real board each passes an RS-422 transceiver, and this program sees
+; the logic side only.
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; timed edge waits, the FIFOs), LD/ST (slice B, SEMANTICS 6.11) for the
+; three words of its setting, and the bit engine in manual mode (SHO,
+; SEMANTICS 6.9) with its CRC unit, built for USB's CRC5/CRC16 and CAN's
+; CRC15, here computing BiSS's CRC-6 (polynomial 0x43) as the data, error
+; and warning bits go out, so the CRC is ready, inverted, one bit after nW.
+; No hardware knows BiSS or SSI: the Ack and start bit, the CDS bit, the
+; position split into 16-bit loads of the shift register, the Gray code,
+; the error and warning bits, the timeout and the error injection are all
+; firmware. The master's MA times every bit, so the program keeps no
+; schedule of its own: its tick only measures the timeout.
+;
+; Sources: as biss_master.loom (tools/protomodels/biss.py lists them and
+; marks what is unchecked).
+;
+; Pins: MA = IN0 and SLO = OUT0 (push-pull, to the RS-422 driver). Both move
+; with the assembler's --pin; the tests put the slave on thread 1 with MA =
+; IN1, SLO = OUT1, wired by the bench to the master's OUT0 and IN0.
+;
+; Host command (INQ): three words, always together and while no frame is
+; running (between frames the slave looks at INQ):
+;     word 1     setting: bits 5:0 the position bits n (1 .. 32), bit 8 SSI
+;                (0 BiSS-C), bit 9 GRAY (send the position Gray coded),
+;                bit 10 WARN (send nW = 0), bit 11 ERR (send nE = 0), bit
+;                12 BADCRC (send the CRC not inverted: a CRC error), bits
+;                14:13 Ack periods minus 1 (the encoder's processing time),
+;                bit 15 NOSTART (never send the start bit: the Ack lasts
+;                until the master gives up).
+;     word 2     position bits 15:0
+;     word 3     position bits 31:16 (bits at and above n must be 0)
+; Before the first command: BiSS-C, 24 bits, position 0, no errors.
+; Nothing is pushed to OUTQ.
+;
+; BiSS-C frame, every change on a rising MA edge: idle SLO high; the first
+; falling edge starts the frame (and latches the position: the one set up
+; before the frame is what goes out); rise 2 Ack (SLO low) for 1 to 4
+; periods; start bit (high); CDS (0, no control data); the n position bits
+; MSB first; nE; nW; the CRC-6 inverted, MSB first. The rising edge after
+; the CRC's last bit begins the timeout: SLO low until MA has been quiet
+; for TTO ticks, then high (ready).
+; SSI frame: the first falling edge latches; each rising edge puts the next
+; bit on SLO, MSB first; the rising edge after the LSB drives SLO low for
+; the monoflop time tm (TTO ticks of a quiet MA), then high.
+; A master that stops clocking inside a frame for TTO ticks ends it: SLO
+; low, then high after TTO more ticks.
+;
+; Rate: the master's MA times every bit. The tick times only tTO (and SSI's
+; tm): TTO = 40 ticks, so the host sets TICK = f_clk * tTO / 40, TICK 25 for
+; 20 us at 50 MHz (the usual fixed BiSS timeout). What limits MA is the
+; work between edges: each bit is on SLO 3 to 4 slots after the rising edge
+; is seen, and the slave must be back in its WAITE before the next rising
+; edge: 10 slots after the edge before the CRC, 8 at a new 16-bit load,
+; 5 otherwise. So MA periods of about 56 clocks or more (890 kHz at 50 MHz)
+; work; the tests run 64 and 128 clocks (781 and 391 kHz).
+;
+; Memory: 158 words with the 3-word setting buffer at the end: on thread 0
+; from 0x000 it runs 30 words into thread 1's quarter; on thread 1 (the
+; tests, beside the master) from 0x080 to 0x11D, into thread 2's quarter.
+; No deadline pairs (no WAITD): every wait is an edge with a timeout.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   MA = IN0, SLO = OUT0
+        .tick   25                      ; 0.5 us at 50 MHz (timeouts only)
+        .equ    TTO = 40                ; ticks: the timeout tTO (SSI: tm)
+        .equ    DEFCFG = 24             ; BiSS-C, 24 bits
+
+; Registers: r0 scratch and the Ack counter; r1 the setting; r2 the frame
+; kind for DJNZ (1 SSI, 2 BiSS); r3, r4 the next 16-bit loads (r4 first);
+; r5 the CRC mask (0xFFFF inverts, 0 is BADCRC); r6 the loads left; r7 16.
+
+start:  SETP    SLO, 1                  ; idle: ready
+        OEP     SLO, 1                  ; (a no-op unless SLO is a BIDIR pin)
+        .csr    BE_PINS, pin(SLO) | (pin(MA) << 5)  ; SHO drives SLO
+        .csr    BE_CFG, 0x0202          ; MSB first (DIR), CRC_EN; NRZ
+        .csr    CRC_POLY, 0x0C00        ; x^6 + x + 1 (0x43) left-aligned
+        .csr    CRC_INIT, 0
+        CALL    prep                    ; the setting in buf: the default
+
+; Idle: a falling MA starts a frame; otherwise take a new setting.
+idle:   SETD    0                       ; TD reached: the WAITB below is a test
+        JP      MA, 0, frame
+        WAITB   INQ_NE, T
+        BT      idle
+        POP     r1                      ; the three words of a setting
+        POP     r3
+        POP     r4
+        MOV16   r0, buf
+        ST      r1, r0, 0
+        ST      r3, r0, 1
+        ST      r4, r0, 2
+        CALL    prep
+        JMP     idle
+
+frame:  MOV     r0, r1
+        SHLI    r0, 8                   ; C = bit 8: SSI
+        BC      bit                     ; SSI: the MSB goes out on rise 1
+        SETD    TTO
+        WAITE   MA, RISE, T             ; rise 1
+        BT      tmo
+        MOV     r0, r1
+        SHLI    r0, 1                   ; C = bit 15: NOSTART
+        BC      nost
+        SHRI    r0, 14                  ; bits 14:13 of the setting
+        INC     r0                      ; Ack periods, 1 .. 4
+        JMP     ackw
+nost:   LDI     r0, 0                   ; DJNZ from 0: 65536 periods, so the
+ackw:   SETD    TTO                     ; master gives up first
+        WAITE   MA, RISE, T             ; rise 2
+        BT      tmo
+        SETP    SLO, 0                  ; Ack
+acklp:  SETD    TTO
+        WAITE   MA, RISE, T
+        BT      tmo
+        DJNZ    r0, acklp
+        SETP    SLO, 1                  ; start bit
+        SETD    TTO
+        WAITE   MA, RISE, T
+        BT      tmo
+        SETP    SLO, 0                  ; CDS: 0
+
+; The data: SR holds the first load and CNT its length (prep), and SHO puts
+; one bit on SLO per rising edge while the CRC unit takes it.
+bit:    SETD    TTO
+        WAITE   MA, RISE, T
+        BT      tmo
+        SHO
+        BNZ     bit
+        DJNZ    r6, more                ; another 16-bit load?
+        DJNZ    r2, crc                 ; BiSS: the CRC follows
+        JMP     fin                     ; SSI: done
+more:   LDSR    r4
+        MOV     r4, r3
+        CSRW    CNT, r7
+        JMP     bit
+crc:    STCRC   r0                      ; CRC[15:10] after nW
+        XOR     r0, r0, r5              ; inverted (or not: BADCRC)
+        LDSR    r0
+        LDI     r0, 6
+        CSRW    CNT, r0
+cbit:   SETD    TTO
+        WAITE   MA, RISE, T
+        BT      tmo
+        SHO
+        BNZ     cbit
+
+; The rising edge after the last bit starts the timeout: SLO low until MA
+; has been quiet for TTO ticks. The next frame's loads are set up meanwhile.
+fin:    SETD    TTO
+        WAITE   MA, RISE, T         ; (or time out: the same either way)
+tmo:    SETP    SLO, 0                  ; busy (also a frame the master left)
+        SETD    TTO                     ; tTO from this edge (or this timeout)
+        CALL    prep
+quiet:  WAITE   MA, ANY, T
+        BT      ready                   ; quiet for TTO: ready
+        SETD    TTO                     ; MA moved: start again
+        JMP     quiet
+ready:  SETP    SLO, 1
+        JMP     idle
+
+; prep: the frame's loads from the setting in buf. The bit stream is
+; r0:r4:r3 right-aligned (pos, then nE and nW for BiSS), r5 its length; it
+; goes out in loads of 16 from the end, the first one shorter.
+prep:   MOV16   r0, buf
+        LD      r1, r0, 0
+        LD      r3, r0, 1               ; position 15:0
+        LD      r4, r0, 2               ; position 31:16
+        MOV     r0, r1
+        SHLI    r0, 7                   ; C = bit 9: GRAY
+        BNC     pbin
+        MOV     r0, r4                  ; g = b ^ (b >> 1), 32 bits
+        SHLI    r0, 15
+        MOV     r2, r3
+        SHRI    r2, 1
+        OR      r2, r2, r0
+        XOR     r3, r3, r2
+        MOV     r0, r4
+        SHRI    r0, 1
+        XOR     r4, r4, r0
+pbin:   MOV     r5, r1
+        ANDI    r5, 63                  ; n
+        LDI     r0, 0                   ; bits 47:32 of the stream
+        LDI     r2, 1                   ; SSI ...
+        MOV     r6, r1
+        SHLI    r6, 8                   ; C = bit 8: SSI
+        BC      pk
+        LDI     r2, 2                   ; ... or BiSS: pos, nE, nW
+        MOV     r0, r4
+        SHRI    r0, 14
+        SHLI    r4, 2
+        MOV     r6, r3
+        SHRI    r6, 14
+        OR      r4, r4, r6
+        SHLI    r3, 2
+        MOV     r6, r1
+        SHRI    r6, 10
+        ANDI    r6, 3                   ; {ERR, WARN} ...
+        XORI    r6, 3                   ; ... as {nE, nW}
+        OR      r3, r3, r6
+        ADDI    r5, 2
+pk:     LDI     r6, 1                   ; loads
+        CMPI    r5, 17
+        BNC     pk1
+        INC     r6
+        SUBI    r5, 16
+        CMPI    r5, 17
+        BNC     pk1
+        INC     r6
+        SUBI    r5, 16                  ; r5: the first load's length, 1 .. 16
+pk1:    CMPI    r6, 2
+        BC      pk23
+        MOV     r0, r3                  ; one load
+        JMP     pkset
+pk23:   BNZ     pkset                   ; three: r0, then r4, then r3
+        MOV     r0, r4                  ; two: r4, then r3
+        MOV     r4, r3
+pkset:  LDI     r7, 16
+        SUB     r7, r7, r5
+        SHL     r0, r0, r7              ; left-aligned: SHO sends bit 15 first
+        LDSR    r0
+        CSRW    CNT, r5
+        CRCI
+        LDI     r7, 16
+        LDI     r5, 0xFF
+        LDIH    r5, 0xFF                ; the CRC goes out inverted ...
+        MOV     r0, r1
+        SHLI    r0, 4                   ; C = bit 12: BADCRC
+        BNC     pret
+        LDI     r5, 0                   ; ... unless BADCRC
+pret:   RET
+
+buf:    .word   DEFCFG, 0, 0            ; the setting: word 1, 2, 3

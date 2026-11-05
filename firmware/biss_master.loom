@@ -1,0 +1,311 @@
+; biss_master.loom
+; A BiSS-C and SSI master: reads an absolute position encoder, the kind on
+; the motor shaft of a servo drive. MA (the master's clock) goes out on one
+; pin and SLO (the encoder's data) comes in on another; on a real board each
+; passes an RS-422 transceiver, and this program sees the logic side only.
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, the FIFOs), the deadline-latched pin write (SEMANTICS 6.10,
+; built for clock-exact UART and WS2812 edges), here placing every MA edge
+; on its tick, and the bit engine in manual mode (SHI, SEMANTICS 6.9) with
+; its CRC unit, built for USB's CRC5/CRC16 and CAN's CRC15, here running
+; BiSS's CRC-6 (polynomial 0x43) over the data, error and warning bits as
+; they are sampled. No hardware knows BiSS or SSI: the Ack and start-bit
+; search, the line-delay count, the CDS bit, the split of a frame of up to
+; 40 bits into the 16-bit shift register, the inverted-CRC check, the Gray
+; decode and the wait for the encoder's timeout are all firmware.
+;
+; Sources (tools/protomodels/biss.py has the full list and what is
+; unchecked): the BiSS C frame as Beckhoff's EL5042 documentation draws it
+; ("Basics of BiSS-C technology", fig. 5) and iC-Haus's BiSS C protocol
+; description and application notes AN3/AN6 (CRC-6 0x43, sent inverted);
+; for SSI, the SSI timing of Hengstler's and Kubler's absolute encoder
+; datasheets (clock idle high, first falling edge latches, MSB first, the
+; monoflop time tm after the last clock).
+;
+; Pins: MA = OUT0 (push-pull, to the RS-422 driver), SLO = IN0 (from the
+; receiver). Both move with the assembler's --pin.
+;
+; Host command (INQ[0]):
+;     bit 15 = 1   CONFIG: bits 5:0 the position bits n (1 .. 32), bit 8 SSI
+;                  (0 BiSS-C), bit 9 GRAY (decode the position from Gray
+;                  code). Nothing is clocked. After reset: BiSS-C, 24 bits,
+;                  binary.
+;     bit 15 = 0   READ: clock one frame.
+; Result (OUTQ[0]), three words per READ:
+;     status       bit 0 ERR (the encoder's nE bit was 0), bit 1 WARN (nW
+;                  was 0), bit 2 CRC (the CRC-6 did not check), bit 3 NOACK
+;                  (no Ack, or no start bit, in its window: frame abandoned),
+;                  bit 4 BUSY (SLO did not go high within 255 ticks of the
+;                  READ: the encoder is still in its timeout or absent),
+;                  bit 5 the CDS bit, bits 11:8 the line delay in whole MA
+;                  periods (BiSS: periods after the earliest possible Ack),
+;                  bit 15 SSI. For SSI only BUSY and SSI mean anything.
+;     pos low      position bits 15:0
+;     pos high     position bits 31:16 (0 for n <= 16)
+;
+; Rate: one tick is half an MA period, MA = clk / (2 * TICK). The host sets
+; TICK_INT (and TICK_FRAC) before RUN. The program is written for a tick of
+; 25 clocks or more (.tick below), MA 1 MHz at 50 MHz: BiSS-C allows up to
+; 10 MHz, SSI is commonly 100 kHz to 1 MHz, so this master covers SSI and
+; the low end of BiSS-C. Every MA edge is a SETP ..., D staged before the
+; WAITD of its tick, so both half periods are exact to the clock, which
+; needs more than the checker's proof: the WAITD must commit by the edge of
+; its tick, and a WAITD before it completes up to 3 clocks after its own,
+; so each pair needs 5 clocks of slack (3 late, 2 to commit). At .tick 25
+; the longest pairs (5 slots, 20 clocks) have exactly that. At a tick of 20
+; the pairs are still proved, but an edge after a 5-slot pair lands up to
+; 3 clocks late (half periods of 17 and 23 clocks measured on the model).
+;
+; Decided at integration (2026-11-05): the iC-Haus BiSS C protocol
+; description and the SSI encoder datasheets were not read; the figures
+; marked unchecked in tools/protomodels/biss.py stay so marked. Line delay
+; is compensated in whole MA periods only, a stated limit, not a bug. The
+; program declares .tick 25 although the checker proves tick 20, because a
+; deadline-latched edge needs its WAITD committed 5 clocks before the tick.
+
+; Frame (BiSS-C): MA idles high. The first falling edge starts the frame;
+; the encoder answers the second rising edge with SLO low (Ack), holds it
+; while it works, raises it for the start bit, then sends CDS, the n
+; position bits MSB first, nE, nW and the CRC-6 inverted, changing SLO
+; after rising MA edges. The master samples SLO once a period, 3 to 6
+; clocks after each falling MA edge: half a period after the encoder's
+; change on a short line, the middle of the bit cell. After the
+; last bit MA stays high; the encoder holds SLO low for its timeout tTO and
+; then raises it, and the next READ waits for that.
+; SSI: MA idles high, the first falling edge latches the position, each
+; rising edge shifts out the next bit MSB first; n + 1 clock pulses, n
+; samples (after falling edges 2 .. n + 1); the encoder's monoflop time tm
+; then holds SLO low.
+;
+; Line delay. A BiSS encoder on a long cable answers late. The master looks
+; for the Ack and the start bit by level, sample after sample, so a delay
+; of whole MA periods just moves the frame, and the master counts it
+; (status bits 11:8). Within a period it samples at one fixed phase, so a
+; delay whose fractional part brings SLO's change to within a few clocks
+; of the sample point (half a period plus 3 to 6 clocks after a rising MA
+; edge) is not compensated (a dedicated master
+; measures the delay and moves the sample point; with one tick per half
+; period this program has only the one phase).
+;
+; Memory: 186 words, 122 at 0x000 (thread 0's quarter) and the 64 of the
+; post-processing at 0x180 (thread 3's quarter; thread 3 must not be
+; started with this image). The slave (biss_slave.loom, 158 words) runs
+; beside it on thread 1 from 0x080, into thread 2's quarter (to 0x11D), so
+; with both loaded only threads 0 and 1 run.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   MA = OUT0, SLO = IN0
+        .tick   25                      ; half an MA period, at the fastest
+        .equ    DEFCFG = 0x8000 | 24    ; after reset: BiSS-C, 24 bits, binary
+        .equ    NACK = 16               ; samples that may pass before the Ack
+        .equ    NSTART = 16             ; periods the Ack may last
+        .equ    RDY = 255               ; ticks to wait for SLO high (tTO)
+        .equ    RESIDUE = 0x0800        ; CRC-6 left in CRC[15:10] after a good
+                                        ; frame: the CRC of six 1s, because the
+                                        ; CRC goes out inverted
+
+; Registers: r0 Ack sample counter copy, then scratch; r1 configuration; r2
+; frame kind for DJNZ (1 SSI, 2 BiSS), then the last chunk; r3 16; r4, r5
+; the first two chunks; r6 loop counter and CDS; r7 status (and the .csr
+; scratch at start only).
+
+start:  SETP    MA, 1                   ; MA idles high
+        OEP     MA, 1                   ; (a no-op unless MA is a BIDIR pin)
+        .csr    BE_PINS, (pin(SLO) << 5) | 31   ; SHI samples SLO; SHO unused
+        .csr    BE_CFG, 0x0202          ; MSB first (DIR), CRC_EN; NRZ
+        .csr    CRC_POLY, 0x0C00        ; x^6 + x + 1 (0x43) left-aligned
+        .csr    CRC_INIT, 0
+        MOV16   r1, DEFCFG
+
+cmd:    POP     r0                      ; next command (blocks while INQ is empty)
+        MOV     r6, r0
+        SHLI    r6, 1                   ; C = bit 15: CONFIG
+        BNC     read
+        MOV     r1, r0                  ; keep it; nothing is clocked
+        JMP     cmd
+
+read:   SETD    RDY                     ; give the encoder its timeout
+        WAITP   SLO, 1, T               ; ready: SLO high
+        BT      busy
+        LDI     r7, 0                   ; status
+        LDI     r4, 0
+        LDI     r5, 0
+        LDI     r3, 16
+        LDSR    r4                      ; SR = 0: a short first chunk is
+        CRCI                            ; right-aligned; CRC = 0
+        MOV     r6, r1
+        ANDI    r6, 63                  ; n
+        LDI     r2, 2                   ; BiSS ...
+        MOV     r0, r1
+        SHLI    r0, 8                   ; C = bit 8: SSI
+        BNC     rbiss
+        LDI     r2, 1                   ; ... or SSI
+        LDIH    r7, 0x80                ; status bit 15
+        JMP     rtot
+rbiss:  ADDI    r6, 8                   ; nE, nW and the CRC follow the data
+rtot:   LDI     r0, 0                   ; r6 = bits after CDS; split into
+        CMPI    r6, 33                  ; chunks of 16 from the end: the
+        BNC     rle32                   ; first chunk's length goes to CNT,
+        SUBI    r6, 32                  ; T = three chunks, C = two
+        LDI     r0, 4
+        JMP     rset
+rle32:  CMPI    r6, 17
+        BNC     rset
+        SUBI    r6, 16
+        LDI     r0, 2
+rset:   CSRW    CNT, r6
+        CSRW    FLAGS, r0               ; nothing below changes a flag until
+        LDI     r6, NACK                ; the dispatch reads T and C
+        SETD    1                       ; anchor, and wait for that tick, so
+        WAITD   0                       ; the first fall is staged after it and
+        DJNZ    r2, ack                 ; lands on the next; 2: BiSS (r2 is now 1)
+
+; SSI: one pulse with no sample (its falling edge latches the position, its
+; rising edge puts the MSB on SLO), then the chunks.
+ssi:    SETP    MA, 0, D
+        WAITD   1                       ; fall 1: the encoder latches
+        SETP    MA, 1, D
+        WAITD   1                       ; rise 1: the MSB goes out
+        BT      c1                      ; three chunks
+        BC      c2                      ; two
+        JMP     c3                      ; one
+
+; BiSS-C: clock until a sample finds the Ack (SLO low), then until one
+; finds the start bit (SLO high); the next sample is CDS.
+ack:    SETP    MA, 0, D
+        WAITD   1                       ; fall
+        JP      SLO, 0, acked           ; sample: Ack?
+        SETP    MA, 1, D
+        WAITD   1                       ; rise
+        DJNZ    r6, ack
+        JMP     noack
+acked:  SETP    MA, 1, D
+        WAITD   1
+        MOV     r0, r6                  ; NACK + 1 - (the sample that saw it)
+        LDI     r6, NSTART
+start1: SETP    MA, 0, D
+        WAITD   1
+        JP      SLO, 1, started         ; sample: start bit?
+        SETP    MA, 1, D
+        WAITD   1
+        DJNZ    r6, start1
+        JMP     noack
+started: SETP   MA, 1, D
+        WAITD   1
+        LDI     r6, 0
+        SETP    MA, 0, D
+        WAITD   1
+        JP      SLO, 0, cds0            ; sample: CDS
+        LDI     r6, 1
+cds0:   SETP    MA, 1, D
+        WAITD   1
+        BT      c1
+        BC      c2
+        JMP     c3
+
+; The data: up to three chunks through SR, the CRC unit taking every bit.
+; Each bit is a period: SLO sampled after the falling edge.
+c1:     SETP    MA, 0, D
+        WAITD   1
+        SHI
+        SETP    MA, 1, D
+        WAITD   1
+        BNZ     c1
+        STSR    r4
+        CSRW    CNT, r3                 ; the next chunks are 16 bits
+c2:     SETP    MA, 0, D
+        WAITD   1
+        SHI
+        SETP    MA, 1, D
+        WAITD   1
+        BNZ     c2
+        STSR    r5
+        CSRW    CNT, r3
+c3:     SETP    MA, 0, D
+        WAITD   1
+        SHI
+        SETP    MA, 1, D
+        WAITD   1
+        BNZ     c3
+        STSR    r2                      ; MA stays high: the frame is over
+        JMP     post
+
+busy:   LDI     r7, 0x10                ; BUSY (SSI's bit 15 is not set here)
+        JMP     report0
+noack:  ORI     r7, 0x08                ; NOACK
+report0: LDI    r4, 0
+        LDI     r5, 0
+        JMP     report
+
+; After the frame, no deadline: SLO's chunks are r4, r5, r2 (the last bit
+; in r2 bit 0), r0 the Ack counter, r6 CDS.
+        .org    0x180                   ; thread 3's quarter (see the header)
+post:   MOV     r3, r1
+        SHLI    r3, 8                   ; C = bit 8: SSI
+        BC      spos
+        LDI     r3, NACK - 2            ; periods after the earliest Ack
+        SUB     r3, r3, r0              ; (the third sample)
+        SHLI    r3, 8
+        OR      r7, r7, r3              ; status bits 11:8
+        SHLI    r6, 5
+        OR      r7, r7, r6              ; status bit 5: CDS
+        MOV     r3, r2
+        SHLI    r3, 9                   ; C = bit 7: nE
+        BC      eok
+        ORI     r7, 0x01                ; ERR
+eok:    MOV     r3, r2
+        SHLI    r3, 10                  ; C = bit 6: nW
+        BC      wok
+        ORI     r7, 0x02                ; WARN
+wok:    STCRC   r3
+        MOV16   r6, RESIDUE
+        CMP     r3, r6
+        BZ      crcok
+        ORI     r7, 0x04                ; CRC
+crcok:  MOV     r3, r4                  ; the position: r4:r5:r2 >> 8
+        SHLI    r3, 8
+        MOV     r6, r5
+        SHRI    r6, 8
+        OR      r4, r3, r6              ; bits 31:16
+        SHLI    r5, 8
+        SHRI    r2, 8
+        OR      r5, r5, r2              ; bits 15:0
+        JMP     gray
+spos:   MOV     r4, r5                  ; SSI: r5:r2 is the position
+        MOV     r5, r2
+gray:   MOV     r3, r1
+        SHLI    r3, 7                   ; C = bit 9: GRAY
+        BNC     report
+        MOV     r2, r4
+        CALL    g2b
+        MOV     r4, r2
+        MOV     r2, r5
+        CALL    g2b
+        MOV     r5, r2
+        MOV     r3, r4                  ; the low half also takes the XOR of
+        ANDI    r3, 1                   ; every Gray bit above it: bit 0 of
+        BZ      report                  ; the decoded high half
+        NOT     r5, r5
+report: PUSH    r7
+        PUSH    r5
+        PUSH    r4
+        JMP     cmd
+
+; Gray to binary in r2 (16 bits), r6 scratch: each bit becomes the XOR of
+; itself and every bit above it.
+g2b:    MOV     r6, r2
+        SHRI    r6, 1
+        XOR     r2, r2, r6
+        MOV     r6, r2
+        SHRI    r6, 2
+        XOR     r2, r2, r6
+        MOV     r6, r2
+        SHRI    r6, 4
+        XOR     r2, r2, r6
+        MOV     r6, r2
+        SHRI    r6, 8
+        XOR     r2, r2, r6
+        RET
