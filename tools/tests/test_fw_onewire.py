@@ -538,6 +538,35 @@ def test_master_and_device_together(backend):
     assert bench.contention_free() and loom.badop() == 0
 
 
+@model_only("reads the model's OD_MASK and starts the RUN on a chosen clock; "
+            "four searches, 1.2 million clocks")
+@pytest.mark.parametrize("phase", range(4))
+def test_master_and_device_keep_both_open_drain_bits_at_every_start_phase(
+        backend, phase):
+    """BUGS 14: both programs read-modify-write the shared OD_MASK CSR, and
+    CSRR, ORI, CSRW are not atomic across threads. Before 676f641 the
+    device's bit was lost when the RUN fell on three of the four clocks of
+    the slot round (cycle mod 4 = 1, 2, 3), so its line was driven push-pull
+    and SEARCH failed. With the device's RMW as its first instructions,
+    both bits survive and SEARCH finds the device at every phase."""
+    bus = OneWireBus(["BIDIR0", "BIDIR1"], clock=FAST * 1_000_000)
+    bench = ow_bench(backend, bus, dmem=True)
+    loom = backend.loom(bench, isa=ISA)
+    words = dict(program(MASTER, FAST).words)
+    words.update(program(DEVICE, FAST).words)
+    loom.load(words)
+    m = bench.machine
+    bench.step((phase - m.cycle) % 4)
+    assert m.cycle % 4 == phase
+    loom.run([0, 1])
+    loom.push(1, rom_words(DEV_ROM) + pad_words(DEV_PAD))
+    bench.step(STARTUP)
+    assert m.od_mask & 0b11 == 0b11, hex(m.od_mask)
+    found, end = m_search(loom)
+    assert found == [(0, DEV_ROM)] and end == END
+    assert bench.contention_free() and loom.badop() == 0
+
+
 # ------------------------------------------------- the reference model alone
 def test_model_crc8_and_rom_helpers():
     """Maxim's CRC-8 has the catalogue check value 0xA1 for "123456789"
