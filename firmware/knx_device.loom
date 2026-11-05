@@ -1,0 +1,484 @@
+; knx_device.loom
+; A KNX TP1 bus device at logic level, behind a TP1 transceiver: it sends
+; the group-write telegrams the host gives it, with KNX's bitwise
+; arbitration (it stops at the first bit it loses, reports the loss and
+; tries again after the bus has been idle), and it receives every telegram
+; on the bus, checks each character's parity and the telegram's check
+; byte, and acknowledges (ACK, or NAK on an error) those addressed to it,
+; on time; every frame and every error goes to OUTQ.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): KNX is in no design document.
+; Hardware used: the M2 core only (OUT and IN through the per-thread
+; OUTGRP and INGRP, built for parallel pin groups; the timed waits, NOW,
+; the FIFOs, PAR, built for UART parity). No hardware knows KNX: the pulse
+; coding (a 0 is a short active pulse inside the bit, a 1 is no pulse),
+; the character framing, the arbitration by reading back every 1 it sends,
+; the check byte, the address filter and the acknowledge are firmware.
+; It is weaker than a dedicated transceiver with a UART core (the TP-UART
+; or the NCN5120 in UART mode) in one way: it samples once per bit, at a
+; fixed point after the start pulse, and does not reject a pulse by its
+; width; see firmware/README.md.
+;
+; One program, two devices. Every thread that runs it reads TID and sets
+; its own OUTGRP and INGRP, so thread t drives OUT<t> and reads IN<t> (t =
+; 0, 1); thread 1's reset vector holds a jump to the shared code. The
+; bench wires the pins into one bus (SEMANTICS has no wired-AND between
+; two threads' pins: each thread gets its own).
+;
+; Pins (thread t): TX = OUT<t> to the transceiver's transmit input, 1 =
+; send an active pulse (a logic 0 on the bus), 0 (also its reset value) =
+; no pulse; RX = IN<t> from its receive output, 0 while the bus carries an
+; active pulse, else 1. The transceiver's delay between TX and RX is not
+; known to the program; it samples well inside the pulse (below).
+;
+; Sources. The KNX standard (KNX System Specifications, Volume 3, Part 3
+; Chapter 2, Physical Layer TP1) is not public; every figure here is from
+; public secondary sources, named in tools/protomodels/knx.py with page
+; and figure, and marked there where it could not be checked:
+;   bit       9600 bit/s, 104.17 us; a logical 0 is an active pulse of
+;             35 us at the start of the bit, a logical 1 is no pulse
+;             (onsemi NCN5120 datasheet; Siemens TP-UART2 datasheet)
+;   character start bit (0), 8 data bits LSB first, even parity, stop bit
+;             (1), then 2 bit times idle: 13 bit times start to start
+;   telegram  after at least 50 bit times of idle bus: control byte,
+;             source address (2 bytes), destination address (2), the
+;             byte {address type (1 = group), hop count (3), length (4)},
+;             the TPCI/APCI and data bytes (length + 1 of them), then the
+;             check byte: the NOT of the XOR of all the bytes before it
+;             (odd parity across each bit position)
+;   acknowledge  one character 15 bit times after the end of the last one:
+;             ACK 0xCC, NAK 0x0C, BUSY 0xC0
+;   arbitration  0 dominates: a sender that reads a 0 where it sent a 1
+;             has lost and sends nothing more of that telegram.
+;
+; Host words (INQ[t]). Once, before anything else:
+;   word 1   this device's individual address (area.line.device, 16 bits)
+;   word 2   the one group address it accepts
+; Then any number of sends, two words each:
+;   word A   the destination group address
+;   word B   15:8 the control byte (the host picks the priority and the
+;            repeat flag: 0xBC is a first send at low priority), 7:0 the
+;            APCI and data byte (0x80 | value: a GroupValue_Write of up to
+;            6 bits, 0x81 is "on")
+; and the device sends: control, own address, word A, 0xE1 (group, hop
+; count 6, length 1), 0x00 (TPCI), word B's low byte, the check byte.
+;
+; Report (OUTQ[t]), for every telegram seen on the bus, its own included:
+;   status   4:0 the bytes received, check byte included; 5 PARITY, a
+;            character with bad parity; 6 CHECK, the check byte is wrong;
+;            7 OWN, this device sent the telegram (and won); 8 LOST, it was
+;            sending and lost arbitration to this telegram; 9 ADDRESSED,
+;            the destination is this device's individual address or its
+;            group (it answered: ACK, or NAK when 5, 6 or 11 is set); 11
+;            FRAMING, a stop bit read 0; 13:12 the answer to an OWN
+;            telegram: 0 none, 1 ACK, 2 NAK, 3 BUSY; 10, 14, 15 are 0
+;   data     ceil(bytes / 2) words, first byte in 15:8 (an odd last byte
+;            in 15:8, 7:0 = 0); the bytes after the 23rd are counted out
+;            and not kept
+; The report is pushed after the answer slot, inside the 50 bit times of
+; idle bus that follow it, and the PUSHes wait for room: a host that leaves
+; OUTQ full stalls the device, which then misses the bus. At 9600 bit/s
+; the host has 5 ms for a report of 6 words.
+; A telegram it lost is retried, after 50 bit times of idle bus, until it
+; wins. One it won but that was answered NAK or BUSY, or not at all, is not
+; repeated: the report says so and the host decides. It never sends BUSY.
+;
+; Timing, in ticks of 1/32 of a bit (3.26 us at 9600 bit/s):
+;   send      a 0: TX high for PULSE = 11 ticks (35.8 us), both edges the
+;             4th slot after their ticks, so the width is exact to the slot
+;             grid's 0..3 clocks; a 1: TX stays low
+;   sample    RX once a bit, SAMPLE = 7 ticks (22.8 us) after the bit
+;             starts. A sender's bit starts on its own tick, so its read-back
+;             tolerates a transceiver delay up to about 20 us; a receiver's
+;             start is the look that first saw the pulse, 0 to 2 ticks after
+;             it, so it samples 7 to 9 ticks into a 10.75-tick pulse
+;   receive   the start pulse is looked for every POLL = 2 ticks with IN
+;             (OUTGRP and INGRP give each thread its pins, so WAITE and JP,
+;             which take a fixed pin, are not used); the bit grid restarts
+;             at every character's start pulse; the fixed sample point makes
+;             the tolerance one-sided: a sender up to 2 % slow or 0.5 % fast
+;             is read (tested on the model), a crystal-timed sender is far
+;             inside that, a dedicated receiver that times the pulse is not
+;             limited this way
+;   end       no start pulse within 4 bit times after a stop bit: the
+;             telegram is over (the next character, if any, starts 2 bit
+;             times after it)
+;   answer    the ACK or NAK character starts 15 bit times after the end
+;             of the last character's stop bit, on the tick
+;   idle      a send starts 2 bit times after 50 bit times with no pulse
+;             seen, counted from the end of the last report
+;   own ACK   after its own telegram the device takes the first character
+;             that starts within 30 bit times of the end as the answer
+;
+; Rate: the host writes TICK_INT and TICK_FRAC before RUN, a 32nd of a bit:
+; at 50 MHz and 9600 bit/s TICK_INT 162, TICK_FRAC 195 (5208.3 clocks a
+; bit). The RTL tests run a faster bit, with every time in the model scaled
+; with it; the program counts in ticks, so only the speed changes. Proved
+; for ticks of 16 clocks or more (the idle looks: 7 slots in 2 ticks).
+;
+; Memory: 282 words of code: 0x000 to 0x07F, thread 1's reset vector 0x080
+; (a JMP to start), then 0x081 to 0x11B, through thread 2's reset vector.
+; Data in thread 3's quarter: 64 words a thread at 0x180 + 64 * t (the
+; addresses, the telegram to send, the bytes received). So threads 0 and
+; 1 may run, as one device or two, and threads 2 and 3 must not.
+;
+; Decided at integration (2026-11-05): the KNX specification (Volume 3) was
+; not read, and neither were the transceiver datasheets named above, so
+; every figure here is unchecked. Readings taken: the answer 15 bit times
+; after the last stop bit; a 35 us pulse (11/32 of a bit, 35.8 us); a start
+; pulse up to 4 bit times after a stop bit continues the telegram; NAK on a
+; parity, framing or check-byte error in a telegram addressed to this
+; device, never BUSY; no automatic repeat after NAK, BUSY or silence (the
+; host repeats), while a lost arbitration is retried until it wins; 52 bit
+; times of idle before a send, without the priority-dependent waits.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .tick   16                      ; the fastest tick proved (header)
+        .equ    BIT = 32                ; ticks per bit
+        .equ    PULSE = 11              ; an active pulse, 35.8 us
+        .equ    SAMPLE = 7              ; the sample point after a bit starts
+        .equ    POLL = 2                ; ticks between two looks at an idle bus
+        .equ    GAP0 = 16               ; ticks after a stop bit before the first look
+
+        .equ    IDLE = 50               ; bit times of idle bus before a send
+        .equ    ENDGAP = 4 * BIT        ; no start this long after a stop: the end
+        .equ    ANSWER = 15 * BIT       ; the answer starts this long after a stop
+        .equ    AWIN = 30 * BIT         ; an answer must start within this
+        .equ    NOTHING = 0x7FF         ; a frame word that sends no pulse
+        .equ    MAXB = 23               ; the longest standard telegram, bytes
+        .equ    DATA = 0x180            ; per-thread data: DATA + 64 * TID
+        .equ    D_IA = 0                ;   own individual address
+        .equ    D_GA = 1                ;   the accepted group address
+        .equ    D_TX = 4                ;   the telegram to send, 9 bytes
+        .equ    D_BUF = 13              ;   bytes received, one a word (23 at most)
+        .equ    TXLEN = 9               ; bytes in a group write telegram
+        .equ    NPCI = 0xE1             ; group address, hop count 6, length 1
+        .equ    ACK = 0xCC
+        .equ    NAK = 0x0C
+        .equ    BUSY = 0xC0
+        ; status bits (header). TXEN and PEND are internal: they sit in bits
+        ; 4:0, which the report fills with the byte count, so never leave
+        .equ    TXEN = 0x08             ; sending, and not lost yet
+        .equ    PEND = 0x10             ; a send is waiting (words A, B stored)
+        .equ    PARITY = 0x20
+        .equ    CHECK = 0x40
+        .equ    OWN = 0x80
+        .equ    LOST = 0x100
+        .equ    ADDR = 0x200
+        .equ    FRAMING = 0x800
+        .equ    ERRS = PARITY | CHECK | FRAMING
+
+; Registers: r0 the frame word (sent, then received), r1 the bit or look
+; counter, r2 the XOR of the bytes, r3 the status (TXEN and PEND in 4:0),
+; r4 scratch, r5 this thread's data block, r6 the bytes, r7 scratch.
+
+start:  CSRR    r0, TID
+        LDI     r1, (1 << 5) | 16       ; OUTGRP: one pin from OUT0 ...
+        ADD     r1, r1, r0              ; ... plus t: OUT<t>
+        CSRW    OUTGRP, r1
+        LDI     r1, (1 << 5) | 8        ; INGRP: one pin from IN0 ...
+        ADD     r1, r1, r0              ; ... plus t: IN<t>
+        CSRW    INGRP, r1
+        LDI     r1, 0
+        OUT     r1                      ; TX low: no pulse
+        MOV     r5, r0
+        SHLI    r5, 6                   ; 64 * t
+        MOV16   r4, DATA
+        ADD     r5, r5, r4              ; r5 = this thread's data block
+        POP     r4
+        ST      r4, r5, D_IA
+        POP     r4
+        ST      r4, r5, D_GA
+
+        LDI     r3, 0                   ; no send pending
+
+; ------------------------------------------------- the idle bus
+; IDLE bit times with no pulse, looked at every POLL ticks; a pulse is a
+; start bit, and the telegram it starts is received. Then, at the first
+; look that finds a send waiting (PEND, or words in INQ), the send starts.
+idle:   LDI     r7, PEND
+        AND     r3, r3, r7              ; a new telegram: only PEND is kept
+        MOV16   r0, NOTHING             ; receive: send no pulse
+        LDI     r2, 0                   ; the XOR of the bytes
+        LDI     r6, 0                   ; the bytes
+        MOV16   r1, IDLE * BIT / POLL
+        LDI     r7, PEND
+        SETD    0
+ipoll:  WAITD   POLL
+        IN      r4
+        TEST    r4, r4
+        BZ      rxc                     ; a start pulse
+        TEST    r3, r7                  ; Z = no send pending (DJNZ keeps Z)
+        DJNZ    r1, ipoll
+        BNZ     send                    ; a lost telegram: again
+rpoll:  WAITD   POLL
+        IN      r4
+        TEST    r4, r4
+        BZ      rxc                     ; a start pulse
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BNT     fetch
+        JMP     rpoll
+
+; Words A and B: build the telegram at D_TX, then count the idle bus again
+; (the second POP may have waited for the host).
+fetch:  .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ[t]"
+        POP     r1                      ; word A, the destination
+        POP     r0                      ; word B
+        LD      r4, r5, D_IA
+        MOV     r2, r0
+        SHRI    r2, 8                   ; the control byte
+        ST      r2, r5, D_TX
+        MOV     r6, r4
+        SHRI    r6, 8
+        ST      r6, r5, D_TX + 1        ; source, high byte
+        XOR     r2, r2, r6
+        SHLI    r4, 8
+        SHRI    r4, 8
+        ST      r4, r5, D_TX + 2        ; source, low byte
+        XOR     r2, r2, r4
+        MOV     r6, r1
+        SHRI    r6, 8
+        ST      r6, r5, D_TX + 3        ; destination, high byte
+        XOR     r2, r2, r6
+        SHLI    r1, 8
+        SHRI    r1, 8
+        ST      r1, r5, D_TX + 4        ; destination, low byte
+        XOR     r2, r2, r1
+        LDI     r4, NPCI
+        ST      r4, r5, D_TX + 5
+        XOR     r2, r2, r4
+        LDI     r4, 0
+        ST      r4, r5, D_TX + 6        ; TPCI
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r5, D_TX + 7        ; APCI and data
+        XOR     r2, r2, r0
+        NOT     r2, r2
+        SHLI    r2, 8
+        SHRI    r2, 8
+        ST      r2, r5, D_TX + 8        ; the check byte
+        LDI     r7, PEND
+        OR      r3, r3, r7
+        JMP     idle
+
+; ------------------------------------------------- a telegram
+send:   LDI     r7, TXEN
+        OR      r3, r3, r7
+        SETD    0
+        JMP     tnext
+
+; After a character (TD = the end of its stop bit): check and keep it, then
+; send the next one or look for the next start bit.
+tchar:  MOV     r4, r0
+        SHRI    r4, 10                  ; the stop bit
+        BNZ     tpar
+        MOV16   r7, FRAMING
+        OR      r3, r3, r7
+tpar:   MOV     r4, r0
+        SHLI    r4, 6
+        SHRI    r4, 7                   ; the data and parity bits
+        PAR     r4, r4                  ; C = their XOR: 0 for even parity
+        BNC     tbyte
+        LDI     r7, PARITY
+        OR      r3, r3, r7
+tbyte:  SHLI    r4, 8
+        SHRI    r4, 8                   ; the byte
+        XOR     r2, r2, r4
+        CMPI    r6, MAXB
+        BC      tsent                   ; no room: counted out, not kept
+        ADD     r7, r5, r6
+        ST      r4, r7, D_BUF
+        INC     r6
+tsent:  LDI     r7, TXEN
+        TEST    r3, r7
+        BZ      tgap                    ; receiving
+        CMPI    r6, TXLEN
+        BC      tgap                    ; all sent
+tnext:  ADD     r7, r5, r6
+        LD      r4, r7, D_TX
+        MOV16   r7, 0x400               ; the stop bit
+        PAR     r4, r4                  ; C = the parity bit
+        BNC     tnp
+        MOV16   r7, 0x600               ; the stop and parity bits
+tnp:    SHLI    r4, 1                   ; the data after the start bit
+        OR      r0, r4, r7
+        LDI     r1, 11                  ; xchar's set-up, before the tick
+        LDI     r4, 1
+        WAITD   2 * BIT                 ; 13 bit times start to start (the
+        CALL    xbit                    ; first start bit: 2 bit times after
+        JMP     tchar                   ; the idle check, SETD 0 at send)
+
+; Thread 1's reset vector: the second device runs the same code.
+        .thread 1
+        .tick   16                      ; as thread 0 (it runs thread 0's code)
+        JMP     start
+        .thread 0
+        .org    0x081
+tgap:   MOV16   r0, NOTHING
+        MOV16   r1, (ENDGAP - GAP0) / POLL
+        WAITD   GAP0
+gpoll:  WAITD   POLL
+        IN      r4
+        TEST    r4, r4
+        BZ      rxc                     ; the next character
+        DJNZ    r1, gpoll
+        JMP     tend
+rxc:    CALL    xchar
+        JMP     tchar
+
+; The telegram is over (TD = ENDGAP after the last stop bit).
+tend:   LDI     r7, TXEN
+        TEST    r3, r7
+        BZ      tcheck
+        LDI     r7, TXEN | PEND | OWN
+        XOR     r3, r3, r7              ; sent and won: OWN, nothing pending
+tcheck: LDI     r7, 0xFF
+        CMP     r2, r7                  ; all bytes XOR the check byte: 0xFF
+        BNZ     tbad
+        CMPI    r6, 8                   ; the shortest telegram, check included
+        BC      taddr
+tbad:   LDI     r7, CHECK
+        OR      r3, r3, r7
+        CMPI    r6, 6
+        BNC     listen                  ; no destination to match
+taddr:  LDI     r7, OWN
+        TEST    r3, r7
+        BNZ     listen                  ; its own telegram: no answer
+        LD      r4, r5, D_BUF + 3
+        SHLI    r4, 8
+        LD      r7, r5, D_BUF + 4
+        OR      r4, r4, r7              ; the destination
+        LD      r7, r5, D_BUF + 5
+        SHLI    r7, 9                   ; C = the address type: 1 group
+        BC      tgrp
+        LD      r7, r5, D_IA
+        JMP     tcmp
+tgrp:   LD      r7, r5, D_GA
+tcmp:   CMP     r4, r7
+        BNZ     listen
+        MOV16   r7, ADDR
+        OR      r3, r3, r7
+        MOV16   r0, (ACK << 1) | 0x400  ; even parity: four 1s in 0xCC
+        MOV16   r7, ERRS
+        TEST    r3, r7
+        BZ      tans
+        MOV16   r0, (NAK << 1) | 0x400  ; 0x0C: two 1s
+tans:   LDI     r1, 11                  ; xchar's set-up, before the tick
+        LDI     r4, 1
+        WAITD   255
+        WAITD   ANSWER - ENDGAP - 255   ; 15 bit times after the stop bit
+        CALL    xbit
+        JMP     report
+
+; Not addressed: the answer, if any, is a character that starts within AWIN
+; of the last stop bit; for an OWN telegram it is the result.
+listen: MOV16   r0, NOTHING
+        MOV16   r1, (AWIN - ENDGAP - GAP0) / POLL
+        WAITD   GAP0                    ; room for the checks above
+apoll:  WAITD   POLL
+        IN      r4
+        TEST    r4, r4
+        BZ      arx
+        DJNZ    r1, apoll
+        JMP     report
+arx:    CALL    xchar
+        LDI     r7, OWN
+        TEST    r3, r7
+        BZ      report
+        SHLI    r0, 7
+        SHRI    r0, 8                   ; the answer byte
+        MOV16   r1, 0x1000              ; 1: ACK
+        LDI     r7, ACK
+        CMP     r0, r7
+        BZ      agot
+        MOV16   r1, 0x2000              ; 2: NAK
+        LDI     r7, NAK
+        CMP     r0, r7
+        BZ      agot
+        MOV16   r1, 0x3000              ; 3: BUSY
+        LDI     r7, BUSY
+        CMP     r0, r7
+        BNZ     report                  ; anything else: none
+agot:   OR      r3, r3, r1
+
+; The report: the status word, then the bytes two a word.
+report: MOV     r4, r3
+        SHRI    r4, 5
+        SHLI    r4, 5                   ; the internal bits 4:0 out
+        OR      r4, r4, r6              ; the byte count in
+        PUSH    r4
+        LDI     r1, 0
+rloop:  CMP     r1, r6
+        BNC     rmore
+        JMP     idle                    ; all reported
+rmore:  ADD     r7, r5, r1
+        LD      r4, r7, D_BUF
+        SHLI    r4, 8
+        INC     r1
+        CMP     r1, r6
+        BC      rlast                   ; an odd last byte
+        ADD     r7, r5, r1
+        LD      r7, r7, D_BUF
+        OR      r4, r4, r7
+        INC     r1
+rlast:  PUSH    r4
+        JMP     rloop
+
+; ------------------------------------------------- one character
+; xchar: one character on the bus, sent and read back at once. In: r0 the
+; 11-bit frame word to send (start in bit 0, stop in bit 10; 0x7FF sends
+; nothing), called just after the start bit's tick (TD = that tick). Every
+; bit: a 0 is an active pulse of PULSE ticks; RX is read SAMPLE ticks in and
+; shifted in at bit 10, so on return r0 holds the 11 samples, start in bit
+; 0. A 1 that reads 0 while TXEN is set loses arbitration: TXEN off, LOST
+; on, and the bits not yet sent become 1s, so the rest of the character is
+; only received. Returns at the end of the stop bit (TD = that tick).
+; Uses r1, r4, r7. A sender enters at xbit with r1 = 11 and r4 = 1 set
+; before its start bit's WAITD, so that every rise, the start bit's too, is
+; the 4th slot after its tick (WAITD, DJNZ or CALL, TEST, BNZ, OUT) and every
+; fall the 4th after its own (WAITD, NOP, NOP, NOP, OUT): the pulse is
+; exactly PULSE ticks, to the slot grid's 0..3 clocks.
+xchar:  LDI     r1, 11
+        LDI     r4, 1
+xbit:   TEST    r0, r4                  ; r4 = 1: Z = a 0 to send
+        BNZ     xone
+        OUT     r4                      ; the active pulse starts
+        WAITD   SAMPLE
+        IN      r4                      ; the bus (our own pulse, delayed)
+        SHRI    r0, 1
+        SHLI    r4, 10
+        OR      r0, r0, r4
+        LDI     r4, 0
+        WAITD   PULSE - SAMPLE
+        NOP
+        NOP
+        NOP
+        OUT     r4                      ; the pulse ends
+        LDI     r4, 1
+        WAITD   BIT - PULSE
+        DJNZ    r1, xbit
+        RET
+xone:   WAITD   SAMPLE
+        IN      r4
+        SHRI    r0, 1
+        TEST    r4, r4
+        BNZ     xkeep                   ; read 1, as sent
+        MOV16   r7, TXEN
+        TEST    r3, r7
+        BZ      xkeep                   ; not sending: a 0 received
+        XOR     r3, r3, r7              ; lost: TXEN off ...
+        MOV16   r7, LOST
+        OR      r3, r3, r7              ; ... LOST on
+        LDI     r7, 1
+        SHL     r7, r7, r1
+        SHRI    r7, 1
+        DEC     r7                      ; (1 << (r1 - 1)) - 1: the bits not sent
+        OR      r0, r0, r7              ; become 1s: send nothing more
+xkeep:  SHLI    r4, 10
+        OR      r0, r0, r4
+        LDI     r4, 1
+        WAITD   BIT - SAMPLE
+        DJNZ    r1, xbit
+        RET
