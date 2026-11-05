@@ -1,0 +1,316 @@
+; tm1637_controller.loom
+; Loom drives a TM1637 LED display driver and key scanner (Titan Micro
+; Electronics): writes to its six display registers, in the chip's
+; auto-increment and fixed-address modes, the display on/off and brightness
+; command, and the key-scan read, with the chip's ACK checked on every byte.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The TM1637's two-wire bus looks
+; like I2C and is not (datasheet V2.4 p.3, "Interface interpretation": "not
+; equal to I2C bus protocol totally because there is no slave address"): no
+; address byte, bytes LSB first, every transaction a single command byte
+; followed by its data, so i2c_master.loom cannot be used as it is. The
+; program uses:
+;   - two open-drain BIDIR pins (OD_MASK), built for I2C: the controller only
+;     pulls CLK and DIO low or lets them go, the board's pull-ups (10 kOhm in
+;     the datasheet's p.8 drawing) make the highs;
+;   - the deadline schedule (SETD, WAITD) on a 1 us tick, built for every
+;     timed protocol, for the clock and the start and stop conditions;
+;   - REV, the 16-bit bit reverse, built for the bit engine's MSB/LSB
+;     conversions, to turn the key bits, sampled first-bit-first, into the
+;     LSB-first byte.
+; What the firmware does that no hardware does: the start and stop
+; conditions, the LSB-first shifting, the ACK check, the chip's command
+; sequences and the error report. Weaker than a dedicated peripheral: one
+; clock edge per slot of the thread, so the bit rate is set by the tick, and
+; the clock pauses (CLK held low, which the TM1637 tolerates: it is static)
+; while the program waits for the host's next data word.
+;
+; Pins: CLK = BIDIR0, DIO = BIDIR1, both open drain. The TM1637 never pulls
+; CLK (there is no clock stretching), so the program never reads it.
+;
+; Host words (FIFO space, thread 0). INQ, one operation per word, bits 15:12
+; the operation:
+;   0x10na  auto-increment write (bits 6:4 n, bits 2:0 a): n display bytes
+;           from register a (0..5, the address C0H + a), followed in INQ by
+;           ceil(n / 2) data words, byte 2k in bits 7:0 and byte 2k+1 in bits
+;           15:8 of word k. On the bus (p.4, first figure): S 40 P, then
+;           S (C0+a) d0 .. d(n-1) P. n = 0 sets the address only. The chip
+;           ignores bytes past C5H (p.5).
+;   0x2add  fixed-address write: byte dd (bits 7:0) to register a (bits
+;           10:8). On the bus (p.4, second figure): S 44 P, S (C0+a) dd P.
+;   0x300c  display control: c = bit 3 display on, bits 2:0 the pulse width
+;           (0 = 1/16 .. 7 = 14/16, p.5). On the bus: S (80+c) P.
+;   0x4000  key scan: S 42 then the chip's key byte, P.
+; A write's data words are popped as the bytes go out; the host pushes them
+; with the operation word, all four fit INQ (depth 4).
+; OUTQ, one result word per operation:
+;   bits 14:12 the operation, bits 7:0 the key byte for a key scan (0xFF: no
+;   key; p.2 table: SG1 with K1 is 0xF7) and 0 otherwise;
+;   bit 15 set: a byte was not acknowledged (DIO high in its ninth clock).
+;   Then bits 11:8 say which byte of the operation (1 = the first after the
+;   START, counting across its transactions) and bits 7:0 hold it (for a key
+;   scan's second byte, the key byte read). The program sends the STOP at
+;   once, pops and drops the data words of the operation still in INQ, and
+;   takes the next word. An unknown operation reports bits 11:8 = 0xF.
+;
+; Timing (datasheet p.10): a 1 us tick (TICK_INT = US = 50 at 50 MHz, set
+; here); a bit is LOW = 3 ticks with CLK low and 2 * HQ = 2 high, 5 us,
+; 200 kHz: under the "less than 250K" the datasheet asks for key reads (p.3)
+; and its 500 kHz maximum (p.10, switching characteristics), and over its
+; 400 ns minimum clock pulse width either way. DIO changes a few slots after
+; CLK falls (tHOLD >= 100 ns) and 3 us before it rises (tSETUP >= 100 ns),
+; and is sampled 1 us after the rise. The chip's ACK goes low at the eighth
+; fall and is released at the end of the ninth clock (p.3). START and STOP
+; are held SU = 2 ticks either side, and BUF = 2 ticks separate a STOP from
+; the next START: the datasheet gives no figure for them, so these are the
+; program's own (four clock pulse widths).
+; The schedule is proved for ticks of 22 clocks or more (US below 22 fails
+; the checker); at 22 a bit is 110 clocks, 455 kHz at 50 MHz.
+;
+; OD_MASK (BUGS 14): CSRR, OR, CSRW is not atomic across threads, and
+; tm1637_device.loom sets its bit the same way as its first act. The program
+; reads OD_MASK back three slots after its write and sets it again if a bit
+; is missing, as dht22_host.loom does: the later writer's check passes, the
+; earlier's fails at most once and its second write keeps the other's bit.
+; No pad is driven before the check passes.
+;
+; Memory: the main loop in thread 0's quarter (0x000..0x07F) and, from the
+; error path on, the subroutines in thread 3's quarter (0x180..), which no
+; program of the pair runs from. With tm1637_device.loom (thread 1, its
+; quarter and thread 2's) the two load together.
+;
+; Registers: r0 transmit shifter, r1 bit count, r2 scratch and the data word
+; being sent, r3 bits sampled from DIO and the result, r4 data words still
+; in INQ, r5 the byte being sent, r6 its number in the operation, r7 the
+; operation word (and the .csr scratch before the first POP).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   CLK = BIDIR0, DIO = BIDIR1
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    LOW = 3                 ; CLK low phase of a bit, in ticks
+        .equ    HQ = 1                  ; half the high phase
+        .equ    SU = 2                  ; START and STOP set-up and hold
+        .equ    BUF = 2                 ; bus free after a STOP
+        .equ    ODM = (1 << pin(CLK)) | (1 << pin(DIO))
+        .equ    OP_AUTO = 1
+        .equ    OP_FIXED = 2
+        .equ    OP_CTRL = 3
+        .equ    OP_KEYS = 4
+        .equ    CMD_AUTO = 0x40         ; data command: write, auto increment
+        .equ    CMD_FIXED = 0x44        ; data command: write, fixed address
+        .equ    CMD_KEYS = 0x42         ; data command: read the key scan
+        .equ    CMD_ADDR = 0xC0         ; address command, C0H + register
+        .equ    CMD_DISP = 0x80         ; display control, 80H + on/width
+
+start:  CSRR    r7, OD_MASK
+        LDI     r2, ODM
+        OR      r7, r7, r2
+        CSRW    OD_MASK, r7             ; CLK and DIO open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK             ; three slots later: still both bits?
+        AND     r7, r7, r2
+        CMP     r7, r2
+        BNZ     start                   ; lost to the other thread's write
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        SETP    CLK, 1                  ; release both lines: the bus idles high
+        SETP    DIO, 1
+
+cmd:    POP     r7                      ; next operation (blocks while INQ is empty)
+        SETD    1                       ; re-anchor after the unbounded POP
+        LDI     r6, 0                   ; no byte sent yet
+        LDI     r4, 0                   ; no data word owed
+        MOV     r2, r7
+        SHRI    r2, 12                  ; the operation
+        CMPI    r2, OP_AUTO
+        BZ      w_auto
+        CMPI    r2, OP_FIXED
+        BZ      w_fixed
+        CMPI    r2, OP_CTRL
+        BZ      control
+        CMPI    r2, OP_KEYS
+        BZ      keys
+        LDI     r6, 15                  ; not an operation: report 0xF
+        LDI     r5, 0
+        JMP     nk_rep
+
+; Auto-increment write: S 40 P, S (C0+a) d0 .. d(n-1) P.
+w_auto: MOV     r4, r7
+        SHRI    r4, 4
+        ANDI    r4, 7
+        ADDI    r4, 1
+        SHRI    r4, 1                   ; ceil(n / 2) data words owed
+        LDI     r0, CMD_AUTO
+        CALL    tstart
+        CALL    wbyte
+        CALL    tstop
+        MOV     r0, r7
+        ANDI    r0, 7
+        LDI     r2, CMD_ADDR
+        OR      r0, r0, r2
+        CALL    tstart
+        CALL    wbyte                   ; S (C0+a)
+wa_word: TEST   r4, r4
+        BZ      wa_end                  ; every word sent
+        POP     r2                      ; two bytes; CLK waits low meanwhile
+        SUBI    r4, 1
+        MOV     r0, r2
+        CALL    wbyte                   ; byte 2k
+        MOV     r0, r7
+        SHRI    r0, 4
+        ANDI    r0, 7
+        ADDI    r0, 2                   ; n + 2 bytes in all, with 40 and C0+a
+        CMP     r0, r6
+        BZ      wa_end                  ; n odd: the last word's high byte unused
+        SWAP    r0, r2
+        CALL    wbyte                   ; byte 2k + 1
+        JMP     wa_word
+wa_end: CALL    tstop
+        JMP     ok
+
+; Fixed-address write: S 44 P, S (C0+a) d P.
+w_fixed: LDI    r0, CMD_FIXED
+        CALL    tstart
+        CALL    wbyte
+        CALL    tstop
+        SWAP    r0, r7
+        ANDI    r0, 7
+        LDI     r2, CMD_ADDR
+        OR      r0, r0, r2
+        CALL    tstart
+        CALL    wbyte                   ; S (C0+a)
+        MOV     r0, r7
+        CALL    wbyte                   ; d
+        CALL    tstop
+        JMP     ok
+
+; Display control: S (80+c) P.
+control: MOV    r0, r7
+        ANDI    r0, 15
+        LDI     r2, CMD_DISP
+        OR      r0, r0, r2
+        CALL    tstart
+        CALL    wbyte
+        CALL    tstop
+        JMP     ok
+
+; Key scan: S 42, the chip's byte, P. The result is the key byte.
+keys:   LDI     r0, CMD_KEYS
+        CALL    tstart
+        CALL    wbyte
+        CALL    rbyte                   ; r3 = the key byte
+        CALL    tstop
+        JMP     done
+ok:     LDI     r3, 0
+done:   MOV     r2, r7                  ; result = operation << 12 | r3
+        SHRI    r2, 12
+        ANDI    r2, 7
+        SHLI    r2, 12
+        OR      r3, r3, r2
+        PUSH    r3                      ; blocks while OUTQ is full: the bus idles
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; The spill: from here on the program sits in thread 3's quarter, 0x180 on
+; (see "Memory" above). Thread 3 must not be started with this image.
+; ---------------------------------------------------------------------------
+        .org    0x180
+
+; A byte not acknowledged (wbyte and rbyte jump here, leaving their return
+; address on the stack, which the next CALL overwrites): STOP, drop the data
+; words of this operation still in INQ, report the byte.
+nack:   CALL    tstop
+        TEST    r4, r4
+        BZ      nk_rep
+nk_drop: POP    r0
+        DJNZ    r4, nk_drop
+nk_rep: SWAP    r3, r6                  ; the byte's number to bits 11:8
+        OR      r3, r3, r5              ; the byte to bits 7:0
+        LDIH    r5, 0x80                ; r5 = 0x80xx: only its bit 15 matters
+        SHRI    r5, 15
+        SHLI    r5, 15
+        OR      r3, r3, r5              ; bit 15: not acknowledged
+        JMP     done
+
+; ---------------------------------------------------------------------------
+; sclk: one CLK pulse. On entry CLK is low (it fell at the last deadline) and
+; DIO is already set. Shifts the DIO level seen in the middle of the high
+; phase into r3 bit 0 and returns with CLK low again, at a deadline.
+; ---------------------------------------------------------------------------
+sclk:   WAITD   LOW                     ; end of the low phase
+        SETP    CLK, 1                  ; the rise: the chip takes DIO (p.2)
+        WAITD   HQ                      ; middle of the high phase
+        SHLI    r3, 1
+        JP      DIO, 0, sk0
+        ORI     r3, 1                   ; sample DIO
+sk0:    WAITD   HQ                      ; end of the high phase
+        SETP    CLK, 0
+        RET
+
+; wbyte: send r0[7:0], LSB first, then clock the chip's ACK slot.
+wbyte:  SETD    0                       ; a fresh schedule (CLK is low)
+        ADDI    r6, 1                   ; this byte's number
+        MOV     r5, r0
+        SHLI    r5, 8
+        SHRI    r5, 8                   ; the byte, for an error report
+        LDI     r3, 0
+        LDI     r1, 8
+wb1:    SHRI    r0, 1                   ; C = the next bit, LSB first
+        BC      wb_one
+        SETP    DIO, 0
+        JMP     wb_clk
+wb_one: SETP    DIO, 1
+wb_clk: CALL    sclk
+        DJNZ    r1, wb1
+        SETP    DIO, 1                  ; release DIO: the chip pulls it (ACK)
+        CALL    sclk
+        SHRI    r3, 1                   ; C = the ACK slot
+        BC      nack                    ; high: not acknowledged
+        SETD    0                       ; see "Return paths" below
+        RET
+
+; rbyte: read the chip's eight key bits, LSB first, and its ACK (p.3: the
+; key byte has its own ACK). Returns the byte in r3.
+rbyte:  SETD    0
+        ADDI    r6, 1
+        SETP    DIO, 1                  ; the chip drives DIO
+        LDI     r3, 0
+        LDI     r1, 9                   ; eight bits and the ACK slot
+rb1:    CALL    sclk
+        DJNZ    r1, rb1
+        SHRI    r3, 1                   ; C = the ACK slot; bit 0 first in bit 7
+        BC      rb_na
+        REV     r3, r3                  ; bit i of the byte to bit 8 + i
+        SWAP    r3, r3                  ; the key byte in bits 7:0
+        SETD    0
+        RET
+rb_na:  REV     r5, r3
+        SWAP    r5, r5                  ; the byte read, for the report
+        JMP     nack
+
+; Return paths. The deadline checker lets every RET return to every CALL
+; site (tools/loomasm/README.md, limit 3), so the SETD 0 before the RETs of
+; wbyte and rbyte cuts the RET-to-RET loops, as in i2c_master.loom. It costs
+; nothing: CLK is low and every byte and condition starts by re-anchoring.
+
+; tstart: START from the idle bus (both lines high).
+tstart: SETD    0
+        WAITD   SU                      ; both lines high
+        SETP    DIO, 0                  ; START: DIO falls while CLK is high
+        WAITD   SU                      ; hold
+        SETP    CLK, 0
+        RET
+
+; tstop: STOP after a ninth clock (CLK low), then a bus-free gap.
+tstop:  SETD    0
+        SETP    DIO, 0                  ; CLK is low: DIO low first
+        WAITD   LOW
+        SETP    CLK, 1
+        WAITD   SU                      ; set-up
+        SETP    DIO, 1                  ; STOP: DIO rises while CLK is high
+        WAITD   BUF                     ; bus free before the next START
+        RET

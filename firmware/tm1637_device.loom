@@ -1,0 +1,275 @@
+; tm1637_device.loom
+; Loom as a TM1637 LED display driver (Titan Micro Electronics), the chip's
+; side of its two-wire bus: the data, address and display control commands,
+; the six display registers in both address modes, and the key scan, which
+; it answers with a key byte the host sets. After every STOP it reports the
+; registers to the host.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The TM1637's bus is not I2C
+; (datasheet V2.4 p.3: no slave address, bytes LSB first, the first byte of
+; every transaction a command). The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C, for DIO: the device
+;     only pulls it low (ACK, a 0 of the key byte) or lets it go;
+;   - IN on a two-pin group (INGRP), built for parallel inputs, to read CLK
+;     and DIO from the same synchroniser edge while it waits for a START,
+;     and JP and WAITP on single pins inside a byte, as i2c_slave_eeprom.loom
+;     does;
+;   - WAITB with a timeout (SEMANTICS 6.4), built for the FIFO flow control,
+;     as a non-blocking test of INQ, so a key scan takes the host's newest
+;     key byte without waiting for one;
+;   - LD and ST (slice B, SEMANTICS 6.11): the six display registers and the
+;     display control byte live in seven words of the instruction memory.
+; What the firmware does that no hardware does: START and STOP detection,
+; LSB-first shifting, the ACK, the command decoding, the address counter
+; and its two modes, and the key byte. Weaker than the real chip: it drives
+; no LEDs and scans no keys (the registers go to the host and the key byte
+; comes from it), and it answers a CLK fall within about 32 clocks, 0.64 us
+; at 50 MHz, where the chip's output delay is at most 300 ns (tPLZ, p.10).
+; That is well inside any controller that keeps CLK low for 1 us or more,
+; as one at the 250 kHz the datasheet asks for key reads (p.3) does.
+;
+; Pins: CLK = BIDIR2 (only read: the TM1637 never drives CLK, so its PIN_OE
+; stays 0), DIO = BIDIR3, open drain. DIO must be CLK + 1 for the IN group.
+; With tm1637_controller.loom on BIDIR0 and BIDIR1 (thread 0) the bench joins
+; BIDIR0 to BIDIR2 and BIDIR1 to BIDIR3: two Loom threads never share a pin.
+;
+; What it does (datasheet V2.4):
+;   START: DIO falls while CLK is high; STOP: DIO rises while CLK is high;
+;     bits are taken at the CLK rise (p.2 pin table), DIO changing while CLK
+;     is low (p.3).
+;   ACK: DIO pulled low from the eighth CLK fall of every byte to the ninth
+;     (p.3), for every byte received and for the key byte sent.
+;   The first byte after a START is a command (p.4, B7:B6):
+;     01 data command: B1 = 1 reads the key scan (42H), else write; B2 = 1
+;        fixed address (44H), 0 auto increment (40H); the mode stays until
+;        the next data command. B3 (test mode) is ignored.
+;     11 address command: the address C0H + B5:B0. Every following byte of
+;        the transaction goes to that register, the address moving on by one
+;        in auto mode, up to C6H. An address of C6H or more, or C6H reached,
+;        ignores data until a valid address is set (p.5). C0H at start.
+;     10 display control: kept as received (on = B3, width = B2:B0, p.5).
+;     00: not a command; acknowledged and ignored.
+;   Bytes after a data or display command are acknowledged and ignored. A
+;   STOP or START inside a byte drops that byte; the bytes before it stay
+;   written (p.4: "Command or data transferred before remain effective").
+;   Key scan: after the ACK of 42H the key byte goes out LSB first, a bit
+;   changing at each CLK fall, then its ACK.
+;
+; Host words (FIFO space, thread 1).
+;   INQ: the key byte to answer a key scan with (bits 7:0; 0xFF, no key, at
+;     start; p.2's table: SG1 with K1 is 0xF7). Taken at each key scan: the
+;     newest word in INQ wins and stays until replaced.
+;   OUTQ, after every STOP, four words: registers 0 and 1 (C0H in bits 7:0,
+;     C1H in bits 15:8), 2 and 3, 4 and 5, then the display control byte in
+;     bits 7:0 (0x80, display off, at start: the datasheet gives no power-on
+;     value, this is the program's) and the address counter in bits 13:8
+;     (0 = C0H; 6 and up mean "past C5H", modulo 64). The PUSHes block while OUTQ is full,
+;     and a blocked device misses the bus: the host pops them.
+;
+; Rate: the controller owns CLK, so the program has no tick and no deadline
+; pair. Every CLK edge is seen by a WAITP or a JP within one slot plus the
+; synchroniser; the longest answer, CLK fall to the DIO pad, is the ACK of a
+; byte, measured at up to 22 clocks (440 ns at 50 MHz) on the model. The
+; tests follow controllers at 200 kHz, at 250 kHz (the key-read limit, p.3)
+; and at 500 kHz (the datasheet's maximum, p.10, 1 us half periods) with
+; data held 100 ns after each fall. The one thing the device needs that the
+; datasheet does not state: the four-word report after a STOP takes about
+; 120 clocks (2.4 us), and the next START's first bit must not be clocked
+; in before it ends, so STOP to the first rise after the next START must be
+; at least about 2.6 us. A first version that reported and only then waited
+; for both lines high needed 3.2 us of bus-free time alone and lost the
+; next START at 333 kHz and faster (the 500 kHz test found it).
+;
+; OD_MASK (BUGS 14): set first and read back three slots later, as
+; tm1637_controller.loom does, so the two can start under one RUN.
+;
+; Memory: 137 words, thread 1's quarter (0x080..0x0ED) and the report in
+; thread 2's (0x100..0x11A); the registers at REGS, the last seven words of
+; thread 2's quarter. Threads 2 and 3 run nothing of the pair.
+;
+; Registers: r0 the byte shifter, r1 bit count, r2 the address counter, r3
+; the last data command (its B2, fixed), r4 the key byte, r5 scratch, r6
+; REGS after an address command (data bytes are written), else 0, r7 0x0080
+; (the bit a received 1 sets) and the .csr scratch before that.
+;
+; Decided at integration (2026-11-05): the datasheet V2.4 English translation (a
+; third-party copy) is the source; which edges tWAIT spans and whether the
+; chip ACKs the key byte are unchecked. The address is read as six bits, so
+; C8H and above are invalid, as "C6H or higher" says. The device needs about
+; 2.6 us between a stop and the next transaction's first clock, which the
+; datasheet does not state. Both programs set their OD_MASK bit and read it
+; back (BUGS 14).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   CLK = BIDIR2, DIO = BIDIR3
+        .equ    DIOBIT = 1 << pin(DIO)
+        .equ    REGS = 0x179            ; C0H..C5H, then the display control byte
+        .equ    CTRL = REGS + 6
+        .equ    NOKEY = 0xFF
+
+start:  CSRR    r7, OD_MASK
+        ORI     r7, DIOBIT
+        CSRW    OD_MASK, r7             ; DIO open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK             ; three slots later: still our bit?
+        ANDI    r7, DIOBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    INGRP, (2 << 5) | pin(CLK)   ; IN reads {DIO, CLK} in bits 1:0
+        LDI     r7, 0x80                ; the bit a received 1 sets
+        MOV16   r5, REGS
+        LDI     r0, 0
+        LDI     r1, 6
+clear:  ST      r0, r5, 0               ; the display registers start at 0
+        ADDI    r5, 1
+        DJNZ    r1, clear
+        LDI     r0, 0x80
+        ST      r0, r5, 0               ; display off
+        LDI     r2, 0                   ; the address: C0H
+        LDI     r3, 0                   ; auto increment
+        LDI     r4, NOKEY
+
+; Idle: wait for a START. IN reads both lines at once: both high, then CLK
+; high with DIO low, is a START.
+idle:   SETP    DIO, 1
+i_both: IN      r5
+        CMPI    r5, 3
+        BNZ     i_both                  ; wait until both lines are high
+i_high: IN      r5
+        CMPI    r5, 3
+        BZ      i_high
+        CMPI    r5, 1                   ; CLK high, DIO low: a START
+        BNZ     i_both                  ; CLK fell first: not a START
+
+; A START (or one seen inside a byte). The command byte follows.
+got_start:
+        WAITP   CLK, 0
+        LDI     r6, 0                   ; no address command yet
+        CALL    rbyte                   ; the command
+        SETP    DIO, 0                  ; ACK
+        MOV     r5, r0
+        SHRI    r5, 6                   ; B7:B6
+        CMPI    r5, 1
+        BZ      c_data
+        CMPI    r5, 3
+        BZ      c_addr
+        CMPI    r5, 2
+        BNZ     d_ack                   ; 00: not a command
+        MOV16   r5, CTRL                ; 10: display control
+        ST      r0, r5, 0
+        JMP     d_ack
+c_addr: MOV     r2, r0
+        ANDI    r2, 63                  ; C0H + B5:B0: 6 and up are not valid
+        MOV16   r6, REGS                ; data bytes are written, from REGS
+        JMP     d_ack
+c_data: MOV     r3, r0                  ; B2: fixed address
+        ANDI    r0, 2
+        BNZ     keys                    ; B1: read the key scan
+
+; The ninth clock of a received byte, then the next byte: data, or the STOP
+; or START that ends the transaction.
+d_ack:  CALL    ackclk
+data:   CALL    rbyte
+        SETP    DIO, 0                  ; ACK
+        TEST    r6, r6
+        BZ      d_ack                   ; not after an address command: ignored
+        CMPI    r2, 6
+        BC      d_ack                   ; past C5H: ignored until a valid address
+        ADD     r5, r6, r2
+        ST      r0, r5, 0               ; the register, at its ACK
+        MOV     r5, r3
+        ANDI    r5, 4
+        BNZ     d_ack                   ; fixed address
+        ADDI    r2, 1                   ; auto increment
+        JMP     d_ack
+
+; Key scan: take the newest key byte from INQ (a test, not a wait: SETD 0
+; makes the timeout immediate), then send it LSB first, a bit at each CLK
+; fall from the end of the ACK clock on, and pull its ACK.
+keys:   SETD    0
+        WAITB   INQ_NE, T               ; anything in INQ?
+        BT      k_send                  ; no: keep the key byte we have
+        POP     r4                      ; cannot block: INQ is not empty
+        JMP     keys
+k_send: MOV     r0, r4
+        LDI     r1, 8
+        WAITP   CLK, 1                  ; the ninth clock of 42H ...
+        WAITP   CLK, 0                  ; ... ends: the first bit goes out
+k_bit:  SHRI    r0, 1                   ; C = the next bit, LSB first
+        BC      k_one
+        SETP    DIO, 0
+        JMP     k_clk
+k_one:  SETP    DIO, 1
+k_clk:  WAITP   CLK, 1                  ; the controller samples on this high
+        WAITP   CLK, 0
+        DJNZ    r1, k_bit
+        SETP    DIO, 0                  ; ACK of the key byte, to the ninth fall
+        JMP     d_ack
+
+; ---------------------------------------------------------------------------
+; rbyte: receive eight bits LSB first into r0 bits 7:0. Entered with CLK low;
+; returns at the CLK fall after the eighth bit. A START or STOP inside the
+; byte leaves for got_start or stopped (the return address left on the
+; stack is overwritten by the next CALL).
+; ---------------------------------------------------------------------------
+rbyte:  LDI     r0, 0
+        LDI     r1, 8
+rbits:  WAITP   CLK, 1                  ; the rise: DIO is valid now
+        SHRI    r0, 1                   ; a bit enters at bit 7, the first ends in bit 0
+        JP      DIO, 1, rb_one
+rb_z:   JP      CLK, 0, rb_next         ; CLK fell: the bit is done
+        JP      DIO, 0, rb_z            ; DIO still low
+        JP      CLK, 0, rb_next         ; DIO rose: after CLK fell, data
+        JMP     stopped                 ; DIO rose while CLK high: STOP
+rb_one: OR      r0, r0, r7
+rb_o:   JP      CLK, 0, rb_next
+        JP      DIO, 1, rb_o
+        JP      CLK, 0, rb_next
+        JMP     got_start               ; DIO fell while CLK high: START
+rb_next: DJNZ   r1, rbits
+        RET
+
+; ackclk: the ninth clock, whose ACK is on DIO: let go of DIO when it ends.
+ackclk: WAITP   CLK, 1
+        WAITP   CLK, 0
+        SETP    DIO, 1
+        RET
+
+; ---------------------------------------------------------------------------
+; The spill: the report sits in thread 2's quarter, 0x100 on (see "Memory").
+; ---------------------------------------------------------------------------
+        .org    0x100
+
+; After a STOP: report the registers, the control byte and the address,
+; unrolled (30 slots), then look at the bus once. The next START may have
+; begun meanwhile: both lines high is the idle bus; CLK high with DIO low is
+; a START under way; CLK low is a START already past whose first bit has not
+; been clocked yet (that needs the report to end before it: "Rate" above).
+stopped: MOV16  r6, REGS
+        LD      r0, r6, 0               ; C0H ...
+        LD      r5, r6, 1               ; ... and C1H
+        SWAP    r5, r5
+        OR      r0, r0, r5
+        PUSH    r0
+        LD      r0, r6, 2
+        LD      r5, r6, 3
+        SWAP    r5, r5
+        OR      r0, r0, r5
+        PUSH    r0
+        LD      r0, r6, 4
+        LD      r5, r6, 5
+        SWAP    r5, r5
+        OR      r0, r0, r5
+        PUSH    r0
+        LD      r0, r6, 6               ; the display control byte
+        MOV     r5, r2
+        ANDI    r5, 63
+        SWAP    r5, r5
+        OR      r0, r0, r5              ; the address in bits 13:8
+        PUSH    r0
+        IN      r5                      ; {DIO, CLK}
+        CMPI    r5, 3
+        BZ      i_high                  ; the idle bus: wait for a START
+        JMP     got_start               ; a START under way, or just past
