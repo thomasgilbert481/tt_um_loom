@@ -1,0 +1,266 @@
+; dht22_host.loom
+; A host for the Aosong AM2302 (DHT22) humidity and temperature sensor: the
+; start pulse, the sensor's response checked with timeouts, the 40 data
+; bits told apart by the length of their high pulse, the checksum, and one
+; report per read to the host: humidity, temperature and an error code.
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The AM2302's single wire is
+; not Maxim's 1-Wire (its datasheet says so, section 6(2)): the host sends
+; one long low, then the sensor talks alone, and a bit is the width of a
+; high pulse, not a level in a slot. The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the host only pulls
+;     the line low or lets it go, and the board's pull-up (the datasheet's
+;     section 5 figure: 1 kOhm to VDD) makes the high level;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): the start pulse is exact to the clock;
+;   - the timed waits, WAITP with a timeout (SEMANTICS 6.4), built for the
+;     receivers' frame timeouts: every edge the sensor makes is waited for
+;     with a deadline, so a sensor that is missing, stuck or wrong cannot
+;     hang the thread;
+;   - the bit engine's SHI (SEMANTICS 6.9), built for the serial protocols,
+;     as a one-bit sampler: it takes the line a fixed time after each rise,
+;     MSB first, and counts the bits in CNT.
+; What the firmware does that no hardware does: the start pulse and the
+; response handshake, the pulse-width decision per bit, the checksum (a sum
+; of four bytes, not a CRC, so the CRC unit is not used), the conversion of
+; the sensor's sign-magnitude temperature to two's complement, and the
+; error reporting.
+;
+; Pin: OW = BIDIR0, open drain (OD_MASK bit 0). Nothing drives the line high.
+;
+; Host words (FIFO space, thread 0).
+;   INQ, one word per read: bits 7:0 K, the start low in steps of 100 us
+;     (STEP); a K below KMIN = 10 is taken as 10 (1 ms, the datasheet's
+;     minimum), so the start low is 1.0 to 25.5 ms. Bits 15:8 are ignored.
+;     The program reads once per word and never on its own: the datasheet's
+;     2 s between reads (section 6(2), p.3, and the "collecting period" of
+;     section 7) is the host's to keep. A deadline is a 16-bit tick count
+;     and a 2 s wait would need a loop of 8000 WAITDs for nothing, so the
+;     interval is the host's choice, not the program's.
+;   OUTQ, three words per read:
+;     1. the humidity word as received (tenths of a %RH: 652 = 65.2 %RH);
+;     2. the temperature in tenths of a degree C, two's complement (the
+;        sensor sends sign and magnitude: 0x8065 is -10.1 C, datasheet p.3;
+;        the program sends 0xFF9B);
+;     3. status: bits 7:0 the checksum byte received, bits 11:8 the error
+;        code, bits 15:12 zero. Error codes:
+;          0 none
+;          1 E_UP     the line was not high UP_TO us after the release
+;          2 E_NORESP no fall from the sensor within RESP_TO us
+;          3 E_RLOW   the response low was high at its middle (40 us) or
+;                     lasted past MID + HALF_TO = 120 us
+;          4 E_RHIGH  the same for the response high
+;          5 E_BLOW   a bit's low lasted past LOW_TO = 100 us
+;          6 E_BHIGH  a bit's high lasted past THR + HIGH_TO = 100 us
+;          7 E_END    the end low lasted past END_TO = 100 us
+;          8 E_SUM    the checksum is not the low byte of the sum of the
+;                     four data bytes
+;        With an error from 1 to 7 the words that had not arrived are 0 (a
+;        word half received is not reported). The PUSHes block while OUTQ
+;        is full: the host pops each report before the next read.
+;
+; Rate: the program sets its own tick, TICK_INT = 50 (1 us at 50 MHz): the
+; datasheet gives every time in microseconds. Another board clock: change US
+; (the checker proves the schedule down to US = 10).
+;
+; Timing, AM2302 datasheet section 6(2), p.4 text and figures, from the
+; release R of the start low (every time in us):
+;     start low     K x 100, exact (latched); "at least 1~10ms", figure
+;                   "1ms minimum"
+;     release       the sensor answers 20..40 after R: a fall by R + RESP_TO
+;     response      80 low, 80 high: each half must still be at its level
+;                   at its middle (40 after its edge) and end within 120
+;     each bit      a 50 low, then a high of 26..28 for a 0 or 70 for a 1
+;     end           the sensor's low after the last bit (p.3 figure, no
+;                   length given; 50 in other versions, unchecked)
+; The threshold. Each bit is the line THR = 49 us after the rise that ends
+; its low: a 0's high (26..28) has ended by then and a 1's (70) has not.
+; 49 is the middle of 28 and 70, so either length may be off by 21 us
+; before a bit is misread. The rise is seen 2 to 6 clocks late (the
+; synchroniser and the slot grid, SEMANTICS 2) and SETD 0 takes the tick
+; under way, up to one less: the sample lands 48 to 49.2 us after the rise.
+; The datasheet gives no tolerance on these widths in this version, so the
+; windows the model checks are its own (tools/protomodels/dht22.py).
+;
+; OD_MASK (BUGS 14): CSRR, ORI, CSRW is not atomic across threads, and
+; dht22_sensor.loom sets its bit with the same three instructions as its
+; first. Started under one RUN the two would overlap and one bit would be
+; lost, so both programs read OD_MASK back three slots after their write
+; and set it again if their bit is missing. Three slots is past the other
+; thread's own write in any overlap (its write is at most two slots after
+; its read, and that read came before this write), so the later writer's
+; check passes, the earlier's fails at most once, and its second write
+; reads the other's bit. No pad is driven before the check passes.
+;
+; Memory: thread 0's quarter, 0x000..0x07F. With dht22_sensor.loom (thread
+; 1, 0x080) the two load together.
+;
+; Registers: r0 the humidity, r1 the temperature, r2 the checksum byte, r3
+; the error code, r4 the start steps, r5 scratch, r6 0x00FF, r7 scratch and
+; the `.csr` scratch.
+;
+; Decided at integration (2026-11-05): the windows come from the figures of
+; the Aosong AM2302 version Adafruit hosts (no timing table), marked
+; unchecked in tools/protomodels/dht22.py; the 2 s minimum between reads is
+; left to the host; the sensor takes any low of 250 us or more as a start.
+; Each program sets its OD_MASK bit first and then reads it back and sets it
+; again: setting it first is not enough when both programs do it under one
+; RUN, and the read-back works in either start order.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    OWPIN = 0               ; BIDIR0
+        .pins   OW = OWPIN
+        .equ    OWBIT = 1 << OWPIN      ; its bit in OD_MASK
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    STEP = 100              ; the start low's unit, in us
+        .equ    KMIN = 10               ; 1 ms
+        .equ    UP_TO = 10              ; in us, after the release
+        .equ    RESP_TO = 100           ; the sensor's fall: 20..40 us (header)
+        .equ    MID = 40                ; the response halves' middle (80 us)
+        .equ    HALF_TO = 80            ; ... and their end, by MID + HALF_TO
+        .equ    LOW_TO = 100            ; a bit's 50 us low
+        .equ    THR = 49                ; the bit's sample, after its rise
+        .equ    HIGH_TO = 100 - THR     ; a 1's 70 us high ends by rise + 100
+        .equ    END_TO = 100            ; the end low
+        .equ    DIR = 1 << 1            ; BE_CFG: MSB first, no CRC
+        .equ    E_UP = 1
+        .equ    E_NORESP = 2
+        .equ    E_RLOW = 3
+        .equ    E_RHIGH = 4
+        .equ    E_BLOW = 5
+        .equ    E_BHIGH = 6
+        .equ    E_END = 7
+        .equ    E_SUM = 8
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, OWBIT
+        CSRW    OD_MASK, r7             ; OW open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, OWBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, DIR
+        CSRW    BE_CFG, r7
+        LDI     r7, OWPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples OW
+        LDI     r7, (1 << 5) | OWPIN
+        CSRW    INGRP, r7               ; IN reads OW into bit 0
+        LDI     r6, 0xFF
+        SETP    OW, 1                   ; released: the pull-up holds it high
+
+; One read per host word: the start low of K steps.
+cmd:    POP     r4                      ; K (blocks)
+        AND     r4, r4, r6
+        CMPI    r4, KMIN
+        BC      k_ok
+        LDI     r4, KMIN                ; below 1 ms: 1 ms
+k_ok:   SUBI    r4, 1
+        SETD    0                       ; re-anchor after the unbounded POP
+        SETP    OW, 0, D                ; stage the fall
+        WAITD   2                       ; F: the fall lands
+lo:     WAITD   STEP
+        DJNZ    r4, lo                  ; K - 1 steps ...
+        SETP    OW, 1, D
+        WAITD   STEP                    ; ... and the last: R, released at F + K x 100
+        LDI     r0, 0
+        LDI     r1, 0
+        LDI     r2, 0
+
+; The response: the line back up, the sensor's fall, 80 us low, 80 us high.
+        LDI     r3, E_UP
+        SETD    UP_TO
+        WAITP   OW, 1, T                ; the pull-up, through the synchroniser
+        BT      report
+        LDI     r3, E_NORESP
+        SETD    RESP_TO
+        WAITP   OW, 0, T                ; the sensor's fall
+        BT      report
+        LDI     r3, E_RLOW
+        SETD    0
+        WAITD   MID
+        IN      r7                      ; 0 expected
+        SETD    HALF_TO
+        WAITP   OW, 1, T
+        BT      report                  ; too long
+        TEST    r7, r7
+        BNZ     report                  ; too short
+        LDI     r3, E_RHIGH
+        SETD    0
+        WAITD   MID
+        IN      r7                      ; 1 expected
+        SETD    HALF_TO
+        WAITP   OW, 0, T                ; the first bit's low begins
+        BT      report
+        TEST    r7, r7
+        BZ      report
+
+; The 40 bits, MSB first: 16 humidity, 16 temperature, 8 checksum.
+        LDI     r7, 16
+        CSRW    CNT, r7
+        CALL    bits
+        STSR    r0
+        LDI     r7, 16
+        CSRW    CNT, r7
+        CALL    bits
+        STSR    r1
+        LDI     r7, 8
+        CSRW    CNT, r7
+        CALL    bits
+        STSR    r2
+        AND     r2, r2, r6
+        LDI     r3, E_END
+        SETD    END_TO
+        WAITP   OW, 1, T                ; the end low, then the pull-up
+        BT      report
+
+; The checksum: the low byte of the sum of the four data bytes.
+        MOV     r7, r0
+        SHRI    r7, 8
+        AND     r5, r0, r6
+        ADD     r7, r7, r5
+        MOV     r5, r1
+        SHRI    r5, 8
+        ADD     r7, r7, r5
+        AND     r5, r1, r6
+        ADD     r7, r7, r5
+        AND     r7, r7, r6
+        LDI     r3, 0
+        CMP     r7, r2
+        BZ      report
+        LDI     r3, E_SUM
+
+; The report: humidity, temperature (two's complement), status.
+report: MOV     r7, r1
+        SHLI    r7, 1                   ; C = the sign bit
+        BNC     t_pos
+        SHRI    r7, 1                   ; the magnitude
+        NEG     r1, r7
+t_pos:  PUSH    r0
+        PUSH    r1
+        SHLI    r3, 8
+        OR      r3, r3, r2
+        PUSH    r3
+        JMP     cmd
+
+; bits: CNT bits into SR. Entered with the line low (a bit's low begun);
+; returns at the fall that ends the last bit's high, with the line low.
+bits:   LDI     r3, E_BLOW
+        SETD    LOW_TO
+        WAITP   OW, 1, T                ; the rise that ends the 50 us low
+        BT      report
+        SETD    0
+        WAITD   THR
+        SHI                             ; the line at rise + 49: the bit; Z = (CNT == 0)
+        LDI     r3, E_BHIGH             ; (LDI, SETD, WAITP and BT keep Z)
+        SETD    HIGH_TO
+        WAITP   OW, 0, T                ; a 0 has ended already, a 1 ends at 70
+        BT      report
+        BNZ     bits
+        RET

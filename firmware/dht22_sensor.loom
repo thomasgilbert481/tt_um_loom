@@ -1,0 +1,165 @@
+; dht22_sensor.loom
+; Loom as an Aosong AM2302 (DHT22) sensor: it waits for a host's start
+; pulse, answers with the 80 us low and 80 us high response, then sends 40
+; bits, humidity, temperature (sign and magnitude, as the sensor does) and
+; their checksum, from values the host on the SPI side sets.
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). A sensor makes every edge of
+; the exchange after the host's release, so the whole reply is a schedule
+; of deadlines. The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the sensor pulls the
+;     line low or lets it go, as the host does;
+;   - WAITP on that pin, untimed for the host's fall and release and with a
+;     timeout to tell a start pulse from a glitch;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every edge of the reply lands on the clock
+;     of its deadline, 1 us ticks from the host's release as seen, so each
+;     pulse width is exact to 20 ns;
+;   - WAITB INQ_NE with a reached deadline (SEMANTICS 6.4), a test rather
+;     than a wait, so new values from the host are taken between reads and
+;     never block an answer.
+; What the firmware does that no hardware does: the start detection, the
+; response, the bit encoding as high widths, the sign-magnitude conversion
+; and the checksum. No hardware in Loom encodes a bit as a pulse width.
+;
+; Pin: OW = BIDIR1, open drain (OD_MASK bit 1). With dht22_host.loom on
+; BIDIR0 (thread 0) the bench joins the two pins as one line: two Loom
+; threads never share a pin (a pin's output register holds whichever
+; thread wrote last).
+;
+; Host words (FIFO space, thread 1). INQ: pairs of words, the humidity in
+; tenths of a %RH (sent as given: 652 is 65.2 %RH) and the temperature in
+; tenths of a degree C, two's complement (-101 is -10.1 C, sent as 0x8065,
+; datasheet p.3). The sensor stays off the line until the first pair has
+; arrived; after each reply it takes the next pair if one is waiting, so
+; the host may change the values at any time: a pair pushed while the
+; sensor waits is taken after its next reply and sent from the read after
+; that one. A temperature of -32768 has no magnitude in
+; 15 bits; the datasheet's range, -40 to 80 C, is far inside. Nothing goes
+; to OUTQ.
+;
+; Rate: the program sets its own tick, TICK_INT = 50 (1 us at 50 MHz).
+; Another board clock: change US (the checker proves it down to 10).
+;
+; Timing, AM2302 datasheet section 6(2), p.4 text and figures, every time in
+; us from the moment R the sensor sees the host's release (2 to 6 clocks
+; after it, and SETD 0 takes the tick under way, so up to one tick less):
+;     start         a low still there LOMIN = 250 us after its fall; the
+;                   datasheet asks the host for "at least 1~10ms" and does
+;                   not say what the sensor needs, so this is lenient
+;     response      fall at R + RESP = 30 (the host waits 20..40), released
+;                   80 later, fall again 80 later
+;     each bit      released after the 50 us low, then a high of H0 = 27
+;                   (26..28) for a 0 or H1 = 70 for a 1
+;     end           the last bit's fall, then a low of 50 and the release
+;                   (p.3 figure, no length given; 50 is unchecked)
+; A low that ends before LOMIN is not a start: the sensor waits for the
+; next. The 2 s between reads is the host's to keep (dht22_host.loom).
+;
+; OD_MASK (BUGS 14): set first and read back three slots later, as
+; dht22_host.loom does and for the same reason (its header).
+;
+; Memory: thread 1's quarter, 0x080..0x0FF.
+;
+; Registers: r0 the humidity, r1 the temperature as sent, r2 the checksum
+; in bits 15:8, r3 the bit count, r4 scratch, r5 the word being sent, r6
+; 0x00FF, r7 scratch and the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    OWPIN = 1               ; BIDIR1
+        .pins   OW = OWPIN
+        .equ    OWBIT = 1 << OWPIN
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    LOMIN = 250             ; in us: the shortest start low taken
+        .equ    RESP = 30               ; release to the response's fall
+        .equ    RLOW = 80
+        .equ    RHIGH = 80
+        .equ    BLOW = 50               ; a bit's low
+        .equ    H0 = 27                 ; a 0's high (26..28)
+        .equ    H1 = 70                 ; a 1's high
+        .equ    ENDLO = 50              ; the end low (unchecked, header)
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, OWBIT
+        CSRW    OD_MASK, r7             ; OW open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, OWBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r6, 0xFF
+        SETP    OW, 1                   ; let go of the line
+
+; A new pair of values: the temperature to sign and magnitude, the checksum.
+take:   POP     r0                      ; the humidity
+        POP     r1                      ; the temperature, two's complement
+        MOV     r7, r1
+        SHLI    r7, 1                   ; C = negative
+        BNC     t_pos
+        NEG     r1, r1
+        MOV16   r7, 0x8000
+        OR      r1, r1, r7              ; the sign bit over the magnitude
+t_pos:  MOV     r7, r0
+        SHRI    r7, 8
+        AND     r4, r0, r6
+        ADD     r7, r7, r4
+        MOV     r4, r1
+        SHRI    r4, 8
+        ADD     r7, r7, r4
+        AND     r4, r1, r6
+        ADD     r7, r7, r4
+        AND     r7, r7, r6
+        MOV     r2, r7
+        SHLI    r2, 8                   ; the checksum, MSB first from bit 15
+
+; Wait for a start: a low that lasts LOMIN, then the host's release.
+idle:   WAITP   OW, 1                   ; the line idle
+        WAITP   OW, 0                   ; a fall
+        SETD    LOMIN
+        WAITP   OW, 1, T
+        BNT     idle                    ; it rose too soon: not a start
+        WAITP   OW, 1                   ; R: the host lets go
+        SETD    0                       ; anchored on R
+        SETP    OW, 0, D
+        WAITD   RESP                    ; the response low ...
+        SETP    OW, 1, D
+        WAITD   RLOW                    ; ... the response high ...
+        SETP    OW, 0, D
+        WAITD   RHIGH                   ; ... and the first bit's low
+        MOV     r5, r0
+        LDI     r3, 16
+        CALL    send                    ; the humidity
+        MOV     r5, r1
+        LDI     r3, 16
+        CALL    send                    ; the temperature
+        MOV     r5, r2
+        LDI     r3, 8
+        CALL    send                    ; the checksum
+        SETP    OW, 1, D
+        WAITD   ENDLO                   ; the end low, then the pull-up
+
+; New values, if the host has sent a pair: a test, not a wait.
+        SETD    0
+        WAITB   INQ_NE, T               ; TD is reached: done at once
+        BT      idle                    ; nothing waiting: the same values
+        JMP     take
+
+; send: r3 bits of r5, MSB first. Entered with a fall staged or landed at
+; the last deadline (the bit's low begins there); returns with the fall
+; that ends the last bit's high landed.
+send:   SHLI    r5, 1                   ; C = the bit
+        SETP    OW, 1, D
+        WAITD   BLOW                    ; the rise, 50 us after the fall
+        SETP    OW, 0, D
+        BC      one
+        WAITD   H0                      ; a 0: the fall 27 us after the rise
+        JMP     next
+one:    WAITD   H1                      ; a 1: 70 us
+next:   DJNZ    r3, send
+        RET
