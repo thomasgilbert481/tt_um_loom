@@ -1,0 +1,171 @@
+; arinc429_tx.loom
+; ARINC 429 transmitter (the avionics data bus) on OUT0 and OUT1, the two
+; logic inputs of a line driver, fed with 32-bit words by the host through
+; INQ[0].
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): ARINC 429 is in no design
+; document. The program uses one piece of hardware built for another job:
+; the deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016),
+; built so that WS2812 pulses land on the exact clock, with the fractional
+; tick divider (SEMANTICS 4) built for UART rates. It also uses REV and PAR,
+; ALU instructions put in for bit-order and UART parity. What the firmware
+; does that no hardware does: the bipolar return-to-zero coding (a HI or LO
+; half-bit, then a NULL half-bit), the label's bit reversal, the odd parity
+; bit, the word gap, and the host's choice of speed and gap. No bit engine:
+; its DIFF output (6.9.1) drives two pins as complements, not as the
+; three-level HI / NULL / LO a line driver takes.
+;
+; Wire format (ARINC Specification 429 Part 1 is not public; every figure is
+; from a public secondary source, as tools/protomodels/arinc429.py cites
+; them): Holt HI-8282A datasheet (DS8282A, May 2001) page 3, the received
+; timing ARINC 429 gives: high speed 100 kbit/s +-1 %, a HI or LO pulse of
+; 5 us +-5 %; low speed 12 to 14.5 kbit/s, a pulse of 34.5 to 41.7 us (half
+; a bit at 14.5 and at 12 kbit/s). Its transmitter (page 4): a bit is 10
+; clocks, 5 of data and 5 of NULL, with a word gap of 40 clocks (4 bit
+; times). The word (Alta Data Technologies "ARINC Protocol Tutorial";
+; Wikipedia "ARINC 429"): 32 bits sent bit 1 first; label bits 1 to 8,
+; sent most significant bit of the octal label first; SDI bits 9 and 10;
+; data 11 to 29; SSM 30 and 31; bit 32 odd parity over the word.
+;
+; Line driver: TWO logic pins, TXA = OUT0 and TXB = OUT1, as a Holt HI-8585
+; or HI-3182 style driver takes them: TXA high is HI (a 1), TXB high is LO
+; (a 0), both low is NULL. Both high is never driven: every edge of the
+; program moves one pin only (a 1 is TXA up then TXA down, a 0 the same on
+; TXB), so the other pin is low whenever one is high, by construction and
+; whatever the tick. The rise and fall times of the line (1.5 +- 0.5 us at
+; high speed, 10 +- 5 us at low speed) are made by the driver's slope
+; control, not by logic: the logic edges here are clock-exact.
+;
+; Tick (set by the host before RUN): one tick is half a bit, TICK = f_clk /
+; (2 x bit rate): 250 at 50 MHz for 100 kbit/s (exact), 2000 for 12.5
+; kbit/s; 12 kbit/s is 2083 + 85/256 (12000.0 bit/s to 0.01 %) and 14.5
+; kbit/s 1724 + 35/256. Every edge is `SETP x, v, D` and the WAITD that lands
+; it, so it changes the pad on the exact clock edge of its tick (6.10 rule
+; 1): HI and NULL are each exactly one tick, the ratio 50 %, on every bit.
+; The schedule is proved for ticks of 32 clocks or more (.tick 32), so 100
+; kbit/s needs a clock of 6.4 MHz or more.
+;
+; Host words (FIFO space, thread 0). Nothing is pushed to OUTQ.
+;   An ARINC word is two INQ words, low first. As a 32-bit value V, bit k
+;   of V is ARINC bit k + 1, except the label: V bits 7:0 hold the label as
+;   it is written in octal (label 0o205 is 0x85), and the program reverses
+;   it so that its most significant bit goes out first. The low word is
+;   V[15:0] (label, SDI, data bits 11 to 16), the high word V[31:16] (data
+;   17 to 29, SSM, and bit 32). Bit 32 from the host is ignored: the
+;   program computes odd parity over bits 1 to 31 and sends it, unless the
+;   configuration's RAW bit is set (below).
+;   A host pushes the two words together. If only the first is there when
+;   the gap begins, the program waits for the second and the gap grows (a
+;   longer gap is still a valid one); with INQ empty the line stays NULL.
+;
+; Configuration: the word at `cfg` (data memory, loaded with the image;
+; the host may rewrite it before RUN). Bits 7:0: G, the gap in bit times,
+; at least 4 (0..3 are taken as 4). Bit 15 RAW: send bit 32 as the host gave
+; it, parity not computed (for testing a receiver's parity check). Reset
+; value: G = 4, RAW = 0. It is read once, at RUN.
+;
+; Timing of one word: bit k (1..32) starts with its rise at tick 2(k - 1)
+; and its fall at 2k - 1 from the first rise; the line is NULL from the
+; last fall at tick 63 to the next word's first rise at tick 64 + 2G, so the
+; NULL after a word is G + 1/2 bit times (Holt's 40-clock gap after a
+; 5-clock NULL half: 4.5 bits at G = 4). Back to back, a word every 32 + G
+; bits: 360 us at 100 kbit/s, 2.88 ms at 12.5 kbit/s.
+;
+; Registers: r0 the half-word being sent, r1 the high half, r2 bits left in
+; r0, r3 halves left, r4 G, r5 RAW (0x8000 or 0), r6 gap counter, r7 scratch.
+;
+; Size: 67 words, 0x000..0x042 in thread 0's quarter, the last the cfg
+; word. `--strict`: 16 deadline pairs, worst slack 0 clocks at the 32-clock
+; tick (a bit whose 16th follows: the half-word move and two reloads ride in
+; the NULL half before the next rise), two `.bounded` POPs, each guarded by
+; a `WAITB INQ_NE, T` just before it that completed with T = 0.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TXA = OUT0, TXB = OUT1
+        .tick   32                      ; the shortest tick the schedule is proved for
+        .equ    GMIN = 4                ; bit times of gap, at least (Holt TX, 40 clocks)
+
+start:  SETP    TXA, 0                  ; NULL
+        SETP    TXB, 0
+        MOV16   r7, cfg
+        LD      r4, r7, 0               ; the configuration
+        MOV16   r5, 0x8000
+        AND     r5, r5, r4              ; RAW
+        SHLI    r4, 8
+        SHRI    r4, 8                   ; G
+        CMPI    r4, GMIN                ; C = (G >= 4)
+        BC      gok
+        LDI     r4, GMIN
+gok:    SETD    0                       ; anchor: TD = NOW, reached
+
+; ------------------------------------------------------------ the gap
+; Entered with TD just reached at the last fall of a word (or at the anchor
+; above). Takes the next word, then lands nothing for G x 2 ticks.
+; The work is split over the gap's first three WAITD 2, so that no interval
+; is longer than the bit loop's budget allows at the proved tick.
+gap:    WAITB   INQ_NE, T               ; a word? (a test: TD is reached)
+        BT      idle
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0                      ; one slot: it cannot stall
+        WAITB   INQ_NE, T               ; its high half?
+        BT      late
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r1
+        JMP     sta
+idle:   POP     r0                      ; INQ empty: the line stays NULL
+late:   POP     r1                      ; the high half came late
+        SETD    0                       ; re-anchor: the gap only grows
+sta:    WAITD   2                       ; gap tick 2
+
+; The label, reversed: V bits 7:0 hold it in octal order, bit 1 is its MSB.
+        REV     r7, r0                  ; r7[15:8] = r0[7:0] reversed
+        SHRI    r7, 8
+        SHRI    r0, 8
+        SHLI    r0, 8
+        OR      r0, r0, r7              ; bits 1..8 in wire order
+        WAITD   2                       ; gap tick 4
+
+; Bit 32: odd parity over bits 1..31, unless RAW.
+        TEST    r5, r5
+        BNZ     stc
+        SHLI    r1, 1
+        SHRI    r1, 1                   ; bit 32 = 0
+        XOR     r7, r0, r1
+        PAR     r7, r7                  ; C = XOR of bits 1..31
+        BC      stc                     ; odd already: bit 32 stays 0
+        MOV16   r7, 0x8000
+        OR      r1, r1, r7              ; bit 32 = 1
+stc:    MOV     r6, r4
+        SUBI    r6, 3                   ; G - 3 >= 1 more gap bits
+        WAITD   2                       ; gap tick 6
+gw:     WAITD   2
+        DJNZ    r6, gw                  ; TD = the last fall + 2G
+
+; ------------------------------------------------------------ the word
+; 32 bits, LSB first from r0 then r1. Each bit stages its rise, lands it
+; on the next tick, stages its fall, lands it a tick later.
+        LDI     r3, 2                   ; two halves
+wh:     LDI     r2, 16
+bit:    SHRI    r0, 1                   ; C = this bit
+        BC      one
+        SETP    TXB, 1, D               ; a 0: LO
+        WAITD   1                       ; the rise lands: the bit starts
+        SETP    TXB, 0, D
+        WAITD   1                       ; the fall lands: NULL, mid-bit
+        DJNZ    r2, bit
+        MOV     r0, r1                  ; (the tail below, repeated: no JMP)
+        DJNZ    r3, wh
+        JMP     gap
+one:    SETP    TXA, 1, D               ; a 1: HI
+        WAITD   1
+        SETP    TXA, 0, D
+        WAITD   1
+        DJNZ    r2, bit
+hnext:  MOV     r0, r1
+        DJNZ    r3, wh
+        JMP     gap                     ; TD on the last fall
+
+; ------------------------------------------------------------ data
+cfg:    .word   GMIN                    ; G = 4, RAW = 0 (header)

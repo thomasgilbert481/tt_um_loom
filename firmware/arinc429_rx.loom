@@ -1,0 +1,245 @@
+; arinc429_rx.loom
+; ARINC 429 receiver on IN0 and IN1, the two logic outputs of a line
+; receiver: finds each word by the NULL gap before it, checks every bit's
+; timing, the parity and a label filter, and delivers the words with a
+; status word to the host through OUTQ[1].
+;
+; Written on 2026-11-04, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): ARINC 429 is in no design
+; document. The program shifts each bit into the bit engine's shift
+; register with `SHI` (built for USB, CAN and the Manchester receiver),
+; time-stamps edges with the `NOW` tick counter (built as the deadline
+; timebase, SEMANTICS 4), bounds every wait for a NULL with a timed `WAITP`
+; (built for I2C clock stretching), checks parity with `PAR` (put in for
+; UART parity), un-reverses the label with `REV`, and keeps the label table
+; in data memory (`LD`, built for the EEPROM emulation). What the firmware
+; does that no hardware does: the word sync on the gap, the bit-to-bit
+; rate check, the two-line three-level decoding (HI, LO, NULL, and both
+; lines high as an error), the label filter and the reports.
+;
+; Line receiver: TWO logic inputs, RXA = IN0 and RXB = IN1, as a Holt
+; HI-8482 / HI-8588 style receiver gives them: RXA high on a ONE (HI, +6.5
+; to +13 V differential), RXB high on a ZERO (LO, -6.5 to -13 V), both low
+; on NULL (+-2.5 V; levels from the Holt HI-8282A datasheet, DS8282A, page
+; 3). Both high is not a line state: it is reported as an error.
+;
+; Timing rules, from the Holt HI-8282A datasheet page 3 (ARINC 429 Part 1
+; itself is not public; tools/protomodels/arinc429.py cites every figure).
+; Holt's receiver samples at 10 times the data rate and each data bit must
+; follow its predecessor by not less than 8 and not more than 12 samples,
+; which it says accepts 83 to 125 kbit/s at the 100 kbit/s setting and 10.4
+; to 15.6 kbit/s at 12.5 kbit/s. This program stamps edges with a tick of
+; a twentieth of the nominal bit, twice Holt's sampling rate, so that its
+; one-tick stamping error and its poll lag (below) still let it guarantee
+; that whole range:
+;   - Each later rise is BMIN = 15 to BMAX = 25 ticks after the one before,
+;     measured with NOW (Holt rule 3, 0.75 to 1.25 bits). A measured
+;     interval is the true one to within 2.1 ticks at 50 MHz and 100
+;     kbit/s (one tick of stamping and the poll's lag, below), so every
+;     rate from 83.6 to 124.4 kbit/s is always taken and every rate under
+;     73.9 or over 154.8 kbit/s always refused; on a 10 MHz board at the
+;     12.5 kbit/s setting (1.7 ticks), 10.3 to 15.9 kbit/s taken, under 9.4
+;     or over 18.7 refused. Between, a bit may go either way, as with any
+;     sampling receiver. The low-speed range, 12 to 14.5 kbit/s, is 20.8 to
+;     17.2 ticks.
+;   - The line must be NULL again (both lines low) within HIMAX = 18 ticks
+;     of a rise (Holt rule 2: a One or Zero must be followed by a Null
+;     within the data bit time; a pulse is 10 ticks).
+;   - A word starts at a rise after at least GAPMIN = 60 ticks (3 nominal
+;     bit times) of NULL; Holt's word-gap counter needs 3 NULL samples a
+;     bit apart. A transmitter's gap is at least 4 bits, so a NULL of 4.5
+;     bits before each word (72 ticks at 125 kbit/s, the fastest taken).
+;   - A 32nd bit ends the word. No rise within SHORT = 32 ticks of the
+;     last one before the 32nd: a short word. A rise 26 to 31 ticks after
+;     the last is a bit too late (E_RATE), not the end of the word.
+; Measured edges: the rise poll is 3 slots while waiting for a word and 6
+; slots inside one, so a rise is seen 2 to 29 clocks late (the synchroniser
+; and the poll), the same for both ends of an interval to within 27
+; clocks: at 50 MHz and 100 kbit/s, 1.1 ticks of 25 clocks.
+;
+; Tick (set by the host before RUN): a twentieth of the nominal bit, TICK =
+; f_clk / (20 x rate): 25 at 50 MHz for 100 kbit/s, 200 for 12.5 kbit/s
+; (40 on a 10 MHz board). The program keeps no deadline schedule (no
+; WAITD), so there is nothing for the checker to prove; it needs the tick
+; to be 16 clocks or more (a bit's work after its fall, about 14 slots,
+; then fits in 4 of the NULL half's 10 ticks), so 100 kbit/s needs a clock
+; of 32 MHz or more, and the poll lag is under 2 ticks.
+;
+; Label filter: a 256-bit table at `ltab` (data memory, 16 words, loaded
+; with the image; the host may rewrite it before RUN, or while every thread
+; is halted): label L (in octal order, 0..0o377) is accepted when bit
+; (L & 15) of word (L >> 4) is 1. The image accepts every label.
+;
+; Results (FIFO space read, thread 1). A status word, then, when its bit 7
+; is set, the word as two more words in the transmitter's host format
+; (arinc429_tx.loom): low word = ARINC bits 1..16 with the label in bits 7:0
+; in octal order (un-reversed), high word = bits 17..32 as received
+; (bit 32, the parity bit, in bit 15).
+;   status bit 15      1 (a status word)
+;   bit 7              a word follows (two more words)
+;   bit 0  E_PAR       the word has even parity (reported, flagged)
+;   bit 1  E_RATE      a bit came under 15 or over 25 ticks after the last
+;   bit 2  E_SHORT     a gap before the 32nd bit
+;   bit 3  E_BOTH      both lines high at a rise
+;   bit 4  E_NULL      no NULL within 18 ticks of a rise
+;   bit 5  E_GAP       a word started under 3 bit times after the last one
+;   bits 13:8          bits received before the error (0 with bit 7 or E_GAP)
+; A word whose label the table rejects is dropped with no report. After
+; E_RATE, E_BOTH, E_NULL and E_GAP the program waits for both lines low and
+; then for the next gap: the rest of that word is ignored, not reported
+; again. A status word for a good word goes out after the 32nd bit's NULL,
+; inside the gap; the host must keep three entries of OUTQ free (it holds
+; four): a full OUTQ stalls the program, which loses the next word and
+; finds the gap after it.
+;
+; Registers: r0 bits 1..16, r1 bits 17..32 and the NOW of a rise, r2 bits
+; left in the word (in the hunt: 1 after a word, 0 after an error), r3 the
+; status word, r4 and r5 scratch, r6 NOW at the last rise, r7 NOW at the
+; last fall.
+;
+; Size: 121 words on thread 1, 0x080..0x0F8: 105 of code and the 16-word
+; label table at the end, inside thread 1's quarter. With arinc429_tx.loom
+; (67 words, 0x000..0x042) on thread 0 the two share no word, and threads
+; 2 and 3 are free. `--strict`: no deadline pair (no WAITD), no diagnostic.
+;
+; Decided at integration (2026-11-05): the readings above stand. The word
+; gap is counted after the last bit's full bit time (Holt's transmitter);
+; parity is computed by the firmware unless RAW is set; a word with bad
+; parity is reported with E_PAR, not dropped; labels are shown to the host
+; un-reversed. The pulse-width tolerance at low speed is derived from the
+; high-speed 5 us +- 5 %, which ARINC 429 Part 1 (not read) may state
+; differently.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   RXA = IN0, RXB = IN1
+        .tick   16                      ; no WAITD: nothing to prove (header)
+        .equ    BMIN   = 15             ; ticks from rise to rise, at least (Holt rule 3)
+        .equ    BMAX   = 25             ; and at most
+        .equ    GAPMIN = 60             ; NULL ticks before a word, at least
+        .equ    SHORT  = BMAX + 7       ; no rise this long after the last: a short word
+        .equ    HIMAX  = 18             ; ticks from a rise to the NULL, at most
+        .equ    NOPIN  = 15             ; a pin index no write reaches (SEMANTICS 6.3)
+        .equ    E_PAR  = 0x01           ; status word bits (header)
+        .equ    E_RATE = 0x02
+        .equ    E_SHORT = 0x04
+        .equ    E_BOTH = 0x08
+        .equ    E_NULL = 0x10
+        .equ    E_GAP  = 0x20
+        .equ    S_WORD = 0x8080         ; a status word with a word after it
+
+start:  .csr    BE_PINS, pin(RXA) << 5 | NOPIN  ; SHI samples RXA, SHO writes no pad
+        LDI     r2, 0                   ; no word before: no E_GAP
+        JMP     skip
+
+; ------------------------------------------------------------ the hunt
+; Both lines low, r7 = NOW at the fall. A rise under GAPMIN ticks after it
+; is inside a word (or a word too soon): skipped. Then any rise starts one.
+hunt:   JP      RXA, 1, early
+        JP      RXB, 1, early
+        CSRR    r4, NOW
+        SUB     r4, r4, r7              ; NULL ticks so far
+        CMPI    r4, GAPMIN              ; C = (enough)
+        BNC     hunt
+armed:  JP      RXA, 1, wstart
+        JP      RXB, 1, wstart
+        JMP     armed
+early:  TEST    r2, r2
+        BZ      skip                    ; inside a word we are not in
+        MOV16   r3, 0x8000 | E_GAP      ; the word after a word, too soon
+        PUSH    r3
+skip:   WAITP   RXA, 0                  ; wait for NULL, however long
+        WAITP   RXB, 0
+        JP      RXA, 1, skip            ; both low at once
+        CSRR    r7, NOW
+        LDI     r2, 0
+        JMP     hunt
+wstart: CSRR    r6, NOW                 ; bit 1
+        LDI     r2, 32
+        JMP     bitin
+
+; ------------------------------------------------------------ a word
+; At the fall of a bit: wait for the next rise, 15..25 ticks after the last.
+nx:     JP      RXA, 1, rise
+        JP      RXB, 1, rise
+        CSRR    r4, NOW
+        SUB     r4, r4, r6
+        CMPI    r4, SHORT               ; C = (no bit: the word has ended)
+        BNC     nx
+        LDI     r3, E_SHORT             ; the line stayed NULL: a short word
+        JMP     report
+rise:   CSRR    r1, NOW
+        SUB     r4, r1, r6              ; ticks since the last rise
+        MOV     r6, r1
+        CMPI    r4, BMIN                ; C = (not too soon)
+        BNC     erate
+        CMPI    r4, BMAX + 1            ; C = (too late)
+        BC      erate
+bitin:  JP      RXA, 0, one             ; not both high?
+        JP      RXB, 0, one
+        LDI     r3, E_BOTH
+        JMP     error
+one:    SHI                             ; RXA into SR: 1 on a ONE, 0 on a ZERO
+        SETD    HIMAX                   ; the NULL is due by then
+        WAITP   RXA, 0, T
+        WAITP   RXB, 0, T
+        BT      enull
+        CSRR    r7, NOW                 ; the fall
+        SUBI    r2, 1                   ; Z = (that was bit 32)
+        BZ      wdone
+        CMPI    r2, 16
+        BNZ     nx
+        STSR    r0                      ; bits 1..16, bit 1 in bit 0
+        JMP     nx
+erate:  LDI     r3, E_RATE
+        JMP     error
+enull:  LDI     r3, E_NULL
+error:  CALL    status                  ; the report, then the rest of the word ignored
+        LDI     r2, 0
+        JMP     skip
+report: CALL    status                  ; a short word: the line is NULL already
+        LDI     r2, 0
+        JMP     hunt
+
+; status: push 0x8000 | bits received << 8 | r3 (the error bit).
+status: LDI     r4, 32
+        SUB     r4, r4, r2              ; bits received whole
+        SHLI    r4, 8
+        OR      r3, r3, r4
+        MOV16   r4, 0x8000
+        OR      r3, r3, r4
+        PUSH    r3
+        RET
+
+; ------------------------------------------------------------ a whole word
+; At the 32nd bit's fall; the gap (72 ticks or more) has begun.
+wdone:  STSR    r1                      ; bits 17..32, bit 17 in bit 0
+        XOR     r4, r0, r1
+        PAR     r4, r4                  ; C = (odd parity: good)
+        MOV16   r3, S_WORD
+        BC      podd
+        ORI     r3, E_PAR
+podd:   REV     r4, r0
+        SHRI    r4, 8                   ; L: bits 1..8 back in octal order
+        MOV     r5, r4
+        SHRI    r5, 4
+        MOV16   r2, ltab
+        ADD     r2, r2, r5
+        LD      r5, r2, 0               ; the table word of L
+        MOV     r2, r4
+        ANDI    r2, 15
+        SHR     r5, r5, r2
+        ANDI    r5, 1                   ; Z = (L not wanted)
+        LDI     r2, 1                   ; a word was seen (LDI keeps Z)
+        BZ      hunt                    ; dropped, no report
+        SHRI    r0, 8
+        SHLI    r0, 8
+        OR      r0, r0, r4              ; the label in octal order
+        PUSH    r3
+        PUSH    r0
+        PUSH    r1
+        JMP     hunt
+
+; ------------------------------------------------------------ data
+ltab:   .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
