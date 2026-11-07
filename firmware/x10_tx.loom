@@ -1,0 +1,137 @@
+; x10_tx.loom - X10 powerline transmitter, logic level (thread 0)
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It was written in a
+; restricted-reading trial (W-067): from firmware/PORTING.md,
+; docs/CAPABILITY.md, docs/ISA.md, docs/SEMANTICS.md and the loomasm README
+; only, without opening any other program.
+;
+; Hardware used: the edge-wait WAITE (built for generic pin waits), the
+; deadline-latched SETP ... D (D-016, built for exact edges such as WS2812)
+; and the tick divider, which here runs at the 120 kHz carrier's half
+; period. No bit-engine feature is used: X10 has no shift-register shape.
+; What firmware does that no hardware does: it follows the mains zero
+; crossings, makes the 120 kHz carrier itself edge by edge, sends each bit
+; in true and complement on alternate half-cycles, repeats the frame and
+; keeps the silence after each pair.
+;
+; Pins: ZC = IN0 (TW523 zero-crossing square wave, every edge a zero
+; crossing), TX = OUT0 (the 120 kHz bursts as the TW523/PL513 transmit
+; input would see them).
+;
+; Sources (X10 Ltd. technical note "X-10 Powerline Carrier (PLC)
+; Technology", as reproduced at kbase.x10.com/wiki/PLC, read 2026-11-07):
+; a 1 is a 1 ms burst of 120 kHz at the zero crossing, a 0 its absence;
+; "within 200 microseconds of the zero crossing point"; start code 1110,
+; the only code not sent in true/complement form; each 4- or 5-bit code in
+; true/complement form on alternate half-cycles; frames "in groups of 2
+; with 3 power line cycles between each group"; bright and dim
+; "continuously (at least twice) with no gaps"; three-phase: the 1 ms
+; burst sent three times, to the zero crossing of each phase.
+;
+; Tick: one half period of the carrier. 120 kHz at 50 MHz is 208.33
+; clocks, TICK_INT 208, TICK_FRAC 85 (written by the host before RUN).
+; The fastest proved tick is 20 clocks (five slots between deadlines).
+;
+; Host interface (INQ, one word each):
+;   1. C, carrier cycles per burst (120 for 1 ms at 120 kHz), 1 or more
+;   2. B, bursts per half-cycle: 1, or 3 for three-phase
+;   3. G, ticks of silence between the bursts of one half-cycle, 1 or more
+;      (burst start to start is 2C + G ticks: 2.778 ms at 60 Hz is
+;      G = 667 - 240 = 427; 3.333 ms at 50 Hz is G = 560); unused if B = 1
+;   then any number of commands:
+;      bits 8..0 = H1 H2 H4 H8 D1 D2 D4 D8 D16, bit 8 sent first
+;      bit 15 = 1: no silence after this pair (bright/dim runs)
+; OUTQ: each command word back once its pair (and silence) is sent.
+;
+; Timing on the pins: a burst's first rise lands on the 4th tick after the
+; slot that saw the ZC edge (3 to 4 ticks later), and that slot is at most
+; 8 clocks after the edge (synchroniser and slot grid): at most 16.8 us at
+; 120 kHz, inside the 200 us window. The burst is 2C ticks of carrier
+; (exact, staged edges), so 1 ms at C = 120.
+; SETD 3, not 2: with SETD 2 the first staged rise was measured landing on
+; the SETD's own deadline, one tick early (the hazard of PORTING section 5:
+; the SETP ... D commits five slots after the SETD and the tick can reach
+; that TD before the WAITD moves it). With 3 the TD is at least 2 ticks
+; (40 clocks) after the SETD's slot and the WAITD commits 26 clocks after
+; it, so it always moves TD first.
+; Missed-edge check: none. B, C and G must fit in one half-cycle
+; (3 bursts at 60 Hz end at 6.56 ms of 8.33 ms).
+;
+; Words: 54 of thread 0's 128.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Repeat and gap: the two copies of a frame back to back, then six clear
+;   half-cycles, as [PLC] puts three power-line cycles between groups.
+;   Code tables: from Wikipedia only (the note's own table is an image).
+;   They are secondary and unchecked; a second search for a text copy of
+;   an X10 Ltd. table (the CM11A protocol document) found none reachable.
+;   The programs take raw 9-bit codes, so an error would be in the model
+;   and the tests, not here.
+;   Three bursts a half-cycle (three-phase): host-set, B = 1 or 3.
+;   Pins are logic level, as the brief defines them. A real TW523 is not
+;   checked: its note was a scan that could not be read.
+
+        .imem   512
+        .pins   ZC = IN0, TX = OUT0
+        .tick   20
+
+        .thread 0
+start:  POP     r0                      ; C, carrier cycles per burst
+        POP     r2                      ; B, bursts per half-cycle
+        POP     r3                      ; G, gap ticks between bursts
+        SETP    TX, 0
+cmd:    POP     r5
+        CALL    frame
+        CALL    frame
+        MOV     r1, r5
+        SHLI    r1, 1                   ; C = bit 15, no silence
+        BC      ack
+        LDI     r7, 0
+        LDI     r1, 6                   ; six clear zero crossings
+quiet:  CALL    half
+        DJNZ    r1, quiet
+ack:    PUSH    r5
+        JMP     cmd
+
+; one frame: start code 1110, then 9 bits each as (b, not b)
+frame:  LDI     r7, 1
+        CALL    half
+        CALL    half
+        CALL    half
+        LDI     r7, 0
+        CALL    half
+        MOV     r1, r5
+        SHLI    r1, 7                   ; bits 8..0 to 15..7
+        LDI     r6, 0x40
+        OR      r1, r1, r6              ; sentinel at bit 6
+fbit:   SHLI    r1, 1                   ; C = next bit; Z once the sentinel left
+        BZ      fdone
+        LDI     r7, 0
+        BNC     ftrue
+        LDI     r7, 1
+ftrue:  CALL    half
+        XORI    r7, 1
+        CALL    half
+        JMP     fbit
+fdone:  RET
+
+; one half-cycle: wait for the zero crossing, then B bursts if r7 != 0
+half:   WAITE   ZC, ANY
+        SETD    3                       ; 3, not 2: see the header
+        TEST    r7, r7
+        BZ      hret
+        MOV     r4, r2
+hburst: MOV     r6, r0
+hcar:   SETP    TX, 1, D
+        WAITD   1
+        SETP    TX, 0, D
+        WAITD   1
+        DJNZ    r6, hcar
+        DEC     r4
+        BZ      hret
+        MOV     r6, r3
+hgap:   WAITD   1
+        DJNZ    r6, hgap
+        JMP     hburst
+hret:   RET

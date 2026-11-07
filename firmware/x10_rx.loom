@@ -1,0 +1,115 @@
+; x10_rx.loom - X10 powerline receiver, logic level (thread 1)
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035), in the restricted-reading
+; trial W-067 (no other program was opened).
+;
+; Hardware used: the edge-wait WAITE (built for generic pin waits), the
+; conditional pin branch JP and the tick divider. Nothing protocol-shaped:
+; what firmware does that no hardware does is all of it - it samples the
+; receive envelope a set time after every zero crossing, hunts for the
+; start code 1110, checks that every bit comes as true then complement,
+; checks that the frame is repeated, and reports.
+;
+; Pins: ZC = IN1 (TW523 zero-crossing square wave, every edge a zero
+; crossing), RX = IN2 (receive envelope, high while a 120 kHz burst is
+; present: the logic-level reading of the brief; the real TW523 output's
+; polarity is in QUESTIONS.md).
+;
+; Sources (X10 Ltd. technical note "X-10 Powerline Carrier (PLC)
+; Technology", as reproduced at kbase.x10.com/wiki/PLC, read 2026-11-07):
+; 1 ms bursts at the zero crossing; start code 1110, the only code that
+; does not follow the true/complement rule; 4-bit house and 5-bit key code
+; in true/complement form on alternate half-cycles; frames in pairs with
+; three cycles of silence between pairs. The sample point (about the
+; middle of the 1 ms burst) is from memory, unchecked: the TW523 note's
+; receive-timing figure is an image that could not be read here.
+;
+; Host interface: INQ word 1 = S, 1 or more: RX is sampled on the
+; (S + 2)th tick after the slot that sees a ZC edge, so S + 1 to S + 2
+; ticks after it, and that slot is at most 8 clocks after the edge (a 1 us
+; tick and S = 498 sample 499 to 500 us after the edge, mid-burst). OUTQ, one word per frame pair:
+;   (status << 12) | value, value = H1 H2 H4 H8 D1 D2 D4 D8 D16 in 8..0
+;   status 0  pair received, both copies equal
+;          1  a bit was not followed by its complement (value so far)
+;          2  the repeat differs from the first copy (value of the repeat)
+;          3  a lone frame: no start code right after it (its value)
+; Since 111 cannot occur inside true/complement data, a start code is
+; recognised anywhere, also right after an error.
+;
+; Words: 65 of thread 1's 128.
+
+        .imem   512
+        .pins   ZC = IN1, RX = IN2
+
+        .thread 1
+        .tick   8
+start:  POP     r0                      ; S, sample offset in ticks
+hunt:   LDI     r1, 0
+h1:     CALL    smp
+        SHLI    r1, 1
+        OR      r1, r1, r5
+        MOV     r7, r1
+        ANDI    r7, 15
+        CMPI    r7, 14                  ; last four half-cycles 1110
+        BNZ     h1
+        CALL    frame
+        TEST    r3, r3
+        BNZ     rpt                     ; status 1
+        MOV     r1, r2                  ; first copy
+        LDI     r3, 0
+        LDI     r4, 4
+s4:     CALL    smp
+        SHLI    r3, 1
+        OR      r3, r3, r5
+        DJNZ    r4, s4
+        CMPI    r3, 14
+        BNZ     lone
+        CALL    frame
+        TEST    r3, r3
+        BNZ     rpt                     ; status 1, in the repeat
+        CMP     r1, r2
+        BZ      rpt                     ; status 0
+        LDI     r3, 2
+        JMP     rpt
+lone:   MOV     r7, r3                  ; keep those four samples
+        MOV     r2, r1
+        MOV     r1, r7
+        LDI     r3, 3
+        MOV     r7, r3
+        SHLI    r7, 12
+        OR      r7, r7, r2
+        PUSH    r7
+        JMP     h1
+rpt:    MOV     r7, r3
+        SHLI    r7, 12
+        OR      r7, r7, r2
+        PUSH    r7
+        JMP     hunt
+
+; nine bits, each a sample and its complement; r2 = value, r3 = 0 or 1
+frame:  LDI     r2, 0
+        LDI     r3, 0
+        LDI     r4, 9
+fb:     CALL    smp
+        MOV     r7, r5
+        CALL    smp
+        CMP     r7, r5
+        BZ      fbad
+        SHLI    r2, 1
+        OR      r2, r2, r7
+        DJNZ    r4, fb
+        RET
+fbad:   LDI     r3, 1
+        RET
+
+; one half-cycle: wait for the zero crossing, then the (S + 2)th tick, r5 = RX
+smp:    WAITE   ZC, ANY
+        SETD    2
+        MOV     r6, r0
+sd:     WAITD   1
+        DJNZ    r6, sd
+        LDI     r5, 0
+        JP      RX, 0, sret
+        LDI     r5, 1
+sret:   RET
