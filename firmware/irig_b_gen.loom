@@ -1,0 +1,272 @@
+; irig_b_gen.loom
+; IRIG-B time code generator (signals B000..B007, dc level shift) on OUT0.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; IRIG time codes. The program uses two pieces of hardware built for other
+; jobs: the deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10,
+; D-016), built so that WS2812 pulses land on the exact clock, puts every
+; leading and trailing edge on the exact clock edge of its tick, so the
+; on-time edge of Pr is the tick itself, not the tick plus code; and the
+; data memory (`LD`/`ST`, SEMANTICS 6.11, D-027), built for device emulation
+; (a 24C02), holds the time of year and the counting table. What the
+; firmware does that no hardware does: the frame (100 pulse-width coded
+; elements, the P0 Pr reference marker, the position identifiers, the index
+; markers), the BCD time of year, the year and the straight binary seconds,
+; the coded expressions of B000..B007, and the clock itself: it counts
+; seconds, minutes, hours, days (365 or 366) and years.
+;
+; Pin: TX = OUT0, push-pull, low between pulses (the dc level shift form of
+; IRIG 200-16 Table 5-6: a bit is the high level). OUT0 is low until RUN.
+;
+; Sources: IRIG Standard 200-16 (RCC, August 2016), section numbers in
+; tools/protomodels/irig.py, which is written from it: element widths 2, 5
+; and 8 ms (Table 5-6), P0 then Pr, the leading edge of Pr on time (3.4,
+; 5.3), the bit table (Table 5-4, Table 5-5), the coded expressions (Table
+; 4-1, Table 4-3), the counting rules (3.6).
+;
+; Host words (FIFO space, thread 0), in this order after RUN:
+;   1. TICK_INT of 1 ms, in clocks (50,000 at 50 MHz; 22 or more, .tick).
+;   2. Bits 2:0 z, the signal B00z (0..7); bit 5 bit 16 of the SBS of the
+;      start time; bits 15:8 TICK_FRAC of the 1 ms tick.
+;   3. The SBS of the start time, bits 15:0 (the host computes it with the
+;      time: Loom has no multiplier, and the words are better spent here).
+;   4..8. The start time in BCD, one field a word: seconds (0x00..0x59),
+;      minutes, hours (0x00..0x23), day of year (0x001..0x366), year
+;      (0x00..0x99, two digits of 2000..2099; it also decides leap years
+;      when the signal does not carry it).
+; Nothing is pushed to OUTQ.
+;
+; The time line. Pr of the first frame, carrying the start time, rises 2
+; ticks after the last host word is popped (the SETD below); from then on
+; every Pr is exactly 1000 ticks after the previous one, counted by the
+; chip's clock, and each frame carries the time of its own Pr (Table 5-4
+; note 1). The generator is a free-running clock: its second is the board
+; crystal's, and the host aligns it to a time scale by timing word 8.
+;
+; Frame. Ten groups, each its data elements then a position identifier:
+; group 0 is Pr and indices 1..8 then P1; group g (1..9) is 10g .. 10g+8
+; then P(g+1), P0 at 99. A group's bits, least significant (lowest index)
+; first, come from `group`, called in the 8 ms high time of the marker
+; before it (Pr for group 0), which has the time to spare; the data
+; elements only shift. Field to group: seconds 0, minutes 1, hours 2, the
+; day's units and tens 3, its hundreds 4, the year 5 (B004..B007, else
+; index markers), the CF 6 and 7 (sent as 0: 200-16 3.8 leaves them to the
+; user, and no host word sets them), the SBS 8 and 9 (z 0, 3, 4, 7, else
+; index markers). A BCD group is the field byte with a 0 inserted at bit 4,
+; the index marker between the digits: (x & 15) | (x >> 4) << 5.
+;
+; Counting. At P0 the program sets CARRY and adds one to the SBS. Each
+; group with a field (0, 1, 2, 3, 5) first adds the carry to its field in
+; BCD and passes a carry on only when the field wraps (0x60, 0x60, 0x24,
+; 0x366 or 0x367 in a leap year, 0x100), so the count ripples up the
+; frame, one field a marker, each just before it is sent. The day wraps to
+; 001, the others to 0, and a wrap of the hours (2400) clears the SBS
+; (200-16 3.6). Leap seconds are not counted (QUESTIONS.md).
+;
+; Timing. Each edge is `SETP TX, v, D` and the WAITD that lands it, on the
+; exact clock edge of its tick (SEMANTICS 6.10 rule 1). An element is 10
+; ticks: high 2, 5 or 8, then low. The tightest interval is the 2 ticks of
+; a 0's high time (5 slots, 60 clocks of slack at the proved tick); the
+; longest is the call of `group` in a marker's 8 ticks (79 slots, the day's
+; leap-year test on the path, 4 clocks of slack), so the schedule is proved
+; for a tick of 40 clocks or more (.tick, 22 pairs, no `.bounded`): any
+; 1 ms tick at any board clock of 40 kHz or more, 50,000 clocks at 50 MHz.
+; With a whole number of clocks a tick, every edge is on its exact clock:
+; Pr to Pr is 1000 TICK_INT clocks with no jitter (Table C-1 allows 200 ns
+; pulse to pulse). With TICK_FRAC the tick edges themselves dither by one
+; clock (SEMANTICS 4), 20 ns at 50 MHz.
+;
+; Registers: r0 the group's bits, r1 the group index, r2 the SBS bits 15:0,
+; r3 flags (bits 2:0 z, SBSP, CARRY, SBS16), r4 a field, r5 the elements
+; left in the group, then the wrap value, r6 a field's address, r7 scratch.
+;
+; Size: 160 words, 150 of code and 10 of data (the time and the wrap
+; table), 32 more than a quarter of the 512-word memory: on thread t it
+; spills into thread t + 1's first 32 words, so that thread cannot run a
+; program of its own (as lin_slave and sent_rx spill). With irig_b_rx.loom
+; on thread 2 the two fit together, and thread 3 keeps its quarter.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Year tens weights 10, 20, 40, 80: Table 5-5 of 200-16 prints
+;   10/20/20/20, taken as a misprint (BCD needs 40 and 80).
+;   A bit is the high level, as DC level shift outputs usually are; the
+;   standard does not say so in words.
+;   Absent fields (no year, no control functions, no SBS) are sent as
+;   index markers (section 3.9). Control-function bits are sent as 0;
+;   leap seconds are not handled.
+;   The host gives the start time's SBS, to save code words.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   40                      ; the shortest 1 ms tick the schedule is proved for
+        .equ    SBSP   = 0x08           ; r3: the signal carries the SBS
+        .equ    CARRY  = 0x10           ;     a second to add to the next field
+        .equ    SBS16  = 0x20           ;     bit 16 of the SBS
+        .equ    NF     = 5              ; the wrap table follows the five fields
+
+start:  SETP    TX, 0                   ; low between pulses
+        POP     r7                      ; 1. TICK_INT of 1 ms
+        CSRW    TICK_INT, r7
+        POP     r3                      ; 2. z, SBS bit 16, TICK_FRAC
+        MOV     r7, r3
+        SHRI    r7, 8
+        CSRW    TICK_FRAC, r7
+        ANDI    r3, SBS16 | 7
+        MOV     r7, r3                  ; z 0, 3, 4, 7 carry the SBS: z[0] == z[1]
+        SHRI    r7, 1
+        XOR     r7, r7, r3
+        ANDI    r7, 1
+        BNZ     nosbs
+        ORI     r3, SBSP
+nosbs:  POP     r2                      ; 3. the SBS, bits 15:0
+        MOV16   r6, time
+        LDI     r1, 5
+tload:  POP     r4                      ; 4..8. seconds, minutes, hours, day, year
+        ST      r4, r6, 0
+        INC     r6
+        DJNZ    r1, tload
+        SETD    0                       ; re-anchor after the unbounded POPs
+        SETP    TX, 1, D
+        WAITD   2                       ; the first Pr's leading edge
+
+; A frame, entered at Pr's leading edge (landed). Group 0 is built in Pr.
+frame:  SETP    TX, 0, D
+        LDI     r1, 0
+        CALL    group
+        WAITD   8                       ; Pr's trailing edge
+low2:   SETP    TX, 1, D
+        WAITD   2                       ; the next element's leading edge
+
+; Data elements, entered at a leading edge (landed): r5 of them, r0's bit 0
+; first.
+bits:   SHRI    r0, 1                   ; C: this element is a 1
+        SETP    TX, 0, D
+        BC      one
+        WAITD   2                       ; a 0 (or an index marker): 2 ms
+        SETP    TX, 1, D
+        WAITD   8
+        DJNZ    r5, bits
+        JMP     mark
+one:    WAITD   5                       ; a 1: 5 ms
+        SETP    TX, 1, D
+        WAITD   5
+        DJNZ    r5, bits
+
+; A position identifier, entered at its leading edge (landed): P1..P9 build
+; the next group in their high time, P0 counts the second.
+mark:   SETP    TX, 0, D
+        INC     r1
+        CMPI    r1, 10
+        BZ      p0
+        CALL    group
+        WAITD   8                       ; 8 ms
+        JMP     low2
+p0:     ORI     r3, CARRY               ; the next frame is one second later
+        INC     r2                      ; and so is its SBS
+        BNC     p0w
+        ORI     r3, SBS16
+p0w:    WAITD   8                       ; P0's trailing edge
+        SETP    TX, 1, D
+        WAITD   2                       ; the next Pr: on time
+        JMP     frame
+
+; group: r0 = the bits of group r1 (index order, bit 0 first), r5 = its
+; data elements (8 for group 0, else 9); first adds a pending second to
+; the group's field (header, Counting). Runs in a marker's high time.
+group:  CMPI    r1, 6
+        BC      cfsbs                   ; groups 6..9: no field
+        MOV     r6, r1
+        CMPI    r1, 4
+        BNC     gf                      ; groups 0..3: field g
+        DEC     r6                      ; groups 4, 5: the day again, the year
+gf:     MOV16   r7, time
+        ADD     r6, r6, r7
+        LD      r4, r6, 0               ; the field, BCD
+        CMPI    r1, 4
+        BZ      hund                    ; the day's hundreds: counted at group 3
+        MOV     r7, r3
+        ANDI    r7, CARRY
+        BZ      spread                  ; no second to add
+        LD      r5, r6, NF              ; the value the field wraps at
+        CMPI    r1, 3
+        BNZ     inc
+        LD      r0, r6, 1               ; the day: is the year (BCD) leap?
+        MOV     r7, r0                  ; 10 T + U = 2 T + U mod 4
+        SHRI    r7, 3
+        ANDI    r7, 0x1E                ; 2 T
+        ADD     r0, r0, r7
+        ANDI    r0, 3
+        BNZ     inc
+        INC     r5                      ; a leap year: day 366 is valid
+inc:    INC     r4                      ; add the second, in BCD
+        MOV     r7, r4
+        ANDI    r7, 15
+        CMPI    r7, 10
+        BNZ     cmpw
+        ADDI    r4, 6                   ; the units carry into the tens
+        MOV     r7, r4
+        SHRI    r7, 4
+        ANDI    r7, 15
+        CMPI    r7, 10
+        BNZ     cmpw
+        LDI     r7, 0x60                ; the tens carry into the hundreds
+        ADD     r4, r4, r7
+cmpw:   CMP     r4, r5
+        BNZ     nowrap
+        LDI     r4, 0                   ; wrapped: the carry goes on
+        CMPI    r1, 3
+        BNZ     nday
+        LDI     r4, 1                   ; the day after 365 (366) is 001
+nday:   CMPI    r1, 2
+        BNZ     store
+        LDI     r2, 0                   ; 2400: the SBS reads 0 (3.6)
+        ANDI    r3, 0x1F                ; and its bit 16 is clear
+        JMP     store
+nowrap: ANDI    r3, 0x3F - CARRY        ; the carry stops here
+store:  ST      r4, r6, 0
+spread: CMPI    r1, 5
+        BNZ     sp
+        MOV     r7, r3
+        ANDI    r7, 4                   ; z 4..7 carry the year
+        BNZ     sp
+        LDI     r4, 0                   ; else index markers
+sp:     MOV     r0, r4                  ; (x & 15) | (x >> 4) << 5
+        ANDI    r0, 15
+        SHRI    r4, 4
+        SHLI    r4, 5
+        OR      r0, r0, r4
+        LDI     r5, 9
+        TEST    r1, r1
+        BNZ     gret
+        LDI     r5, 8                   ; group 0: indices 1..8
+gret:   RET
+hund:   SHRI    r4, 8                   ; indices 40, 41; 42..48 index markers
+        MOV     r0, r4
+        LDI     r5, 9
+        RET
+cfsbs:  LDI     r5, 9
+        LDI     r0, 0                   ; CF (6, 7), or no SBS: index markers
+        CMPI    r1, 8
+        BNC     gret
+        MOV     r7, r3
+        ANDI    r7, SBSP
+        BZ      gret
+        MOV     r0, r2
+        CMPI    r1, 8
+        BNZ     g9
+        SHLI    r0, 7                   ; group 8: SBS bits 8:0
+        SHRI    r0, 7
+        RET
+g9:     SHRI    r0, 9                   ; group 9: SBS bits 15:9, then bit 16
+        MOV     r7, r3
+        ANDI    r7, SBS16
+        BZ      gret
+        LDI     r7, 0x80
+        OR      r0, r0, r7
+        RET
+
+; The time of year (written from the host words) and the wrap table.
+time:   .word   0, 0, 0, 0, 0           ; seconds, minutes, hours, day, year (BCD)
+        .word   0x60, 0x60, 0x24, 0x366, 0x100

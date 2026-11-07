@@ -1,0 +1,229 @@
+; irig_b_rx.loom
+; IRIG-B time code reader (B000..B007, dc level shift) on IN0, with a 1 PPS
+; output on OUT0 and the time of every frame to the host through OUTQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; IRIG time codes. The program measures every pulse with the level waits
+; (`WAITP`, built for the I2C and SPI pins) and reads of the `NOW` tick
+; counter (built as the deadline timebase, SEMANTICS 4), and assembles the
+; bits with `REV` (built for the LSB-first serial protocols). What the
+; firmware does that no hardware does: the width decision (0, 1, position
+; identifier), the search for the P0 Pr reference marker, the check of every
+; position identifier's place, the BCD fields and the SBS, and the 1 PPS
+; pulse on the on-time edge.
+;
+; Pins: RX = IN0, the dc level shift code, high for a bit (IRIG 200-16
+; Table 5-6); PPS = OUT0, push-pull, low until RUN.
+;
+; Sources: IRIG Standard 200-16 (RCC, August 2016), section numbers in
+; tools/protomodels/irig.py, which is written from it.
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT of the measuring unit, 1/50 of the 10 ms element (0.2 ms,
+;      10,000 clocks at 50 MHz).
+;   2. Bits 15:8 TICK_FRAC of the unit (bits 7:0 are ignored).
+;
+; Reports (FIFO space read, thread 0). Four words per frame that was read
+; whole and right (every position identifier in its place, every other
+; element a 0 or a 1), pushed at the leading edge of the next Pr:
+;   word 0   minutes (bits 14:8) and seconds (6:0), BCD
+;   word 1   hours (bits 15:10) and day of year (9:0), BCD
+;   word 2   year (bits 7:0, BCD; 0 for B000..B003) and SBS bit 16 (bit 8)
+;   word 3   SBS bits 15:0 (0 for B001, B002, B005, B006)
+; This is the time of the frame's own Pr (200-16 Table 5-4, note 1), the
+; second that began at the previous PPS: the report arrives about 8 us
+; (the push slots) after the PPS that ends that second. The control
+; functions (indices 60..78) and the index markers are not reported or
+; checked. The host must read each report within the second that follows
+; it: OUTQ holds four words, and a PUSH into a full OUTQ stalls the program
+; until the host reads, which loses sync until the next P0 Pr.
+;
+; Widths (0.2 ms units, measured leading edge to trailing edge): under 3
+; (0.6 ms) is a glitch; 3..17 a 0 (2 ms nominal); 18..32 a 1 (5 ms); 33..47
+; a position identifier (8 ms); 48 (9.6 ms) or more is a stuck line. The
+; thresholds are the midpoints between the nominal widths of Table 5-6
+; (3.5 and 6.5 ms), rounded up to the unit; 200-16 gives no width
+; tolerance for the dc level shift code. A pulse is measured from one NOW
+; read to the next, 7 slots apart at the least, so the shortest width the
+; program can see is 28 clocks: the glitch rule holds for a unit of 10
+; clocks or more (2,000 clocks at 50 MHz has room to spare). A glitch,
+; a stuck line, a 0 or 1 where a position identifier is due, or a position
+; identifier where a bit is due, loses sync: the program hunts for two
+; position identifiers in a row (P0 Pr, 3.4) and starts again at the next
+; element. The first frame after a hunt is decoded but has no PPS at its
+; Pr, which was only known as Pr after it ended.
+;
+; 1 PPS. After a frame read whole, the next leading edge is Pr's, the
+; on-time point (3.4): the program waits for it with `WAITP` and raises PPS
+; in the next slot, and lowers PPS once Pr's trailing edge is seen and
+; classified, so the PPS pulse is Pr's 8 ms plus about 10 slots. The latency from the RX pad's rise to
+; the PPS pad's rise is 8 to 11 clocks (SEMANTICS 3: the pad sampled at
+; edge x - 1 in X cycle x, so the first X cycle that can see the rise is
+; 2 to 5 clocks after it; the SETP is the thread's next slot, 4 clocks
+; later, and reaches the pad 2 clocks after its X cycle): a fixed 8 clocks
+; plus up to 3 for the 4-clock slot grid, 160 to 220 ns at 50 MHz. That
+; one slot of jitter is the receiver's floor (Loom samples a pin once a
+; slot); 200-16 Table C-1 asks a generator for 200 ns pulse to pulse.
+; The PPS is predicted from the frame before: if Pr then turns out not to
+; be a position identifier, that PPS was raised and sync is lost.
+;
+; Timing. No WAITD, so no deadline pair. The longest stretch between a
+; trailing edge and the WAITP that must see the next leading edge is after
+; a position identifier, whose low time is 2 ms: 19 slots after the WAITP
+; that saw the trailing edge, which itself sees it up to 5 clocks late, so
+; the unit must be 8 clocks or more (81 clocks in 10 units) for every
+; leading edge to be time-stamped in its own slot; with the glitch rule
+; above, 10 clocks: 0.2 ms at any board clock of 50 kHz or more. The tests
+; run 8 (and 16 for the glitch).
+;
+; Registers: r0 the group's bits, after a 1 that marks how full it is; r1
+; the group index; r2 NOW at the last leading edge; r3..r6 the report words
+; 0..3; r7 the width class, scratch.
+;
+; Size: 118 words, inside a quarter of the 512-word memory. With
+; irig_b_gen.loom (160 words, spilling into thread 1's quarter) on thread
+; 0, this program runs on thread 2 (0x100..0x175) with PPS moved to OUT1,
+; the generator's TX being OUT0.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0, PPS = OUT0
+        .tick   10                      ; no WAITD: nothing to prove (header)
+        .equ    P      = 2              ; width classes from `fall`
+        .equ    BAD    = 3
+
+start:  SETP    PPS, 0
+        POP     r7                      ; 1. TICK_INT of 0.2 ms
+        CSRW    TICK_INT, r7
+        POP     r7                      ; 2. TICK_FRAC
+        SHRI    r7, 8
+        CSRW    TICK_FRAC, r7
+        WAITP   RX, 0                   ; start between pulses
+
+; Hunt: two position identifiers in a row, P0 then Pr (200-16 3.4).
+hunt:   CALL    rise
+        CALL    fall
+        CMPI    r7, P
+        BNZ     hunt
+hunt2:  CALL    rise
+        CALL    fall
+        CMPI    r7, P
+        BNZ     hunt
+
+; In sync, after Pr's trailing edge. A group is its data elements (8 in
+; group 0, 9 after) shifted into r0 behind a marker 1, then a position
+; identifier, recognised by the marker reaching bit 9.
+sync:   LDI     r1, 0
+grp:    LDI     r0, 1
+        TEST    r1, r1
+        BNZ     elem
+        LDI     r0, 2                   ; group 0: one element fewer
+elem:   CALL    rise
+        MOV     r7, r0
+        SHRI    r7, 9
+        BNZ     mark                    ; the group is full: a marker is due
+        CALL    fall
+        CMPI    r7, P
+        BZ      hunt2                   ; a position identifier: maybe P0
+        BC      hunt                    ; a glitch or a stuck line
+        ADD     r0, r0, r0
+        ADD     r0, r0, r7              ; the bit, behind the earlier ones
+        JMP     elem
+
+; The group is full and this element must be a position identifier: file
+; the group during its high time. r0's bit k is then the group's k-th
+; element (index 10 g + k, or k + 1 in group 0).
+mark:   REV     r0, r0                  ; the first element was shifted in first
+        SHRI    r0, 7
+        TEST    r1, r1
+        BNZ     m1
+        SHRI    r0, 1                   ; group 0: index 0 is Pr
+m1:     CMPI    r1, 8
+        BC      sbs                     ; groups 8, 9
+        CMPI    r1, 4
+        BZ      hun
+        CMPI    r1, 6
+        BC      mfall                   ; groups 6, 7: control functions, not kept
+        MOV     r7, r0                  ; BCD: drop the index marker at bit 4
+        SHRI    r7, 5
+        SHLI    r7, 4
+        ANDI    r0, 15
+        OR      r0, r0, r7
+        CMPI    r1, 1
+        BNC     g0
+        BZ      g1
+        CMPI    r1, 3
+        BC      g35
+        SHLI    r0, 10                  ; group 2: hours, word 1 bits 15:10
+        MOV     r4, r0
+        JMP     mfall
+g35:    BNZ     g5
+        OR      r4, r4, r0              ; group 3: the day's tens and units
+        JMP     mfall
+g5:     MOV     r5, r0                  ; group 5: the year
+        JMP     mfall
+g0:     MOV     r3, r0                  ; group 0: seconds
+        JMP     mfall
+g1:     SWAP    r0, r0                  ; group 1: minutes, word 0 bits 14:8
+        OR      r3, r3, r0
+        JMP     mfall
+hun:    SHLI    r0, 14                  ; group 4: the day's hundreds (40, 41)
+        SHRI    r0, 6
+        OR      r4, r4, r0
+        JMP     mfall
+sbs:    BNZ     g9
+        MOV     r6, r0                  ; group 8: SBS bits 8:0
+        JMP     mfall
+g9:     MOV     r7, r0                  ; group 9: SBS bits 16:9
+        SHLI    r7, 9
+        OR      r6, r6, r7
+        SHRI    r0, 7
+        ANDI    r0, 1
+        SWAP    r0, r0
+        OR      r5, r5, r0              ; bit 16 to word 2 bit 8
+mfall:  CALL    fall
+        CMPI    r7, P
+        BNZ     hunt
+        INC     r1
+        CMPI    r1, 10
+        BNZ     grp
+
+; P0 read: the frame was whole. The next leading edge is Pr's, on time.
+        WAITP   RX, 1
+        SETP    PPS, 1                  ; 8 to 11 clocks after the RX pad (header)
+        CSRR    r2, NOW
+        PUSH    r3                      ; the frame just read: the time of the
+        PUSH    r4                      ; previous Pr
+        PUSH    r5
+        PUSH    r6
+        CALL    fall
+        SETP    PPS, 0
+        CMPI    r7, P
+        BNZ     hunt
+        JMP     sync
+
+; rise: wait for a leading edge, r2 = NOW there.
+rise:   WAITP   RX, 1
+        CSRR    r2, NOW
+        RET
+
+; fall: wait for the trailing edge; r7 = the pulse's class: 0, 1, P, BAD.
+fall:   WAITP   RX, 0
+        CSRR    r7, NOW
+        SUB     r7, r7, r2              ; the width in 0.2 ms units
+        CMPI    r7, 48
+        BC      bad                     ; 9.6 ms or more: a stuck line
+        CMPI    r7, 33
+        BC      isp                     ; 6.6 ms or more: a position identifier
+        CMPI    r7, 3
+        BNC     bad                     ; under 0.6 ms: a glitch
+        CMPI    r7, 18                  ; C: 3.6 ms or more, a 1
+        LDI     r7, 0
+        BNC     fret
+        LDI     r7, 1
+fret:   RET
+isp:    LDI     r7, P
+        RET
+bad:    LDI     r7, BAD
+        RET
