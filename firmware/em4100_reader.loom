@@ -1,0 +1,213 @@
+; em4100_reader.loom
+; An EM4100 125 kHz RFID reader at logic level: thread 0 makes the field
+; clock RF_CLK, thread 1 decodes the tag's Manchester data from DEMOD,
+; finds the header, checks every row parity, the column parities and the
+; stop bit, and reports the 40-bit ID to the host, or the reason it
+; rejected the frame.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses:
+;   - the deadline-latched pin write (SEMANTICS 6.10, D-016), built so that
+;     UART and the bit-banged protocols put an edge on the exact tick, as a
+;     clock generator: RF_CLK's edges land on thread 0's ticks to the clock,
+;     whatever the half period, so the field has no jitter at all;
+;   - the Manchester decoder of the bit engine (6.9.1, ENC = 2), built for
+;     10 Mbit/s IEEE 802.3 Manchester (the target D-029 cut): two SHI per
+;     bit, T set by a bit with no transition in its middle;
+;   - the tick restart on a TICK_INT write (SEMANTICS 4), built for the
+;     UART, CAN and Manchester receivers' hard synchronisation, here twice:
+;     to time every DEMOD level from its edge while hunting, and to put the
+;     bit grid on the middle of a bit;
+;   - PAR (6.1) for the row parities.
+; What the firmware does that no hardware does: finding the bit phase from
+; the pulse lengths (a level a whole bit long only ever ends in the middle
+; of a bit), finding the header, the ten row parities, the column parities,
+; the stop bit, the assembly of the ID and the report. Weaker than a
+; dedicated reader chip (an EM4095 front end and its MCU): DEMOD is a
+; clean logic level from an envelope detector the bench does not model;
+; the reader synchronises once per frame and never re-times inside it,
+; which is right only because it makes the field itself (the tag's bits
+; are whole field cycles of the reader's own clock); and one frame is
+; read, checked and reported at a time.
+;
+; Source: EM Microelectronic-Marin, EM4100 data sheet (copyright 2004),
+; p. 5 "Memory Array for Manchester & Bi-Phase encoding ICs" (the frame:
+; 9 header ones, 10 rows of D?0..D?3 and an even parity, 4 even column
+; parities, the stop bit 0; "this sequence cannot be reproduced in the
+; data string") and Fig. 6 (Manchester on "Modulator control": a 1 is low
+; then high); p. 1 "Operating frequency 100 - 150 kHz", L for 125 kHz;
+; p. 4 and p. 8: 64 or 32 field periods per bit.
+;
+; Pins: RF_CLK = OUT0, the field clock, 50 % duty, low at reset; DEMOD =
+; IN0, the envelope: high while the tag's load switch is off. With
+; em4100_tag.loom on the same chip the bench wires OUT0 to the tag's IN1
+; and the tag's OUT1 to IN0.
+;
+; Rate: the host writes TICK_INT (and TICK_FRAC if needed) of both threads
+; before RUN, the M2 convention.
+;   thread 0: P = half the field period. 125 kHz at 50 MHz is P = 200,
+;             exactly: 400 clocks per period, error 0 against the chip
+;             clock (its crystal's tolerance is the only error). For a
+;             clock that is not a multiple of 250 kHz, TICK_FRAC sets P in
+;             1/256 clock, so the average period is within 1/256 clock of
+;             the ideal one (the latch puts each edge on the tick, and a
+;             tick lands on the first clock edge at or after its ideal
+;             time, so single periods dither by one clock). The program
+;             takes P >= 20 (.tick 20): 1.25 MHz at 50 MHz. The bound is
+;             the latch's, not the checker's: a staged edge lands on its
+;             tick only if the WAITD that sets its deadline commits by that
+;             tick (6.10 rules 1 and 2). After the WAITD that lands an edge
+;             completes (0 to 3 clocks after its tick) the loop spends up to
+;             three slots (JMP, SETP .. D, WAITD 1) and commits TD at the
+;             edge 2 clocks after the last X cycle: 17 clocks at most, so P
+;             must be 17 or more; 20 is the next multiple of the slot. At
+;             P = 16 the edges are exact only when the tick falls 0 to 2
+;             clocks before thread 0's X cycle (the host's TICK_INT write
+;             sets that phase), and at 15 they dither by a clock (measured
+;             on the model, 2026-11-07), though the checker proves the
+;             3-slot interval at 16 (12 clocks): it proves that the WAITD
+;             is on time, not that the staged edge is.
+;   thread 1: Q = a quarter of a bit = N * P with N = 32 field periods per
+;             half-bit for RF/64, N = 16 for RF/32: 6,400 (RF/64) or 3,200
+;             (RF/32) at 125 kHz. Proved for Q >= 256 (.tick 256).
+;
+; Host words, OUTQ[1], one report per frame:
+;     status 0       a good frame; three words follow: ID[39:32] (bits 7:0),
+;                    ID[31:16], ID[15:0], D00 = ID[39] as em4100_tag.loom
+;     status != 0    the frame was rejected, nothing follows:
+;                    bit 0 a row parity was odd, bits 7:4 its row (0..9);
+;                    bit 1 the column parities did not match;
+;                    bit 2 the stop bit was 1;
+;                    bit 3 a bit with no mid-bit transition after the header.
+; Checks stop at the first failure. After any report thread 1 hunts again,
+; so frames that pass while the host has not popped are not read (OUTQ
+; holds one good report; thread 1 waits in PUSH until there is room).
+;
+; Decoding (thread 1, tick Q, so one half-bit H = 2 ticks).
+; Hunt: every DEMOD edge restarts the tick grid and arms a timeout of 3
+; ticks, 1.5 H. A Manchester level lasts H or 2 H, and a 2 H level is the
+; second half of one bit and the first half of the next with no edge
+; between: it always ends in the middle of a bit. So after a timeout the
+; next edge is a mid-bit edge; the grid restarts on it and the level after
+; it is that bit's value (a rising edge ends a 1). From there SHI samples
+; DEMOD at 3, 5, 7, .. ticks: the middles of the following half-bits. The
+; header is nine 1s in a row, which nothing else in a frame can give (the
+; row parity limits a run of 1s in the data to 8, and the stop bit 0
+; ends the frame). Then 10 rows of five bits (CNT = 5, Z after the fifth
+; second-half SHI) and the last five bits. A violation (T) before the
+; header starts the hunt over, unreported.
+;
+; Registers, thread 1: r0..r2 the ID being assembled (40 bits, shifted in
+; a nibble at a time); r3 the XOR of the nibbles; r4 the count of 1s, then
+; the rows left; r5 the bits read; r6 scratch; r7 Q. Thread 0: none.
+; Memory (.imem 512): thread 0 from 0x000, thread 1 from 0x080, each in its
+; own quarter, so em4100_tag.loom runs beside them on thread 2.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RF_CLK = OUT0, DEMOD = IN0
+        .equ    CFG = (2 << 3) | (1 << 1)       ; ENC Manchester, DIR MSB first
+
+; ------------------------------------------------------------------- field
+        .thread 0
+        .tick   20                      ; the shortest half period (header)
+        SETP    RF_CLK, 0
+        SETD    1
+rf:     SETP    RF_CLK, 1, D            ; staged: lands on the next deadline
+        WAITD   1
+        SETP    RF_CLK, 0, D
+        WAITD   1
+        JMP     rf
+
+; ------------------------------------------------------------------ decode
+        .thread 1
+        .tick   256                     ; the shortest quarter-bit proved
+        .csr    BE_PINS, pin(DEMOD) << 5        ; in = DEMOD
+        CSRR    r7, TICK_INT            ; Q, kept for the restarts
+hunt:   .csr    BE_CFG, CFG, r6         ; also clears HALF (6.9.1)
+lp:     CSRW    TICK_INT, r7            ; the grid restarts at this edge
+        SETD    3                       ; 1.5 H from it
+        WAITE   DEMOD, ANY, T
+        BNT     lp                      ; an edge within 1.5 H: time from it
+        WAITE   DEMOD, ANY              ; the end of a 2 H level: mid-bit
+        CSRW    TICK_INT, r7            ; the bit grid starts on it
+        SETD    1                       ; first sample 3 ticks on (WAITD 2)
+        LDI     r6, 0
+        CSRW    FLAGS, r6               ; T = 0 (the timeout set it)
+        LDI     r4, 0                   ; 1s in a row
+        JP      DEMOD, 0, h1            ; the level now is this bit's value
+        LDI     r4, 1
+h1:     WAITD   2                       ; the middle of a first half
+        SHI
+        WAITD   2                       ; the middle of the second half
+        SHI                             ; the bit; T if both halves agree
+        BT      hunt                    ; out of phase, or noise: hunt again
+        STSR    r5
+        ANDI    r5, 1
+        BZ      h0
+        INC     r4
+        CMPI    r4, 9                   ; C = (nine 1s: the header)
+        BNC     h1
+        BRA     data
+h0:     LDI     r4, 0
+        BRA     h1
+
+data:   LDI     r0, 0                   ; the ID
+        LDI     r1, 0
+        LDI     r2, 0
+        LDI     r3, 0                   ; the column XOR
+        LDI     r4, 10                  ; rows left
+row:    LDI     r5, 5
+        CSRW    CNT, r5
+rb:     WAITD   2
+        SHI
+        WAITD   2
+        SHI
+        BNZ     rb                      ; Z = (CNT == 0): five bits in
+        BT      viol
+        STSR    r5
+        ANDI    r5, 31                  ; D?0 D?1 D?2 D?3 P?
+        PAR     r6, r5                  ; C = an odd number of 1s
+        BC      rowerr
+        SHRI    r5, 1                   ; the nibble
+        XOR     r3, r3, r5
+        MOV     r6, r1                  ; r0:r1:r2 <<= 4, the nibble in
+        SHRI    r6, 12
+        SHLI    r0, 4
+        OR      r0, r0, r6
+        MOV     r6, r2
+        SHRI    r6, 12
+        SHLI    r1, 4
+        OR      r1, r1, r6
+        SHLI    r2, 4
+        OR      r2, r2, r5
+        DJNZ    r4, row
+        LDI     r5, 5                   ; PC0..PC3 and S0
+        CSRW    CNT, r5
+cb:     WAITD   2
+        SHI
+        WAITD   2
+        SHI
+        BNZ     cb
+        BT      viol
+        STSR    r5
+        ANDI    r5, 31
+        LDI     r6, 4                   ; status: the stop bit
+        SHRI    r5, 1                   ; C = S0
+        BC      report
+        LDI     r6, 2                   ; status: the column parities
+        CMP     r5, r3                  ; even columns: PC = XOR of the nibbles
+        BNZ     report
+        LDI     r6, 0                   ; a good frame
+        PUSH    r6
+        PUSH    r0
+        PUSH    r1
+        PUSH    r2
+        JMP     hunt
+rowerr: LDI     r6, 10
+        SUB     r6, r6, r4              ; the row, 0..9
+        SHLI    r6, 4
+        ORI     r6, 1
+        BRA     report
+viol:   LDI     r6, 8
+report: PUSH    r6
+        JMP     hunt

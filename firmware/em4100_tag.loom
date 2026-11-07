@@ -1,0 +1,215 @@
+; em4100_tag.loom
+; An EM4100 read-only 125 kHz RFID tag at logic level: the tag counts the
+; cycles of the reader's field on RF and sends its 64-bit frame on MOD,
+; Manchester coded at RF/64 (or RF/32), repeated for as long as it runs.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The tag has no clock of its
+; own: every bit time is a count of input-pin edges, not a deadline, so the
+; program never uses the deadline timebase at all (no SETD, no WAITD). It
+; uses:
+;   - the Manchester encoder of the bit engine (SEMANTICS 6.9.1, ENC = 2),
+;     built for 10 Mbit/s IEEE 802.3 Manchester, the target D-029 cut (it
+;     stayed for the L3-MANCH loopback): a bit is two SHO, the engine keeps
+;     the half-bit phase. The EM4100's code is the same convention (below);
+;   - WAITP on an input pin and DJNZ as an edge counter, the idea of the
+;     quadrature programs (quad_decoder.loom polls levels with JP): here the
+;     level waits WAITP RF, 0 / WAITP RF, 1 count field cycles, so a field
+;     edge that comes while the thread is busy is not lost, as it would be
+;     for WAITE (SEMANTICS 6.4: PREV_PINS is refreshed by every slot);
+;   - CNT and Z of the engine as the bit counter of a 16-bit word, so that
+;     the next word is loaded in the second half of a word's last bit,
+;     after the bit has left SR (6.9.1: a data bit leaves SR on the first
+;     SHO of its two).
+; What the firmware does that no hardware does: the frame itself (header,
+; the ten even row parities, the four column parities, the stop bit) built
+; from the 40-bit ID, the division of the field by 32 or 16 per half-bit,
+; and the endless repetition. Weaker than the real chip: the tag needs a
+; host to give it its ID (an EM4100 is laser programmed), and its MOD edge
+; lags the field edge by 12 to 15 clocks, where the chip's own logic is
+; clocked by the field directly (the data sheet gives no lag at all).
+;
+; Source: EM Microelectronic-Marin, EM4100 data sheet (copyright 2004):
+; "Memory Array for Manchester & Bi-Phase encoding ICs" (p. 5): 9 header
+; bits of 1, then 10 rows of 4 data bits D?0..D?3 and an even row parity
+; P0..P9, then 4 even column parity bits PC0..PC3 and a stop bit S0 = 0,
+; "outputted serially" and "repeated continuously until power goes off";
+; "Code Description, Manchester" and Fig. 6 (p. 5): a transition in the
+; middle of every bit; on "Modulator control" a 1 is low then high and a 0
+; high then low, and "low means high current" (the load switch on);
+; "Sequencer" (p. 4) and "Ordering Information" (p. 8): 64 or 32 field
+; periods per bit (versions A6 and A5). Bits go out in the table's order,
+; row by row, D?0 first. The data sheet does not say which field edge the
+; sequencer counts or where a bit starts against the field; this tag
+; changes MOD after the rising edge of RF that completes a half-bit's count.
+;
+; Pins: RF = IN1, the reader's field as a logic square wave (what COIL1's
+; clock extractor would give); MOD = OUT1, push-pull, carrying Fig. 6's
+; "Modulator control": 1 = load switch off, 0 = load switch on. A reader
+; whose envelope detector reads high when the field is unloaded sees MOD
+; itself on its DEMOD input; the bench wires MOD to DEMOD. MOD is 1 (no
+; load) from the start until the first half-bit.
+;
+; Host words, INQ[2], three of them, read once after RUN:
+;     word 0   bits 7:0 ID[39:32] (D00..D13: the version or customer
+;              byte), bit 8: 1 = RF/32, 0 = RF/64; other bits ignored
+;     word 1   ID[31:16]           word 2   ID[15:0]
+; D00 is ID[39], D93 is ID[0]: the ID is the ten nibbles in the order they
+; are sent. To change the ID the host resets the thread and pushes again.
+; Nothing is reported on OUTQ[2].
+;
+; Frame build. The 64 bits are appended one at a time to the chain
+; r0:r1:r2:r3 (app), so r0 ends up holding bits 0..15 (the header and D00
+; D01 D02 D03 P0 D10 D11), r3 bits 48..63. Each row's parity comes from the
+; four bits just appended (r3 & 15) with PAR; the column parities are the
+; XOR of the ten nibbles. Building takes about 4,000 clocks (measured:
+; under 4,200), during which MOD stays 1.
+;
+; Transmit. r5 = N field cycles per half-bit (32 or 16). Each half-bit is
+; N passes of WAITP RF, 0; WAITP RF, 1; DJNZ, then SHO, which drives the
+; half's level on MOD (ENC = 2, DIR = MSB first). After the first-half SHO
+; of a word's last bit CNT is 0 and Z set: that half's count is split in
+; three chunks of one field cycle each, in which the next word goes into SR
+; and the four words rotate (r0 is always the word being sent, r1 the next)
+; and CNT is reloaded with 16, so the frame runs on without a gap.
+;
+; Field edge to MOD edge (SEMANTICS 2 and 3). A rising edge of RF sampled
+; first at edge s completes WAITP RF, 1 in an X cycle x in s+1..s+4; DJNZ
+; is at x+4 and SHO at x+8, and the pad changes at edge x+10. So every MOD
+; edge comes 12 to 15 clocks after the RF rise that ends a half-bit's
+; count (the bench drives a pad for a whole cycle and the chip samples it
+; at the edge that ends the cycle). The longest path from a completed
+; WAITP RF, 1 to the next WAITP RF, 0 is five slots (x+20, after a SHO, a
+; MOV and a BZ or JMP), and that WAITP must still find the low half of the
+; same field cycle: the field period must be at least 24 clocks with a 50 %
+; duty cycle, and each half at least 4 (one slot). 125 kHz is 400 clocks at
+; 50 MHz; the RTL tests run the field at 32 clocks per period to stay in
+; the simulation budget, and the model tests sweep it down to the limit.
+;
+; Registers: r0..r3 the frame words; r4 the field-cycle count; r5 N;
+; r6 the column parity while building, then 16; r7 the bit to append, then
+; scratch. Memory (.imem 512): thread 2's quarter, from 0x100, so the tag
+; runs beside em4100_reader.loom (threads 0 and 1).
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Which field edge is counted and where a bit starts: the data sheet does
+;   not say; the choice is in the model. The reader finds the bit phase
+;   from pulse lengths, so it does not depend on it.
+;   Bit order in a row (D00 first, then the row parity): from memory,
+;   unchecked against the data sheet's figure.
+;   MOD and DEMOD are logic level as the brief defines them; a front end
+;   that inverts needs only BE_CFG.INV.
+;   The 8 version bits are treated as ID bits, with the same parity rules.
+;   The RTL runs use a fast field (32 and 40 clocks a period); 125 kHz
+;   runs on the model.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RF = IN1, MOD = OUT1
+        .equ    CFG = (2 << 3) | (1 << 1)       ; ENC Manchester, DIR MSB first
+
+        .thread 2
+        SETP    MOD, 1                  ; no load until the first half-bit
+        .csr    BE_PINS, pin(MOD)       ; out = MOD
+        LDI     r6, 0                   ; the column parities
+        LDI     r7, 1
+        LDI     r5, 9
+head:   CALL    app                     ; the nine header bits, all 1
+        DJNZ    r5, head
+        POP     r4                      ; word 0: rate bit 8, ID[39:32]
+        LDSR    r4                      ; kept in SR until the rate is needed
+        SHLI    r4, 8                   ; D00 to bit 15
+        LDI     r5, 2
+        CALL    rows                    ; rows 0 and 1
+        POP     r4                      ; ID[31:16]
+        LDI     r5, 4
+        CALL    rows                    ; rows 2 to 5
+        POP     r4                      ; ID[15:0]
+        LDI     r5, 4
+        CALL    rows                    ; rows 6 to 9
+        MOV     r4, r6
+        SHLI    r4, 12                  ; PC0 to bit 15
+        CALL    bit                     ; PC0 .. PC3
+        CALL    bit
+        CALL    bit
+        CALL    bit
+        LDI     r7, 0
+        CALL    app                     ; S0, the stop bit: 64 bits appended
+
+        STSR    r7                      ; word 0 again
+        SHRI    r7, 8
+        ANDI    r7, 1                   ; Z = (RF/64)
+        LDI     r5, 32
+        BZ      rate
+        LDI     r5, 16
+rate:   LDI     r6, 16                  ; bits per word
+        .csr    BE_CFG, CFG             ; also clears HALF (6.9.1)
+        LDSR    r0                      ; word 0 of the frame
+        CSRW    CNT, r6
+        MOV     r4, r5
+
+; ---------------------------------------------------------------- transmit
+c1:     WAITP   RF, 0                   ; one field cycle: a low ...
+        WAITP   RF, 1                   ; ... and the rising edge after it
+        DJNZ    r4, c1
+        SHO                             ; first half of a bit: CNT - 1
+        MOV     r4, r5
+        BZ      last                    ; CNT = 0: the word's last bit
+c2:     WAITP   RF, 0
+        WAITP   RF, 1
+        DJNZ    r4, c2
+        SHO                             ; second half (Z ignored)
+        MOV     r4, r5
+        JMP     c1
+
+; the second half of a word's last bit: SR is free; one field cycle a chunk
+last:   WAITP   RF, 0
+        WAITP   RF, 1
+        LDSR    r1                      ; the next word
+        MOV     r7, r0
+        MOV     r0, r1
+        WAITP   RF, 0
+        WAITP   RF, 1
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r7                  ; rotated: r0 is the word in SR
+        WAITP   RF, 0
+        WAITP   RF, 1
+        CSRW    CNT, r6                 ; so the second-half SHO leaves Z clear
+        SUBI    r4, 3                   ; three of the N cycles are spent
+        JMP     c2
+
+; ------------------------------------------------------------- frame build
+; rows: r5 rows from r4 (left-aligned nibbles), each four bits and parity
+rows:   CALL    bit
+        CALL    bit
+        CALL    bit
+        CALL    bit
+        MOV     r7, r3
+        ANDI    r7, 15                  ; the nibble just appended
+        XOR     r6, r6, r7              ; into the column parities
+        PAR     r7, r7                  ; C = odd number of 1s
+        LDI     r7, 0
+        BNC     rpar
+        LDI     r7, 1                   ; even parity: the row's P bit
+rpar:   CALL    app
+        DJNZ    r5, rows
+        RET
+
+; bit: append the top bit of r4 and shift r4 left
+bit:    LDI     r7, 0
+        SHLI    r4, 1                   ; C = the bit
+        BNC     app
+        LDI     r7, 1
+; app: append r7 (0 or 1) to the 64-bit chain r0:r1:r2:r3
+app:    SHLI    r0, 1
+        SHLI    r1, 1                   ; C = r1's top bit, into r0
+        BNC     a1
+        ORI     r0, 1
+a1:     SHLI    r2, 1
+        BNC     a2
+        ORI     r1, 1
+a2:     SHLI    r3, 1
+        BNC     a3
+        ORI     r2, 1
+a3:     OR      r3, r3, r7
+        RET
