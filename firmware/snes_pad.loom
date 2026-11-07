@@ -1,0 +1,93 @@
+; snes_pad.loom
+; A Super Nintendo (SNES / Super Famicom) game controller: the pad side of
+; the controller port. LATCH loads the button word, each CLOCK rise shifts
+; the next button onto DATA, active low; the buttons come from the host.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the SNES controller port is
+; in no Loom design document. Nintendo published no specification; every
+; figure comes from public secondary sources, cited in
+; tools/protomodels/snes_pad.py. The program uses:
+;   - the bit engine's shift register in manual mode (SHO, SEMANTICS 6.9),
+;     built for the synchronous serial programs, as the pad's 4021-type
+;     shift register: LDSR is the parallel load, SHO the shift, and the
+;     zero shifted in behind the 16 bits is the 4021's grounded serial
+;     input (after 16 clocks DATA stays low);
+;   - the timed waits (WAITP ... T, SEMANTICS 6.4), built for the
+;     receivers' timeouts: every LATCH and CLOCK level is waited for with
+;     a deadline, so a console that stops in the middle cannot hang it.
+; What the firmware does that no hardware does: the latch-and-shift
+; sequence of the 4021 following the console's lines, the button word
+; from the host, and the recovery from a cut-short read. Weaker than a
+; real pad: a 4021 changes DATA a few tens of ns after the CLOCK rise;
+; this program changes it 7 to 15 clocks (0.14 to 0.3 us at 50 MHz) after
+; it (the two-flop synchroniser, the 4-clock slot grid, one slot for the
+; SHO, the output register). The console samples at the next fall, a
+; half period later (6 us in the sources, 0.5 us at the fastest), so it
+; is enough down to a clock half of about 0.32 us. The latch's parallel
+; load happens once, at the rise: a host word that arrives while LATCH is
+; high is used from the next latch.
+;
+; Pins: LATCH = IN1, CLOCK = IN2, DATA = OUT2 (push-pull, low at start).
+; With snes_host.loom on thread 0 the board wires are OUT0 to IN1, OUT1 to
+; IN2 and OUT2 to IN0.
+;
+; Host words (INQ[1]): the buttons, 1 = pressed, in the layout of
+; snes_host.loom's reply (bit 15 B, the first bit sent, down to bit 4 R;
+; bits 3:0 the last four bits, 0 for a standard pad). The pad starts with
+; nothing pressed. No reply.
+;
+; Timing: the program sets its own tick, TK = 50 clocks, 1 us at 50 MHz.
+; Idle, it looks for LATCH high and for a host word in PIECE = 16 us
+; pieces. After the latch every level waits CTO = 100 us at most (the
+; sources' whole read is about 200 us, one clock half 6 us); a timeout
+; drops the read and goes back to idle, as a console that stops early
+; would leave a real pad (the next latch reloads it). A LATCH held high
+; for longer than CTO reloads the word and waits again.
+;
+; Registers: r1 the word as it goes on the wire (active low), r2 the
+; clock rises still to follow, r7 .csr scratch.
+;
+; Deadline proof: no pair. The program keeps no schedule of its own; its
+; deadlines are only the timeouts of its waits. One .bounded: the POP,
+; guarded by WAITB INQ_NE, T.
+;
+; Memory: 32 words from 0x080, thread 1's quarter (.imem 512).
+;
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   LAT = IN1, CLK = IN2, DATA = OUT2
+        .equ    TK = 50                 ; ticks of 1 us at 50 MHz
+        .equ    PIECE = 16              ; idle: a look at INQ every 16 us
+        .equ    CTO = 100               ; a level not seen in 100 us: give up
+
+start:  SETP    DATA, 0
+        .csr    BE_PINS, pin(DATA)      ; SHO drives DATA (no SHI)
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, bit 15 (B) first
+        .csr    TICK_INT, TK
+        MOV16   r1, 0xFFFF              ; nothing pressed: all high on the wire
+
+idle:   SETD    PIECE
+        WAITP   LAT, 1, T
+        BNT     latch
+        WAITB   INQ_NE, T               ; a test: TD was reached
+        BT      idle
+        .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ[1]"
+        POP     r1
+        NOT     r1, r1                  ; 1 = pressed -> low on the wire
+        JMP     idle
+
+latch:  LDSR    r1                      ; the parallel load
+        SHO                             ; the first bit (B) on DATA
+        LDI     r2, 16                  ; 15 more bits, then the 0 behind them
+        SETD    CTO
+        WAITP   LAT, 0, T
+        BT      latch                   ; held high: load again
+bit:    SETD    CTO
+        WAITP   CLK, 0, T
+        BT      idle                    ; the read was cut short
+        WAITP   CLK, 1, T
+        BT      idle
+        SHO                             ; the rise shifts the next bit out
+        DJNZ    r2, bit
+        JMP     idle

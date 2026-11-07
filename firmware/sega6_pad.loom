@@ -1,0 +1,176 @@
+; sega6_pad.loom
+; A Sega Mega Drive / Genesis six-button control pad (or, on command, a
+; three-button one): the pad side. It follows SELECT (TH) and puts the
+; buttons of each phase on six parallel lines, active low; a counter of TH
+; falls brings the identification and X, Y, Z, Mode in their phases, and
+; resets after 1.5 ms with no TH edge. The buttons come from the host.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): it is in no Loom design
+; document, and it has no clock. Every figure is from public secondary
+; sources, cited in tools/protomodels/sega6_pad.py. The program uses:
+;   - the pin groups (OUT with OUTGRP, SEMANTICS 6.3), built so that a
+;     program can write several pins in one slot: the six lines change
+;     together in one OUT, as the pad's multiplexer switches them;
+;   - the timed waits (WAITP ... T, SEMANTICS 6.4), built for the
+;     receivers' timeouts, as the pad's reset timer, with TD stepped on an
+;     absolute grid (CSRW TD) so that the 1.5 ms is exact to the tick.
+; What the firmware does that no hardware does: the multiplexer, the TH
+; counter and its timeout, the three-button mode, and the button word from
+; the host. Weaker than a real pad: its multiplexer (a 74HC157 class part,
+; from memory, unchecked) switches in tens of ns; this program changes the
+; lines up to about 45 clocks (0.9 us at 50 MHz) after a TH edge (the
+; synchroniser, the slot grid, up to 9 slots). A console that reads less
+; than 1 us after its TH write reads the old phase; sega6_host.loom waits
+; 2 us, and the 68000 code the sources show waits "a few nop".
+;
+; The phases (gen-hw.txt 3.2, Genesis Plus GX gamepad.c); n is the number
+; of TH falls since the counter reset; lines D5..D0:
+;     TH high, n = 0, 1, 2, 4, 5   C B R L D U
+;     TH low,  n = 1, 2, 5         S A 0 0 D U
+;     TH low,  n = 3               S A 0 0 0 0     (six buttons: the ID)
+;     TH high, n = 3               C B M X Y Z
+;     TH low,  n = 4               S A 1 1 1 1
+; n stops at 5: further pulses give the three-button values until the
+; reset. The three-button mode shows only the first two rows.
+;
+; Pins: TH = IN3; D0..D5 = OUT0..OUT5 (push-pull: U, D, L, R, TL, TR in
+; gen-hw's order). With sega6_host.loom on thread 2 the board wires are
+; BIDIR6 to IN3 and OUT0..OUT5 to BIDIR0..BIDIR5.
+;
+; Host words (INQ[3]): the buttons, 1 = pressed, in the layout of
+; sega6_host.loom's reply: bits 5:0 U D L R B C, 7:6 A Start, 11:8 Z Y X
+; Mode; bit 15 set: be a three-button pad. Taken between TH edges, from
+; the next phase on. The pad starts as a six-button pad with nothing
+; pressed. No reply.
+;
+; Timing: the program sets its own tick, TK = 50 clocks, 1 us at 50 MHz.
+; Between edges it looks at INQ every PIECE = 15 us; NP = 100 pieces with
+; no TH edge, 1500 ticks (1.5 ms) from the X cycle that saw the last edge,
+; reset the counter (the pieces are on one grid of deadlines, so no slot
+; time adds up).
+;
+; Registers: r0 pieces left, r1 n, r2 high n != 3, r3 high n = 3, r4 low
+; n != 3, 4, r5 low n = 3, r6 low n = 4 (each as the six lines carry it),
+; r7 scratch and the host word (and .csr scratch at start).
+;
+; Deadline proof: no pair. Its deadlines are only the timeouts of its
+; waits. One .bounded: the POP, guarded by WAITB INQ_NE, T.
+;
+; Memory: 101 words from 0x180, thread 3's quarter (.imem 512).
+;
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 3
+        .pins   TH = IN3, D0 = OUT0
+        .equ    TK = 50                 ; ticks of 1 us at 50 MHz
+        .equ    PIECE = 15              ; a look at INQ every 15 us
+        .equ    NP = 100                ; 100 pieces: the 1.5 ms reset
+
+start:  .csr    OUTGRP, (6 << 5) | pin(D0) ; OUT writes D0..D5 from bits 5:0
+        .csr    TICK_INT, TK
+        LDI     r7, 0                   ; nothing pressed, six buttons
+        CALL    mk
+        LDI     r1, 0
+        JP      TH, 0, low0
+        OUT     r2
+        JMP     hi
+low0:   OUT     r4
+        JMP     lo
+
+; TH high: wait for the fall, a piece at a time.
+hi:     LDI     r0, NP
+        SETD    PIECE
+hw:     WAITP   TH, 0, T
+        BNT     fell
+        WAITB   INQ_NE, T               ; a test: TD was reached
+        BNT     hnew
+hcnt:   DJNZ    r0, hstep
+        LDI     r1, 0                   ; 1.5 ms with no edge: the reset
+        OUT     r2
+        LDI     r0, NP
+hstep:  CSRR    r7, TD                  ; the next piece on the same grid
+        ADDI    r7, PIECE
+        CSRW    TD, r7
+        JMP     hw
+hnew:   .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ[3]"
+        POP     r7
+        CALL    mk
+        CMPI    r1, 3
+        BZ      hn3
+        OUT     r2
+        JMP     hcnt
+hn3:    OUT     r3
+        JMP     hcnt
+
+fell:   CMPI    r1, 5
+        BC      f1                      ; n stops at 5
+        INC     r1
+f1:     CMPI    r1, 3
+        BZ      f3
+        CMPI    r1, 4
+        BZ      f4
+        OUT     r4                      ; S A 0 0 D U
+        JMP     lo
+f3:     OUT     r5                      ; S A 0 0 0 0
+        JMP     lo
+f4:     OUT     r6                      ; S A 1 1 1 1
+
+; TH low: wait for the rise.
+lo:     LDI     r0, NP
+        SETD    PIECE
+lw:     WAITP   TH, 1, T
+        BNT     rose
+        WAITB   INQ_NE, T               ; a test: TD was reached
+        BNT     lnew
+lcnt:   DJNZ    r0, lstep
+        LDI     r1, 0                   ; the reset
+        OUT     r4
+        LDI     r0, NP
+lstep:  CSRR    r7, TD
+        ADDI    r7, PIECE
+        CSRW    TD, r7
+        JMP     lw
+lnew:   .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ[3]"
+        POP     r7
+        CALL    mk
+        CMPI    r1, 3
+        BZ      ln3
+        CMPI    r1, 4
+        BZ      ln4
+        OUT     r4
+        JMP     lcnt
+ln3:    OUT     r5
+        JMP     lcnt
+ln4:    OUT     r6
+        JMP     lcnt
+
+rose:   CMPI    r1, 3
+        BZ      r3o
+        OUT     r2                      ; C B R L D U
+        JMP     hi
+r3o:    OUT     r3                      ; C B M X Y Z
+        JMP     hi
+
+; mk: the five line words from the host word in r7 (1 = pressed).
+mk:     NOT     r6, r7                  ; active low
+        MOV     r2, r6
+        ANDI    r2, 63                  ; C B R L D U
+        MOV     r5, r6
+        SHRI    r5, 2
+        ANDI    r5, 0x30                ; S A 0 0 0 0
+        MOV     r4, r6
+        ANDI    r4, 3
+        OR      r4, r4, r5              ; S A 0 0 D U
+        MOV     r3, r6
+        SHRI    r3, 8
+        ANDI    r3, 15                  ; M X Y Z
+        ANDI    r6, 0x30
+        OR      r3, r3, r6              ; C B M X Y Z
+        MOV     r6, r5
+        ORI     r6, 15                  ; S A 1 1 1 1
+        SHRI    r7, 15
+        BZ      mkr
+        MOV     r3, r2                  ; three buttons: no extra phases
+        MOV     r5, r4
+        MOV     r6, r4
+mkr:    RET

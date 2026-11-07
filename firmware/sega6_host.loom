@@ -1,0 +1,201 @@
+; sega6_host.loom
+; A console-side host for the Sega Mega Drive / Genesis control pad, three-
+; and six-button: the console toggles SELECT (TH) and reads six parallel
+; lines in each phase; the six-button pad's counter of TH pulses brings
+; X, Y, Z and Mode onto the lines in the fourth high phase. One report
+; word a read goes to the host, once on command or at a polling rate.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): it is in no Loom design
+; document, and it has no clock at all. Sega's own manual (MK-1653-50,
+; cited by Genesis Plus GX) was not available; every figure comes from
+; public secondary sources, cited in tools/protomodels/sega6_pad.py and
+; marked there as read or unchecked. The program uses:
+;   - the pin groups (IN with INGRP, SEMANTICS 6.3), built so that a
+;     program can read several pins in one slot: the six lines are taken
+;     in one IN, all in the same clock, as the console's one bus read;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built
+;     for clock-exact edges: every TH edge lands on its tick, so each
+;     phase's settle time before the read is exact.
+; What the firmware does that no hardware does: the TH sequence of the
+; six-button cycle, the detection of a pad (D3:D2 low with TH low) and of
+; the six-button pad (D3:D0 low in the third low phase), the guard time
+; that lets the pad's counter reset between reads, the assembly of the
+; report and the polarity (the wire is active low; the report is 1 =
+; pressed). Weaker than the console: nothing found; the console's reader
+; is software doing the same.
+;
+; The sequence (gen-hw.txt 3.2 as Genesis Plus GX gamepad.c quotes it,
+; and plutiedev's seven steps; the console writes TH, waits, reads
+; D5..D0):
+;     TH = 1   C B R L D U      read: h1
+;     TH = 0   S A 0 0 D U      read: l1 (D3:D2 = 00: a pad is there)
+;     TH = 1   C B R L D U      not read
+;     TH = 0   S A 0 0 D U      not read
+;     TH = 1   C B R L D U      not read
+;     TH = 0   S A 0 0 0 0      read: l3, the third fall (D3:D0 = 0000:
+;                               six buttons)
+;     TH = 1   C B M X Y Z      read: h3
+;     TH = 0   S A 1 1 1 1      not read
+;     TH = 1                    left high
+; READ3 stops after l1 (TH high again): what a three-button game does.
+; The pad resets its counter after about 1.5 ms with no TH edge (secondary,
+; disputed: 1.0 to 1.6 ms, sega6_pad.py); the program waits GUARD = 32
+; units, 2.05 ms, after every read before the next one.
+;
+; Rate: the program sets its own tick, TICK_INT = TK = 25 clocks, 0.5 us
+; at 50 MHz. Each phase is 1 + S ticks: the edge, then S = 4 ticks (2 us)
+; before the read (secondary: "a few nop" on a 7.67 MHz 68000, plutiedev;
+; six-button pads "a lot more picky"; the figure is ours, unchecked).
+;
+; Pins: D0..D5 = BIDIR0..BIDIR5 (inputs: U, D, L, R, TL, TR in gen-hw's
+; order, B/A and C/Start), TH = BIDIR6 (push-pull, high at start).
+;
+; Host commands (INQ[2]):
+;     0x0000        READ6: the six-button cycle. Stops polling.
+;     0x0001        READ3: the three-button read only. Stops polling.
+;     0x8000 | M << 13 | N   POLL: a read every 37 + 128 N ticks (READ6,
+;                   M = 0) or 7 + 128 N (READ3, M = 1), N = bits 12:0;
+;                   N below 32 is taken as 32 (the guard); N = 0 stops
+;                   polling. N = 260 gives 33317 ticks, 16.66 ms (60 Hz).
+; Reply (OUTQ[2]), one word a read, 1 = pressed:
+;     bits 5:0   U D L R B C       (h1, D0..D5)
+;     bits 7:6   A Start           (l1, D4 D5)
+;     bits 11:8  Z Y X Mode        (h3, D0..D3; 0 unless bit 13)
+;     bit 12     a pad answered    (l1 D3:D2 = 00)
+;     bit 13     a six-button pad  (READ6, bit 12, and l3 D3:D0 = 0000)
+;     bits 15:14 0
+; With nothing connected (lines high) the word is 0. If OUTQ is full when
+; a read ends, that read's word is dropped: the host pops each word.
+;
+; Registers: r0 the report, r1 the command then h1, r2 l1 then the guard
+; count, r3 l3 then the poll count, r4 N (0: not polling), r5 h3, r6 1
+; for READ3, r7 scratch (and .csr scratch at start).
+;
+; Deadline proof at TK = 25: the longest interval is 6 slots, 24 clocks
+; (the guard's last WAITD into the next poll read's first WAITD, which
+; stages nothing). One .bounded: the PUSH, guarded by WAITB OUTQ_NF, T.
+; Every staged SETP is at most the 4th slot after the WAITD before it, so
+; it commits at most 21 clocks after that tick, before the tick it lands
+; on (SEMANTICS 6.10 rule 1): the TH edges are exact for TK >= 22.
+;
+; Memory: 98 words from 0x100, thread 2's quarter (.imem 512).
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   The 6-button sequence: the eight-step table, which Genesis Plus GX's
+;   quote of gen-hw.txt and plutiedev agree on (one copy of gen-hw.txt
+;   shows six rows), so the six-button ID is read on the third TH fall.
+;   Secondary sources only.
+;   Counter reset: the sources give 1.07 to about 1.6 ms; the pad resets
+;   after 1.5 ms and the host waits 2.05 ms after a read, safe for the
+;   whole range.
+;   Settle before each read: 2 us, a choice; no source gives a figure.
+;
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 2
+        .pins   D0 = BIDIR0, TH = BIDIR6
+        .equ    TK = 25                 ; ticks of 0.5 us at 50 MHz
+        .equ    S = 4                   ; settle, edge to read: 2 us
+        .equ    UNIT = 128              ; ticks per poll unit (64 us)
+        .equ    GUARD = 32              ; units after a read: 2.05 ms
+
+start:  SETP    TH, 1
+        OEP     TH, 1                   ; TH is the only line driven
+        .csr    INGRP, (6 << 5) | pin(D0) ; IN reads D0..D5 into bits 5:0
+        .csr    TICK_INT, TK
+        LDI     r4, 0                   ; not polling
+
+cmd:    POP     r1
+        MOV     r0, r1
+        SHRI    r0, 15
+        BNZ     poll
+        MOV     r6, r1
+        ANDI    r6, 1                   ; READ6 or READ3
+        LDI     r4, 0                   ; a single read stops polling
+        JMP     go
+poll:   MOV     r6, r1
+        SHRI    r6, 13
+        ANDI    r6, 1                   ; M
+        MOV     r4, r1
+        SHLI    r4, 3
+        SHRI    r4, 3                   ; N
+        BZ      cmd                     ; N = 0: polling stops
+        CMPI    r4, GUARD
+        BC      go                      ; N >= GUARD
+        LDI     r4, GUARD
+
+; One read. Every TH edge is staged and lands on its tick.
+go:     SETD    2                       ; anchor (re-anchored after the POP)
+rd:     WAITD   1
+        IN      r1                      ; h1: TH has been high for long
+        SETP    TH, 0, D
+        WAITD   1                       ; TH falls
+        WAITD   S
+        IN      r2                      ; l1
+        TEST    r6, r6
+        BNZ     three
+        SETP    TH, 1, D
+        WAITD   1
+        WAITD   S                       ; the second high: not read
+        SETP    TH, 0, D
+        WAITD   1
+        WAITD   S                       ; the second low: not read
+        SETP    TH, 1, D
+        WAITD   1
+        WAITD   S                       ; the third high: not read
+        SETP    TH, 0, D
+        WAITD   1
+        WAITD   S
+        IN      r3                      ; l3, the third low: the six-button pad's 0000
+        SETP    TH, 1, D
+        WAITD   1
+        WAITD   S
+        IN      r5                      ; h3: C B M X Y Z
+        SETP    TH, 0, D
+        WAITD   1
+        WAITD   S                       ; the fourth low: not read
+three:  SETP    TH, 1, D
+        WAITD   1                       ; TH back high, idle
+
+        NOT     r0, r1
+        ANDI    r0, 63                  ; U D L R B C
+        NOT     r7, r2
+        ANDI    r7, 0x30
+        SHLI    r7, 2
+        OR      r0, r0, r7              ; A Start
+        MOV     r7, r2
+        ANDI    r7, 12
+        BNZ     report                  ; D3:D2 not low: no pad
+        LDI     r7, 0
+        LDIH    r7, 0x10
+        OR      r0, r0, r7              ; bit 12: a pad
+        TEST    r6, r6
+        BNZ     report                  ; READ3
+        MOV     r7, r3
+        ANDI    r7, 15
+        BNZ     report                  ; not 0000: three buttons
+        NOT     r7, r5
+        ANDI    r7, 15
+        SHLI    r7, 8
+        OR      r0, r0, r7              ; Z Y X Mode
+        LDI     r7, 0
+        LDIH    r7, 0x20
+        OR      r0, r0, r7              ; bit 13: six buttons
+report: WAITB   OUTQ_NF, T              ; a test: TD was reached at the rise
+        BT      full
+        .bounded "guarded by the WAITB OUTQ_NF above; only this thread pushes OUTQ[2]"
+        PUSH    r0
+full:   LDI     r2, GUARD
+        MOV     r3, r4
+        SUBI    r3, GUARD               ; the poll units after the guard
+gw:     WAITD   UNIT                    ; the guard: the pad's counter resets
+        DJNZ    r2, gw
+        TEST    r4, r4
+        BZ      cmd                     ; not polling
+        OR      r3, r3, r3
+        BZ      rd                      ; N = GUARD
+pw:     WAITD   UNIT                    ; the poll grid: no SETD, no drift
+        WAITB   INQ_NE, T               ; a test: TD was just reached
+        BNT     cmd                     ; a command ends the wait
+        DJNZ    r3, pw
+        JMP     rd

@@ -1,0 +1,157 @@
+; snes_host.loom
+; A console-side host for the Super Nintendo (SNES / Super Famicom) game
+; controller: one LATCH pulse, then 16 CLOCK pulses, sampling the pad's
+; serial DATA once a pulse; the 16 button bits go to the host as one word,
+; once on command or at a fixed polling rate.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the SNES controller port is
+; in no Loom design document. Nintendo published no specification; every
+; figure comes from public secondary sources, cited in
+; tools/protomodels/snes_pad.py and marked there as read or unchecked. The
+; program uses:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for the clock-exact bit edges of the serial transmitters: every
+;     LATCH and CLOCK edge lands on the exact clock of its tick, so the
+;     latch width, the latch-to-clock gap and both clock halves are exact;
+;   - the bit engine's shift register in manual mode (SHI, SEMANTICS 6.9),
+;     built for the synchronous serial programs, as a one-bit sampler that
+;     assembles the word MSB first, the first bit (B) in bit 15.
+; What the firmware does that no hardware does: the latch pulse and its
+; gap, the 16-pulse frame with a host-set clock speed, the polling grid
+; with no drift, and the polarity (the wire is active low; the report is
+; 1 = pressed). Weaker than the console: nothing; the console's own
+; reader is the same kind of fixed sequencer. Not done: a 17th clock to
+; tell an official pad from a third-party one (nesdev: reads past 16
+; return 1 on official pads), and the pad port's second data line.
+;
+; Timing (secondary sources, tools/protomodels/snes_pad.py SOURCES; us):
+;     LATCH high    12, every 16.67 ms (60 Hz)        (Christy, section 5)
+;     LATCH fall to first CLOCK fall   6              (Christy, section 5)
+;     CLOCK         16 pulses, 12 a cycle, 50 % duty, idle high; the pad
+;                   shifts on the rise, the console samples on the fall
+;                                                     (Christy, section 5)
+;     fastest CLOCK seen in the sources: a 0.5 us pulse (superfamicom.org,
+;                   "Controller Ports", the mouse's clock diagram)
+; Rate: the program sets its own tick, TICK_INT = TK = 25 clocks, 0.5 us
+; at 50 MHz. The latch is LATCH = 24 ticks (12 us) and the gap GAP = 12
+; (6 us), fixed; each clock half is H ticks, H = 1..63 (0.5 to 31.5 us),
+; 12 (6 us, the sources' figure) after reset. DATA is sampled by the SHI
+; one slot after the WAITD of each falling edge: at the fall, as the
+; console does, which leaves the pad the whole high half to shift.
+;
+; Pins: LATCH = OUT0, CLOCK = OUT1 (push-pull, LATCH low and CLOCK high at
+; start), DATA = IN0.
+;
+; Host commands (INQ[0]):
+;     0x0000        READ once; also stops polling. Reply: one word.
+;     0x4000 | H    the clock half, H ticks (bits 5:0; 0 is taken as 1).
+;                   No reply. Polling, if on, goes on at the new speed.
+;     0x8000 | N    POLL: a read every 36 + 32 H + 128 N ticks (bits 13:0,
+;                   N = 1..0x3FFF); N = 0 stops polling. At H = 12, N = 257
+;                   gives 33316 ticks, 16.66 ms (60 Hz). No drift: the
+;                   whole poll runs on one chain of deadlines.
+; Reply (OUTQ[0]), one word a read, 1 = pressed, the first bit sent in
+; bit 15: 15 B, 14 Y, 13 Select, 12 Start, 11 Up, 10 Down, 9 Left,
+; 8 Right, 7 A, 6 X, 5 L, 4 R, 3:0 the pad's last four bits (0 for a
+; standard pad; 0xFFFF is what an empty port, pulled low, gives). If OUTQ
+; is full when a read ends, that read's word is dropped so the schedule
+; never stalls: the host pops each word.
+;
+; Registers: r0 the word, r1 the command, r2 the half counter, r3 H - 1,
+; r4 N (0: not polling), r5 the bit count, r6 the poll unit count, r7
+; .csr scratch.
+;
+; Deadline proof at TK = 25: every interval is at most 5 slots, 20
+; clocks. One .bounded: the PUSH, guarded by WAITB OUTQ_NF, T. The proof
+; says each WAITD is on time; an exact edge needs more, that the staged
+; SETP commit before the tick it lands on (SEMANTICS 6.10 rule 1;
+; otherwise rule 2 writes it at the WAITD's commit, up to 3 clocks late).
+; Every staged SETP here is at most the 4th slot after the WAITD before
+; it, so it commits at most 3 + 16 + 2 = 21 clocks after that tick:
+; the edges are exact for TK >= 22. (The first version had the latch rise
+; 5 slots after the poll grid's WAITD, which the checker passed with 1
+; clock of slack; the test measured those rises 2 clocks late.)
+;
+; Memory: 66 words from 0x000, thread 0's quarter (.imem 512).
+;
+; Readings taken on the open spec questions (2026-11-07): the fastest
+; CLOCK, a 0.5 us pulse, is from one secondary source
+; (superfamicom.org's mouse diagrams); the host's default stays at the
+; 6 us halves. That an official pad drives DATA low after the 16th clock
+; is a reading of nesdev's wording, used only to tell pads apart.
+;
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   LAT = OUT0, CLK = OUT1, DATA = IN0
+        .equ    TK = 25                 ; ticks of 0.5 us at 50 MHz
+        .equ    LATCH = 24              ; 12 us
+        .equ    GAP = 12                ; 6 us, latch fall to first clock fall
+        .equ    UNIT = 128              ; ticks per poll unit (64 us)
+
+start:  SETP    LAT, 0
+        SETP    CLK, 1                  ; CLOCK idles high
+        .csr    BE_PINS, (pin(DATA) << 5) | pin(CLK) ; SHI reads DATA (no SHO)
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first
+        .csr    TICK_INT, TK
+        LDI     r3, 11                  ; H = 12, 6 us
+        LDI     r4, 0                   ; not polling
+
+cmd:    POP     r1
+        MOV     r0, r1
+        SHRI    r0, 14
+        BZ      read1                   ; 00: one read
+        CMPI    r0, 1
+        BZ      half                    ; 01: the clock half
+        MOV     r4, r1                  ; 1x: POLL N
+        SHLI    r4, 2
+        SHRI    r4, 2
+        BZ      cmd                     ; N = 0: polling stops
+        JMP     go
+half:   ANDI    r1, 63
+        BNZ     hok
+        LDI     r1, 1                   ; 0 is taken as 1
+hok:    MOV     r3, r1
+        DEC     r3
+        TEST    r4, r4
+        BZ      cmd
+        JMP     go                      ; polling goes on at the new speed
+read1:  LDI     r4, 0                   ; a single read stops polling
+
+; One read. Every edge is staged and lands on its tick.
+go:     SETD    2                       ; anchor (re-anchored after the POP)
+rd:     SETP    LAT, 1, D
+        WAITD   1                       ; LATCH rises
+        SETP    LAT, 0, D
+        WAITD   LATCH                   ; LATCH falls 12 us later
+        LDI     r5, 16
+        WAITD   GAP - 1                 ; the first fall comes 1 tick after this
+b:      SETP    CLK, 0, D
+        WAITD   1                       ; CLOCK falls
+        SHI                             ; sample DATA at the fall
+        OR      r2, r3, r3
+        BZ      up                      ; H = 1
+lo:     WAITD   1
+        DJNZ    r2, lo
+up:     SETP    CLK, 1, D
+        WAITD   1                       ; CLOCK rises: the pad shifts
+        OR      r2, r3, r3
+        BZ      nx
+hi:     WAITD   1
+        DJNZ    r2, hi
+nx:     DJNZ    r5, b
+        STSR    r0
+        NOT     r0, r0                  ; the wire is active low
+        WAITB   OUTQ_NF, T              ; a test: TD was reached at the last WAITD
+        BT      full
+        .bounded "guarded by the WAITB OUTQ_NF above; only this thread pushes OUTQ[0]"
+        PUSH    r0
+full:   TEST    r4, r4
+        BZ      cmd                     ; not polling
+        MOV     r6, r4
+pw:     WAITD   UNIT                    ; the poll grid: no SETD, no drift
+        DJNZ    r6, pchk
+        JMP     rd                      ; the staged rise commits 2 slots in
+pchk:   WAITB   INQ_NE, T               ; a test: TD was just reached
+        BNT     cmd                     ; a command ends the wait
+        JMP     pw
