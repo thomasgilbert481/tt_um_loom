@@ -1,0 +1,326 @@
+; kline_ecu.loom
+; An ECU on the ISO 9141-2 K line: it hears the tester's 5-baud address,
+; answers with the sync byte and the key bytes, checks the inverted key,
+; confirms with the inverted address and then answers OBD requests from
+; a table the host gives. Logic level, one wire: TX to the transceiver's
+; TXD (1 = recessive), RX from its RXD, the line level.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Loom has no UART and no
+; slow-rate detector: the 5-baud address is sampled with 200 ms deadlines
+; on a 1 ms tick whose grid the program restarts on the start edge (a
+; TICK_INT write, the divider built so that the host could pick a rate);
+; the 10400 bit/s bytes run on a half-bit tick the program writes in the
+; same way. It needs the M2 core and LD/ST of slice B (SEMANTICS 6.11,
+; built for the I2C EEPROM's array), which hold the table and the request.
+; What no hardware does here: the 5-baud receiver, the W and P timing,
+; the key check, the header and checksum checks and the table look-up.
+;
+; Pins: TX = OUT1, RX = IN1 (beside kline_tester.loom on OUT0/IN0; the
+; bench joins the two TX pins into one K line).
+;
+; Host table (INQ[2]), once, before the first address: c (0 .. 4), then c
+; entries, each the request {mode in 15:8, PID in 7:0}, n (1 .. 6) and
+; the n data bytes of the answer, one per word in 7:0 (for mode 1 PID 0:
+; 0x41 0x00 and the four bitmap bytes). The table is fixed from then on.
+;
+; Timing, from the end of the last stop bit, sent or received:
+;   the address 0x33 at 5 baud: each bit sampled 100 ms into it, on the
+;        grid of its start edge; a start bit that is high again at 100 ms
+;        (a 10400 bit/s byte, a glitch) or a low stop bit is ignored;
+;   W1   the sync byte 0x55 100 ms after the address (60 .. 300);
+;   W2   key byte 1 (0x08) 10 ms after it (5 .. 20);
+;   W3   key byte 2 (0x08) 10 ms after that (0 .. 20);
+;   W4   key byte 2 inverted (0xF7) awaited for 50 ms; then 30 ms (25 ..
+;        50) to the address inverted (0xCC). A wrong or missing inverted
+;        key opens no session;
+;   P3   in the session, a request awaited for 5 s (P3 max), else the
+;        session ends and the ECU listens for an address again;
+;   P4   a request ends at 20 ms of silence (P4 max);
+;   P2   the answer starts 30 ms after the request (25 .. 50) on the
+;        golden model's and the real build; the table look-up adds at most
+;        about 70 slots, 11 ms at the RTL build's scaled tick (25 clocks a
+;        ms), so P2 there is 30 to 41 scaled ms;
+;   P1   5 ms (0 .. 20) before every answer byte after the first.
+; A request is answered when it is six bytes (0x68 0x6A 0xF1, mode, PID,
+; checksum), the checksum (the sum modulo 256 of the five bytes before
+; it) is right and {mode, PID} is in the table. The answer is 0x48 0x6B
+; 0x10 (the ECU's own address, SRC), the entry's n bytes and the checksum.
+;
+; Reports (OUTQ[2]), one word each; the pushes wait for room, at points
+; where the next deadline is re-anchored after them:
+;     0x2000 | b  the inverted key was b, not 0xF7: no session
+;     0x2100      no inverted key within 50 ms: no session
+;     0x3000      session open (the inverted address sent)
+;     0x4000 | f << 8 | n  a request of n bytes: f bit 0 answered, bit 1
+;                 checksum wrong, bit 2 not six bytes or a wrong header,
+;                 bit 3 not in the table (only bit 0 answers)
+;     0x5000      session closed: no request for 5 s
+;
+; Rates as in kline_tester.loom: MS, HBI and HBF, scaled by the test
+; module through the same three .equ lines.
+;
+; Limits. One ECU address (0x33) and fixed key bytes; no fast init, no
+; L line, no reading back of its own bits, no answers longer than six
+; data bytes, no multi-frame answers, no negative response (a request
+; that is not in the table is ignored, as an OBD ECU that does not
+; support the PID does).
+;
+; Memory: thread 2 (0x100); the code spills into thread 3's quarter
+; (thread 3 must not be started); the request buffer BUF and the table
+; TABLE at the end of memory, which the image does not load (the program
+; writes every word before it reads it). Summary at the end of the file.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 2
+        .pins   TX = OUT1, RX = IN1
+        .equ    MS = 50000              ; clocks per ms tick (scaled builds: 500, 25)
+        .equ    HBI = 2403              ; half a bit at 10400 bit/s, integer part
+        .equ    HBF = 218               ; and the fraction, in 1/256 clocks
+        .equ    ADDR = 0x33             ; the address it answers
+        .equ    KB1 = 0x08              ; ISO 9141-2 key bytes
+        .equ    KB2 = 0x08
+        .equ    SRC = 0x10              ; its own address, in the answer header
+        .equ    TW1 = 100               ; ms
+        .equ    TW2 = 10
+        .equ    TW3 = 10
+        .equ    TW4 = 30
+        .equ    TP2 = 30
+        .equ    TP1 = 5
+        .equ    BUF = 0x1D7             ; eight words: the request's first bytes
+        .equ    TABLE = 0x1DF           ; c, then four entries of ENT words
+        .equ    ENT = 8                 ; request, n, six data bytes
+
+start:  SETP    TX, 1                   ; recessive
+        CALL    msclk
+
+; ------------------------------------------------------------- the table
+; TABLE: c, then entry i at TABLE + ENT i: +1 the request, +2 n, +3 .. the
+; data bytes.
+        POP     r2                      ; c
+        MOV16   r4, TABLE
+        ST      r2, r4, 0
+lent:   TEST    r2, r2
+        BZ      waddr
+        POP     r0
+        ST      r0, r4, 1               ; the request
+        POP     r1
+        ST      r1, r4, 2               ; n
+        MOV     r5, r4
+        ADDI    r5, 2
+ldat:   INC     r5
+        POP     r0
+        ST      r0, r5, 0
+        DJNZ    r1, ldat
+        ADDI    r4, ENT
+        DEC     r2
+        JMP     lent
+
+; ------------------------------------------------------ the 5-baud address
+; Every bit 200 ms, sampled 100 ms in, on a 1 ms grid restarted on the
+; start edge (TICK_FRAC is 0 on the ms tick).
+waddr:  WAITP   RX, 1                   ; the line idle first
+        WAITP   RX, 0                   ; a start bit, however long it takes
+        .csr    TICK_INT, MS            ; the grid restarts on the edge
+        SETD    0
+        WAITD   100                     ; the middle of the start bit
+        JP      RX, 1, waddr            ; high: a fast byte or a glitch
+        LDI     r0, 0
+        LDI     r1, 8
+a5b:    WAITD   200
+        SHLI    r0, 1                   ; MSB first here, reversed below
+        JP      RX, 0, a50
+        INC     r0
+a50:    DJNZ    r1, a5b
+        WAITD   200                     ; the middle of the stop bit
+        JP      RX, 0, waddr            ; framing error
+        REV     r0, r0
+        SHRI    r0, 8
+        CMPI    r0, ADDR
+        BNZ     waddr                   ; another ECU's address
+
+; ---------------------------------------------------- sync and key bytes
+        WAITD   100 + TW1               ; the stop bit's second half, and W1
+        LDI     r0, 0x55
+        CALL    txbyte
+        WAITD   TW2
+        LDI     r0, KB1
+        CALL    txbyte
+        WAITD   TW3
+        LDI     r0, KB2
+        CALL    txbyte
+        SETD    51                      ; W4 max 50 ms
+        CALL    rxbyte
+        BT      nokey
+        LDI     r7, 255 - KB2
+        CMP     r0, r7
+        BNZ     badkey
+        WAITD   TW4
+        LDI     r0, 255 - ADDR
+        CALL    txbyte
+        MOV16   r0, 0x3000
+        PUSH    r0                      ; session open
+
+; ------------------------------------------------------------ the session
+; P3 max: 20 waits of 250 ms for a request's first start bit.
+sess:   LDI     r2, 20
+sw:     SETD    250
+        WAITP   RX, 0, T
+        BNT     req
+        DJNZ    r2, sw
+        MOV16   r0, 0x5000
+        PUSH    r0                      ; session closed
+        JMP     waddr
+nokey:  MOV16   r0, 0x2100
+        PUSH    r0
+        JMP     waddr
+badkey: LDIH    r0, 0x20
+        PUSH    r0
+        JMP     waddr
+
+; A request: bytes until 20 ms of silence (P4 max); r2 counts them, r3
+; sums them, r6 is the last, the first eight go to BUF.
+req:    MOV16   r4, BUF
+        LDI     r2, 0
+        LDI     r3, 0
+rq:     CALL    rxbyte                  ; the first: its start bit is here
+        BT      rqend
+        ADD     r3, r3, r0
+        MOV     r6, r0
+        CMPI    r2, 8
+        BC      rqn                     ; past the buffer: counted only
+        ST      r0, r4, 0
+        INC     r4
+rqn:    INC     r2
+        SETD    21                      ; P4 max 20 ms
+        JMP     rq
+
+; The request ended 21 ms after its last stop bit's end (rxbyte's
+; SETD 0 there). r6 becomes the report, {f, n}.
+rqend:  CMPI    r2, 6
+        BNZ     fmt                     ; not six bytes
+        SUB     r3, r3, r6
+        SUB     r3, r3, r6
+        SHLI    r3, 8                   ; Z: the checksum is right
+        BNZ     ckerr
+        MOV16   r4, BUF
+        LD      r0, r4, 0
+        LDI     r7, 0x68
+        CMP     r0, r7
+        BNZ     fmt
+        LD      r0, r4, 1
+        LDI     r7, 0x6A
+        CMP     r0, r7
+        BNZ     fmt
+        LD      r0, r4, 2
+        LDI     r7, 0xF1
+        CMP     r0, r7
+        BNZ     fmt
+        LD      r5, r4, 3
+        SWAP    r5, r5                  ; the mode in 15:8
+        LD      r0, r4, 4
+        OR      r5, r5, r0              ; {mode, PID}
+        MOV16   r4, TABLE
+        LD      r1, r4, 0               ; c
+find:   TEST    r1, r1
+        BZ      notab
+        LD      r0, r4, 1
+        CMP     r0, r5
+        BZ      hit
+        ADDI    r4, ENT
+        DEC     r1
+        JMP     find
+notab:  MOV     r6, r2
+        LDIH    r6, 0x48
+        JMP     rep
+fmt:    MOV     r6, r2
+        LDIH    r6, 0x44
+        JMP     rep
+ckerr:  MOV     r6, r2
+        LDIH    r6, 0x42
+        JMP     rep
+
+; The answer: P2 from here is 21 ms already gone plus the look-up, then
+; TP2 - 21; P1 before each byte after the first (sendb).
+hit:    MOV     r6, r2
+        LDIH    r6, 0x41                ; the report: answered
+        SETD    TP2 - 21 - TP1
+        LDI     r3, 0
+        LDI     r0, 0x48
+        CALL    sendb
+        LDI     r0, 0x6B
+        CALL    sendb
+        LDI     r0, SRC
+        CALL    sendb
+        LD      r2, r4, 2               ; n
+        ADDI    r4, 2
+rdat:   INC     r4
+        LD      r0, r4, 0
+        CALL    sendb
+        DJNZ    r2, rdat
+        MOV     r0, r3
+        CALL    sendb                   ; the checksum
+rep:    PUSH    r6
+        JMP     sess
+
+; ------------------------------------------------------------ subroutines
+; The same three as kline_tester.loom, on this program's pins.
+; sendb: r3 += r0, then TP1 ms from TD and the byte r0.
+sendb:  ADD     r3, r3, r0
+        WAITD   TP1
+        JMP     txbyte
+
+; txbyte: r0's low byte, 8N1 at 2 ticks of HBI + HBF/256 clocks a bit;
+; returns on the ms tick at the end of the stop bit with TD = NOW.
+txbyte: .csr    TICK_FRAC, HBF
+        .csr    TICK_INT, HBI           ; the grid restarts here
+        LDIH    r0, 1                   ; bit 8: the stop bit
+        SHLI    r0, 1                   ; bit 0: the start bit
+        LDI     r1, 10
+        SETD    0
+txb:    SHRI    r0, 1
+        BC      tx1
+        SETP    TX, 0
+        JMP     txn
+tx1:    SETP    TX, 1
+txn:    WAITD   2
+        DJNZ    r1, txb
+        JMP     msclk
+
+; rxbyte: a byte whose start bit comes before TD (ms tick); T = 1 if none,
+; a glitch or a low stop bit, else T = 0 and r0 = the byte. Returns on
+; the ms tick at the end of the stop bit with TD = NOW.
+rxbyte: WAITP   RX, 0, T
+        BT      rxret
+        .csr    TICK_FRAC, HBF
+        .csr    TICK_INT, HBI           ; the grid restarts on the edge
+        SETD    0
+        WAITD   1                       ; the middle of the start bit
+        JP      RX, 1, rxbad
+        LDI     r0, 0
+        LDI     r1, 8
+rxb:    WAITD   2
+        SHLI    r0, 1
+        JP      RX, 0, rx0
+        INC     r0
+rx0:    DJNZ    r1, rxb
+        REV     r0, r0
+        SHRI    r0, 8
+        WAITD   2                       ; the middle of the stop bit
+        JP      RX, 0, rxbad            ; framing error
+        WAITD   1                       ; the end of the stop bit
+        JMP     msclk                   ; T = 0 from the WAITP
+rxbad:  LDI     r7, 4
+        CSRW    FLAGS, r7               ; T = 1
+; msclk: the 1 ms tick from here (the grid restarts), TD = NOW. r7.
+msclk:  .csr    TICK_FRAC, 0
+        .csr    TICK_INT, MS
+rxret:  SETD    0                       ; every RET follows an anchor
+        RET
+
+        .tick   min(25, MS, HBI)        ; the deadline proof's tick, clocks
+
+; Memory: 210 words at 0x100..0x1D1 in the real and model builds (206 in
+; the RTL build), 82 of them in thread 3's quarter (thread 3 must not be
+; started); BUF 0x1D7..0x1DE and TABLE 0x1DF..0x1FF, written before read.
+; Beside kline_tester.loom (thread 0, 0x000..0x097) the image fits.

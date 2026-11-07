@@ -1,0 +1,283 @@
+; kline_tester.loom
+; An OBD-II tester on the ISO 9141-2 K line: the 5-baud initialisation,
+; the key-byte handshake and one request with its response. Logic level,
+; one wire: TX to the K-line transceiver's TXD (an L9637 or an MC33290,
+; 1 = recessive), RX from its RXD, the line level, which includes the
+; tester's own bytes (the K line is half duplex and every node hears
+; itself).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Loom has no UART: every bit
+; is a SETP or a JP on a deadline. The 5-baud address and the W and P
+; times run on a 1 ms tick; the 10400 bit/s bytes on a half-bit tick. The
+; program switches between the two by writing its own TICK_INT and
+; TICK_FRAC, the divider built so that the host could pick a rate, and
+; uses the write's side effect (the tick grid restarts, SEMANTICS 4) to
+; synchronise every received byte on its start edge. What no hardware
+; does here: the 2 s address at 5 baud, the W1 to W4 and P1 to P4 windows,
+; the key exchange and the sum checksum.
+;
+; Pins: TX = OUT0, RX = IN0.
+;
+; Host command (INQ[0]): one word {mode in 15:8, PID in 7:0}. For each
+; command the tester runs a whole session:
+;   W5   the line idle (high) for 300 ms, restarted by any low;
+;   the address 0x33 at 5 baud (200 ms a bit, 8N1, 2 s in all);
+;   W1   the sync byte 0x55 within 300 ms of the address's stop bit;
+;   W2   key byte 1 within 20 ms, W3 key byte 2 within 20 ms;
+;   W4   after 30 ms (25 .. 50), key byte 2 inverted;
+;   W4   the address inverted (0xCC) within 50 ms;
+;   P3   after 70 ms (55 .. 5000), the request 0x68 0x6A 0xF1, mode, PID
+;        and the checksum, P4 = 10 ms (5 .. 20) before every byte;
+;   P2   the response's first byte within 50 ms, then bytes until 20 ms
+;        of silence (P1 max).
+; Every time is counted from the end of the last stop bit, sent or
+; received (a received stop bit is checked in its middle and its end
+; waited for); each time-out is the standard's maximum plus one ms tick,
+; which covers the tick's phase. The key bytes are reported, not
+; judged: ISO 9141-2 ECUs send 0x08 0x08 or 0x94 0x94, and the host decides.
+;
+; Result (OUTQ[0]): key byte 1 and key byte 2 (if they came), then every
+; byte of the response including the header and the checksum, one per
+; word in 7:0, then the status word, the only word with bit 15 set:
+;     bits 14:12 0 good; 1 no sync byte 0x55 (W1); 2 a key byte missing
+;                (W2, W3); 3 no inverted address (W4); 4 no response
+;                (P2); 5 the response's checksum is wrong
+;     bit 5      a byte was dropped because OUTQ was full
+;     bits 4:0   n, the response bytes received
+; The byte reports wait for nothing (a full OUTQ drops the byte and sets
+; bit 5); the status word waits for room. A session that fails ends at
+; once; the ECU then waits out its own P3 max (5 s) before it listens
+; for an address again, so the host should not start the next session
+; sooner.
+;
+; Rates. The 1 ms tick is MS clocks and the half bit HBI + HBF/256 clocks:
+; 50000 and 2403 + 218/256 at 50 MHz (10400.0 bit/s). The test module
+; assembles two scaled builds by changing those three .equ lines: MS = 500
+; with the real bit rate for the golden model, and MS = 25 with HBI = 150
+; (a 300-clock bit) for the RTL, where the real 2 s address would be 100 M
+; clocks. Every time named above scales with MS. Real time on the model
+; is one opt-in scenario (tools/tests/test_fw_kline.py).
+;
+; Limits. One request per session. No fast init (ISO 14230's 25 ms low
+; wake-up), no L line, no reading back of the tester's own bits (a
+; collision is not seen), no keep-alive, no length check on the response
+; (ISO 9141-2 has no length byte: the response ends at 20 ms of silence).
+;
+; Deadline pairs: proved for a 25-clock tick (.tick at the end), the
+; smallest tick of any build, so every build is proved; the checker
+; rounds TICK_FRAC down.
+;
+; Memory: see the summary at the end of the file.
+;
+; Readings taken on the open spec questions (2026-11-07): ISO 9141-2 was
+; not read (the free copy is a scan); W1 to W5 and P1 to P4 are the
+; defaults of a vehicle-interface manual, the sequence, headers, checksum
+; and key bytes from published K-line notes. Secondary throughout.
+;   Bit-rate tolerance 1 %, assumed (no source gives one).
+;   One request per session in this ECU; it then holds the session for
+;   5 s. The table look-up stretches P2 in the scaled RTL build (42 of
+;   25 to 50 ms); at the real 1 ms tick it adds almost nothing.
+;   The real-time run on the model (about 120 M clocks) is opt-in:
+;   LOOM_KLINE_REAL_TIME=1.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .equ    MS = 50000              ; clocks per ms tick (scaled builds: 500, 25)
+        .equ    HBI = 2403              ; half a bit at 10400 bit/s, integer part
+        .equ    HBF = 218               ; and the fraction, in 1/256 clocks
+        .equ    ADDR = 0x33             ; the OBD-II address of ISO 9141-2
+        .equ    TW4 = 30                ; W4, ms: key byte 2 to its inverse
+        .equ    TP3 = 60                ; P3 less TP4, ms
+        .equ    TP4 = 10                ; P4, ms
+
+start:  SETP    TX, 1                   ; recessive
+        CALL    msclk
+cmd:    POP     r5                      ; {mode, PID}
+        LDI     r6, 0                   ; n and the overflow bit
+        LDI     r2, 1                   ; the step that can fail next
+
+; ------------------------------------------------------------ W5, address
+; The line must stay high for 300 ms (two waits of 150 and 151 ticks: a
+; tick may be partly gone); any low starts the count again.
+idle:   SETD    150
+        WAITP   RX, 0, T
+        BNT     idle
+        SETD    151
+        WAITP   RX, 0, T
+        BNT     idle
+        LDI     r0, ADDR
+        LDIH    r0, 1                   ; bit 8: the stop bit
+        SHLI    r0, 1                   ; bit 0: the start bit
+        LDI     r1, 10
+        SETD    0
+        WAITD   1                       ; onto the ms grid
+a5:     SHRI    r0, 1                   ; C = the next bit, LSB first
+        BC      a1
+        SETP    TX, 0
+        JMP     an
+a1:     SETP    TX, 1
+an:     WAITD   200                     ; 200 ms a bit: 5 baud
+        DJNZ    r1, a5
+
+; ------------------------------------------------------- sync and keys
+; W1: 0x55 within 300 ms of the stop bit's end (150 + 151 ticks: the
+; first wait ends early if the start bit comes, and rxbyte sees it low).
+        SETD    150
+        WAITP   RX, 0, T
+        SETD    151
+        CALL    rxbyte
+        BT      done
+        LDI     r7, 0x55
+        CMP     r0, r7
+        BNZ     done                    ; not a sync byte
+        INC     r2                      ; 2
+        SETD    21                      ; W2 max 20 ms
+        CALL    rxbyte
+        BT      done
+        CALL    report                  ; key byte 1
+        SETD    21                      ; W3 max 20 ms
+        CALL    rxbyte
+        BT      done
+        MOV     r4, r0
+        CALL    report                  ; key byte 2
+        INC     r2                      ; 3
+        WAITD   TW4                     ; W4 from the stop bit's end
+        LDI     r0, 255
+        SUB     r0, r0, r4              ; key byte 2 inverted
+        CALL    txbyte
+        SETD    51                      ; W4 max 50 ms
+        CALL    rxbyte
+        BT      done
+        LDI     r7, 255 - ADDR
+        CMP     r0, r7
+        BNZ     done                    ; not the inverted address
+        INC     r2                      ; 4
+
+; ------------------------------------------------------------ request
+; 0x68 0x6A 0xF1 mode PID checksum: the checksum is the sum of the five
+; bytes before it, modulo 256 (sendb sums into r3; txbyte sends r0's low
+; byte, whatever its high byte holds).
+        WAITD   TP3                     ; P3 = TP3 + TP4 from the stop bit
+        LDI     r3, 0
+        LDI     r0, 0x68
+        CALL    sendb
+        LDI     r0, 0x6A
+        CALL    sendb
+        LDI     r0, 0xF1
+        CALL    sendb
+        MOV     r0, r5
+        SHRI    r0, 8
+        CALL    sendb                   ; mode
+        MOV     r0, r5
+        CALL    sendb                   ; PID
+        MOV     r0, r3
+        CALL    sendb                   ; checksum
+
+; ----------------------------------------------------------- response
+; P2: the first byte within 50 ms; P1: each next one within 20 ms, so 20
+; ms of silence ends the response. r3 sums every byte, r4 is the last:
+; the checksum is right when (r3 - 2 r4) mod 256 = 0.
+        LDI     r3, 0
+        SETD    51                      ; P2 max 50 ms
+resp:   CALL    rxbyte
+        BT      rend
+        ADD     r3, r3, r0
+        MOV     r4, r0
+        INC     r6
+        CALL    report
+        SETD    21                      ; P1 max 20 ms
+        JMP     resp
+rend:   MOV     r0, r6
+        ANDI    r0, 31
+        BZ      done                    ; nothing: 4, no response
+        SUB     r3, r3, r4
+        SUB     r3, r3, r4
+        SHLI    r3, 8                   ; Z: the checksum is right
+        LDI     r2, 0                   ; (LDI keeps Z)
+        BZ      done
+        LDI     r2, 5
+done:   MOV     r0, r2
+        ORI     r0, 8                   ; bit 15 once shifted
+        SHLI    r0, 12
+        OR      r0, r0, r6
+        PUSH    r0                      ; the status: waits for room
+        JMP     cmd
+
+; ------------------------------------------------------------ subroutines
+; sendb: r3 += r0, then P4 (TP4 ms from TD: the end of the last stop bit
+; sent, or TP3 later) and the byte r0.
+sendb:  ADD     r3, r3, r0
+        WAITD   TP4
+        JMP     txbyte
+
+; report: r0 to OUTQ if there is room, else bit 5 of r6. Called with TD
+; reached (rxbyte's SETD 0), so the WAITB is a test, not a wait; returns
+; with TD = NOW.
+report: WAITB   OUTQ_NF, T
+        BT      rfull
+        .bounded "guarded by the WAITB above; only the host pops OUTQ[0]"
+        PUSH    r0
+        JMP     rxret
+rfull:  ORI     r6, 32
+        JMP     rxret
+
+; txbyte: r0's low byte, 8N1 at 2 ticks of HBI + HBF/256 clocks a bit,
+; the grid started at the call; returns on the ms tick at the end of the
+; stop bit with TD = NOW. r0, r1, r7 clobbered.
+txbyte: .csr    TICK_FRAC, HBF
+        .csr    TICK_INT, HBI           ; the grid restarts here
+        LDIH    r0, 1                   ; bit 8: the stop bit
+        SHLI    r0, 1                   ; bit 0: the start bit
+        LDI     r1, 10
+        SETD    0
+txb:    SHRI    r0, 1
+        BC      tx1
+        SETP    TX, 0
+        JMP     txn
+tx1:    SETP    TX, 1
+txn:    WAITD   2
+        DJNZ    r1, txb
+        JMP     msclk
+
+; rxbyte: a byte whose start bit comes before TD (ms tick). T = 1 if none
+; came, or the start bit was a glitch, or the stop bit was low. Else T = 0
+; and r0 = the byte, sampled mid-bit on a grid started on its own start
+; edge. Returns on the ms tick at the end of the stop bit with TD =
+; NOW. r0, r1, r7 clobbered.
+rxbyte: WAITP   RX, 0, T
+        BT      rxret                   ; TD passed: no byte
+        .csr    TICK_FRAC, HBF
+        .csr    TICK_INT, HBI           ; the grid restarts on the edge
+        SETD    0
+        WAITD   1                       ; the middle of the start bit
+        JP      RX, 1, rxbad            ; high again: a glitch
+        LDI     r0, 0
+        LDI     r1, 8
+rxb:    WAITD   2                       ; the middle of the next bit
+        SHLI    r0, 1                   ; MSB first here, reversed below
+        JP      RX, 0, rx0
+        INC     r0
+rx0:    DJNZ    r1, rxb
+        REV     r0, r0
+        SHRI    r0, 8                   ; LSB first: the byte in 7:0
+        WAITD   2                       ; the middle of the stop bit
+        JP      RX, 0, rxbad            ; framing error
+        WAITD   1                       ; the end of the stop bit
+        JMP     msclk                   ; T = 0 from the WAITP
+rxbad:  LDI     r7, 4
+        CSRW    FLAGS, r7               ; T = 1
+; msclk: the 1 ms tick from here (the grid restarts), TD = NOW. r7.
+msclk:  .csr    TICK_FRAC, 0
+        .csr    TICK_INT, MS
+rxret:  SETD    0                       ; (every RET follows an anchor: the
+        RET                             ; checker returns to every CALL)
+
+        .tick   min(25, MS, HBI)        ; the deadline proof's tick, clocks
+
+; Memory: 152 words at 0x000..0x097 in the real and model builds (149 in
+; the RTL build, whose MS and HBI fit one-word MOV16s): 24 words run into
+; thread 1's quarter, so thread 1 must not be started. Beside
+; kline_ecu.loom (thread 2, 0x100..0x1D1, its buffer and table to 0x1FF)
+; the two take 362 of the 512 words and threads 1 and 3 stay stopped.
