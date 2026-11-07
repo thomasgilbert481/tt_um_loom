@@ -1,0 +1,213 @@
+; ax25_rx.loom
+; An AX.25 packet receiver over Bell 202 AFSK, on one thread: it times the
+; zero crossings of the limited audio, recovers the bits, undoes NRZI,
+; finds the flags, removes the stuff bits, checks the FCS and hands every
+; frame's octets and a status word to the host. The receive side of
+; ax25_tx.loom: wire OUT0 to IN0.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The hardware it uses, and
+; what that hardware was built for:
+;   - the edge wait (WAITE ANY, built for clocked and pulse-width inputs)
+;     and NOW as a time stamp, as bell202_demod.loom uses them;
+;   - the bit engine's shift register, bit counter and CRC unit (6.9),
+;     built for USB, CAN and the serial buses, here fed by SHI from the
+;     PIN_OUT view of RXD (pin index 18, SEMANTICS 3): the program writes
+;     each data bit to RXD and shifts it in from there, so SR assembles the
+;     octets, CNT counts their bits and the CRC unit runs the FCS-16;
+;   - OUTQ for the octets and the reports.
+; What the firmware does that no hardware does: the tone decision and the
+; bit clock (bell202_demod.loom's DPLL, unchanged), NRZI decoding (the
+; engine's NRZI decoder reads a pin once a bit at its own tick, but here
+; the bits come from software at irregular times), the flag, abort and
+; stuff-bit logic of HDLC (a 0 after five 1s; the engine's stuffing knows
+; USB's and CAN's rules), the frame boundaries and the report.
+;
+; Why one thread: the receiver is edge-driven, with no deadline (as
+; bell202_demod.loom), so the link layer can run in the time between two
+; zero crossings (36 ticks at least, about 11 000 clocks at 50 MHz; the
+; longest path from one WAITE to the next, for an edge that emits one
+; sample and a report, is under 70 slots). Split across
+; two threads it would need a pin between them read once a bit, and so a
+; second bit clock: the DPLL already is one. The registers fit because
+; the bit engine holds the octet, its bit count and the CRC.
+;
+; Input: RX = IN0, a logic-level signal whose edges are the zero crossings
+; of the line signal (a comparator after a band-pass filter; or
+; ax25_tx.loom's square wave directly). RXD = OUT2 shows every data bit
+; as it is shifted in (flags and stuff bits are not), a debug view; it
+; must be one of OUT0..OUT5.
+;
+; Standards: AX.25 2.2 and Bell 202 as ax25_tx.loom; tools/protomodels/
+; ax25.py gives the sections and marks what could not be checked.
+;
+; Tick: as bell202_demod.loom, 1/132 of a bit: at 50 MHz TICK_INT 315,
+; TICK_FRAC 168. The tone decision, the DPLL and their tolerances are that
+; program's (header there): a tone may be 15 ticks off, the bit rate a few
+; per cent; with HDLC a transition comes at least every sixth bit (a flag
+; has six 1s in a row, data at most five), so the DPLL re-times far more
+; often than in an 8N1 character.
+;
+; NRZI and HDLC, one sample at a time. A sample whose tone differs from
+; the last one is a 0, else a 1 (AX.25: a 0 is a change of tone). The run
+; of 1s is counted: after five 1s a 0 is a stuff bit and is dropped; after
+; six a 0 ends a flag; a seventh 1 is an abort, and the receiver hunts for
+; the next flag. Every other bit is data: it goes to RXD and through SHI.
+; A flag ends the frame in progress and opens the next (a shared flag
+; works: the closing flag of one frame may be the opening flag of the
+; next). Because the five 1s before a flag's sixth have gone through SHI
+; with the 0 before them, a good frame leaves its CRC not at the usual
+; 0x1D0F (FCS-16's good residue, x^15 first) but at what those six bits
+; 0 1 1 1 1 1 make of it, 0xD0F9, and CNT at 2 (six bits into an octet).
+;
+; Host interface (OUTQ[3], when on thread 3):
+;   a data word per octet, as soon as its eighth bit is in: bits 7:0 the
+;     octet, 15:8 = 0. The FCS octets come too (the last two before the
+;     report); the program cannot know they are the FCS until the flag.
+;   after the closing flag (or an abort) of a frame with at least one
+;     octet, a report: bit 15 = 1 (a report, never a data word), bit 14
+;     bad FCS, bit 13 not a whole number of octets, bit 12 abort; bits
+;     11:0 the octets delivered, the FCS included. All three clear: a good
+;     frame. Flags with no octet between them (idle flags) report nothing.
+;   PUSH blocks while OUTQ is full (FIFO_DEPTH 4), and edges are missed
+;   while it does, so the host drains OUTQ within four octets (27 ms).
+; Nothing is read from INQ. No address filtering: every frame is
+; delivered, and the host applies AX.25 2.2's 3.9: a frame of fewer than
+; 136 bits, flags included, is invalid, and so is one not octet-aligned
+; (bit 13). An abort (3.10: fifteen 1s or more) shows at the seventh 1.
+;
+; Memory: 119 words, 0x180 to 0x1F6 of thread 3's quarter (.imem 512),
+; beside ax25_tx.loom (threads 0 and 1, buffer at 0x100). Start thread 3 only.
+
+        .imem   512
+        .thread 3
+        .pins   RX = IN0, RXD = OUT2
+        .equ    RXDIDX = 18                     ; OUT2 in the pin index space
+        .equ    CFG    = 1 << 9                 ; CRC_EN, LSB first, NRZ, no stuffing
+        .equ    POLY   = 0x1021                 ; FCS-16
+        .equ    GOOD6  = 0xD0F9                 ; 0x1D0F after the bits 0 1 1 1 1 1
+        .equ    BIT_T  = 132                    ; ticks a bit
+        .equ    HBIT   = 66                     ; half a bit
+        .equ    MK     = 66                     ; a mark half-period
+        .equ    SP     = 36                     ; a space half-period
+        .equ    THRESH = 51                     ; (MK + SP) / 2
+        .equ    BOUNCE = 12                     ; shortest half-period accepted
+        .equ    NEW    = 16                     ; r5: the tone changed since the last sample
+
+; r0 T0, the last accepted edge   r1 P, the half-period before   r2 S, the
+; next sample time   r3 the tone, 1 mark 0 space   r4 the octets of the
+; frame so far, bit 15 = hunting (no frame open)   r5 the run of 1s, plus
+; NEW   r6 r7 scratch
+
+start:  .csr    BE_PINS, RXDIDX << 5    ; in = RXD
+        .csr    CRC_POLY, POLY
+        .csr    CRC_INIT, 0xFFFF
+        .csr    BE_CFG, CFG
+        MOV16   r4, 0x8000              ; hunting
+        LDI     r5, 0
+        LDI     r3, 1                   ; assume mark
+        LDI     r1, MK
+        CSRR    r0, NOW
+        LDI     r2, HBIT
+        ADD     r2, r2, r0
+
+; bell202_demod.loom's tone decision and bit clock, unchanged but for NEW.
+edge:   WAITE   RX, ANY
+        CSRR    r6, NOW                 ; one slot after every edge alike
+        SUB     r7, r6, r0              ; L, this half-period
+        CMPI    r7, BOUNCE
+        BNC     edge                    ; too soon: ignored, T0 kept
+        CMPI    r7, THRESH
+        BC      markhp
+        TEST    r3, r3                  ; a space half-period
+        BZ      same
+        ADD     r2, r0, r1              ; mark to space:
+        ADD     r2, r2, r7              ;   S = T0 + P + 2 L - 2 SP - MK + HBIT
+        ADD     r2, r2, r7
+        SUBI    r2, SP
+        SUBI    r2, SP
+        LDI     r3, 0
+        ORI     r5, NEW
+        JMP     same
+markhp: TEST    r3, r3                  ; a mark half-period
+        BNZ     same
+        LDI     r2, MK + 2 * SP + HBIT  ; space to mark:
+        ADD     r2, r2, r0              ;   S = T0 + MK + 2 SP + HBIT - L - 2 P
+        SUB     r2, r2, r7
+        SUB     r2, r2, r1
+        SUB     r2, r2, r1
+        LDI     r3, 1
+        ORI     r5, NEW
+same:   MOV     r1, r7                  ; P = L
+        MOV     r0, r6                  ; T0 = this edge
+
+emit:   SUB     r7, r0, r2              ; every sample due by this edge takes
+        SHLI    r7, 1                   ; this half-period's tone; C = 1: S is
+        BC      edge                    ; still ahead (half-window, mod 2^16)
+
+; One sample. NRZI: a change of tone is a 0.
+        CMPI    r5, NEW                 ; C = NEW set (the run is at most 6)
+        BC      zero
+        INC     r5                      ; a 1: the run grows
+        CMPI    r5, 6
+        BC      run6                    ; six or more
+        SETP    RXD, 1                  ; a data 1
+        JMP     shift
+run6:   BZ      adv                     ; six: a flag if a 0 comes next
+        LDI     r5, 7                   ; seven or more: held at 7, below NEW
+        ADD     r6, r4, r4              ; an abort. C = hunting
+        BC      adv
+        TEST    r4, r4
+        BZ      hunt                    ; no octet yet: nothing to report
+        MOV16   r7, 0x9000              ; a report: abort
+        OR      r4, r4, r7
+        PUSH    r4                      ; blocks while OUTQ is full
+hunt:   MOV16   r4, 0x8000
+        JMP     adv
+
+zero:   MOV     r6, r5
+        ANDI    r6, 15                  ; the run of 1s before this 0
+        LDI     r5, 0
+        CMPI    r6, 5
+        BZ      adv                     ; after five 1s: a stuff bit, dropped
+        CMPI    r6, 6
+        BZ      flag                    ; after six: a flag
+        SETP    RXD, 0                  ; a data 0
+shift:  ADD     r6, r4, r4              ; C = hunting: nothing is collected
+        BC      adv
+        SHI                             ; RXD into SR and the CRC; Z: an octet
+        BNZ     adv
+        STSR    r6
+        SHRI    r6, 8                   ; LSB first: the octet was in SR[15:8]
+        PUSH    r6                      ; blocks while OUTQ is full
+        INC     r4
+        LDI     r6, 8
+        CSRW    CNT, r6
+        JMP     adv
+
+flag:   ADD     r6, r4, r4              ; C = hunting: this flag opens a frame
+        BC      open
+        TEST    r4, r4
+        BZ      open                    ; no octet between the flags: no report
+        CSRR    r7, CNT
+        CMPI    r7, 2                   ; six flag bits into the last octet
+        BZ      whole
+        MOV16   r7, 0x2000              ; not a whole number of octets
+        OR      r4, r4, r7
+whole:  STCRC   r7
+        MOV16   r6, GOOD6
+        CMP     r7, r6
+        BZ      good
+        MOV16   r7, 0x4000              ; bad FCS
+        OR      r4, r4, r7
+good:   MOV16   r7, 0x8000              ; a report
+        OR      r4, r4, r7
+        PUSH    r4                      ; blocks while OUTQ is full
+open:   LDI     r4, 0                   ; a frame is open, no octet yet
+        CRCI
+        LDI     r6, 8
+        CSRW    CNT, r6
+
+adv:    LDI     r7, BIT_T
+        ADD     r2, r2, r7              ; the next sample, a bit later
+        JMP     emit

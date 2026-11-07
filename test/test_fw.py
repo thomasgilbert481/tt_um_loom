@@ -106,6 +106,7 @@ from tools.tests import test_fw_baudot                            # noqa: E402
 from tools.tests import test_fw_x10                               # noqa: E402
 from tools.tests import test_fw_padctl                            # noqa: E402
 from tools.tests import test_fw_em4100                            # noqa: E402
+from tools.tests import test_fw_ax25                              # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
@@ -126,7 +127,7 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_hdq, test_fw_joybus, test_fw_cec, test_fw_hd44780,
            test_fw_psi5, test_fw_cppm, test_fw_bell202, test_fw_ds1302,
            test_fw_morse, test_fw_microwire, test_fw_baudot, test_fw_x10,
-           test_fw_padctl, test_fw_em4100)
+           test_fw_padctl, test_fw_em4100, test_fw_ax25)
 
 
 def _make(scenario):

@@ -1,0 +1,349 @@
+; ax25_tx.loom
+; An AX.25 packet transmitter over Bell 202 AFSK, the stack amateur packet
+; radio and APRS use: a UI frame built from the host's callsigns and
+; payload, its FCS, HDLC zero-bit insertion and flags, NRZI, and the two
+; tones, phase-continuous, at 1200 bit/s. Two threads, one per layer:
+; thread 0 is the link layer and leaves an NRZI baseband line on LINE;
+; thread 1 is the modem and turns that line into tones on TX.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The hardware it uses, and
+; what that hardware was built for:
+;   - the bit engine's NRZI encoder (SEMANTICS 6.9.1), built for USB, on
+;     thread 0: 0 = a transition, which is AX.25's line code too;
+;   - the CRC unit (6.9), built for USB, CAN and CRC-8: here the FCS-16,
+;     x^16 + x^12 + x^5 + 1, CRC_POLY 0x1021, CRC_INIT 0xFFFF;
+;   - LD/ST (6.11), built for the EEPROM and USB programs: the frame buffer;
+;   - the PIN_OUT view of the OUT pins (pin indices 16..21, SEMANTICS 3),
+;     built so a program can read back what it drives: here thread 1 reads
+;     the line thread 0 drives, with no wire and no FIFO between them;
+;   - the shared flags (6.5), built for handshakes between threads: they
+;     start the two threads' tick grids one clock apart;
+;   - the fractional tick and the deadline-latched pin write (6.10), built
+;     for UART baud rates and clock-exact edges: the tones.
+; What the firmware does that no hardware does: the AX.25 address field
+; (each callsign octet shifted left one bit, the extension bit on the
+; last), the UI control and PID octets, HDLC's zero-bit insertion (the
+; engine's stuffing knows USB's and CAN's rules, not a 0 after five 1s),
+; the flags, and the AFSK oscillator itself. The two threads are
+; hdlc_loopback.loom's transmitter and bell202_mod.loom's oscillator,
+; each changed only where the layers meet.
+;
+; Why two threads and not one: a thread has eight registers, and the
+; oscillator needs four of them every tick while the framer needs all
+; eight at a bit boundary; split, each layer keeps its registers, its own
+; schedule (one deadline a bit against one a tick) and its own proof, and
+; the interface between them is one wire, as it is between a TNC and a
+; modem. Nothing has to be interleaved by hand.
+;
+; The layers meet on LINE. NRZI turns "a 0 is a transition" into a line
+; level; 1200 bit/s packet radio sends a 0 as a change of tone and a 1 as
+; no change (the TNC-2 / APRS convention; AX.25 2.2 leaves the physical
+; layer out, QUESTIONS.md). So the modem
+; needs no bit clock and no knowledge of frames: thread 1 sends mark while
+; LINE is high and space while it is low, read once a tick. The tone
+; changes exactly when the line does, and the line changes only on
+; thread 0's bit ticks.
+;
+; Standards (tools/protomodels/ax25.py gives the sections and marks what
+; could not be checked): AX.25 Link Access Protocol, version 2.2 (TAPR,
+; July 1998), read 2026-11-07: 3.1 flags (a shared flag allowed), 3.6
+; zero-bit insertion, 3.7 FCS per ISO 3309, 3.8 octets LSB first and the
+; FCS "most-significant bit first", 3.11 flags as time fill, 3.12 address
+; field encoding, 4.3.3.6 UI frame (control 000P0011), 3.4 PID 0xF0 (no
+; layer 3), 6.1.2 command/response bits. NRZI and the tones are not in
+; AX.25: Bell 202 as bell202_mod.loom cites it (mark 1200 Hz, space
+; 2200 Hz, 1200 bit/s, continuous phase).
+; Pins: TX = OUT0, the AFSK square wave (an external low-pass makes the
+; sine, as for bell202_mod.loom); LINE = OUT1, the NRZI baseband, also on
+; its pad (a scope sees the link layer on its own). LINE must be one of
+; OUT0..OUT5 (thread 1 reads it through the PIN_OUT view, index 16..21).
+;
+; Host words, INQ[0] (thread 0):
+;   a command: bits 7:0 n, the information octets, 0..240 (the buffer
+;     holds 128 words); bits 15:8 ignored;
+;   then 7 words, the 14 address octets, two a word, the first in 7:0:
+;     the destination callsign (6 ASCII characters, upper case and digits,
+;     padded with spaces), its SSID octet, the source callsign and its
+;     SSID octet, all before the shift: an SSID octet is given as
+;     C << 6 | 0x30 | SSID (the two reserved bits are 1, AX.25 2.2 3.12.2;
+;     C is the command/response bit: 1 for the destination of a command
+;     frame and 0 for its source, 6.1.2). The program shifts every octet
+;     left one bit and sets the extension bit of the last (3.12): that
+;     octet's bit 0. Two addresses: no digipeater path (QUESTIONS.md).
+;   then (n + 1) / 2 words of information, first octet in 7:0 (an odd last
+;     octet in 7:0, 15:8 ignored).
+; The program adds control 0x03 (UI, P = 0) and PID 0xF0, computes the FCS
+; and sends flag, address, control, PID, information, FCS, flag. Nothing is
+; ever pushed to OUTQ.
+;
+; Timing. Both threads run on one tick, 1/132 of a bit, as bell202_mod.loom
+; does: at 50 MHz TICK_INT 315, TICK_FRAC 168 (1.0 ppm fast). The host sets
+; it for threads 0 and 1 before RUN, and starts both. Thread 0 waits 132
+; ticks a bit; thread 1 one tick. At start thread 1 signals SFLAGS[1],
+; thread 0 waits for it and signals SFLAGS[0], and each then rewrites its
+; TICK_INT (SEMANTICS 4: ACC <= 0); the order of those slots is fixed, so
+; thread 1's tick falls one clock after thread 0's, always. Thread 0's line
+; edge is visible by 9 clocks after its tick (a WAITD is up to 3 late, the
+; SHO or SETP is the next slot, 2 more for the shared view, SEMANTICS 2);
+; thread 1 reads LINE in the fourth slot or later after its own tick, 13
+; clocks or more after thread 0's: every bit's tone change falls on the
+; same tick of the bit, with no race and no jitter.
+; The schedule is proved for a tick of 44 clocks or more (thread 1's
+; longest tick is 11 slots). The tones' edges are exact from 46 clocks on:
+; a staged SETP lands on its deadline's own edge only if the WAITD after
+; it has committed before that tick (SEMANTICS 6.10, rule 1); at 44 the
+; WAITD may commit up to 1 clock after it (3 late, 40 more, 2 to commit)
+; and the edge falls on the slot grid instead, up to 4 clocks late (seen
+; on the model 2026-11-07). At 50 MHz the tick is 315 clocks.
+;
+; Idle: flags back to back on LINE, so the tones never stop (no carrier
+; control: a PTT pin is QUESTIONS.md's). A frame starts two flags after
+; its last word is in (an idle flag, then the opening flag); a slow host
+; delays a frame but never breaks it.
+;
+; Memory (.imem 512): 162 words. Thread 0's code is 138 words, more than
+; a quarter: 0x000 to 0x046, and on from 0x0A0 to 0x0E2 (the opening flag,
+; the FCS and the bit loop), past thread 1's 24 words at 0x080 to 0x097.
+; The transmit buffer is thread 2's quarter, 0x100 to 0x17F (128 words,
+; written with ST before any LD reads them). ax25_rx.loom (119 words)
+; fits beside it in thread 3's quarter. Start threads 0 and 1 only.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   The physical layer (NRZI, Bell 202 at 1200 baud) is not in AX.25 2.2;
+;   it is the TNC-2 / APRS convention, from memory and unchecked, with
+;   Bell 202 cited as bell202_mod.loom cites it.
+;   FCS bit order: the ISO 3309 (HDLC) order, as the shipped HDLC program
+;   sends it; not checked against a frame captured from a real TNC.
+;   Two addresses only (no digipeater path), C bits from the host, and the
+;   tones run until the threads stop (no PTT or carrier-off pin).
+;   AX.25 2.2 figure 3.5 shows 0x98 for a shifted "N"; the text's rule
+;   gives 0x9C, which the tests use.
+
+        .imem   512
+        .pins   TX = OUT0, LINE = OUT1
+        .equ    BIT_T  = 132            ; ticks a bit
+        .equ    CFG = (1 << 3) | (1 << 9)       ; ENC NRZI, DIR LSB first, CRC_EN
+        .equ    CFGI = CFG | (1 << 7)           ; the same with INV
+        .equ    POLY = 0x1021           ; FCS-16, x^16 + x^12 + x^5 + 1
+        .equ    FLAG = 0x7E
+        .equ    UI = 0x03               ; control: UI frame, P = 0
+        .equ    PID = 0xF0              ; no layer 3 protocol
+        .equ    TXBUF = 0x100
+        .equ    LINEIDX = 17            ; OUT1 in the pin index space (16 + 1)
+
+; --------------------------------------------------------- thread 0: link
+; The transmitter of hdlc_loopback.loom, at one bit per 132 ticks: the
+; engine sends with ENC = NRZI, STUFF = 0 and CRC_EN, LSB first; after the
+; fifth 1 in a row the next bit is a stuff 0 sent by hand (SETP of the
+; complement of the line, then BE_CFG rewritten with INV equal to the new
+; level, which clears LVL, 6.9.1, so the encoder goes on from the line as
+; it stands); the stuff bit never enters SR or the CRC. The FCS: STCRC,
+; NOT, REV (the x^15 coefficient first) and sixteen more bits through the
+; same loop. Idle flags are raw (never stuffed); while they go out the
+; command and its words are taken from INQ, one word a bit, each POP
+; guarded by a WAITB INQ_NE, T that completed by condition.
+; r0 the command, then the word on the wire   r1 the next raw octet, then
+; the 1s still allowed before a stuff bit   r2 the buffer pointer
+; r3 words to come, then the CNT reload   r4 bits to go   r5 CFG   r6 CFGI
+; r7 scratch, then how many ends are to come (the data's, the FCS's)
+
+        .thread 0
+        .tick   44                      ; the fastest tick proved (thread 1 sets it)
+        SETP    LINE, 0                 ; the line starts low ...
+        .csr    BE_PINS, LINEIDX        ; out = LINE
+        .csr    CRC_POLY, POLY
+        .csr    CRC_INIT, 0xFFFF
+        MOV16   r5, CFG
+        MOV16   r6, CFGI
+        CSRW    BE_CFG, r5              ; ... and LVL = 0, INV = 0 is the low line
+        WAITS   1                       ; thread 1 is at its WAITS 0 ...
+        SIG     0                       ; ... and leaves it one clock after us:
+        CSRR    r7, TICK_INT            ; both rewrite TICK_INT, so the two
+        CSRW    TICK_INT, r7            ; tick grids restart one clock apart
+        LDI     r1, FLAG
+        SETD    1
+
+; Idle A: flags, and a command taken if one is waiting.
+ia:     LDSR    r1                      ; FLAG
+        LDI     r4, 8
+        MOV16   r2, TXBUF
+al:     WAITD   BIT_T
+        SHO                             ; raw: idle octets are not stuffed
+        WAITB   INQ_NE, T               ; TD has passed: a test, not a wait
+        BT      an
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only thread 0 pops INQ[0]"
+        POP     r0                      ; the command, kept for the opening flag
+        SHLI    r0, 8
+        SHRI    r0, 8                   ; n
+        MOV     r3, r0
+        ADDI    r3, 15
+        SHRI    r3, 1                   ; words to come: 7 + (n + 1) / 2
+        LDI     r1, 7                   ; of which address words
+        DJNZ    r4, bl
+        JMP     ib
+an:     DJNZ    r4, al
+        JMP     ia
+
+; Idle B: flags, and the frame's words into the buffer, one a bit. The
+; seven address words are encoded on the way in (AX.25 2.2, 3.12): both
+; octets shifted left one bit (the low octet's bit 7 is 0, ASCII and the
+; SSID octet are 7-bit, so it lands as the high octet's bit 0), and the
+; last word's bit 7 set first, which is the extension bit E = 1 of the
+; last address octet after the shift. Control and PID go in after them.
+ib:     LDI     r7, FLAG
+        LDSR    r7
+        LDI     r4, 8
+bl:     WAITD   BIT_T
+        SHO
+        WAITB   INQ_NE, T
+        BT      bn
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only thread 0 pops INQ[0]"
+        POP     r7
+        CMPI    r1, 0
+        BZ      bs                      ; information: as it is
+        DEC     r1                      ; an address word; Z: the last
+        BNZ     bsh
+        XOR     r7, r7, r5              ; CFG ^ CFGI is INV, bit 7: E,
+        XOR     r7, r7, r6              ; once shifted
+        SHLI    r7, 1
+        ST      r7, r2, 0               ; TXBUF + 6
+        INC     r2
+        MOV16   r7, (PID << 8) | UI     ; TXBUF + 7: control, PID
+        JMP     bs
+bsh:    SHLI    r7, 1
+bs:     ST      r7, r2, 0
+        INC     r2
+        DJNZ    r3, bn
+        DJNZ    r4, cl                  ; all in: finish this octet, then open
+        JMP     open
+bn:     DJNZ    r4, bl
+        JMP     ib
+cl:     WAITD   BIT_T
+        SHO
+        DJNZ    r4, cl
+        JMP     open
+
+; The thread 1 section follows here in memory; the opening flag and the
+; FCS set-up are at 0x0A0, after it, in thread 1's quarter.
+
+; -------------------------------------------------------- thread 1: modem
+; bell202_mod.loom's oscillator with the bit source changed: no queue, no
+; framing, no bit counter. r0 holds the phase still to go in the current
+; half-cycle, minus one, in units of 1/396 half-cycle; mark spends 6 a
+; tick (396 / 66), space 11 (396 / 36). When a step would pass zero the
+; output toggles and r0 gains 396, keeping the remainder, so the phase
+; carries across every change of tone. The toggle is staged with SETP ... D
+; and lands on the next tick exactly. LINE is read once a tick, in the
+; fourth slot or later after the WAITD (see Timing above), and decides the
+; step of the ticks that follow: a tone change is one tick after the line
+; change on every bit. A bit is 132 ticks of either tone: a mark bit is 792
+; units and a space bit 1452, both multiples of 66, so (bell202_mod.loom's
+; argument) every crossing of the ideal continuous-phase wave is on a tick.
+; r0 phase to go - 1   r1 phase step   r5 HALF   r7 scratch
+
+        .equ    HALF   = 396                    ; phase units a half-cycle
+        .equ    MARK   = 6                      ; units a tick at 1200 Hz (396 / 66)
+        .equ    SPACE  = 11                     ; units a tick at 2200 Hz (396 / 36)
+
+        .thread 1
+        .tick   44                      ; the fastest tick the schedule is proved for
+        SETP    TX, 1                   ; a half-cycle starts high
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
+        MOV16   r5, HALF
+        MOV16   r0, HALF - 1            ; a whole half-cycle to go
+        LDI     r1, MARK                ; LINE starts low, but idles on flags
+        SIG     1                       ; ready ...
+        WAITS   0                       ; ... and thread 0 has signalled
+        CSRR    r7, TICK_INT
+        CSRW    TICK_INT, r7            ; one clock after thread 0's rewrite
+        SETD    1
+
+tick:   WAITD   1
+        SUB     r0, r0, r1              ; C = 0: this tick ends the half-cycle
+        BC      look
+        ADD     r0, r0, r5              ; the remainder carries into the next one
+        JP      TX, 1, fall
+        SETP    TX, 1, D                ; staged: lands on the next tick exactly
+        JMP     look
+fall:   SETP    TX, 0, D
+look:   LDI     r1, MARK                ; high line: mark (LDI keeps the flags)
+        JP      LINE, 1, tick
+        LDI     r1, SPACE               ; low line: space
+        JMP     tick
+
+; ------------------------------------------- thread 0, continued at 0x0A0
+; Two more flags, the second the opening flag, with the frame set up
+; between their bits. r0 is n.
+        .thread 0
+        .org    0x0A0
+open:   MOV16   r1, (FLAG << 8) | FLAG
+        LDSR    r1
+        LDI     r1, 14                  ; flag bits 1 to 14 in the loop below
+        MOV     r4, r0
+        WAITD   BIT_T                   ; flag bit 0
+        SHO
+        ADDI    r4, 16                  ; the octets: address 14, control, PID, n
+        SHLI    r4, 3                   ; the bits
+        LDI     r7, 2                   ; ends to come: the data's, the FCS's
+        LDI     r3, 16                  ; the CNT reload
+        MOV16   r2, TXBUF
+        LD      r0, r2, 0               ; the first two address octets
+        INC     r2
+fo:     WAITD   BIT_T                   ; flag bits 1 to 14
+        SHO
+        DJNZ    r1, fo
+        WAITD   BIT_T                   ; bit 15, the last of the opening flag
+        SHO
+        CRCI                            ; the FCS covers what follows the flag
+        LDSR    r0
+        CSRW    CNT, r3
+        SHRI    r0, 1                   ; C = the first bit
+        LDI     r1, 5                   ; five 1s before a stuff bit
+        JMP     txb
+
+; The FCS, entered right after the last data bit's SHO.
+fcs:    STCRC   r0
+        NOT     r0, r0                  ; sent complemented ...
+        REV     r0, r0                  ; ... the x^15 coefficient first
+        LDSR    r0
+        CSRW    CNT, r3
+        LDI     r4, 16
+        SHRI    r0, 1                   ; and on into txb
+
+; Every bit of address, control, PID, information and FCS.
+txb:    WAITD   BIT_T
+        SHO                             ; the bit; Z = (CNT == 0): the word is out
+        BC      t1                      ; C = this bit (the SHRI of the copy before)
+        LDI     r1, 5                   ; a 0: five more 1s before a stuff bit
+tn:     BZ      wend
+        SHRI    r0, 1                   ; C = the next bit
+        DJNZ    r4, txb                 ; bits left in the data, or in the FCS
+        DJNZ    r7, fcs                 ; the data are out: the FCS
+close:  LDI     r1, FLAG                ; the FCS is out: the closing flag is
+        JMP     ia                      ; the first idle flag
+wend:   DJNZ    r4, wl                  ; the word is out: bits left?
+        DJNZ    r7, fcs
+        JMP     close
+wl:     LD      r0, r2, 0               ; the next word
+        INC     r2
+        LDSR    r0
+        CSRW    CNT, r3
+        SHRI    r0, 1
+        JMP     txb
+t1:     DJNZ    r1, tn                  ; a 1: fewer than five so far
+        LDI     r1, 5                   ; the fifth: a stuff bit next
+        JP      LINE, 1, th             ; the level the stuff bit leaves
+        WAITD   BIT_T
+        SETP    LINE, 1                 ; the stuff 0: the line rises ...
+        CSRW    BE_CFG, r6              ; ... and LVL = 0 is now the high line
+ts:     BZ      wend                    ; then on with the bit before it
+        SHRI    r0, 1
+        DJNZ    r4, txb
+        DJNZ    r7, fcs
+        JMP     close
+th:     WAITD   BIT_T
+        SETP    LINE, 0                 ; the line falls ...
+        CSRW    BE_CFG, r5              ; ... and LVL = 0 is the low line
+        JMP     ts
+
