@@ -1,0 +1,308 @@
+; swim_target.loom
+; An STM8-style SWIM target in firmware: it waits in the OFF state for the
+; entry sequence, answers with the synchronisation frame, then takes SRST,
+; ROTF and WOTF at the low speed against a small memory and SWIM_CSR, with
+; ACK on every good frame, NACK on a bad header or parity, the host's NACK
+; answered by the same byte again, and the communication reset.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It is the other end of
+; swim_host.loom, and uses the same hardware for the same jobs: an
+; open-drain BIDIR pin (OD_MASK, built for I2C); the deadline-latched pin
+; write (SETP ... D, SEMANTICS 6.10, built for ws2812's exact edges) for
+; every fall and every 0's release; the fractional tick (SEMANTICS 4, built
+; for UART baud rates), here the target's HSI: the host sets it, so a test
+; can put the target's clock off nominal; the bit engine's SHI (SEMANTICS
+; 6.9) sampling the host's bits MSB first; PAR for parity; LD/ST (6.11) for
+; the memory. What the firmware does that no hardware does: the entry
+; detector, the sync frame, the bit decision, frames, parity, ACK/NACK, the
+; command decoder and the address map.
+;
+; Source: ST UM0470, DocID14024 Rev 4 (August 2016), as swim_host.loom
+; cites it: 3.2 (entry, sync of 128 SWIM clocks), 3.3.2 (low-speed bits),
+; 3.4 (frames, parity, ACK/NACK), 3.5 and Table 1 (SRST 000, ROTF 001,
+; WOTF 010, N, @E @H @L), 3.6 (communication reset: low over 64 SWIM
+; clocks), 3.10.1 (SWIM_CSR at 0x7F80; SWIM_DM is bit 5).
+;
+; Timing, in ticks of the target's two SWIM clocks (12.5 clocks at a
+; nominal 8 MHz SWIM clock; the host sets the tick, header below):
+;     host bit   sampled at G + 5 ticks, G its fall seen (swim_host.loom
+;                derives 9.4 to 12.3 SWIM clocks after the fall)
+;     comm reset a low past G + 32 ticks, 64 SWIM clocks (3.6): the target
+;                waits for the rise and sends the sync frame
+;     own bits   as swim_host.loom: falls 12 ticks apart, a 0 low 10 ticks
+;                (latched), a 1 low 10 to 13 clocks; each frame or ACK the
+;                first fall 12 ticks after the host's last rise
+;     sync       its fall SYNCD = 40 ticks (10 us) after the entry's last
+;                rise or the reset's rise, 64 ticks (128 SWIM clocks) low
+; Entry detection (3.2): after a low (the 16 us), sixteen halves are timed
+; with NOW: eight between LMIN and LMIN + LSPAN (1 kHz: 500 us nominal,
+; accepted 375 to 625 us), then eight in half that window (2 kHz: 250 us,
+; accepted 188 to 312 us); the last is a low, and its rise ends the entry.
+; Anything else starts the detection again from the next low. UM0470 says
+; the target detects the frequency ratio, whatever its LSI; here the
+; windows are fixed, +-25 %, in the target's own ticks (QUESTIONS.md item 1).
+;
+; Memory map (@E @H @L, 3.5):
+;     0x000000..0x00000F   16 bytes of RAM (data memory MEM..MEM+15)
+;     0x007F80             SWIM_CSR (3.10.1), reset value 0x00
+;     anything else        reads 0x00, writes ignored
+; While SWIM_CSR.SWIM_DM (bit 5) is 0, only SWIM_CSR is reached and SRST
+; does nothing (3.10.1); the host writes 0xA0 first (3.2 step 6). The other
+; SWIM_CSR bits are stored as written; HS is stored but the target stays
+; at the low speed (QUESTIONS.md item 4), and RST, SAFE_MASK and the
+; read-only bits have no effect.
+;
+; Host words (FIFO space, thread 1): one word before anything else, the
+; target's tick, {TICK_INT, TICK_FRAC}: 0x0C80 for 12.5 clocks (8 MHz SWIM
+; clock at 50 MHz). The deadline checker proves the program at 12 clocks,
+; so the word must give 12.0 or more (a 4 % fast HSI at most).
+; Reports (FIFO space read, thread 1), if OUTQ has room (else dropped):
+;     0x5000   SRST taken (SWIM_DM set)
+;     0x6000   a WOTF completed
+;
+; OD_MASK (BUGS 14): set first and read back three slots later, as
+; swim_host.loom does.
+;
+; Memory: 197 words, 17 of them data. Thread 1's quarter, 0x080..0x0FF,
+; with the data at its end; the entry detector and the subroutines in
+; thread 3's quarter at 0x180 (thread 3 must not be started). With
+; swim_host.loom (thread 0, spill at 0x100) they load together: 407 of
+; the 512 words.
+;
+; Registers: r0 a value, r1 a bit count, r2 a frame's length, r3 N, r4 the
+; command and an "@E is not 0" flag (bit 5), r5 @H @L, r6 scratch and a bit
+; counter, r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    SWPIN = 1               ; BIDIR1
+        .pins   SW = SWPIN
+        .equ    SWBIT = 1 << SWPIN
+        .equ    ETICK = 100             ; the host's entry tick in clocks (scaled build: 10)
+        .equ    LMIN = 15 * ETICK       ; a 1 kHz half, in ticks: 2000 nominal
+        .equ    LSPAN = 10 * ETICK
+        .equ    SYNCD = 40
+        .equ    RLOW = 64               ; 128 SWIM clocks
+        .equ    MEM = 0x0EF             ; 16 bytes, one a word
+        .equ    NMEM = 16
+        .equ    CSRA = 0x0FF            ; SWIM_CSR
+        .equ    DM = 0x20               ; SWIM_CSR.SWIM_DM
+        .equ    EBAD = 0x20             ; r4: @E was not 0
+        .tick   12                      ; the host sets 12.0 or more (header)
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, SWBIT
+        CSRW    OD_MASK, r7             ; SWIM open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, SWBIT
+        BZ      start                   ; lost to the other thread's write
+        SETP    SW, 1                   ; let go of the line
+        POP     r0                      ; the tick {TICK_INT, TICK_FRAC}
+        MOV     r7, r0
+        SHRI    r7, 8
+        CSRW    TICK_INT, r7
+        CSRW    TICK_FRAC, r0
+        LDI     r7, 2
+        CSRW    BE_CFG, r7              ; SHI MSB first (DIR), no CRC
+        LDI     r7, SWPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples SWIM
+
+        JMP     off                     ; OFF: the entry detector, at 0x180
+; The sync frame (3.2 step 4, 3.6): SYNCD after the rise, RLOW low.
+sync:   SETD    0
+        SETP    SW, 0, D
+        WAITD   SYNCD                   ; the fall
+        SETP    SW, 1, D
+        WAITD   RLOW                    ; released
+
+; ACTIVE: a command frame, then what it needs.
+main:   LDI     r2, 5                   ; header, b2..b0, parity
+        CALL    rxh
+        CALL    ack
+        MOV     r4, r0                  ; the command
+        LDI     r2, 10                  ; data frames from here on
+        CMPI    r0, 3
+        BC      main                    ; reserved (Table 1): acknowledged, ignored
+        CMPI    r0, 0
+        BNZ     rw
+        LDI     r7, CSRA                ; SRST: only with SWIM_DM (3.5.1)
+        LD      r7, r7, 0
+        ANDI    r7, DM
+        BZ      main
+        LDI     r7, 0
+        LDIH    r7, 0x50
+        JMP     report
+rw:     CALL    rxh
+        CALL    ack
+        MOV     r3, r0                  ; N
+        CALL    rxh                     ; @E
+        CALL    ack
+        CMPI    r0, 0
+        BZ      rw_e0
+        ORI     r4, EBAD
+rw_e0:  CALL    rxh
+        CALL    ack
+        SWAP    r5, r0                  ; @H in 15:8
+        CALL    rxh
+        CALL    ack
+        OR      r5, r5, r0              ; @L
+        CMPI    r3, 0
+        BZ      main                    ; N = 0: nothing (3.5 says 1 to 255)
+        MOV     r7, r4
+        ANDI    r7, 3
+        CMPI    r7, 1
+        BNZ     wotf
+; ROTF: N bytes from @E @H @L, each in a target frame (header 1), sent
+; again while the host NACKs it (3.5.2).
+rotf:   CALL    loc
+        LDI     r0, 0
+        BZ      r_send                  ; not mapped: 0x00
+        LD      r0, r7, 0
+r_send: ADD     r6, r0, r0              ; the byte, then room for the parity
+        PAR     r7, r0                  ; C = XOR of the b(i)
+        BNC     r_par
+        ORI     r6, 1
+r_par:  SHLI    r6, 7                   ; b7 in bit 15
+        MOV     r0, r6
+        LDI     r6, 10                  ; header, byte, parity
+        CMP     r6, r6                  ; C = 1: the target's header
+        CALL    txb
+        LDI     r1, 1
+        CALL    rxbits                  ; the host's ACK or NACK
+        STSR    r7
+        ANDI    r7, 1
+        BZ      rotf                    ; NACK: the same byte again
+        ADDI    r5, 1
+        DJNZ    r3, rotf
+        JMP     main
+; WOTF: N bytes to @E @H @L; rxh NACKs a bad frame and takes it again.
+wotf:   CALL    rxh
+        CALL    loc
+        BZ      w_next                  ; not mapped: ignored
+        ST      r0, r7, 0
+w_next: CALL    ack                     ; written: now the ACK
+        ADDI    r5, 1
+        DJNZ    r3, wotf
+        LDI     r7, 0
+        LDIH    r7, 0x60                ; 0x6000 WOTF done
+report: WAITB   OUTQ_NF, T              ; room? (TD is in the past here)
+        BT      main                    ; full: the report is dropped
+        PUSH    r7                      ; cannot stall: room was just seen
+        JMP     main
+
+; The memory (header): RAM, then SWIM_CSR. Initial RAM 0x10 + the index.
+        .org    MEM
+        .word   0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17
+        .word   0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
+        .word   0x00                    ; SWIM_CSR
+
+; ------------------------------------------------ thread 3's quarter (spill)
+        .org    0x180
+
+; OFF: the entry sequence (header).
+off:    WAITP   SW, 0                   ; a low ...
+        WAITP   SW, 1                   ; ... and its end
+        CSRR    r5, NOW
+        MOV16   r4, LMIN
+        MOV16   r3, LSPAN
+        LDI     r1, 16
+o_half: WAITE   SW, ANY                 ; the end of the next half
+        CSRR    r6, NOW
+        SUB     r7, r6, r5              ; its length
+        MOV     r5, r6
+        SUB     r7, r7, r4
+        CMP     r7, r3                  ; C: outside [LMIN, LMIN + LSPAN)
+        BC      off
+        CMPI    r1, 9
+        BNZ     o_next
+        SHRI    r4, 1                   ; the 2 kHz halves
+        SHRI    r3, 1
+o_next: DJNZ    r1, o_half
+        JMP     sync
+
+; loc: the data-memory word of @E @H @L (r4 bit 5, r5) in r7 and not Z, or
+; Z if it is not mapped (header). Clobbers r6.
+loc:    MOV     r7, r4
+        ANDI    r7, EBAD
+        BNZ     l_no                    ; @E is not 0
+        LDI     r7, CSRA
+        MOV16   r6, 0x7F80
+        CMP     r5, r6
+        BZ      l_yes                   ; SWIM_CSR, always reached
+        LD      r6, r7, 0
+        ANDI    r6, DM
+        BZ      l_no                    ; SWIM_DM clear: SWIM_CSR only
+        CMPI    r5, NMEM
+        BC      l_no
+        LDI     r7, MEM
+        ADD     r7, r7, r5
+l_yes:  ORI     r7, 0                   ; not Z
+        RET
+l_no:   ANDI    r7, 0                   ; Z
+        RET
+
+; rxh: a host frame of r2 bits (header 0, the bits, the parity); a bad
+; header or parity is NACKed and the frame received again (3.4). Returns
+; the bits between header and parity in r0, not yet ACKed: the caller
+; does what the frame asks first and then calls ack, so that it is back
+; at its WAITP within a few slots of the ACK's end (the host may start
+; its next frame as soon as the ACK's cell ends: Table 3, inter-frame time
+; >= 0). Clobbers r1 r6 r7.
+rxh:    MOV     r1, r2
+        CALL    rxbits
+        STSR    r0
+        LDI     r7, 16
+        SUB     r7, r7, r2
+        SHL     r0, r0, r7
+        SHR     r0, r0, r7              ; the frame alone
+        MOV     r6, r2
+        SUBI    r6, 1
+        SHR     r7, r0, r6              ; Z: header 0
+        BNZ     h_nak
+        PAR     r7, r0                  ; C = 1: odd, a parity error
+        BC      h_nak
+        SHRI    r0, 1                   ; drop the parity
+        RET                             ; the caller ACKs, when it is done
+h_nak:  ANDI    r7, 0                   ; C = 0: NACK
+        LDI     r6, 1
+        CALL    txb
+        JMP     rxh
+
+; ack: the ACK bit (3.4) after a good host frame.
+ack:    CMP     r7, r7                  ; C = 1: ACK
+        LDI     r6, 1
+        JMP     txb
+
+; rxbits: r1 bits into SR, MSB first; a low past 64 SWIM clocks is the
+; communication reset (3.6).
+rxbits: WAITP   SW, 0                   ; a fall
+        SETD    0                       ; G: seen
+        WAITD   5
+        SHI                             ; the line at G + 5: the bit
+        SETD    27
+        WAITP   SW, 1, T                ; the end of the low, by G + 32
+        BT      crst
+        DJNZ    r1, rxbits
+        RET
+crst:   WAITP   SW, 1                   ; the end of the reset
+        JMP     sync                    ; resynchronised: the sync frame
+
+; txb: as swim_host.loom's. r6 bits, the first in C, the rest from r0 MSB
+; first; the first fall 12 ticks from now, falls 12 ticks apart.
+txb:    SETD    0
+tx_l:   WAITD   10                      ; F + 10: a 0 released (latched)
+        SETP    SW, 0, D
+        WAITD   2                       ; F: the fall
+        BNC     tx_0
+        SETP    SW, 1                   ; a 1: released two slots after F
+tx_0:   SETP    SW, 1, D                ; a 0: released at F + 10
+        SUBI    r6, 1
+        BZ      tx_e
+        SHLI    r0, 1                   ; C = the next bit
+        JMP     tx_l
+tx_e:   WAITD   10
+        RET
