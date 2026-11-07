@@ -1,0 +1,308 @@
+; j1708_node.loom
+; An SAE J1708 node (the heavy-vehicle serial bus that SAE J1587 messages
+; ride on): it sends the host's messages and gives the host every message
+; it sees on the bus, its own included.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core (pins,
+; deadlines, the FIFOs) and LD/ST of slice B (SEMANTICS 6.11), built for the
+; I2C EEPROM's array and USB's descriptors, here holding the message so that
+; a node that loses the bus can send it again. It also uses the tick
+; restart of SEMANTICS 4 (a write of TICK_INT clears the tick accumulator),
+; to lock the bit grid to every start bit it receives. No hardware knows
+; J1708: the UART framing, the bus-access wait of (10 + 2 P) bit times, the
+; bit-by-bit read-back that finds a collision, the release at the bit that
+; lost, the retry, the message framing by idle time and the checksum are
+; all firmware. Nothing here was built for a UART: the bits are SETP and JP
+; on the deadline grid, as in uart_tx.loom and uart_rx.loom.
+;
+; J1708 as the public descriptions give it (the SAE text is not free;
+; tools/protomodels/j1708.py cites them, all secondary): 9600 bit/s, 8N1,
+; LSB first, 0 dominant on a wired bus; a message is a MID byte, data
+; bytes and a checksum, the two's complement of the eight-bit sum of the
+; MID and the data, 21 bytes at most; no more than 2 bit times between
+; the bytes of a message; a node may start only after the bus has been
+; idle for its bus access time, 10 + 2 P bit times for priority P = 1
+; (highest) .. 8, and watches the bus as it sends: on a difference it
+; stops and tries again after the next bus access time.
+;
+; Pins: TX = OUT0, RX = IN0. TX is the level to send into a J1708 or
+; RS-485 transceiver wired open-collector (1 = released, the bus idles at
+; 1); RX is the bus level from its receiver, so every bit sent comes back.
+; PIN_OUT resets to 0, which is dominant: the host sets the TX pin high
+; (PIN_OUT, through the debug space) before the transceiver is enabled or
+; the thread runs, as tools/tests/test_fw_j1708.py does.
+;
+; Host message (INQ): a header word, then N words of data.
+;     bits 7:0    MID
+;     bits 12:8   N = 0..19 data bytes (larger values are clamped to 19;
+;                 the words after the nineteenth are then read as headers)
+;     bits 15:13  P - 1: priority P = 1..8
+;     data        one byte per word in bits 7:0
+; The node appends the checksum. The next header is read once the message
+; has gone out whole; a message that loses the bus is sent again, as often
+; as it takes.
+;
+; Report (OUTQ): every message on the bus, byte by byte, then a status.
+;     byte word   bits 7:0 the byte, bit 15 = 0
+;     status      bit 15 = 1, then
+;         bit 0   OWN: this node sent the message and read every bit back
+;         bit 1   LOST: this node was sending and the bus differed; it let
+;                 go at that bit, the bytes are what the bus carried, and
+;                 its message stays queued for a retry
+;         bit 2   FRAMING: a stop bit read low
+;         bit 3   OVERRUN: OUTQ was full and at least one byte was dropped
+;         bit 4   CKERR: the eight-bit sum of the message is not 0
+; A message ends when no start bit follows a stop bit within 2.5 bit times
+; (J1708 allows 2 between bytes; the half bit is the receiver's margin).
+;
+; Timing, with a tick of half a bit (the host writes TICK_INT and TICK_FRAC
+; before RUN, the M2 convention; at 50 MHz and 9600 bit/s TICK_INT 2604,
+; TICK_FRAC 43 for 2604.17 clocks). Sent bits start on the tick, 1 to 2
+; slots after it (SETP after WAITD); the line is read back at each bit's
+; middle. A received byte is sampled from its own start edge, locked by
+; rewriting TICK_INT: inside a message the edge is seen within a slot
+; (WAITP); from the idle loop within 6 slots, or 20 when the edge comes
+; while a header is being read from INQ (about 90 clocks with the
+; synchroniser: 1.7 % of a bit at 9600 bit/s, a third of one at the tests'
+; 256 clocks), and every sample sits that much after the middle of its bit. The schedule is proved for ticks of 128 clocks
+; or more (.tick below; the tests run at 256 clocks a bit and at 9600 bit/s).
+;
+; Bus access: the idle loop counts ticks since the last stop bit ended (r6)
+; and starts a ready message once the count reaches 2 (10 + 2 P), checking
+; the line one last time in the slot before its start bit goes out (WAITP
+; ... T), so two nodes start together only if both see the bus free within
+; the same slot or two. Arbitration is then bitwise, as on CAN: a node that
+; sent a 1 and reads a 0 has lost, releases the line (its 1 already does)
+; and goes on receiving the winner's message from that bit, which the
+; winner sends undisturbed. Same-priority nodes with the same MID collide
+; undetectably until their data differ; J1708 leaves that to MID
+; assignment.
+;
+; Memory: 183 words, 163 of code and a 20-word message buffer, from thread
+; 0's reset vector: all of thread 0's quarter of the 512-word memory and 55
+; words of thread 1's (0x000..0x0B6), so thread 1 must not run. Any even
+; thread may run it with .thread and .pins changed; two nodes on threads 0
+; and 2 is how tools/tests/test_fw_j1708.py runs a collision.
+;
+; Readings taken on the open spec questions (2026-11-07): every figure is
+; secondary (SAE J1708 and J1587 were not read).
+;   Bus access time 10 + 2 P bit times with P from 1 to 8, as Kvaser
+;   gives it (the brief's 12 + 2 x priority, counting priority from 0, is
+;   the same).
+;   Collision detection on every bit, so the loser stops at the first bit
+;   that differs and the winner's message stays intact.
+;   A message ends when no start bit comes within 2.5 bit times of a
+;   stop bit (2 allowed, half a bit of margin).
+;   TX resets to 0, which holds the bus dominant: the host must set TX
+;   high before RUN.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .tick   128                     ; the shortest half bit the schedule is proved for
+        .equ    OWN = 1                 ; status bits, kept in r4's low byte
+        .equ    LOST = 2
+        .equ    FRAMING = 4
+        .equ    OVERRUN = 8
+        .equ    CKERR = 16
+        .equ    BYTES = 32              ; at least one byte (not reported)
+        .equ    MAXN = 19               ; data bytes: 21 with the MID and the checksum
+        .equ    GAP = 6                 ; ticks from a stop bit's middle to the end of a message
+; Registers: r0 scratch, the byte being sent; r1 a bit count or the idle
+; ticks; r2 a pointer into buf (buf itself when no message is held); r3 the
+; data words still to load, or while sending the end of the message; r4 the
+; message seen on the bus: its eight-bit sum in 15:8, status bits in 5:0;
+; r5 the held message's bus access time in ticks, 0 when none is ready;
+; r6 NOW when the bus last went idle; r7 the byte being received.
+
+start:  SETP    TX, 1                   ; released
+        MOV16   r2, buf
+        CSRR    r6, NOW                 ; the bus counts as busy until now
+        JMP     poll
+
+; --------------------------------------------------------------- receiving
+; rxnew starts a message, rxcont takes the next byte of one. The grid is
+; locked to the start edge just seen, so the middle of every bit is a whole
+; number of ticks from it.
+rxnew:  LDI     r4, 0
+rxcont: CSRR    r0, TICK_INT
+        CSRW    TICK_INT, r0            ; restart the tick grid at this edge
+        SETD    0
+        WAITD   1                       ; the middle of the start bit
+        JP      RX, 1, glitch
+        LDI     r1, 8
+rxbit:  WAITD   2                       ; the middle of the next bit
+        SHLI    r7, 1                   ; MSB first here, reversed below
+        JP      RX, 0, rx0
+        INC     r7
+rx0:    DJNZ    r1, rxbit
+rxstop: WAITD   2                       ; the middle of the stop bit
+        JP      RX, 0, rxferr
+        JMP     bdone
+rxferr: ORI     r4, FRAMING
+        JMP     bdone
+glitch: CSRR    r6, NOW                 ; high again at its middle: not a start bit
+        MOV     r0, r4
+        ANDI    r0, BYTES
+        BNZ     mend                    ; it ends the message that was going on
+        JMP     poll
+
+; ------------------------------------------------------------ the idle loop
+; The line is looked at every few slots; a start bit goes to rxnew.
+poll:   JP      RX, 0, rxnew
+        SETD    0                       ; TD = NOW: the timed waits below only test
+        CSRR    r0, NOW
+        SUB     r1, r0, r6              ; ticks the bus has been idle
+        JP      RX, 0, rxnew
+        CMPI    r1, 63
+        BNC     fresh
+        SUBI    r0, 63                  ; hold the count at 63 (above every access
+        MOV     r6, r0                  ; time), so NOW's wrap never shortens it
+fresh:  JP      RX, 0, rxnew
+        TEST    r3, r3
+        BNZ     load                    ; data words still to come
+        TEST    r5, r5
+        BNZ     ready                   ; a message waits for the bus
+        WAITB   INQ_NE, T
+        BT      poll
+        .bounded "INQ_NE was true at the WAITB above; only this thread pops INQ"
+        POP     r0                      ; a header: MID, N, P - 1
+        ST      r0, r2, 0               ; the MID (bits 15:8 are never sent)
+        INC     r2
+        MOV     r3, r0
+        SHRI    r3, 8
+        ANDI    r3, 31                  ; N
+        CMPI    r3, MAXN + 1
+        BNC     nok
+        LDI     r3, MAXN
+nok:    SHRI    r0, 13
+        SHLI    r0, 2
+        ADDI    r0, 24                  ; 2 (10 + 2 P) ticks = 4 (P - 1) + 24
+        MOV     r5, r0
+        JMP     poll
+
+load:   WAITB   INQ_NE, T
+        BT      poll
+        .bounded "INQ_NE was true at the WAITB above; only this thread pops INQ"
+        POP     r0
+        ST      r0, r2, 0
+        INC     r2
+        DEC     r3
+        JMP     poll
+
+ready:  CMP     r1, r5                  ; C: idle for the access time
+        BC      tx
+        JMP     poll
+
+; ----------------------------------------------------------------- sending
+; The grid restarts here; the start bit goes out on the next tick unless
+; the line goes low before it (then the other node's message is received
+; and ours waits). Every edge is 2 slots after its tick; each bit is read
+; back at its middle.
+tx:     CSRR    r0, TICK_INT
+        CSRW    TICK_INT, r0            ; restart the tick grid
+        SETD    1
+        MOV     r3, r2                  ; the end: one past the last data byte
+        MOV16   r2, buf
+        LDI     r4, OWN
+        LD      r0, r2, 0               ; the MID
+        WAITP   RX, 0, T                ; a last look at the line until the tick
+        BNT     yield
+send:   SETP    TX, 0                   ; the start bit
+        WAITD   1                       ; its middle
+        LDI     r1, 8
+txbit:  SHRI    r0, 1                   ; C = the bit
+        WAITD   1                       ; the bit starts
+        BC      tx1
+        SETP    TX, 0
+        SHLI    r7, 1
+        WAITD   1                       ; its middle
+        JP      RX, 0, tx0ok
+        SETP    TX, 1                   ; sent 0, read 1: a fault on the line; let go
+        INC     r7
+        JMP     lost
+tx1:    SETP    TX, 1
+        SHLI    r7, 1
+        WAITD   1
+        JP      RX, 0, lost             ; sent 1, read 0: another node won
+        INC     r7
+tx0ok:  DJNZ    r1, txbit
+        WAITD   1
+        NOP                             ; keeps the stop edge 2 slots after its tick
+        SETP    TX, 1                   ; the stop bit
+        WAITD   1
+        JP      RX, 1, bdone
+        XORI    r4, OWN | LOST          ; low in our stop bit: lost
+        ORI     r4, FRAMING
+        MOV     r2, r3
+        LDI     r3, 0
+        JMP     bdone
+lost:   XORI    r4, OWN | LOST          ; OWN was set: now LOST
+        MOV     r2, r3                  ; the message stays in buf .. r2
+        LDI     r3, 0
+        DJNZ    r1, rxbit               ; receive the rest of this byte
+        JMP     rxstop
+yield:  MOV     r2, r3
+        LDI     r3, 0
+
+; A byte is complete (received, or sent and read back): add it to the sum,
+; give it to the host, and send the next byte of our own message.
+bdone:  REV     r7, r7
+        SHRI    r7, 8                   ; LSB first: the byte in 7:0
+        SWAP    r0, r7
+        ADD     r4, r4, r0              ; the sum, in bits 15:8
+        ORI     r4, BYTES
+        WAITB   OUTQ_NF, T              ; TD is reached: a test, not a wait
+        BT      ovr
+        .bounded "OUTQ_NF was true at the WAITB above; only the host pops OUTQ"
+        PUSH    r7
+        JMP     bnext
+ovr:    ORI     r4, OVERRUN
+bnext:  MOV     r0, r4
+        ANDI    r0, OWN
+        BZ      gapw                    ; not sending
+        INC     r2
+        CMP     r3, r2
+        BNC     gapw                    ; the checksum was the last byte
+        BZ      txck
+        LD      r0, r2, 0               ; the next data byte
+        JMP     tnext
+txck:   MOV     r0, r4
+        SHRI    r0, 8
+        NEG     r0, r0                  ; the checksum: the sum's two's complement
+tnext:  WAITD   1                       ; the stop bit ends
+        JMP     send
+
+; ----------------------------------------------------- the end of a message
+; No start bit by GAP ticks after the stop bit's middle (2.5 bit times
+; after its end): the message is over.
+gapw:   CSRR    r0, TD
+        ADDI    r0, GAP
+        CSRW    TD, r0
+        WAITP   RX, 0, T
+        BT      gend
+        JMP     rxcont                  ; a start bit within the gap: the same message
+gend:   CSRR    r6, NOW
+        SUBI    r6, GAP - 1             ; the bus went idle when the stop bit ended
+mend:   MOV     r0, r4
+        SHRI    r0, 8
+        BZ      sumok
+        ORI     r4, CKERR               ; the sum of MID, data and checksum is not 0
+sumok:  MOV     r0, r4
+        ANDI    r0, OWN
+        BZ      mpush
+        LDI     r5, 0                   ; ours went out whole: the next header
+        LDI     r3, 0
+        MOV16   r2, buf
+mpush:  ANDI    r4, 31                  ; the status bits
+        LDIH    r4, 0x80
+        SETD    8                       ; up to 4 bit times for room in OUTQ
+        WAITB   OUTQ_NF, T
+        BT      mdrop                   ; still full: the status is lost (OVERRUN
+        .bounded "OUTQ_NF was true at the WAITB above; only the host pops OUTQ"
+        PUSH    r4                      ; is not reported for it)
+mdrop:  JMP     poll
+; The held message: the MID and up to MAXN data bytes, one to a word.
+buf:    .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0
