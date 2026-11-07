@@ -1,0 +1,218 @@
+; ltc_rx.loom
+; SMPTE linear timecode (LTC) reader on IN0: biphase mark decoded by edge
+; spacing, the sync word found in either direction, the tape's speed
+; followed, and every frame read whole reported to the host through
+; OUTQ[0]. OUT0 shows the direction of play.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; timecode or for biphase mark code. The program times every edge with the
+; level waits (`WAITP`, built for the I2C and SPI pins) and reads of the
+; `NOW` tick counter (built as the deadline timebase, SEMANTICS 4), keeps
+; its window of the last 16 bits in a register and normalises the bit order
+; with `REV` (built for the LSB-first serial protocols), and parks the four
+; data words in the data memory (`LD`/`ST`, SEMANTICS 6.11, D-027, built for
+; device emulation). What the firmware does that no hardware does: the
+; biphase mark decision, the bit-period tracking that follows a deck's
+; speed, the sync-word search in both directions and the framing.
+;
+; The bit engine does not help: its decoders sample on a fixed tick (SHI
+; reads the pin when the program says), and biphase mark from a tape has no
+; fixed tick. The Manchester decoder (6.9.1) is also the wrong code: it
+; reads the level in each half-bit, and biphase mark carries the bit in
+; whether there is an edge in the middle, whatever the levels.
+;
+; Pins: RX = IN0, the code (either polarity); DIR = OUT0, push-pull, low
+; until RUN, then 1 while the last frame reported was read in reverse.
+;
+; Sources: the public descriptions of SMPTE ST 12-1 (Wikipedia, "Linear
+; timecode", read 2026-11-07; secondary), cited by item in
+; tools/protomodels/ltc.py, which is written from them: biphase mark code,
+; the 80-bit frame, the sync word 0011 1111 1111 1101 in bits 64..79, "00
+; before and 01 after" telling the direction.
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT of the measuring unit, in clocks. The nominal bit period
+;      must be 32 to 8,000 units (64 clocks: 325 units at 30 fps, 50 MHz).
+;   2. TICK_FRAC of the unit.
+;   3. The nominal bit period, in units: the starting estimate.
+;
+; Reports (FIFO space read, thread 0). Four words per frame read whole (a
+; sync word, 64 bits, a sync word in the same direction 80 bits after the
+; first): the frame's bits 0..63 in frame order whatever the direction,
+; bit 0 in word 0's bit 0. So word 0 holds the frames (bits 3:0 units, 9:8
+; tens), the drop-frame flag (10) and the colour-frame flag (11), word 1 the
+; seconds, word 2 the minutes, word 3 the hours, each field's units in bits
+; 3:0 and tens from bit 8, and the user bits in bits 7:4 and 15:12 of each
+; word, as the frame has them. DIR is written before the four PUSHes. A
+; forward frame is reported as its own sync word ends; a reverse frame
+; once its bit 0 and the sync word of the frame before it have passed. The
+; host must read each report within the next frame (OUTQ holds four words,
+; and a PUSH into a full OUTQ stalls the reader, which then loses the
+; frames it misses until the next pair of sync words).
+;
+; Decoding. Every edge is time-stamped by a `WAITP` for the level the line
+; must go to next (so an edge that comes while the program is busy is late,
+; never lost) and a read of NOW. With T the bit-period estimate: an interval
+; of 2T or more is a gap (a dropout, the tape stopping) and gives no bit;
+; 3T/4 or more is a whole bit, a 0; less is a half, and two halves are a 1.
+; A half followed by a whole is a lone half (a glitch, or the reader having
+; started in the middle of a 1): it is dropped and the whole is a 0. After
+; each bit T becomes the mean of T and the bit just measured. The window of
+; the last 16 bits reads 0x3FFD after a forward sync word and 0xBFFC after a
+; reverse one; the window is stored at bits 16, 32, 48 and 64 after a sync
+; word, and a report needs the next sync word in the same direction at bit
+; 80. Anything else (a corrupted sync word, a bit misread) costs that frame
+; and the next, and the reader is back at the next sync word.
+;
+; Speed. A 0 is read right while its period is 3T/4 or more, a 1 while its
+; halves are under 3T/4, so a bit is read right while its period is between
+; 3T/4 and 3T/2: the tape may run up to a third fast or a third slow
+; against the estimate, and the estimate moves half way to each bit's
+; period, so it follows a change within a few bits. Tested: 10 % fast (both
+; backends), 10 % slow, steps of +20 % and -20 % in the middle of a frame,
+; and a shuttle from play speed to twice it over four frames (model). A
+; deck that starts more than a third off the host's nominal is not sure to
+; lock: far fast, the estimate walks down to the true period; far slow
+; (half speed or less), halves can pass for whole bits and the estimate can
+; settle on the half-bit. Neither is tested; the host gives the nominal.
+;
+; Timing. No WAITD, so no deadline pair. The longest stretch from an edge's
+; time-stamp (the CSRR of NOW) to the WAITP for the next edge is a forward
+; report, 51 slots (204 clocks; the PUSHes one slot each, OUTQ having room
+; when the host keeps up). The WAITP sees an edge 2 to 5 clocks after the
+; pad changes and the CSRR is the slot after it, so every edge is stamped in
+; its own slot when the half-bit at the tape's fastest is 216 clocks or
+; more (10,416 at 30 fps and 50 MHz: 48 times play speed in processing,
+; though a 64-clock unit then leaves 7 units a bit). A late stamp is not
+; always fatal (it shortens the next interval by as much as it lengthens
+; this one), but the tests keep to the floor: a shuttle at 2x runs at a
+; 512-clock nominal half-bit, and the same shuttle at 256 lost a bit.
+;
+; Size: 107 words, 102 of code and 5 of data (the window store and the
+; direction), inside a quarter of the 512-word memory. It runs on any
+; thread (no data address is an LD/ST offset); the tests run it on thread
+; 1 with DIR on OUT1 beside ltc_gen.loom on thread 0.
+;
+; Registers: r0 the window of the last 16 bits, the newest in bit 0; r1 the
+; bits since the last sync word; r2 NOW at the last edge; r3 the bit-period
+; estimate T; r4 the first half of a 1, scratch; r5 the threshold 3T/4,
+; scratch; r6 the line level; r7 the interval, scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0, DIR = OUT0
+        .tick   8                       ; no WAITD: nothing to prove (header)
+        .equ    SYNCF  = 0x3FFD         ; the window after a forward sync word
+        .equ    SYNCR  = 0xBFFC         ; and after a reverse one
+
+        JMP     start                   ; the buffer sits low, so offsets reach it
+buf:    .word   0, 0, 0, 0              ; the window at bits 16, 32, 48, 64
+dirw:   .word   0                       ; the direction of the last sync word
+
+start:  SETP    DIR, 0
+        POP     r7                      ; 1. TICK_INT of the unit
+        CSRW    TICK_INT, r7
+        POP     r7                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r7
+        POP     r3                      ; 3. the nominal bit period, the first T
+        LDI     r1, 255                 ; no sync word yet
+        LDI     r6, 0                   ; the line's level now
+        JP      RX, 0, lvl
+        LDI     r6, 1
+lvl:    CSRR    r2, NOW
+
+; A bit: one whole interval (a 0) or two halves (a 1).
+bit:    CALL    edge
+        ADD     r5, r3, r3
+        CMP     r7, r5
+        BC      bit                     ; 2T or more: a gap, no bit
+        MOV     r5, r3                  ; 3T/4 = T/2 + T/4
+        SHRI    r5, 1
+        MOV     r4, r5
+        SHRI    r4, 1
+        ADD     r5, r5, r4
+        CMP     r7, r5
+        BC      zero                    ; a whole bit
+        MOV     r4, r7                  ; a half: the first of a 1
+        CALL    edge
+        CMP     r7, r5
+        BC      zero                    ; a lone half, then a whole bit: a 0
+        ADD     r7, r7, r4              ; the 1's period
+        SHLI    r0, 1
+        ORI     r0, 1
+        JMP     track
+zero:   SHLI    r0, 1
+track:  ADD     r3, r3, r7              ; T = (T + this bit) / 2
+        SHRI    r3, 1
+        INC     r1
+        MOV16   r4, SYNCF
+        CMP     r0, r4
+        BZ      fwd
+        MOV16   r4, SYNCR
+        CMP     r0, r4
+        BZ      rev
+        MOV     r4, r1                  ; bits 16, 32, 48, 64: keep the window
+        ANDI    r4, 15
+        BNZ     bit
+        MOV     r4, r1
+        SHRI    r4, 4
+        CMPI    r4, 5
+        BC      bit
+        LDI     r5, buf - 1             ; buf + 0..3: past imm5's reach on thread 1..3
+        ADD     r4, r4, r5
+        ST      r0, r4, 0
+        JMP     bit
+
+; A sync word. A frame is whole if the last one was 80 bits ago, same way.
+fwd:    LDI     r4, 0
+        JMP     synced
+rev:    LDI     r4, 1
+synced: LDI     r5, 80
+        CMP     r1, r5
+        LDI     r1, 0                   ; LDI keeps Z
+        LDI     r5, buf
+        BNZ     newdir
+        LD      r7, r5, dirw - buf
+        CMP     r4, r7
+        BNZ     newdir
+        TEST    r4, r4
+        BNZ     back
+        SETP    DIR, 0                  ; forward: bits 0..15 first, reversed
+        LD      r7, r5, 0
+        REV     r7, r7
+        PUSH    r7
+        LD      r7, r5, 1
+        REV     r7, r7
+        PUSH    r7
+        LD      r7, r5, 2
+        REV     r7, r7
+        PUSH    r7
+        LD      r7, r5, 3
+        REV     r7, r7
+        PUSH    r7
+        JMP     bit
+back:   SETP    DIR, 1                  ; reverse: bits 63..48 first, in order
+        LD      r7, r5, 3
+        PUSH    r7
+        LD      r7, r5, 2
+        PUSH    r7
+        LD      r7, r5, 1
+        PUSH    r7
+        LD      r7, r5, 0
+        PUSH    r7
+        JMP     bit
+newdir: ST      r4, r5, dirw - buf
+        JMP     bit
+
+; edge: wait for the line to go to the other level; r7 = the interval in
+; units since the last edge, r2 = NOW at this one.
+edge:   XORI    r6, 1
+        BZ      e0
+        WAITP   RX, 1
+        JMP     e1
+e0:     WAITP   RX, 0
+e1:     CSRR    r7, NOW
+        SUB     r7, r7, r2
+        ADD     r2, r2, r7
+        RET

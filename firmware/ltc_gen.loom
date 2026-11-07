@@ -1,0 +1,247 @@
+; ltc_gen.loom
+; SMPTE linear timecode (LTC) generator on OUT0: 80-bit frames, biphase mark
+; code, at 24, 25, 30 or 29.97 drop-frame frames a second, counting from a
+; time the host sets.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; timecode or for biphase mark code. The program uses two pieces of hardware
+; built for other jobs: the deadline-latched pin write (`SETP pin, v, D`,
+; SEMANTICS 6.10, D-016), built so that WS2812 pulses land on the exact
+; clock, puts every edge of the code on the exact clock edge of its half-bit
+; tick; and the data memory (`LD`/`ST`, SEMANTICS 6.11, D-027), built for
+; device emulation (a 24C02), holds the time and the frame's four data
+; words. What the firmware does that no hardware does: the biphase mark code
+; itself, the frame (BCD fields, the drop-frame flag, the sync word), the
+; polarity correction bit, and the clock: it counts frames, seconds, minutes
+; and hours, with the drop-frame rule at 29.97.
+;
+; The bit engine does not help. Its Manchester encoder (SEMANTICS 6.9.1) is
+; IEEE 802.3 Manchester, where the level in each half of a bit is fixed by
+; the bit; biphase mark fixes only where the edges are. Biphase mark is NRZI
+; (the engine's USB encoder, a 0 toggles) of the half-bit stream 0, ~b for
+; each bit b, so the engine could send it from a shift register holding the
+; frame doubled and inverted in alternate bits, but `SHO` writes the pin in
+; its own slot, on the 4-clock slot grid, not on the tick, and the engine
+; has no deadline-latched form: the edges would be 0 to 3 clocks late and
+; the program would spend as many words building the doubled words as it
+; saves. The firmware keeps the line level in r6 and toggles it.
+;
+; Pin: TX = OUT0, push-pull. Low until RUN; the code is polarity-free, so
+; the first edge is a rise.
+;
+; Sources: the public descriptions of SMPTE ST 12-1 (Wikipedia, "Linear
+; timecode" and "SMPTE timecode", read 2026-11-07; secondary, ST 12-1 itself
+; was not read), cited by item in tools/protomodels/ltc.py, which is written
+; from them: the bit assignment, the sync word 0011 1111 1111 1101 in bits
+; 64..79, biphase mark code, the polarity bit (27, or 59 at 25 fps) that
+; makes the number of 0s in a frame even, the drop-frame rule.
+;
+; Host words (FIFO space, thread 0), in this order after RUN:
+;   1. TICK_INT of the half-bit, in clocks: 1 / (160 x frame rate). At
+;      50 MHz: 13,020 (24 fps), 12,500 (25), 10,416 (30), 10,427 (29.97);
+;      184 or more (.tick).
+;   2. TICK_FRAC of the half-bit (213, 0, 171, 21 at 50 MHz).
+;   3. The frames a second in BCD: 0x24, 0x25 or 0x30 (29.97 too).
+;   4. 0x400 for drop-frame counting (the flag's place in word 0, bit 10),
+;      else 0.
+;   5..8. The time of the first frame in BCD, one field a word: frames,
+;      seconds, minutes, hours. The host gives a valid time (not a dropped
+;      label at 29.97).
+; Nothing is pushed to OUTQ.
+;
+; The stream. The first thing sent is a sync word, then the first frame's
+; data bits 0..63, its sync word 64..79, the next frame, and so on: a
+; reader locks on the first sync word and reads the first frame whole.
+; Bit 0 of a frame starts exactly 160 ticks after bit 0 of the one before.
+; The program is a free-running clock: its frame is the board crystal's,
+; and the host aligns it to a video reference by timing word 8. The first
+; edge lands 2 ticks after word 8 is popped.
+;
+; Coding. Each edge is `SETP TX, v, D` and the WAITD 1 that lands it, on
+; the exact clock edge of its tick (SEMANTICS 6.10 rule 1): an edge at the
+; start of every bit and one in its middle for a 1 (the middle WAITD of a
+; 0 lands nothing). With a whole number of clocks a tick every edge is on
+; the half-bit grid exactly; with TICK_FRAC the ticks dither by one clock
+; (SEMANTICS 4), 20 ns at 50 MHz against a 208 us half-bit.
+;
+; Counting. Each data word is the field's BCD byte with the tens moved to
+; bits 8 and up, (x & 15) | (x >> 4) << 8, the frame layout's own. The next
+; frame is built while the sync word goes out, one step in each bit's first
+; half, so that no half-bit holds more than one step and no loop runs
+; between two deadlines: bits 64..67 each add the carry to one field
+; (frames, seconds, minutes, hours) and rebuild its word, bit 68 applies
+; the drop-frame rule (a carry into a minute whose units digit is not 0
+; skips frames 0 and 1), bit 69 adds the drop-frame flag and the polarity
+; bit: the sync word holds 13 ones, so the bit is set when the data's ones
+; are even. The colour-frame flag, the user bits and BGF0..2 are sent as 0.
+;
+; Timing. The longest half-bit is bit 69's first, the polarity step: 44
+; slots (176 clocks) from the WAITD that lands the bit's edge to the WAITD
+; that lands its middle, with the step's loads and stores at two slots
+; each. The schedule is proved (20 pairs, no `.bounded`) for a tick of 184
+; clocks or more, 8 clocks of slack: any board clock of 0.9 MHz or more at
+; 30 fps (0.71 MHz at 24). The tests run 256 clocks a half-bit.
+;
+; Registers: r0 the word being sent, r1 its bits left, r2 a field record,
+; r3 the drop-frame flag as bit 10 (0x400 or 0), r4 the carry, r5 the words
+; left, then scratch, r6 the line level, r7 scratch.
+;
+; Size: 128 words, 116 of code and 12 of data (the four field records),
+; exactly a quarter of the 512-word memory. With ltc_rx.loom (107 words)
+; on thread 1 the two run together, threads 2 and 3 keep their quarters.
+;
+; Readings taken on the open spec questions (2026-11-07): SMPTE ST 12-1 was
+; not read; every figure is secondary (two encyclopedia articles).
+;   24 fps uses the 30 fps bit layout (polarity bit 27); the articles show
+;   only the 30 and 25 fps columns.
+;   Polarity: an even number of 0s in the frame, sync word included.
+;   User bits and the colour-frame and BGF flags are sent as 0.
+;   29.97 fps runs at 80 x 30/1.001 bit/s, with the drop-frame rule.
+;   One sync word is sent before the first frame, so a reader can take
+;   the first frame whole. No tolerance is given by the sources, so the
+;   generator is checked for exact edges only.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   184                     ; the shortest half-bit the schedule is proved for
+        .equ    SYNCW  = 0xBFFC         ; bits 64..79, bit 64 in bit 0
+
+        JMP     start                   ; the field records sit low, so LDI reaches them
+; The field records: value (BCD), wrap value, data word, for the frames,
+; seconds, minutes and hours.
+tim:    .word   0, 0, 0                 ; frames (the wrap from host word 3)
+        .word   0, 0x60, 0              ; seconds
+        .word   0, 0x60, 0              ; minutes
+        .word   0, 0x24, 0              ; hours
+
+start:  SETP    TX, 0                   ; low until the first edge
+        LDI     r6, 0                   ; and the level says so
+        POP     r7                      ; 1. TICK_INT of the half-bit
+        CSRW    TICK_INT, r7
+        POP     r7                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r7
+        LDI     r2, tim
+        POP     r7                      ; 3. frames a second, BCD
+        ST      r7, r2, 1               ; the frames' wrap value
+        POP     r3                      ; 4. 0x400 for drop frame (bit 10), else 0
+        LDI     r1, 4
+tload:  POP     r7                      ; 5..8. frames, seconds, minutes, hours
+        ST      r7, r2, 0
+        ADDI    r2, 3
+        DJNZ    r1, tload
+        LDI     r4, 0                   ; the first frame is the host's time
+        SETD    1                       ; re-anchor after the unbounded POPs
+
+; The sync word, bits 64..79, and the next frame built in its first halves.
+sync0:  MOV16   r0, SYNCW
+        LDI     r1, 16
+        LDI     r2, tim
+sbit:   CALL    edge
+        WAITD   1                       ; the edge at the start of the bit
+        CMPI    r1, 13
+        BC      fstep                   ; bits 64..67: a field each
+        CMPI    r1, 12
+        BZ      drop                    ; bit 68
+        CMPI    r1, 11
+        BZ      polar                   ; bit 69
+smid:   SHRI    r0, 1
+        BNC     sz
+        CALL    edge
+sz:     WAITD   1
+        DJNZ    r1, sbit
+
+; A frame's data bits 0..63, four words of 16, bit 0 first.
+frame:  LDI     r2, tim + 2             ; word 0
+        LDI     r5, 4
+word:   LD      r0, r2, 0
+        ADDI    r2, 3
+        LDI     r1, 16
+dbit:   CALL    edge
+        WAITD   1                       ; the edge at the start of the bit
+        SHRI    r0, 1                   ; C: a 1
+        BNC     dz
+        CALL    edge
+dz:     WAITD   1                       ; the middle: an edge for a 1
+        DJNZ    r1, dbit
+        DJNZ    r5, word
+        LDI     r4, 1                   ; the next frame is one later
+        JMP     sync0
+
+; A field record at r2: add the carry r4, pass a carry on if the field
+; wraps, rebuild the word.
+fstep:  LD      r5, r2, 0
+        TEST    r4, r4
+        BZ      fword                   ; no carry: the word only
+        INC     r5                      ; add one, in BCD
+        MOV     r7, r5
+        ANDI    r7, 15
+        CMPI    r7, 10
+        BNZ     fwrap
+        ADDI    r5, 6                   ; the units carry into the tens
+fwrap:  LD      r7, r2, 1
+        CMP     r5, r7
+        LDI     r4, 0                   ; LDI keeps Z: the carry stops here
+        BNZ     fst
+        LDI     r5, 0                   ; wrapped: the carry goes on
+        LDI     r4, 1
+fst:    ST      r5, r2, 0
+fword:  MOV     r7, r5                  ; (x & 15) | (x >> 4) << 8
+        ANDI    r7, 15
+        SHRI    r5, 4
+        SHLI    r5, 8
+        OR      r5, r5, r7
+        ST      r5, r2, 2
+        ADDI    r2, 3
+        JMP     smid
+
+; Drop frame: a carry into a minute that is not a multiple of ten (its
+; units digit is not 0) starts the minute at frame 2.
+drop:   TEST    r3, r3
+        BZ      smid
+        LDI     r2, tim
+        LD      r5, r2, 0               ; frames and seconds both 0: a new minute
+        LD      r7, r2, 3
+        OR      r5, r5, r7
+        BNZ     smid
+        LD      r5, r2, 6
+        ANDI    r5, 15
+        BZ      smid                    ; minutes 00, 10, .., 50 keep frames 0, 1
+        LDI     r5, 2
+        ST      r5, r2, 0               ; frame 2, and its word
+        ST      r5, r2, 2
+        JMP     smid
+
+; The drop-frame flag into word 0, then the polarity bit: set when the ones
+; of bits 0..63 are even (the sync word has 13), bit 27 (word 1 bit 11), or
+; 59 (word 3 bit 11) at 25 fps.
+polar:  LDI     r2, tim
+        LD      r5, r2, 2
+        OR      r5, r5, r3
+        ST      r5, r2, 2
+        LD      r7, r2, 5
+        XOR     r5, r5, r7
+        LD      r7, r2, 8
+        XOR     r5, r5, r7
+        LD      r7, r2, 11
+        XOR     r5, r5, r7
+        PAR     r5, r5                  ; C: the data's ones are odd
+        BC      smid
+        LD      r7, r2, 1
+        CMPI    r7, 0x25
+        BNZ     pol27
+        ADDI    r2, 6                   ; 25 fps: word 3
+pol27:  LD      r7, r2, 5
+        MOV16   r5, 0x0800
+        OR      r7, r7, r5
+        ST      r7, r2, 5
+        JMP     smid
+
+; edge: stage the next edge (the level r6 toggles) for the next WAITD.
+edge:   XORI    r6, 1
+        BZ      elo
+        SETP    TX, 1, D
+        RET
+elo:    SETP    TX, 0, D
+        RET
