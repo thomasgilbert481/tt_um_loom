@@ -1,0 +1,182 @@
+; dtmf_gen.loom
+; A DTMF (telephone touch-tone) generator: for each key the host queues, the
+; sum of its low-group and high-group tones for a host-set time, then a
+; host-set pause, then the next key, as a one-bit pulse-density stream on
+; one pin that an RC low-pass turns into audio.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). DTMF is not a line code at
+; all but two analog sine waves added together, and nothing in Loom was
+; built for it: there is no DAC, no PWM unit, no oscillator. The program
+; uses:
+;   - the per-thread tick (TICK_INT, built for UART baud rates) as the
+;     sample clock of a first-order sigma-delta modulator: one output bit
+;     per tick, 125 000 a second;
+;   - the deadline schedule (WAITD 1 every sample, proved by the checker);
+;   - the data memory (LD, built for device-emulation tables such as a
+;     24C02's contents) for a 64-entry sine table and the key's phase steps;
+;   - OUT through a one-pin OUTGRP group, so the bit computed from the carry
+;     flag goes to the pin with no branch: every sample's write lands the
+;     same number of clocks after its tick.
+; What the firmware does that no hardware does: two numerically controlled
+; oscillators (16-bit phase accumulators), the table look-up, the two-tone
+; sum, the sigma-delta modulation itself (the carry of a 16-bit
+; accumulator is the output bit), the keypad-to-frequency mapping and the
+; tone and pause timing.
+;
+; Standard: ITU-T Q.23 (11/1988) and Q.24 (11/1988), as
+; tools/protomodels/dtmf.py cites them. Q.23 section 6: low group 697, 770,
+; 852, 941 Hz, high group 1209, 1336, 1477, 1633 Hz, keys as Figure 1/Q.23;
+; section 7.1: each frequency within +-1.8 %; section 7.2: distortion
+; products at least 20 dB below the fundamentals. Q.24 Table A-1 (AT&T
+; column): a receiver operates on 40 ms and more, rejects 23 ms and less,
+; needs a 40 ms pause, and takes a level difference of +4 to -8 dB.
+;
+; Sample rate and frequencies. fs = 125 000 Hz (50 MHz / 400). A tone's
+; phase step is round(f * 65536 / fs), so the frequencies made are
+;     697 -> 365 = 696.18 Hz (-0.12 %)   1209 -> 634 = 1209.26 Hz (+0.02 %)
+;     770 -> 404 = 770.57 Hz (+0.07 %)   1336 -> 700 = 1335.14 Hz (-0.06 %)
+;     852 -> 447 = 852.59 Hz (+0.07 %)   1477 -> 774 = 1476.29 Hz (-0.05 %)
+;     941 -> 493 = 940.32 Hz (-0.07 %)   1633 -> 856 = 1632.69 Hz (-0.02 %)
+; the worst 0.12 %, against Q.23's 1.8 % (and against Q.24's AT&T receive
+; limit of 1.5 %); a board clock off by e ppm moves them all by e ppm. The
+; frequencies scale with the tick: at any other clock the host sets the
+; tick to clock / 125 000 (the checker proves the loop for 144 clocks, so
+; any board of 18 MHz or more).
+;
+; The table holds 16384 + round(16000 sin(2 pi i / 64)), i = 0..63; the top
+; six bits of the phase pick the entry. Two entries added are 768..64 768,
+; the modulator's input x, read as x / 65536 of full scale: the pin's mean
+; level is 1/2 + 0.244 (sin a + sin b), each tone 0.244 of the logic swing
+; in amplitude, equal (no twist: both tones come from one table). The
+; modulator adds x to a 16-bit accumulator each sample; the carry out is
+; the bit, so the density of ones is x / 65536 exactly over time.
+; Silence (the pause, and while no key is queued) is x = 32768: the pin
+; alternates 1, 0 at 62.5 kHz, which the filter turns into a steady half
+; level, so the line does not step between keys.
+;
+; Spectrum: phase truncation to 6 bits puts spurs near -40 dB, and the
+; first-order modulator's noise (oversampling 18x over 3.4 kHz) dominates.
+; tools/protomodels/dtmf.py measured the total in 300..3400 Hz at -27 to
+; -31 dB under the weaker tone for the sixteen keys, against Q.23's -20 dB.
+;
+; Timing. The host gives both durations in sample periods (8 us at
+; 125 kHz: 125 per ms). A tone is exactly its count of samples and a pause
+; exactly its count of silent samples; while the queue is empty the
+; silence goes on and INQ is looked at again every sample, so the next
+; tone starts on the first sample boundary after its key arrives. The
+; next phase is set up in the slots after the last sample of the one
+; before, inside the same sample period, so the sample grid never slips.
+; Q.24 asks 40 ms (5000 samples) for both.
+;
+; Pins: TX = OUT0 (any output with --pin TX=<pin>). The RC filter (for
+; example 1 kohm and 47 nF, a 3.4 kHz corner) and any line interface are
+; the board's, not Loom's.
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, first: the tone duration in samples (1..65535, 524 ms at most),
+;   INQ, second: the pause duration in samples (1..65535);
+;   INQ, then: one word a key, bits 3:0 = 4 * row + column of Figure
+;     1/Q.23 (0 '1', 1 '2', 2 '3', 3 'A', 4 '4', ... 12 '*', 13 '0',
+;     14 '#', 15 'D'); other bits ignored.
+;   Nothing goes to OUTQ.
+;
+; Memory: 0x000 .. 0x07F, thread 0's whole quarter (.imem 512): the code and
+; the step and duration words in 0x000 .. 0x03F, the sine table in
+; 0x040 .. 0x07F. The table is reached by an absolute address (ADDI 63 then
+; LD +1: no base register is left), so the program runs as thread 0 only.
+;
+; Deadlines: the longest path from one WAITD 1 to the next is a sample that
+; ends a pause and takes a key, 36 slots, 144 clocks: the checker proves a
+; tick of 144 clocks (the .tick below), any board of 18 MHz or more. At
+; 50 MHz the tick is 400 clocks.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Reception limits from the AT&T column of Q.24 Table A-1 (the tightest
+;   frequency limit, 1.5 %), and Q.23 section 7 for the transmitter.
+;   Durations are set in samples (125 a millisecond), not milliseconds.
+;   No high-group pre-emphasis: twist is 0 dB, inside every column.
+;   No detector is shipped. A one-bit input cannot meet Q.24 (the
+;   tests in tools/tests/test_fw_dtmf.py record the numbers), and a
+;   detector that works only at zero twist would not be a DTMF receiver.
+
+        .imem   512
+        .thread 0
+        .pins   TX = OUT0
+        .tick   144
+        .equ    TBL = 0x40                      ; the sine table, 64 words
+
+; r0 r1 the low and high phase (16 bits, 2^16 = one cycle)   r2 r3 their
+; steps (0 in silence)   r4 the modulator's accumulator   r5 the next bit
+; (and scratch before it is computed)   r6 scratch   r7 samples left
+        JMP     start
+LOWSTEP: .word  365, 404, 447, 493              ; 697 770 852 941 Hz
+HIGHSTEP: .word 634, 700, 774, 856              ; 1209 1336 1477 1633 Hz
+DUR:    .word   0, 0                            ; tone, pause (samples)
+
+start:  .csr    OUTGRP, (1 << 5) | pin(TX)      ; OUT r writes r[0] to TX
+        LDI     r0, 0                           ; silence: both phases at
+        LDI     r1, 0                           ; entry 0 (sin 0), both
+        LDI     r2, 0                           ; steps 0; r4 and r5 may
+        LDI     r3, 0                           ; start from anything
+        POP     r7                              ; the tone duration (blocks)
+        ST      r7, r0, DUR
+        POP     r7                              ; the pause duration (blocks)
+        ST      r7, r0, DUR + 1
+        LDI     r7, 1                           ; one silent sample, then INQ
+        SETD    1
+
+; One sample: the bit decided last sample goes out right after the tick,
+; then both phases advance, two table words are added and the sum enters
+; the modulator. 18 slots and the WAITD; no branch but the loop's own.
+loop:   WAITD   1
+        OUT     r5
+        ADD     r0, r0, r2
+        ADD     r1, r1, r3
+        MOV     r5, r0
+        SHRI    r5, 10                          ; the top 6 bits of the phase
+        ADDI    r5, 63
+        LD      r5, r5, TBL - 63                ; 16384 + 16000 sin(low)
+        MOV     r6, r1
+        SHRI    r6, 10
+        ADDI    r6, 63
+        LD      r6, r6, TBL - 63                ; 16384 + 16000 sin(high)
+        ADD     r5, r5, r6                      ; x, 768 .. 64768
+        ADD     r4, r4, r5                      ; C = the bit
+        CSRR    r5, FLAGS                       ; {T, C, Z}
+        SHRI    r5, 1                           ; r5[0] = C
+        DJNZ    r7, loop
+
+; The last sample of a tone, a pause or an idle wait has been computed (r5
+; holds its bit): set up the next phase in the same sample period.
+        TEST    r2, r2                          ; a tone (a step is never 0)?
+        BZ      key
+        LDI     r0, 0                           ; tone over: silence for the
+        LDI     r1, 0                           ; pause
+        LDI     r2, 0
+        LDI     r3, 0
+        LD      r7, r0, DUR + 1
+        JMP     loop
+key:    LDI     r7, 1                           ; queue empty: one more silent
+        WAITB   INQ_NE, T                       ; sample. A test, not a wait:
+        BT      loop                            ; TD (this sample's) is reached
+        .bounded "guarded by the WAITB above; only this thread pops INQ"
+        POP     r6
+        MOV     r2, r6                          ; r0 = r1 = 0 here (silence)
+        SHRI    r2, 2
+        ANDI    r2, 3                           ; the row: low group
+        LD      r2, r2, LOWSTEP
+        ANDI    r6, 3                           ; the column: high group
+        LD      r3, r6, HIGHSTEP
+        LD      r7, r0, DUR                     ; the tone duration
+        JMP     loop
+
+        .org    TBL                             ; 16384 + round(16000 sin(2 pi i / 64))
+        .word   16384, 17952, 19505, 21029, 22507, 23926, 25273, 26534
+        .word   27698, 28752, 29688, 30495, 31166, 31695, 32077, 32307
+        .word   32384, 32307, 32077, 31695, 31166, 30495, 29688, 28752
+        .word   27698, 26534, 25273, 23926, 22507, 21029, 19505, 17952
+        .word   16384, 14816, 13263, 11739, 10261,  8842,  7495,  6234
+        .word    5070,  4016,  3080,  2273,  1602,  1073,   691,   461
+        .word     384,   461,   691,  1073,  1602,  2273,  3080,  4016
+        .word    5070,  6234,  7495,  8842, 10261, 11739, 13263, 14816
