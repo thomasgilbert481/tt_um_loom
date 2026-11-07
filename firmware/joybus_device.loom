@@ -1,0 +1,262 @@
+; joybus_device.loom
+; A controller-side device for the single-wire controller bus of the
+; Nintendo 64 and GameCube ("joybus"): it listens for the console's command,
+; decodes each bit by the length of its low, and after the console stop bit
+; answers the info command (0x00 or 0xFF: 3 bytes), the N64 poll (0x01: 4
+; bytes) and the GameCube poll (0x40 with its two argument bytes: 8 bytes)
+; from a table the host sets, ending each reply with the device stop bit.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): it is in no design document.
+; There is no public specification from the console makers; every figure
+; comes from public secondary sources, cited in tools/protomodels/joybus.py.
+; The program is a timing device on an open-drain line, nothing more: the
+; table's bytes mean whatever the host puts there. It uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C;
+;   - the timed waits, WAITP with a timeout (SEMANTICS 6.4), built for the
+;     receivers' frame timeouts: every console edge has a deadline, and a
+;     frame that goes wrong sends the program back to waiting for a quiet
+;     line, never into a hang;
+;   - the bit engine's SHI (SEMANTICS 6.9) as a one-bit sampler, CNT
+;     counting the command bits;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     ws2812: the reply's edges are exact to the clock, and its first fall
+;     a fixed RESP after the console stop bit's rise is seen;
+;   - LD/ST (SEMANTICS 6.11), built for device emulation, for the table.
+; What the firmware does that no hardware does: the bit decision by low
+; time, the command dispatch, the turnaround within 2 us, the three-to-one
+; reply shapes and the device stop bit, the resynchronisation.
+; Weaker than a dedicated peripheral: a command that is not one of the four
+; gets no answer (official devices do the same: the console reports a
+; timeout, N64brew), and the table is changed only between frames.
+;
+; Readings taken on the open spec questions (2026-11-06): the console
+; makers publish no specification, so every figure is from the public
+; secondary sources named above, and four are unchecked: the device's
+; reply delay (2 us taken; the only bound is "within about 62.5 us"), the
+; device stop bit's 1 us low (joybus-pio only), the GameCube 0x41 reply
+; length (so 0x41 is not answered), and any tolerance (the model's
+; +-0.25 us windows are its own). Nothing here is game content: it is the
+; bus timing and the command set only.
+;
+; Pin: JB = BIDIR1, open drain (OD_MASK bit 1). Nothing drives the line high.
+;
+; Host words (FIFO space, thread 1).
+;   INQ, two words per table entry: the index I (bits 2:0; the rest
+;     ignored), then the value. The table, TAB[0..7], two bytes a word, the
+;     first sent in bits 15:8:
+;       TAB[0]     info bytes 1, 2: the device identifier (reset 0x0500, an
+;                  N64 controller; a GameCube controller is 0x0900)
+;       TAB[1]     bits 15:8 info byte 3, the status (reset 0x00); 7:0 unused
+;       TAB[2..3]  the N64 poll reply, 4 bytes
+;       TAB[2..5]  the GameCube poll reply, 8 bytes (the first 4 are the
+;                  N64 ones: one table, one console at a time)
+;       TAB[6..7]  unused (read ahead by the sender, never sent)
+;     The program reads INQ only while the line is quiet (between frames):
+;     an entry pushed during a frame is taken after it. Push both words of
+;     an entry together: the second POP waits for its word.
+;   OUTQ: not used.
+;
+; Replies (bytes, MSB first, then the device stop bit):
+;     0x00, 0xFF   TAB[0] and the high byte of TAB[1]: 3 bytes
+;     0x01         TAB[2..3]: 4 bytes
+;     0x40 a b     TAB[2..5]: 8 bytes (a and b are read and ignored; on a
+;                  GameCube they set the poll mode and the rumble, int03)
+;
+; Rate: TICK_INT = TK = 10 clocks, 0.2 us at 50 MHz, as joybus_host.loom.
+;
+; Timing (us; sources in tools/protomodels/joybus.py):
+; Receiving: a frame is taken only after the line has been high QUIET_IN
+; (5 us, more than any high inside a frame, 3 us), so a fall in the middle
+; of a frame never starts one. Each bit's line is sampled THR = 9 ticks
+; after its fall is seen, 1.84 to 2.08 us after the fall on the model (as
+; joybus_host.loom measures it).
+; After a bad frame (a low or a high too long, or an unknown command) the
+; program waits for QUIET (8 us) of high line before it listens again.
+; Turnaround: the console stop bit is 1 us low; its rise is seen 2 to 6
+; clocks late and the reply's first fall lands RESP = 10 ticks after the
+; slot that saw it, about 2.2 us after the rise. The sources give no figure
+; for a controller's delay (N64brew: within about 62.5 us); 2 us is the
+; "few microseconds" real controllers take, unchecked.
+; Sending: as joybus_host.loom, every edge latched: lows of exactly 1 and
+; 3 us, cells of exactly 4 us; the device stop bit is 1 us low (joybus-pio;
+; N64brew gives only its 4 us length).
+;
+; OD_MASK (BUGS 14): as joybus_host.loom: set, read back three slots
+; later, set again if lost.
+;
+; Memory: 125 words of code in thread 1's quarter, 0x080..0x0FC, and the
+; 8-word table at TAB = 0x1F8, the end of thread 3's quarter (thread 3
+; must not be started with this program loaded).
+;
+; Registers: r0 the command byte, then the sender's 16-bit countdown; r1 the
+; reply word on top; r3 the reply bits; r4 the receive phase (1: the 0x40
+; arguments), then the next reply word; r5 the table pointer; r6 0x00FF;
+; r7 scratch and the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    JBPIN = 1               ; BIDIR1
+        .pins   JB = JBPIN
+        .equ    JBBIT = 1 << JBPIN
+        .equ    TK = 10                 ; clocks per 0.2 us tick at 50 MHz
+        .equ    T1 = 5                  ; 1 us
+        .equ    T3 = 15                 ; 3 us
+        .equ    QUIET_IN = 25           ; 5 us of high line before a frame
+        .equ    LISTEN = 250            ; 50 us: then INQ is looked at again
+        .equ    QUIET = 40              ; 8 us after a bad frame
+        .equ    THR = 9                 ; the bit's sample, after the fall
+        .equ    LOW_TO = 12             ; the rise, by sample + 2.4 us
+        .equ    HIGH_TO = 20            ; the next fall, by rise + 4 us
+        .equ    STOP_TO = 10            ; the console stop bit's low, 2 us
+        .equ    RESP = 10               ; the turnaround, 2 us
+        .equ    DIR = 1 << 1            ; BE_CFG: MSB first, no CRC
+        .equ    TAB = 0x1F8
+        .equ    TAB_INFO = TAB          ; the info reply
+        .equ    TAB_POLL = TAB + 2      ; the poll replies
+
+start:  CSRR    r7, OD_MASK
+        ORI     r7, JBBIT
+        CSRW    OD_MASK, r7             ; JB open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, JBBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, TK            ; one tick = 0.2 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, DIR
+        CSRW    BE_CFG, r7
+        LDI     r7, (JBPIN << 5) | JBPIN
+        CSRW    BE_PINS, r7             ; SHI samples JB
+        LDI     r6, 0xFF
+        SETP    JB, 1                   ; let go of the line
+
+; Between frames: the table entries the host has pushed.
+idle:   SETD    0
+        WAITB   INQ_NE, T               ; TD is reached: done at once
+        BT      listen                  ; nothing waiting
+        POP     r0                      ; I
+        POP     r1                      ; the value (pushed with I)
+        ANDI    r0, 7
+        MOV16   r7, TAB
+        ADD     r7, r7, r0
+        ST      r1, r7, 0
+        JMP     idle
+
+; A frame starts with a fall after QUIET_IN of high line.
+listen: SETD    LISTEN
+        WAITP   JB, 1, T
+        BT      idle                    ; held low: look at INQ, try again
+        SETD    QUIET_IN
+        WAITP   JB, 0, T
+        BNT     resync                  ; a fall inside a frame
+; The line is quiet: it stays so while no fall comes, so a timeout below
+; goes back here, past the quiet test, unless INQ has a word.
+quiet:  LDI     r7, 8
+        CSRW    CNT, r7
+        LDI     r4, 0                   ; the command byte first
+        SETD    LISTEN
+        WAITP   JB, 0, T                ; the command's first fall
+        SETD    0                       ; anchored on the fall (if it came)
+        BNT     rbit
+        WAITB   INQ_NE, T               ; TD is reached: done at once
+        BT      quiet                   ; nothing waiting: still quiet
+        JMP     idle
+
+; The command, MSB first: each bit begins at a fall, anchored by the SETD 0
+; right after the wait that saw it.
+rbit:   WAITD   THR
+        SHI                             ; the line at fall + 2 us; Z = (CNT == 0)
+        BZ      word
+rrise:  SETD    LOW_TO                  ; (SETD, WAITP and BT keep Z)
+        WAITP   JB, 1, T                ; a 1 has risen, a 0 rises at 3 us
+        BT      resync
+        SETD    HIGH_TO
+        WAITP   JB, 0, T                ; the next bit's fall
+        SETD    0                       ; anchored on it (keeps T)
+        BNT     rbit
+        JMP     resync
+
+; A byte is in (between the sample and the rise): what to answer.
+word:   TEST    r4, r4
+        BNZ     stop                    ; the arguments of 0x40 are in
+        STSR    r0
+        AND     r0, r0, r6              ; the command byte
+        MOV16   r5, TAB_POLL            ; the poll replies (info: below)
+        LDI     r7, 0x40
+        CMP     r0, r7
+        BNZ     not40
+        LDI     r7, 16
+        CSRW    CNT, r7                 ; its two argument bytes
+        LDI     r4, 1
+        LDI     r3, 64
+        JMP     rrise
+not40:  LDI     r3, 32
+        CMPI    r0, 1
+        BZ      stop                    ; the N64 poll
+        SUBI    r5, 2                   ; TAB_INFO
+        LDI     r3, 24
+        TEST    r0, r0
+        BZ      stop                    ; info
+        CMP     r0, r6
+        BNZ     resync                  ; not one of the four: no answer
+
+; The console stop bit after the last bit's rise, then the turnaround.
+stop:   SETD    LOW_TO
+        WAITP   JB, 1, T                ; the last bit's rise
+        BT      resync
+        SETD    HIGH_TO
+        WAITP   JB, 0, T                ; the stop bit's fall
+        BT      resync
+        SETD    STOP_TO
+        WAITP   JB, 1, T                ; ... and its rise: the turnaround
+        BT      resync
+        SETD    0
+        SETP    JB, 0, D
+        LD      r1, r5, 0               ; the first reply word ...
+        LD      r4, r5, 1               ; ... and the next
+        ADDI    r5, 2
+        LDI     r0, 16
+        WAITD   RESP                    ; the reply's first fall lands
+
+; The reply, MSB first, every edge latched (as joybus_host.loom).
+dbit:   SHLI    r1, 1                   ; C = the bit
+        SETP    JB, 1, D                ; stage the rise
+        BC      d1
+        CALL    feed                    ; a 0: in its 3 us low
+        WAITD   T3                      ; the rise at fall + 3 us
+        SETP    JB, 0, D
+        WAITD   T1                      ; the next fall at + 4 us
+        DJNZ    r3, dbit
+        JMP     dstop
+d1:     WAITD   T1                      ; a 1: the rise at fall + 1 us
+        SETP    JB, 0, D
+        CALL    feed                    ; in its 3 us high
+        WAITD   T3                      ; the next fall at + 4 us
+        DJNZ    r3, dbit
+dstop:  SETP    JB, 1, D                ; the device stop bit: 1 us low
+        WAITD   T1
+
+; After a frame, good or bad: QUIET of high line, then listen again.
+resync: SETD    QUIET
+        WAITP   JB, 0, T
+        BT      idle                    ; quiet: back to INQ and listening
+        SETD    LISTEN
+        WAITP   JB, 1, T                ; wait out the low (bounded)
+        BT      idle                    ; held low
+        JMP     resync
+
+; feed: shift the next word's top bit into r1; every 16 bits, the next word.
+feed:   SHLI    r4, 1
+        BNC     fz
+        ORI     r1, 1
+fz:     DJNZ    r0, fr
+        LDI     r0, 16
+        LD      r4, r5, 0
+        ADDI    r5, 1
+fr:     RET
+
+        .org    TAB
+tab:    .word   0x0500, 0x0000, 0, 0, 0, 0, 0, 0

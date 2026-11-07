@@ -1,0 +1,323 @@
+; joybus_host.loom
+; A console-side host for the single-wire controller bus of the Nintendo 64
+; and GameCube ("joybus"): one host-given command of 1 to 3 bytes sent with
+; the console stop bit, then the device's reply of a host-given length
+; captured bit by bit, each bit decided by the length of its low, with a
+; timeout on every edge; the reply bytes and a status word go to the host.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): it is in no design document.
+; There is no public specification from the console makers; every figure
+; comes from public secondary sources, cited in tools/protomodels/joybus.py
+; (the N64brew wiki "Joybus Protocol" page, raphnet's gc_n64_usb-v3,
+; JonnyHaystack's joybus-pio, and the int03.co.uk GameCube notes) and marked
+; there as checked against two sources or not. The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the host only pulls
+;     the line low or lets it go; the board's pull-up (to 3.3 V on a real
+;     console) makes the high level;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every edge of the command is on the exact
+;     tick, so the 1 us and 3 us lows are exact to the clock;
+;   - the timed waits, WAITP with a timeout (SEMANTICS 6.4), built for the
+;     receivers' frame timeouts: every edge the device makes is waited for
+;     with a deadline, so a missing, stuck or short device cannot hang it;
+;   - the bit engine's SHI (SEMANTICS 6.9), built for the serial protocols,
+;     as a one-bit sampler counting the bits of a word in CNT;
+;   - LD/ST (SEMANTICS 6.11), built for device emulation, as a reply buffer:
+;     the reply is captured whole before the first PUSH, so a host that is
+;     slow to pop cannot stall the thread in the middle of a reply.
+; What the firmware does that no hardware does: the three-to-one bit shapes
+; (a 0 is 3 us low then 1 us high, a 1 is 1 us low then 3 us high), the
+; console stop bit, the turnaround, the decision of each bit by its low
+; time, the check that no low is shorter than a glitch, and the reply
+; framing. Weaker than a dedicated peripheral: the line is sampled through
+; the two-flop synchroniser on the thread's 4-clock slot grid, so an edge
+; is seen 2 to 6 clocks (40 to 120 ns at 50 MHz) late; the windows below
+; allow for it.
+;
+; Readings taken on the open spec questions (2026-11-06): the console
+; makers publish no specification, so every figure is from the public
+; secondary sources named above, and four are unchecked: the device's
+; reply delay (2 us taken; the only bound is "within about 62.5 us"), the
+; device stop bit's 1 us low (joybus-pio only), the GameCube 0x41 reply
+; length (so 0x41 is not answered), and any tolerance (the model's
+; +-0.25 us windows are its own). Nothing here is game content: it is the
+; bus timing and the command set only.
+;
+; Pin: JB = BIDIR0, open drain (OD_MASK bit 0). Nothing drives the line high.
+;
+; Host words (FIFO space, thread 0).
+;   INQ, one or two words per transaction:
+;     1. bits 15:8 the command byte (sent first); bits 7:4 R, the reply
+;        length in bytes (0..15; 0: nothing is awaited after the stop bit);
+;        bits 1:0 L, the command length in bytes (1..3; 0 is taken as 1);
+;        bits 3:2 ignored.
+;     2. only when L >= 2: bits 15:8 the second byte, bits 7:0 the third
+;        (sent only when L = 3).
+;     Examples: N64 info 0x0030 (0x00, 3 bytes back), N64 poll 0x0141,
+;     GameCube info 0x0030, GameCube origin 0x41A1, GameCube poll 0x4083
+;     then 0x0300 (0x40 0x03 0x00, 8 bytes back).
+;   OUTQ, ceil(R / 2) + 1 words per transaction:
+;     the reply, two bytes a word, the first byte received in bits 15:8 (an
+;     odd last byte sits in bits 15:8 of its word over a zero low byte);
+;     words not received are 0;
+;     then status: bits 7:0 B, the reply bytes received whole (counted by
+;     words: an error inside a word drops that word), bits 11:8 the error
+;     code, bits 15:12 zero. Error codes:
+;          0 none
+;          1 E_LINE   the line was low before the command or did not come
+;                     back up LINE_TO after the console stop bit
+;          2 E_NORESP no fall within RESP_TO (64 us) of the stop bit's rise
+;          3 E_SHORT  a low shorter than about 0.5 us: a glitch (header)
+;          4 E_LOW    a low longer than THR + LOW_TO (about 4.4 us)
+;          5 E_HIGH   no next fall within HIGH_TO (4 us) of a rise: a
+;                     reply shorter than R bytes ends here
+;          6 E_STOP   no device stop bit after the last byte, or its low
+;                     past STOP_TO (4 us)
+;     The PUSHes block while OUTQ is full: the host pops each report.
+;
+; Rate: the program sets its own tick, TICK_INT = TK = 10 clocks, 0.2 us at
+; 50 MHz. Every time in this file is in those ticks. Another board clock:
+; change TK so that a tick stays 0.2 us (the checker proves the schedule).
+;
+; Timing (secondary sources, tools/protomodels/joybus.py SOURCES; in us):
+;     bit cell      4: a 0 is 3 low + 1 high, a 1 is 1 low + 3 high
+;     console stop  1 low, then released (3 in all with its high)
+;     device reply  starts "within about 62.5" of the stop bit (N64brew);
+;                   real controllers answer in a few us
+;     device stop   1 low (joybus-pio; the stop is 4 in all, N64brew)
+; Sending: every edge is a latched write on a deadline, so the command's
+; lows are exactly 5 and 15 ticks (1 and 3 us) and its cells exactly 20.
+; Receiving: each bit starts at a fall. The fall is seen 2 to 6 clocks late
+; (the synchroniser and the slot grid), the SETD 0 right after the wait
+; anchors the bit, and SETD takes the tick under way (up to one tick less).
+; Measured on the model over the ten clock phases of the tick (the device's
+; reply moved one clock at a time): the glitch test (IN after SHORT = 2
+; ticks) flags every low under 0.48 us and none from 0.66 us, and the
+; bit's sample (SHI after THR = 9 ticks) reads every low up to 1.84 us as a
+; 1 and every low from 2.08 us as a 0. So a 1's low (1 us) may grow by
+; 0.84 us and a 0's (3 us) shrink by 0.92 us before a bit is misread, and a
+; 1's low may shrink by 0.34 us before it is taken for a glitch.
+; At 50 MHz the tightest window is
+; a 0's 1 us high, 12 slots of this thread: the word bookkeeping is placed
+; between the sample and the rise so that it never falls in it.
+;
+; OD_MASK (BUGS 14): CSRR, ORI, CSRW is not atomic across threads, and
+; joybus_device.loom sets its bit with the same three instructions. Both
+; read OD_MASK back three slots after their write and set it again if their
+; bit is missing (as dht22_host.loom does); no pad is driven before.
+;
+; Memory: 158 words of code and an 8-word reply buffer, more than one
+; quarter: 0x000..0x04A in thread 0's quarter, the rest (from the
+; turnaround on, 0x100..0x152, and BUF at 0x178..0x17F) in thread 2's, as
+; lin_slave and onewire_master spill. Thread 2 must not be started while
+; this program is loaded. With joybus_device.loom (thread 1, 0x080 and its
+; own spill in thread 3's quarter) the two load together and fill memory.
+;
+; Registers: r0 the first host word, r1 R, r2 the reply bytes still to come,
+; r3 the bit count while sending and the error code after, r4 and r5 the
+; command shift register (r5 on top), r6 the buffer pointer, r7 scratch and
+; the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    JBPIN = 0               ; BIDIR0
+        .pins   JB = JBPIN
+        .equ    JBBIT = 1 << JBPIN      ; its bit in OD_MASK
+        .equ    TK = 10                 ; clocks per 0.2 us tick at 50 MHz
+        .equ    T1 = 5                  ; 1 us: a 1's low, a 0's high
+        .equ    T3 = 15                 ; 3 us: a 0's low, a 1's high
+        .equ    LINE_TO = 10            ; 2 us: the line up after the stop bit
+        .equ    RESP_A = 255            ; the reply's first fall, in two parts:
+        .equ    RESP_B = 65             ; 255 + 65 = 320 ticks, 64 us
+        .equ    SHORT = 2               ; the glitch test, after the fall
+        .equ    THR = 9                 ; the bit's sample, after the fall
+        .equ    LOW_TO = 12             ; the rise, by sample + 2.4 us
+        .equ    HIGH_TO = 20            ; the next fall, by rise + 4 us
+        .equ    STOP_TO = 20            ; the stop bit's low, 4 us at most
+        .equ    DIR = 1 << 1            ; BE_CFG: MSB first, no CRC
+        .equ    E_LINE = 1
+        .equ    E_NORESP = 2
+        .equ    E_SHORT = 3
+        .equ    E_LOW = 4
+        .equ    E_HIGH = 5
+        .equ    E_STOP = 6
+        .equ    SPILL = 0x100           ; thread 2's quarter (header, Memory)
+        .equ    BUF = 0x178             ; the reply buffer, its last 8 words
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, JBBIT
+        CSRW    OD_MASK, r7             ; JB open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, JBBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, TK            ; one tick = 0.2 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, DIR
+        CSRW    BE_CFG, r7
+        LDI     r7, JBPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples JB
+        LDI     r7, (1 << 5) | JBPIN
+        CSRW    INGRP, r7               ; IN reads JB into bit 0
+        SETP    JB, 1                   ; released: the pull-up holds it high
+
+; One transaction per host word: parse it, check the line, send.
+cmd:    POP     r0                      ; the first host word (blocks)
+        MOV     r1, r0
+        SHRI    r1, 4
+        ANDI    r1, 15                  ; R
+        MOV     r2, r1                  ; the reply bytes still to come
+        MOV16   r6, BUF                 ; nothing stored yet
+        LDI     r7, 16
+        CMPI    r1, 2
+        BC      c16
+        LDI     r7, 8                   ; a 1-byte reply: one 8-bit word
+c16:    CSRW    CNT, r7                 ; the first reply word's bits
+        MOV     r3, r0
+        ANDI    r3, 3                   ; L
+        BNZ     l_ok
+        LDI     r3, 1                   ; L = 0 is taken as 1
+l_ok:   LDI     r4, 0
+        MOV16   r5, 0xFF00
+        AND     r5, r0, r5              ; the command byte on top
+        CMPI    r3, 2
+        BNC     line                    ; L = 1
+        POP     r4                      ; bytes 2 and 3
+        MOV     r7, r4
+        SHRI    r7, 8
+        OR      r5, r5, r7              ; byte 2 under the command byte
+        SHLI    r4, 8                   ; byte 3 next
+line:   SHLI    r3, 3                   ; 8 L bits
+        SETD    0                       ; re-anchor after the unbounded POPs
+        WAITP   JB, 1, T                ; idle high (TD reached: no wait)
+        BNT     go
+        LDI     r3, E_LINE              ; held low by someone
+        JMP     report
+go:     SETP    JB, 0, D
+        WAITD   4                       ; the first fall lands
+
+; The command, MSB first: each edge latched on its tick (header).
+tbit:   SHLI    r5, 1                   ; C = the bit
+        SETP    JB, 1, D                ; stage the rise
+        BC      t1
+        SHLI    r4, 1                   ; a 0: feed r5 from r4 ...
+        BNC     f0
+        ORI     r5, 1
+f0:     WAITD   T3                      ; ... the rise at fall + 3 us
+        SETP    JB, 0, D
+        WAITD   T1                      ; the next fall at + 4 us
+        DJNZ    r3, tbit
+        JMP     tstop
+t1:     WAITD   T1                      ; a 1: the rise at fall + 1 us
+        SETP    JB, 0, D
+        SHLI    r4, 1
+        BNC     f1
+        ORI     r5, 1
+f1:     WAITD   T3                      ; the next fall at + 4 us
+        DJNZ    r3, tbit
+tstop:  SETP    JB, 1, D                ; the console stop bit: 1 us low
+        WAITD   T1
+        JMP     turn
+
+; The rest spills into thread 2's quarter (header, Memory).
+        .org    SPILL
+
+; The turnaround: the line back up, then the device's first fall.
+turn:   LDI     r3, 0
+        TEST    r1, r1
+        BZ      report                  ; R = 0: nothing awaited
+        LDI     r3, E_LINE
+        SETD    LINE_TO
+        WAITP   JB, 1, T                ; the release, through the synchroniser
+        BT      report
+        LDI     r3, E_NORESP
+        SETD    RESP_A
+        WAITP   JB, 0, T
+        SETD    0                       ; anchored on the fall (if it came)
+        BNT     rbit
+        SETD    RESP_B
+        WAITP   JB, 0, T
+        SETD    0
+        BT      report
+
+; The reply, MSB first, CNT bits a word: each bit begins at a fall, and
+; every wait for a fall is followed at once by the SETD 0 that anchors it.
+rbit:   LDI     r3, E_SHORT
+        WAITD   SHORT
+        IN      r7                      ; still low: not a glitch
+        TEST    r7, r7
+        BNZ     report
+        WAITD   THR - SHORT
+        SHI                             ; the line at fall + 2 us: the bit; Z = (CNT == 0)
+        BZ      word
+rrise:  LDI     r3, E_LOW               ; (LDI, SETD, WAITP and BT keep Z)
+        SETD    LOW_TO
+        WAITP   JB, 1, T                ; a 1 has risen already, a 0 rises at 3 us
+        BT      report
+        LDI     r3, E_HIGH
+        SETD    HIGH_TO
+        WAITP   JB, 0, T                ; the next bit's fall
+        SETD    0                       ; anchored on it (keeps T)
+        BNT     rbit
+        JMP     report
+
+; A word is in: store it, set up the next (between the sample and the rise).
+word:   STSR    r7
+        SUBI    r2, 2                   ; C = 1: two bytes were due
+        BC      w2
+        SHLI    r7, 8                   ; one byte: into bits 15:8
+        LDI     r2, 0
+w2:     ST      r7, r6, 0
+        ADDI    r6, 1
+        TEST    r2, r2
+        BZ      rstop                   ; the last word
+        LDI     r7, 16
+        CMPI    r2, 2
+        BC      w16
+        LDI     r7, 8
+w16:    CSRW    CNT, r7
+        JMP     rrise
+
+; The device stop bit after the last bit's rise.
+rstop:  LDI     r3, E_LOW
+        SETD    LOW_TO
+        WAITP   JB, 1, T                ; the last bit's rise
+        BT      report
+        LDI     r3, E_STOP
+        SETD    HIGH_TO
+        WAITP   JB, 0, T                ; the stop bit's fall
+        BT      report
+        SETD    STOP_TO
+        WAITP   JB, 1, T                ; ... and its rise
+        BT      report
+        LDI     r3, 0
+
+; The report: ceil(R / 2) words (0 where none was stored), then status.
+report: ADDI    r1, 1
+        SHRI    r1, 1                   ; the words due
+        MOV     r5, r6                  ; the end of what was stored
+        MOV16   r6, BUF
+        TEST    r1, r1
+        BZ      rstat
+rword:  LDI     r7, 0
+        CMP     r6, r5
+        BC      rpush                   ; past the stored words: 0
+        LD      r7, r6, 0
+rpush:  PUSH    r7
+        ADDI    r6, 1
+        DJNZ    r1, rword
+rstat:  MOV     r7, r0
+        SHRI    r7, 4
+        ANDI    r7, 15                  ; R again
+        SUB     r7, r7, r2              ; the bytes received whole
+        SHLI    r3, 8
+        OR      r3, r3, r7
+        PUSH    r3
+        JMP     cmd
+
+        .org    BUF
+buf:    .word   0, 0, 0, 0, 0, 0, 0, 0
