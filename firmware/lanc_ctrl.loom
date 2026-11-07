@@ -1,0 +1,213 @@
+; lanc_ctrl.loom
+; A Sony LANC (Control-L) controller, the remote end of a camcorder's
+; LANC jack: it follows the camera's frame byte by byte, writes a command
+; from the host into bytes 0 and 1 of N frames in a row, and reports the
+; camera's status bytes 4 to 7 to the host whenever they change.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). LANC is one open-collector
+; wire at 9600 baud on which the camera is the clock: it starts every byte
+; of an 8-byte frame with its own start bit, once per video field, and the
+; controller has to answer inside the byte slot the camera opened. The
+; program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the controller only
+;     pulls the wire low or lets it go;
+;   - the tick restart on a TICK_INT write (SEMANTICS 4), built for the UART
+;     receiver's start-bit sync: at every start bit the thread's tick grid
+;     restarts, so each byte is timed from the camera's edge, not from the
+;     controller's own clock, and a camera a few per cent fast is followed;
+;   - the bit engine's SHO and SHI with INV (SEMANTICS 6.9), built for the
+;     serial protocols: LSB first, a low line is a 1;
+;   - the timed waits (WAITP ... T, SEMANTICS 6.4), built for the receivers'
+;     frame timeouts: the gap that ends a frame is a WAITP that times out.
+; What the firmware does that no hardware does: finding byte 0 from the
+; frame gap, the byte-slot schedule (write, read or leave alone, by the
+; byte's place in the frame), the repetition of a command over N frames,
+; and the change detection on the status bytes.
+;
+; Pin: LANC = BIDIR0, open drain (OD_MASK bit 0). Nothing drives it high;
+; the camera's pull-up (on the bench, the bench's pull-up) makes the high.
+; With lanc_cam.loom on thread 1 (BIDIR1) the board joins the two pins.
+;
+; Host words (FIFO space, thread 0).
+;   INQ word 1, once, before anything else: N, the frames each command is
+;     written in (bits 7:0; 0 is taken as 1). Boehmel: "A command is valid
+;     after 3...4 telegrams", so N = 5 is the usual choice.
+;   INQ, then, one word per command: bits 7:0 byte 0 (the command type,
+;     0x18 "normal command to VTR or video camera"), bits 15:8 byte 1 (the
+;     command: 0x34 play, 0x30 stop, 0x33 start/stop, ...). A command is
+;     taken in a frame gap when the previous one has had its N frames.
+;   OUTQ, two words per report: bits 7:0 byte 4, 15:8 byte 5; then 7:0
+;     byte 6, 15:8 byte 7. A report is made for the first complete frame
+;     and then whenever bytes 4 to 7 differ from the last report. The
+;     PUSHes block while OUTQ is full; the controller then re-finds the
+;     frame from the next gap (below), so it loses at most that frame.
+;
+; Rate: the host sets the tick before RUN, one eighth of a bit:
+;   9600 baud at 50 MHz: TICK_INT 651, TICK_FRAC 11 (651.04 clocks, 0.0 %);
+;   the tests also run a scaled build at TICK_INT 16 (a 128-clock bit),
+;   which is the tick the deadline checker proves (.tick 16).
+; The program reads TICK_INT once and writes it back at every start bit.
+;
+; Timing (tools/protomodels/lanc.py; every figure secondary, no Sony
+; document is published). Boehmel, "How SONY's LANC(tm) protocol works":
+; a bit is 104 us; the camera makes 8 start bits a frame, start to start
+; 1200 to 1400 us; frames every 20 ms (PAL) or 16.6 ms (NTSC). From memory,
+; unchecked: the line idles high, a start bit is low, a low data bit is a
+; 1, LSB first. Per byte slot, from the camera's start-bit fall S:
+;   bytes 0, 1 (with a command): bit j driven from S + (1 + j) bits, the
+;     camera samples near the middle; released at S + 9 bits (the stop);
+;   bytes 4 to 7: sampled at S + (1.5 + j) bits;
+;   bytes 2, 3 and bytes 0, 1 with no command: left alone.
+; The controller sees S 2 to 5 clocks late (synchroniser and slot grid),
+; restarts its tick one or two slots after that, and each SHO lands one
+; slot after its WAITD, so its edges run late of the camera's grid by a
+; constant 20 to 27 clocks (measured on the pin, tools/tests): 0.5 % of a
+; bit at 9600 baud, 21 % of the scaled test build's 128-clock bit, inside
+; the quarter-bit window of the model and well before the camera's
+; sample at the middle of the bit. The frame gap: the line high for GAPT = 120 ticks
+; (15 bits, 1.56 ms) after a byte's stop. The camera's gap between bytes
+; is at most 1400 - 9 x 104 = 463 us, its gap before byte 0 at least
+; 16.6 - 8 x 1.4 + 0.46 = 5.9 ms, so 1.56 ms tells them apart either way.
+;
+; OD_MASK (BUGS 14, PORTING 4): lanc_cam.loom sets its bit with the same
+; three instructions; each program reads OD_MASK back three slots after
+; its write and writes it again if its bit is missing.
+;
+; Memory: thread 0's quarter, 0x000..0x07F. With lanc_cam.loom (thread 1,
+; 0x080) the two load together.
+;
+; Registers: r0 the command, r1 frames still to write it in, r2 1 until
+; the first report, r3 the byte's place in the frame (8: not known), r4
+; bytes 5:4, r5 bytes 7:6, r6 the host's TICK_INT, r7 scratch. CRC_INIT
+; holds N, CRC_POLY and CRC the last reported bytes 5:4 and 7:6 (the CRC
+; unit is off, so the three registers are plain storage).
+;
+; Readings taken on the open spec questions (2026-11-07): every figure is
+; secondary (no Sony document is published).
+;   Line levels and bit order are from memory and unchecked: idle high,
+;   start bit low, a low data bit is a 1, LSB first. The sources that
+;   could be read give the bit time, the frame shape and the 1200 to
+;   1400 us between start bits, but not the levels. Check before use.
+;   The controller writes bytes 0 and 1 and the camera bytes 2 to 7; the
+;   host sets how many frames a command repeats.
+;   NTSC fields are 16.683 ms (59.94 Hz); the quarter-bit edge window is
+;   this program's choice.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    LPIN = 0                ; BIDIR0
+        .pins   LANC = LPIN
+        .equ    LBIT = 1 << LPIN        ; its bit in OD_MASK
+        .equ    BIT = 8                 ; ticks a bit (tick = bit / 8)
+        .equ    GAPT = 15 * BIT         ; the frame gap (header)
+        .equ    INV = 1 << 7            ; BE_CFG: LSB first, line inverted
+        .equ    UNSYNC = 8              ; r3: the byte's place is not known
+        .tick   16                      ; the scaled test tick (header)
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, LBIT
+        CSRW    OD_MASK, r7             ; LANC open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, LBIT
+        BZ      start                   ; lost to the other thread's write
+        SETP    LANC, 1                 ; released
+        LDI     r7, INV
+        CSRW    BE_CFG, r7
+        LDI     r7, (LPIN << 5) | LPIN
+        CSRW    BE_PINS, r7             ; SHO drives and SHI samples LANC
+        CSRR    r6, TICK_INT            ; the host's tick, for the restarts
+        POP     r7                      ; N (blocks until the host sends it)
+        LDI     r5, 0xFF
+        AND     r7, r7, r5
+        BNZ     n_ok
+        LDI     r7, 1
+n_ok:   CSRW    CRC_INIT, r7
+        LDI     r1, 0                   ; no command yet
+        LDI     r2, 1                   ; report the first frame
+        LDI     r3, UNSYNC
+        WAITP   LANC, 1                 ; the camera's pull-up
+
+; Between bytes: the next start bit within GAPT, or the frame gap.
+idle:   SETD    GAPT
+        WAITP   LANC, 0, T
+        BNT     fall                    ; a start bit: the next byte
+        LDI     r3, 0                   ; the frame gap: byte 0 is next
+        TEST    r1, r1
+        BNZ     wait0                   ; the command has frames to go
+        WAITB   INQ_NE, T               ; a test: TD is reached
+        BT      wait0
+        POP     r0                      ; cannot stall: INQ is not empty
+        CSRR    r1, CRC_INIT            ; N frames of it
+wait0:  WAITP   LANC, 0                 ; byte 0's start bit
+
+; A start bit fell: restart the tick grid on it and take the byte.
+fall:   CSRW    TICK_INT, r6            ; ACC = 0: ticks count from here
+        SETD    0
+        CMPI    r3, 2
+        BC      rd                      ; bytes 2 to 7, or not known
+        TEST    r1, r1
+        BZ      skip                    ; no command: leave 0 and 1 alone
+        CMPI    r3, 1
+        BZ      w1                      ; byte 1: SR holds it already
+        LDSR    r0                      ; byte 0 in SR[7:0], byte 1 next
+w1:     LDI     r7, 8
+        CSRW    CNT, r7
+        WAITD   BIT                     ; S + 1 bit: data bit 0
+wbit:   SHO                             ; a 1 pulls low; Z = (CNT == 0)
+        WAITD   BIT
+        BNZ     wbit
+        SETP    LANC, 1                 ; S + 9 bits: released, the stop
+        CMPI    r3, 1
+        BNZ     after
+        SUBI    r1, 1                   ; one more frame written
+        JMP     after
+
+rd:     CMPI    r3, 4
+        BNC     skip                    ; bytes 2 and 3
+        CMPI    r3, UNSYNC
+        BC      skip                    ; not known: let it pass
+        LDI     r7, 8
+        CSRW    CNT, r7
+        WAITD   BIT + BIT / 2           ; S + 1.5 bits: the middle of bit 0
+rbit:   SHI
+        BZ      rlast
+        WAITD   BIT
+        JMP     rbit
+rlast:  CMPI    r3, 5
+        BNZ     r7th
+        STSR    r4                      ; bytes 5:4 (16 SHIs since byte 4)
+        JMP     after
+r7th:   CMPI    r3, 7
+        BNZ     after
+        STSR    r5                      ; bytes 7:6
+        CSRR    r7, CRC_POLY
+        CMP     r7, r4
+        BNZ     report
+        CSRR    r7, CRC
+        CMP     r7, r5
+        BNZ     report
+        TEST    r2, r2
+        BZ      after
+report: PUSH    r4
+        PUSH    r5
+        CSRW    CRC_POLY, r4
+        CSRW    CRC, r5
+        LDI     r2, 0
+        JMP     after
+
+skip:   WAITD   9 * BIT                 ; S + 9 bits: past the byte's data
+
+; After a byte: the next place, and the line high (the stop) by 2 bits on.
+after:  CMPI    r3, UNSYNC
+        BC      a_stop
+        ADDI    r3, 1
+a_stop: SETD    2 * BIT
+        WAITP   LANC, 1, T
+        BNT     idle
+        LDI     r3, UNSYNC              ; stuck low: lost the frame
+        WAITP   LANC, 1
+        JMP     idle

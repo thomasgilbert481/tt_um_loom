@@ -1,0 +1,189 @@
+; lanc_cam.loom
+; The camcorder end of Sony LANC (Control-L): it makes the frame. Once a
+; video field it sends 8 start bits, 1302 us apart; after the first two it
+; lets the wire go and reads the controller's command (bytes 0 and 1),
+; after the other six it sends status bytes 2 to 7 that the host has set,
+; and it reports each command it received, with the number of frames in a
+; row it was received in.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035), and as the bench partner of
+; lanc_ctrl.loom (a camera to test a controller against, or a controller
+; to test). It uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built
+;     for clock-exact edges (ws2812): every start bit falls on its exact
+;     tick, and the frame is an absolute schedule with no drift;
+;   - the bit engine's SHO and SHI with INV (SEMANTICS 6.9), built for the
+;     serial protocols: LSB first, a low line is a 1;
+;   - the data memory (LD, ST, SEMANTICS 6.11), built for device emulation
+;     (EEPROMs): the six status bytes are a table in the thread's quarter;
+;   - a run-time deadline (CSRW TD): the field period comes from the host.
+; What the firmware does that no hardware does: the frame schedule (who
+; drives which byte), the field rate, and the command-run reports.
+;
+; Pin: LANC = BIDIR1, open drain (OD_MASK bit 1). The pull-up that a real
+; camera has is the board's (the bench's pull-up in the tests).
+;
+; Host words (FIFO space, thread 1).
+;   INQ word 1, once: P, the field period in ticks (bit / 8): 1536 for
+;     20 ms (PAL), 1281 for 16.68 ms (NTSC 59.94 Hz; Boehmel: 16.6 ms).
+;     P below 900 is taken as 900 (the 8 byte slots are 800 ticks).
+;   INQ, then, any time: (k << 8) | v sets status byte k (2..7) to v; a
+;     word with another k is ignored. Words are taken in the frame gap,
+;     all that are waiting, and go out from the next frame on. Bytes not
+;     set are 0x00.
+;   OUTQ, two words per report: the command (bits 7:0 byte 0, 15:8 byte 1)
+;     and the number of frames in a row it was received in. A report is
+;     made in the gap of the first frame that brings a different command
+;     (0x0000 included, which is a frame with no command). Each PUSH is
+;     made only if OUTQ has room (WAITB OUTQ_NF, T), so a full OUTQ drops
+;     a report rather than delaying a frame.
+;
+; Rate: the host sets the tick before RUN, one eighth of a bit:
+;   9600 baud at 50 MHz: TICK_INT 651, TICK_FRAC 11; the scaled test build
+;   TICK_INT 16, the tick the deadline checker proves (.tick 16).
+;
+; Timing (tools/protomodels/lanc.py; every figure secondary, no Sony
+; document is published). Boehmel, "How SONY's LANC(tm) protocol works":
+; 104 us bits, 8 start bits a frame from the camera, start to start 1200
+; to 1400 us, 20 ms or 16.6 ms between frames. From memory, unchecked: the
+; line idles high, a start bit is low, a low data bit is a 1, LSB first.
+; This camera, from each start-bit fall S (exact, latched):
+;   start bit S .. S + 1 bit;
+;   bytes 0, 1: released at S + 1 bit (exact), sampled at S + (1.5 + j)
+;     bits;
+;   bytes 2..7: bit j from S + (1 + j) bits (SHO, at most 8 clocks after the
+;     tick), released at S + 9 bits (the stop);
+;   next start bit at S + 100 ticks = 12.5 bits = 1302 us;
+;   frame start to frame start: P ticks, exact.
+;
+; OD_MASK (BUGS 14, PORTING 4): as lanc_ctrl.loom, set, read back three
+; slots later, set again if missing.
+;
+; Memory: thread 1's quarter, 0x080..0x0FF; the status table is the last
+; six words, 0x0FA..0x0FF (byte k at TABLE + k).
+;
+; Registers: r0 the command received this frame, r1 the command of the
+; current run, r2 its frames, r3 the byte's place k (in the gap: scratch),
+; r4 P - 802, r5 scratch, r6 the next frame's deadline less 2, r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    LPIN = 1                ; BIDIR1
+        .pins   LANC = LPIN
+        .equ    LBIT = 1 << LPIN
+        .equ    BIT = 8                 ; ticks a bit
+        .equ    SLOT = 100              ; ticks start to start (1302 us)
+        .equ    PMIN = 900
+        .equ    INV = 1 << 7            ; BE_CFG: LSB first, line inverted
+        .equ    TABLE = 0x0F8           ; status byte k at TABLE + k
+        .tick   16
+
+start:  CSRR    r7, OD_MASK
+        ORI     r7, LBIT
+        CSRW    OD_MASK, r7             ; LANC open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, LBIT
+        BZ      start                   ; lost to the other thread's write
+        SETP    LANC, 1                 ; released
+        LDI     r7, INV
+        CSRW    BE_CFG, r7
+        LDI     r7, (LPIN << 5) | LPIN
+        CSRW    BE_PINS, r7
+        POP     r4                      ; P (blocks)
+        MOV16   r7, PMIN
+        CMP     r4, r7
+        BC      p_ok
+        MOV     r4, r7
+p_ok:   MOV16   r7, 8 * SLOT + 2
+        SUB     r4, r4, r7              ; P - 802
+        LDI     r1, 0
+        LDI     r2, 0
+        LDI     r0, 0
+        SETD    0
+        CSRR    r7, TD                  ; the first frame: P - 800 from now
+        JMP     gap
+
+; The frame: 8 byte slots of SLOT ticks from the start-bit fall S, which
+; the WAITD before each entry to `byte` has just landed (staged).
+frame:  LDI     r3, 0
+byte:   CMPI    r3, 2
+        BC      tx
+        SETP    LANC, 1, D              ; bytes 0, 1: the controller's
+        WAITD   BIT                     ; S + 1 bit: released, exact
+        LDI     r7, 8
+        CSRW    CNT, r7
+        WAITD   BIT / 2                 ; S + 1.5 bits: the middle of bit 0
+rx:     SHI
+        BZ      rx_end
+        WAITD   BIT
+        JMP     rx
+rx_end: STSR    r0                      ; after byte 1: bytes 1:0
+        ADDI    r3, 1
+        SETP    LANC, 0, D              ; the next start bit
+        WAITD   SLOT - 8 * BIT - BIT / 2 ; from S + 8.5 bits to S + SLOT
+        JMP     byte
+
+tx:     LDI     r5, TABLE               ; bytes 2..7: the host's
+        ADD     r5, r5, r3
+        LD      r7, r5, 0
+        LDSR    r7                      ; byte k in SR[7:0]
+        LDI     r7, 8
+        CSRW    CNT, r7
+tbit:   WAITD   BIT                     ; S + (1 + j) bits
+        SHO                             ; Z = (CNT == 0)
+        BNZ     tbit
+        WAITD   BIT
+        SETP    LANC, 1                 ; S + 9 bits: the stop
+        ADDI    r3, 1
+        CMPI    r3, 8
+        BZ      fend
+        SETP    LANC, 0, D              ; the next start bit
+        WAITD   SLOT - 9 * BIT
+        JMP     byte
+
+fend:   WAITD   SLOT - 9 * BIT          ; F + 800: the frame's slots are over
+        CSRR    r7, TD
+
+; The gap: reports, host words, and the next frame on its deadline.
+gap:    ADD     r6, r7, r4              ; F + P - 2
+        CMP     r0, r1
+        BZ      same
+        TEST    r1, r1
+        BZ      new                     ; the run that ends had no command
+        WAITB   OUTQ_NF, T              ; a test: TD is reached
+        BT      new                     ; full: the report is dropped
+        PUSH    r1                      ; cannot stall: OUTQ has room
+        WAITB   OUTQ_NF, T
+        BT      new
+        PUSH    r2
+new:    MOV     r1, r0
+        LDI     r2, 0
+same:   TEST    r1, r1
+        BZ      inq
+        ADDI    r2, 1                   ; one more frame of the run
+inq:    WAITB   INQ_NE, T
+        BT      go
+        POP     r7                      ; cannot stall: INQ is not empty
+        MOV     r3, r7
+        SHRI    r3, 8                   ; k
+        CMPI    r3, 2
+        BNC     inq
+        CMPI    r3, 8
+        BC      inq
+        LDI     r5, TABLE
+        ADD     r5, r5, r3
+        ST      r7, r5, 0               ; v in bits 7:0; SHO sends only those
+        JMP     inq
+go:     SETD    0                       ; cuts the path for the checker
+        CSRW    TD, r6
+        SETP    LANC, 0, D              ; the frame's first start bit ...
+        WAITD   2                       ; ... at F + P, exact
+        JMP     frame
+
+; The status table, bytes 2..7 (0x00 until the host sets them).
+        .org    TABLE + 2
+        .word   0, 0, 0, 0, 0, 0
