@@ -1,0 +1,379 @@
+; bldc_6step.loom
+;
+; Six-step (trapezoidal) commutation of a three-phase brushless DC motor
+; from its three Hall sensors, with high-side PWM at a host-set duty, a dead
+; time at every commutation, an immediate all-off on an invalid Hall state,
+; and the time between sector changes measured and reported to the host.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as an
+; application Loom was not designed for (D-035): motor control is in no
+; design document, and it is not a serial protocol at all. The program uses:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for clock-exact bit edges of the serial transmitters (UART, CAN,
+;     DShot): here every PWM edge of the active high-side switch lands on
+;     the exact clock of its tick while the thread goes on polling the Hall
+;     sensors;
+;   - OUT through a six-pin OUTGRP and IN through a three-pin INGRP (6.3),
+;     built for parallel buses: all six gates change in one slot, so no
+;     commutation ever passes through a half-written pattern;
+;   - LD (6.11, slice B), built for device-emulation tables: the two drive
+;     tables of the application note and the dead time are words in the
+;     image, and the host may patch the dead-time word before RUN.
+; What the firmware does that no hardware does: the commutation table in
+; both directions, the PWM schedule, the dead time, the invalid-state trip
+; and the speed measurement. There is no PWM unit, no timer capture and no
+; dead-time generator in Loom.
+;
+; Source: Microchip AN857, "Brushless DC Motor Control Made Easy"
+; (DS00857B, 2002-2011), read 2026-11-07:
+;   - Figure 4 "Commutation code segment": FwdTable and RevTable, the drive
+;     words indexed by the sensor code (sensor A the least significant bit),
+;     codes 0 and 7 invalid with drive word 0. Drive word bits 5..0 are
+;     C high, C low, B high, B low, A high, A low (Table 1's column order,
+;     RC5..RC0). The tables below are those words, unchanged.
+;   - page 3, the paragraph on dead-time control: "the proper amount of time
+;     for the high side driver to turn off must be allowed to elapse before
+;     the low side driver is activated"; the note adds that the six-step
+;     sequence never switches one phase from high to low directly, so it
+;     needs no special timing. This program enforces a dead time anyway,
+;     because a reversal or a missed sector does switch one phase directly.
+;   - pages 6-7: modulate the high-side driver and leave the low-side driver
+;     on (AND the drive word with the low-side bits to turn the active high
+;     side off); about 10 kHz; 256 duty levels.
+; The dead-time value (DEADT_DEFAULT below) is not from AN857, which gives
+; none: 1 us is a typical figure from memory, unchecked. The board sets
+; its own (header, "Dead time").
+;
+; Pins (AN857's drive-word order, so the tables need no reordering):
+;     AL = OUT0, AH = OUT1, BL = OUT2, BH = OUT3, CL = OUT4, CH = OUT5:
+;     push-pull gate-driver inputs, high = switch on, all low at start.
+;     The board must hold them low through reset with pull-downs (AN857
+;     page 3); the pads of a halted Loom keep their last value.
+;     HA = IN0, HB = IN1, HC = IN2: the Hall sensor outputs (open collector
+;     on most motors: the board supplies pull-ups), read by both threads.
+;
+; Two threads, because the two jobs have different clocks. Thread 0 owns
+; the six gates and its tick is the PWM resolution (one tick per duty step,
+; 250 ticks a period). Thread 1 owns nothing but its INQ and OUTQ and its
+; tick is the speed resolution, slow enough that a sector of a slowly
+; turning motor still fits in 15 bits. Neither waits for the other: both
+; read the Hall pads, and thread 1 is free to stall on a full OUTQ without
+; delaying a gate edge or the invalid-state trip.
+;
+; Host commands, thread 0 (FIFO space):
+;     D             bit 15 the direction (0: AN857's FwdTable, clockwise;
+;                   1: RevTable, counter-clockwise), bits 7:0 the duty in
+;                   ticks of the 250-tick period (bits 14:8 ignored).
+;                   0 is coast: all six switches off. 1..DMIN-1 are raised
+;                   to DMIN, DMAX+1..255 lowered to DMAX (Timing). No reply.
+;                   The program starts coasting, forward.
+;     The duty is read once a period, after the period's falling high-side
+;     edge, and takes effect from the next period. A change of direction,
+;     or between coast and a duty, commutates again (with the dead time).
+; Host commands, thread 1:
+;     any word      a report request; the reply is two words:
+;                   T  the last sector's length in thread 1 ticks, the
+;                      time between the last two sector changes, or 0xFFFF
+;                      when there is none: before two changes, after an
+;                      invalid Hall state, a skipped sector, or 2^15 ticks
+;                      with no change (the motor is stopped or too slow);
+;                   S  bits 15:4 the number of sector changes (mod 4096),
+;                      bit 3 the measured direction of the last change
+;                      (1 = counter-clockwise), bits 2:0 the Hall code now.
+;
+; Commutation (thread 0). On any change of the Hall code, the thread first
+; replaces its staged PWM edge by a write to an input pin (which changes
+; nothing), then writes all six gates off, looks up the new drive word
+; (FwdTable or RevTable at the code; 0 for 000 and 111), and waits the dead
+; time with every switch off. Then it writes the new drive word, high side
+; on, and starts a new PWM period there; at duty 0 (coast) it writes
+; nothing, so every switch stays off. Every switch that turns on has
+; therefore had both switches of its phase off for at least the dead time,
+; whatever the previous pattern was. An invalid code leaves everything off
+; and the PWM schedule running on the no-op pin, until a valid code comes.
+; Weaker than a dedicated six-step peripheral: the low-side switch that two
+; neighbouring sectors share is also turned off for the dead time at every
+; commutation, a small loss of torque, and the PWM period restarts at every
+; commutation instead of running free.
+;
+; Timing. Thread 0's tick is the PWM step and the host sets it (the M2
+; convention): a period is PERIOD = 250 ticks, 20 kHz at TICK_INT 10 and
+; 50 MHz (5 kHz steps of 200 ns), 10 kHz at TICK_INT 20 as in AN857. The
+; host also sets thread 1's tick, the unit of the speed report (TICK_INT
+; 50: 1 us). The firmware is proved by hand, below, for TICK_INT >= 10 on
+; thread 0; the deadline checker has nothing to prove, because no WAITD is
+; used: thread 0 keeps its schedule in r2 and writes it to TD with CSRW,
+; where the staged edge lands (6.10 rule 1), and polls NOW in between.
+;   - Every high-side edge of a period, but the first rise after a
+;     commutation, is a staged SETP ... D and lands on its tick to the
+;     clock: periods of exactly 250 ticks and pulses of exactly the duty.
+;     The first rise of a sector is the ordinary OUT that ends the dead
+;     time, 2 to 58 clocks after the tick its period starts on.
+;   - Staging an edge must finish before its tick. From a tick to the CSRW
+;     of the next edge the longest path is 22 slots (a poll that just
+;     missed the tick, the stage dispatch to CH), committing 89 clocks
+;     after the tick; 97 from the end of a dead time. So the shortest
+;     pulse is DMIN = 12 ticks, 120 clocks at TICK 10. After a falling edge
+;     the longest path is the command handler with both clamps, 49 slots,
+;     committing 198 clocks after the tick, so the shortest off time is
+;     250 - DMAX = 28 ticks, 280 clocks. A pulse would still come if a
+;     stage were late: rule 2 then fires the write at the CSRW, so a late
+;     edge is late, never lost or doubled.
+;   - The trip: the longest path between two IN of thread 0 is 46 slots
+;     (a falling edge with a host command), and the gates go off 5 slots
+;     after the IN that sees the new code. With the two-flop synchroniser
+;     every gate is off at most 206 clocks after the Hall pad changes
+;     (4.1 us at 50 MHz), at most 110 when no command is being read and 50
+;     while the thread is in a poll loop.
+;   - Thread 1 sees a change at most 63 clocks after it (its longest path
+;     between two IN is 15 slots, a request), so a sector length is right
+;     to one tick plus 63 clocks either way. A request needs 2 free OUTQ
+;     entries; thread 1 stalls on a full OUTQ, and stops measuring, until
+;     the host reads.
+;
+; Dead time. The word at DEADT (0x011, default 5 ticks = 1 us at TICK 10)
+; is the dead time in thread 0 ticks, 1 to 63; the host may write it into
+; the image before RUN. Every commutation turns all six switches off, then
+; waits until NOW has advanced DEADT + 1 ticks past a reading taken 4 slots
+; after the off write, so on the pins the all-off gap is at least DEADT
+; ticks and at most DEADT + 1 ticks plus 76 clocks. Within a sector only
+; the high side switches and its own low side stays off, as AN857 does.
+;
+; Memory: 207 words, all in threads 0 and 1's quarters (.imem 512).
+; Thread 0: 121 words at 0x000 (a JMP, the two tables and the dead time at
+; 0x001-0x011, thread 1's position table at 0x012-0x019, code from 0x01A)
+; and its 27-word command handler at 0x0C0, after thread 1's code: its own
+; quarter is full. Thread 1: 59 words at 0x080. Threads 2 and 3 are free.
+;
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Dead time 1 us by default, from memory, unchecked (AN857 gives no
+;   value); it is a word in the image the host can patch before RUN.
+;   Duty 0 turns all six switches off (coast), the safest reading.
+;   The longest pulse is 222 of 250 ticks (no 100 % duty): the command
+;   handler needs time after each falling edge.
+;   The low side shared by neighbouring sectors is also off during each
+;   commutation's dead time, a small torque loss, so the trip path keeps
+;   its slot.
+;   No deadline pair to prove: thread 0 sets its edges through CSRW TD,
+;   so the timing above is argued by hand from the listing, not by the
+;   checker.
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   AL = OUT0, AH = OUT1, BL = OUT2, BH = OUT3, CL = OUT4, CH = OUT5
+        .pins   HA = IN0, HB = IN1, HC = IN2
+        .pins   NOPIN = IN3             ; the latch's harmless target (6.3: ignored)
+        .equ    PERIOD = 250            ; PWM period in thread 0 ticks
+        .equ    DMIN = 12               ; shortest on time, ticks (Timing)
+        .equ    DMAX = 222              ; longest on time, ticks (Timing)
+        .equ    DEADT_DEFAULT = 5       ; dead time, ticks: 1 us at TICK 10
+        .equ    LOWS = 0b010101         ; the low-side bits of a drive word
+
+        JMP     start                   ; 0x000
+TABLE:  .word   0b000000, 0b010010, 0b001001, 0b011000 ; 0x001 FwdTable 0..3
+        .word   0b100100, 0b000110, 0b100001, 0b000000 ;       FwdTable 4..7
+        .word   0b000000, 0b100001, 0b000110, 0b100100 ; 0x009 RevTable 0..3
+        .word   0b011000, 0b001001, 0b010010, 0b000000 ;       RevTable 4..7
+DEADT:  .word   DEADT_DEFAULT           ; 0x011: the dead time, host-patchable
+POS:    .word   6, 5, 3, 4, 1, 0, 2, 6  ; 0x012: clockwise position of each
+                                        ; code (thread 1's; 6 = invalid)
+
+; Registers: r0 the Hall code read; r1 the code commutated on (8 forces a
+; commutation); r2 the time of the next event, the value in TD once a PWM
+; edge is staged; r3 scratch; r4 the start of the PWM period; r5 the duty;
+; r6 the table offset, 0 forward or 8 reverse; r7 the drive word.
+start:  .csr    OUTGRP, (6 << 5) | pin(AL), r3 ; OUT writes the six gates
+        .csr    INGRP, (3 << 5) | pin(HA), r3  ; IN reads the three Halls
+        LDI     r3, 0
+        OUT     r3                      ; every switch off
+        LDI     r5, 0                   ; coast
+        LDI     r6, 0                   ; forward
+        LDI     r7, 0
+        LDI     r1, 8                   ; commutate on the first poll
+        CSRR    r2, NOW
+
+; The three poll loops are one loop in three copies, one per pending event,
+; so no dispatch is needed when the event is due: 7 slots, the Hall code
+; first, then reached(NOW, r2) as bit 15 of NOW - r2 (SHLI moves it to C).
+poll_dt: IN     r0                      ; waiting for the end of the dead time
+        CMP     r0, r1
+        BNZ     hall
+        CSRR    r3, NOW
+        SUB     r3, r3, r2
+        SHLI    r3, 1
+        BC      poll_dt
+dt_end: CMPI    r5, 0
+        BZ      coast                   ; duty 0: every switch stays off
+        OUT     r7                      ; the drive word, high side on
+coast:  MOV     r4, r2                  ; a period starts at the dead time's end
+        ADD     r2, r2, r5              ; its falling edge
+stage_off: MOV  r3, r7                  ; stage the falling edge of the active
+        SHRI    r3, 2                   ; high side: C = AH
+        BC      off_a
+        SHRI    r3, 2                   ; C = BH
+        BC      off_b
+        SHRI    r3, 2                   ; C = CH
+        BC      off_c
+        SETP    NOPIN, 0, D             ; no high side: a write that does nothing
+        CSRW    TD, r2
+        JMP     poll_off
+off_a:  SETP    AH, 0, D
+        CSRW    TD, r2
+        JMP     poll_off
+off_b:  SETP    BH, 0, D
+        CSRW    TD, r2
+        JMP     poll_off
+off_c:  SETP    CH, 0, D
+        CSRW    TD, r2
+poll_off: IN    r0                      ; waiting for the falling edge
+        CMP     r0, r1
+        BNZ     hall
+        CSRR    r3, NOW
+        SUB     r3, r3, r2
+        SHLI    r3, 1
+        BC      poll_off
+        WAITB   INQ_NE, T               ; a test, not a wait: TD = r2 is reached
+        BNT     command
+next_on: LDI    r3, PERIOD              ; stage the next period's rising edge
+        ADD     r2, r4, r3
+        CMPI    r5, 0
+        BZ      on_none
+        MOV     r3, r7
+        SHRI    r3, 2
+        BC      on_a
+        SHRI    r3, 2
+        BC      on_b
+        SHRI    r3, 2
+        BC      on_c
+on_none: SETP   NOPIN, 1, D
+        CSRW    TD, r2
+        JMP     poll_on
+on_a:   SETP    AH, 1, D
+        CSRW    TD, r2
+        JMP     poll_on
+on_b:   SETP    BH, 1, D
+        CSRW    TD, r2
+        JMP     poll_on
+on_c:   SETP    CH, 1, D
+        CSRW    TD, r2
+poll_on: IN     r0                      ; waiting for the rising edge
+        CMP     r0, r1
+        BNZ     hall
+        CSRR    r3, NOW
+        SUB     r3, r3, r2
+        SHLI    r3, 1
+        BC      poll_on
+        MOV     r4, r2                  ; the period starts at its rising edge
+        ADD     r2, r2, r5
+        JMP     stage_off
+
+; A new Hall code: cancel the staged edge, all six off, then the dead time.
+hall:   SETP    NOPIN, 0, D             ; replaces the staged high-side edge
+        LDI     r3, 0
+        OUT     r3                      ; every switch off (the trip)
+        LD      r3, r3, DEADT           ; the dead time in ticks
+        MOV     r1, r0
+        CSRR    r2, NOW
+        ADD     r2, r2, r3
+        ADDI    r2, 1                   ; + 1: NOW was read part-way into a tick
+        ADD     r3, r0, r6
+        LD      r7, r3, TABLE           ; the drive word, 0 for 000 and 111
+        JMP     poll_dt
+
+; The command handler goes after thread 1's code, in the second half of
+; thread 1's quarter: thread 0's own quarter is full (Memory).
+        .org    0x0C0
+; A host word, read after a falling edge: direction and duty.
+command: POP    r3                      ; cannot stall: the WAITB found an entry
+        MOV     r0, r3
+        SHRI    r0, 15
+        SHLI    r0, 3                   ; the table offset it asks for
+        CMP     r0, r6
+        BZ      c_dir
+        MOV     r6, r0
+        LDI     r1, 8                   ; a new direction: commutate again
+c_dir:  SHLI    r3, 8
+        SHRI    r3, 8                   ; the duty, Z if 0
+        BZ      c_zero
+        CMPI    r3, DMIN
+        BC      c_min
+        LDI     r3, DMIN
+c_min:  LDI     r0, DMAX
+        CMP     r0, r3                  ; C = (DMAX >= duty)
+        BC      c_max
+        MOV     r3, r0
+c_max:  CMPI    r5, 0
+        BNZ     c_set
+        LDI     r1, 8                   ; coast to a duty: commutate again
+        JMP     c_set
+c_zero: CMPI    r5, 0
+        BZ      c_set
+        LDI     r1, 8                   ; a duty to coast: commutate again
+c_set:  MOV     r5, r3
+        JMP     next_on
+
+; ---------------------------------------------------------------- thread 1
+; Registers: r0 the Hall code read, then its position; r1 the last code;
+; r2 the time of the last sector change; r3 the last sector's length
+; (0xFFFF none); r4 1 if r2 is a sector change the next one may be
+; measured from; r5 scratch, the time now; r6 the status word without the
+; Hall code (count in 15:4, direction in bit 3); r7 the old position.
+        .thread 1
+        .pins   HA1 = IN0
+start1: .csr    INGRP, (3 << 5) | pin(HA1), r5
+        IN      r1
+        CSRR    r2, NOW
+        LDI     r4, 0
+        LDI     r3, 0
+        NOT     r3, r3                  ; no measurement yet
+        LDI     r6, 0
+loop1:  IN      r0
+        CMP     r0, r1
+        BNZ     change
+        CSRR    r5, NOW
+        SUB     r5, r5, r2
+        SHLI    r5, 1                   ; C: 2^15 ticks since the last change
+        BC      stale
+        SETD    0
+        WAITB   INQ_NE, T               ; a test: TD = NOW is reached
+        BT      loop1
+        POP     r5                      ; a request (cannot stall: tested)
+        OR      r5, r6, r1
+        PUSH    r3                      ; may stall if the host does not read
+        PUSH    r5
+        JMP     loop1
+stale:  CSRR    r2, NOW                 ; too slow to measure, or stopped
+        JMP     unknown
+change: CSRR    r5, NOW
+        LD      r7, r1, POS
+        MOV     r1, r0
+        LD      r0, r0, POS
+        ADDI    r6, 16                  ; one more sector change
+        CMPI    r0, 6
+        BC      invalid                 ; 000 or 111
+        CMPI    r4, 0
+        BZ      first                   ; nothing valid to measure from
+        SUB     r7, r0, r7              ; positions moved, mod 6
+        BC      d_pos
+        ADDI    r7, 6
+d_pos:  CMPI    r7, 1
+        BZ      cw
+        CMPI    r7, 5
+        BNZ     first                   ; a skipped sector: no length
+        ORI     r6, 8                   ; counter-clockwise
+        JMP     measure
+cw:     ORI     r6, 8
+        XORI    r6, 8                   ; clockwise
+measure: SUB    r3, r5, r2
+        MOV     r2, r5
+        JMP     loop1
+first:  MOV     r2, r5
+        LDI     r4, 1
+        LDI     r3, 0
+        NOT     r3, r3
+        JMP     loop1
+invalid: MOV    r2, r5
+unknown: LDI    r4, 0
+        LDI     r3, 0
+        NOT     r3, r3
+        JMP     loop1
