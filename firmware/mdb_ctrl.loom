@@ -1,0 +1,293 @@
+; mdb_ctrl.loom
+;
+; An MDB/ICP controller (the VMC, the bus master of a vending machine): it
+; sends the blocks the host gives it, address byte first with the mode bit
+; set, then the data bytes and the CHK byte with it clear; it waits up to
+; t-response for the peripheral's answer, receives it byte by byte to the
+; byte whose mode bit is set, checks a data block's CHK and answers it with
+; ACK or NAK, and repeats the block after a silence, a NAK or a bad CHK
+; until the peripheral answers or the host's number of attempts is used up.
+; RESET (10H), POLL (12H) and VEND REQUEST (13H 00H) to a cashless device
+; are three such blocks; the host builds them (see "Host command").
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035); the partner of
+; mdb_cashless.loom. MDB characters have eleven bits: a start bit, eight
+; data bits, the mode bit and a stop bit (MDB 2.1). The shipped UART
+; programs are 8-bit, and no hardware here knows a ninth bit. This program
+; uses the bit engine's shift register in manual mode (SEMANTICS 6.9), built
+; for the M2 serial programs: with CNT = 9, SHO and SHI move nine bits LSB
+; first, so the mode bit is simply the ninth bit shifted, on the wire right
+; after bit 7 where MDB puts it. It also needs the M2 core (pins, deadlines,
+; timed waits, the FIFOs) and LD/ST of slice B (SEMANTICS 6.11) for the
+; block buffer that a retry re-sends. The CHK sum, the mode bit rules, the
+; ACK/NAK decisions, t-response, the inter-byte limit and the retries are
+; all firmware; no peripheral of the chip does any of them.
+;
+; Specification: "Multi-Drop Bus / Internal Communication Protocol",
+; MDB/ICP Version 4.3 (NAMA, July 2019, cashless section September 2020);
+; the brief asked for 4.2, whose public copies could not be fetched on
+; 2026-11-07, and sections 2 and 3 are the same text in both as far as the
+; 4.3 revision notes say (QUESTIONS.md). tools/protomodels/mdb.py is the
+; model. Cited: 2.1 byte format (9600 baud, 1 start, 8 data, mode, 1 stop;
+; master to peripheral, mode 1 marks the ADDRESS byte); 2.2 block format
+; (address byte, data, CHK; at most 36 bytes; t-response is the equivalent
+; of a NAK; on silence the master may repeat the command; the VMC answers a
+; data block with ACK, NAK or RET); 2.2 "CHK byte" (the sum of the address
+; and data bytes, carry ignored); 2.2 "Response codes" (ACK 00H, NAK FFH,
+; RET AAH); 2.5 examples B, D and E; 3.2 (t-inter-byte max 1.0 ms,
+; t-response max 5.0 ms, 9600 baud +1 %/-2 %).
+;
+; Pins: RX = IN0 (from the bus interface's receive optocoupler, logic
+; level, idle high), TX = OUT0 (to its transmit driver, idle high). Both
+; move with the assembler's --pin; TX must stay an OUT pin (no OEP).
+;
+; Rate: eight ticks a bit. 9600 baud at 50 MHz is TICK_INT 651, TICK_FRAC
+; 11 (5208.3 clocks a bit). The pairs are proved for ticks of 8 clocks or
+; more, so the test rate is 64 clocks a bit (TICK 8, 781 kbaud), with every
+; MDB time scaled to the same number of bit times. A second limit is not a
+; deadline pair: bytes that come back to back leave half a bit between a
+; stop bit's middle and the next start bit, and RX must be watched again
+; inside it. So each byte is handled between its mode bit and its stop bit,
+; and the re-arm after the stop bit is 5 slots (20 clocks, under the 32 of
+; half a bit at TICK 8). The first version did the work after the stop bit
+; (17 slots) and read every second byte one bit late at the test rate. The
+; start bit is anchored (SETD 0) in the slot right after the WAITP that saw
+; it, not inside rxbyte: three slots later, a sender 1 % fast made the
+; lateness grow byte by byte. On the model a sender from 1.5 % fast to 3 %
+; slow is read at TICK 8 (3.2: 9600 +1 %/-2 %). At 9600 baud half a bit
+; is 2604 clocks and none of this is close.
+;
+; Settings: three words of data memory the host loads with the image:
+;     0x0C0   TRESP, ticks the controller waits for the first start bit of
+;             the answer, from the end of the block's CHK stop bit (3.2:
+;             5.0 ms, 384 ticks at 9600 baud; 0 .. 32767)
+;     0x0C1   TIB, ticks allowed between the end of one byte of the answer
+;             and the next start bit (3.2: 1.0 ms, 77 ticks at 9600 baud)
+;     0x0C2   TRIES, attempts per block, 1 .. 7
+; Host command (INQ[0]), per block:
+;     word 1     n, the block's length without the CHK, 1 .. 35
+;     n words    the bytes in bits 7:0: the address byte (address in 7:3,
+;                command in 2:0, for example 0x10 RESET, 0x12 POLL and
+;                0x13 VEND to cashless device #1), then the data bytes
+;                (VEND REQUEST: 0x00, price high, price low, item high,
+;                item low; 7.4.5). Bits 15:8 are ignored: the controller
+;                sets the mode bit itself.
+; Result (OUTQ[0]), per block:
+;     bytes      one word per byte of the last attempt's answer, in bits
+;                8:0 with the mode bit in bit 8 (0x100 is ACK, 0x1FF NAK),
+;                pushed as each arrives; a byte that finds OUTQ full is
+;                dropped (the count still counts it)
+;     status     bit 15 set, after the block:
+;                bits 7:0   bytes in the last attempt's answer, CHK included
+;                bit 8      TMO: no answer within TRESP (every attempt)
+;                bit 9      CHK: a data block with a bad CHK; the controller
+;                           sent NAK
+;                bit 10     NAK: the peripheral answered NAK (any one-byte
+;                           answer other than ACK counts as NAK)
+;                bit 11     FERR: a stop bit low, or a gap over TIB inside
+;                           the answer
+;                bits 14:12 attempts made
+; Good when bits 11:8 are zero: an ACK (count 1), or a data block whose CHK
+; was right, which the controller has ACKed. Every failure repeats the block
+; until TRIES attempts are spent, as MDB 2.2 and example 2.5 E allow; a bad
+; data block is NAKed first (example 2.5 D), and the peripheral, by 2.2,
+; repeats its data to the repeated command. After a framing error the
+; controller first waits for TRESP of silence on RX.
+;
+; Weaker than a dedicated MDB UART: RET is never sent (NAK and a repeat
+; reach the same end, 2.5 D), the bus reset (t-break, 100 ms of the
+; transmit line active, 2.2 "Bus reset") is not generated, and the
+; non-response time (7.5, 5 s) and the RESET-every-10-s rule (2.4.3) are the
+; host's: the program does one block at a time.
+;
+; Memory: 128 words, all of thread 0's quarter, 0x000 .. 0x07F, and data at
+; 0x0C0 .. 0x0E5
+; (the settings, then the block buffer of 35 bytes), inside thread 1's
+; quarter, so thread 1 cannot run beside it. The image need not load the
+; buffer.
+;
+; Readings taken on the open spec questions (2026-11-07): MDB/ICP version
+; 4.3 was read (NAMA's copy; every 4.2 link was dead), whose revision
+; notes list no change to sections 2 and 3.
+;   The device NAKs a bad checksum; the controller sends ACK and NAK with
+;   the mode bit clear; a one-byte answer other than ACK is a NAK.
+;   Logic level only: no bus reset (break) is generated.
+;   A partial controller: RESET, POLL and VEND REQUEST only; RET is not
+;   sent (the device treats it as NAK), so a full set-up sequence would
+;   not complete.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0, TX = OUT0
+        .tick   8                       ; the shortest tick the pairs are proved for
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    CCFG = 0x0C0            ; the settings; r1 holds this address
+        .equ    TRSW = 0
+        .equ    TIBW = 1
+        .equ    TRYW = 2
+        .equ    BUFO = 3                ; the block buffer, from CCFG + 3
+        .equ    TMOF = 0x01             ; status bits 11:8, built in r3 3:0
+        .equ    CHKF = 0x02
+        .equ    NAKF = 0x04
+        .equ    FERRF = 0x08
+        .equ    ACK = 0x000             ; 2.2 "Response codes", mode bit clear
+        .equ    NAK = 0x0FF
+
+; Registers: r0 a byte or scratch, r1 CCFG, r2 a pointer or the bytes
+; received, r3 scratch or the status, r4 the CHK sum, r5 attempts made,
+; r6 TIB + OVS / 2, r7 n.
+
+start:  SETP    TX, 1                   ; idle
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        MOV16   r1, CCFG                ; BE_CFG stays 0: NRZ, LSB first (2.1)
+
+; ------------------------------------------------------------------ block
+next:   POP     r7                      ; n
+        MOV     r2, r1
+        ADDI    r2, BUFO
+        MOV     r3, r7
+        POP     r0
+        LDIH    r0, 1                   ; the ADDRESS byte: mode bit set (2.1)
+        JMP     put
+get:    POP     r0
+        LDIH    r0, 0                   ; a DATA byte: mode bit clear
+put:    ST      r0, r2, 0
+        INC     r2
+        DJNZ    r3, get
+        LD      r6, r1, TIBW
+        ADDI    r6, OVS / 2             ; r6: TIB, timed from a stop bit's middle
+        LDI     r5, 8                   ; r5 counts from 8: bit 3 is the status mark
+
+; One attempt: the block back to back, the CHK last (2.2).
+again:  INC     r5
+        MOV     r2, r1
+        ADDI    r2, BUFO
+        MOV     r3, r7
+        LDI     r4, 0
+        SETD    1
+txb:    LD      r0, r2, 0
+        INC     r2
+        ADD     r4, r4, r0              ; the CHK sum (2.2; bit 8 falls away below)
+        CALL    txbyte
+        DJNZ    r3, txb
+        MOV     r0, r4
+        LDIH    r0, 0                   ; CHK: the sum's low byte, mode bit clear
+        CALL    txbyte
+        WAITD   OVS                     ; the end of the CHK's stop bit
+
+; The answer: its first start bit within TRESP (3.2 t-response), then bytes
+; up to the one with the mode bit set (2.2), each within TIB of the last.
+        LDI     r2, 0
+        LDI     r4, 0
+        LD      r0, r1, TRSW
+        CSRR    r3, TD
+        ADD     r3, r3, r0
+        CSRW    TD, r3                  ; the CHK's end + TRESP
+        WAITP   RX, 0, T
+        SETD    0                       ; anchor on the start bit's edge
+        BNT     rxb
+        LDI     r3, TMOF                ; silence: as a NAK (2.2)
+        JMP     fail
+; Each byte is handled between its mode bit and its stop bit, so that RX is
+; watched again a few slots after the stop bit's middle: back-to-back bytes
+; leave half a bit (32 clocks at the test rate) for that.
+rxb:    CALL    rxbyte
+        INC     r2
+        ADD     r4, r4, r0              ; every byte, the CHK too (see last)
+        WAITB   OUTQ_NF, T              ; TD has passed: T = 1 only if OUTQ is full
+        BT      mode
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r0
+mode:   MOV     r3, r0
+        SHRI    r3, 8
+        BNZ     last                    ; the mode bit: the answer's last byte
+        WAITD   OVS                     ; the stop bit's middle
+        JP      RX, 0, ferr
+        CSRR    r3, TD
+        ADD     r3, r3, r6
+        CSRW    TD, r3                  ; the stop bit's end + TIB
+        WAITP   RX, 0, T
+        SETD    0
+        BNT     rxb
+ferr:   LDI     r3, FERRF               ; a low stop bit or a gap over TIB
+        JMP     quiet
+
+; The last byte. A data block ends with its CHK; one byte alone is ACK or
+; NAK, which carry no CHK (2.2), and ACK (00H) passes the same sum test as
+; an empty block. Any other single byte is taken as NAK.
+last:   WAITD   OVS                     ; the stop bit's middle
+        JP      RX, 0, ferr
+        SUB     r3, r4, r0              ; the sum of the bytes before the CHK
+        SUB     r3, r3, r0              ; minus the CHK (and its mode bit, twice)
+        SHLI    r3, 8                   ; Z: their low bytes agree
+        BNZ     bad
+        CMPI    r2, 1
+        BZ      good                    ; ACK: the exchange is over (2.2)
+        LDI     r0, ACK                 ; the VMC ACKs a data block (2.2)
+        SETD    1
+        CALL    txbyte
+        WAITD   OVS
+good:   LDI     r3, 0
+        JMP     report
+bad:    CMPI    r2, 1
+        BNZ     chkbad
+        LDI     r3, NAKF                ; NAK, as is t-response (2.2)
+        JMP     fail
+chkbad: LDI     r0, NAK                 ; 2.5 D: NAK, and the block is repeated
+        SETD    1
+        CALL    txbyte
+        WAITD   OVS
+        LDI     r3, CHKF
+fail:   LD      r0, r1, TRYW
+        ADDI    r0, 8
+        CMP     r5, r0                  ; C: the attempts are spent
+        BNC     again
+report: SHLI    r5, 4                   ; the mark in bit 7, attempts in bits 6:4
+        OR      r3, r3, r5
+        SWAP    r3, r3
+        OR      r3, r3, r2
+        PUSH    r3                      ; the host takes it when it likes
+        JMP     next
+
+; After a framing error the peripheral may still be sending: wait for TRESP
+; with no start bit on RX before the block is repeated.
+quiet:  LD      r0, r1, TRSW
+        CSRR    r4, NOW
+        ADD     r4, r4, r0
+        CSRW    TD, r4
+        WAITP   RX, 0, T
+        BT      fail
+        WAITP   RX, 1
+        JMP     quiet
+
+; txbyte: the nine bits in r0 8:0 (bit 8 the mode bit), its start bit OVS
+; ticks after TD, the stop bit begun on return.
+txbyte: LDSR    r0
+        LDI     r0, 9
+        CSRW    CNT, r0
+        WAITD   OVS
+        SETP    TX, 0                   ; start bit
+tbit:   WAITD   OVS
+        SHO                             ; bits 0 .. 7, then the mode bit (2.1)
+        BNZ     tbit
+        WAITD   OVS
+        SETP    TX, 1                   ; the stop bit
+        RET
+
+; rxbyte: called with TD anchored (SETD 0) in the slot after the WAITP
+; that saw RX fall, so the start bit is timed from one slot after its
+; edge; returns the nine bits in r0 8:0 with TD at the mode bit's middle,
+; so the caller samples the stop bit with WAITD OVS. A start bit that is
+; high at its middle leaves through ferr.
+rxbyte: WAITD   OVS / 2
+        JP      RX, 1, ferr2
+        LDI     r0, 9
+        CSRW    CNT, r0
+rbit:   WAITD   OVS
+        SHI
+        BNZ     rbit
+        STSR    r0
+        SHRI    r0, 7                   ; nine bits, LSB first, right-aligned
+        RET
+ferr2:  JMP     ferr

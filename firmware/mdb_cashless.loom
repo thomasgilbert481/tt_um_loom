@@ -1,0 +1,303 @@
+; mdb_cashless.loom
+;
+; An MDB/ICP cashless device (#1, address 10H): it reads every ADDRESS byte
+; on the controller's line, takes the blocks addressed to it, checks their
+; CHK, and answers within t-response: NAK to a bad CHK, ACK to RESET and
+; to a VEND REQUEST, and to POLL either ACK or the data block it has
+; pending: JUST RESET after a reset, then VEND APPROVED or VEND DENIED once
+; the host has decided on a VEND REQUEST. A data block stays pending until
+; the controller ACKs it, so a NAK or a silence makes it come again at the
+; next POLL.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035); the partner of mdb_ctrl.loom,
+; whose header explains the nine-bit characters: the bit engine's shift
+; register in manual mode (SEMANTICS 6.9), built for the M2 serial
+; programs, run with CNT = 9 so that the mode bit is the ninth bit shifted.
+; It also needs the M2 core and LD/ST of slice B (SEMANTICS 6.11) for the
+; block and response buffers. Address matching, the CHK, the end of a block,
+; the responses and their mode bits are all firmware.
+;
+; Specification: MDB/ICP Version 4.3 (NAMA; see mdb_ctrl.loom on 4.2 and
+; 4.3); tools/protomodels/mdb.py is the model. Cited: 2.1 (ADDRESS bytes
+; are read by every peripheral, DATA bytes only by the one addressed; a
+; peripheral sets the mode bit on the last byte it sends); 2.2 (a
+; peripheral's block is data and a CHK, or ACK, or NAK; it repeats a data
+; block the master NAKs or does not answer within t-response); 2.3
+; (cashless device #1 is 00010xxxB, the command in bits 2:0); 3.2
+; (t-response max 5.0 ms, t-inter-byte max 1.0 ms); 7.4.1 (RESET: no data,
+; go to the Inactive state; the controller's next POLL gets JUST RESET);
+; 7.4.4 (POLL: ACK when nothing is pending; JUST RESET is 00H 00H*); 7.4.5
+; (VEND REQUEST 13H 00H, item price and item number, two bytes each; VEND
+; APPROVED 05H and the vend amount, two bytes; VEND DENIED 06H); 7.3 (a
+; command may be ACKed and its data given to a later POLL).
+;
+; Pins: RX = IN1 (the controller's transmit line, through the bus
+; interface, idle high), TX = OUT1 (to the peripheral transmit driver, idle
+; high). Both move with --pin; TX must stay an OUT pin. mdb_ctrl uses IN0
+; and OUT0, so the two run together with the bench wiring OUT0 to IN1 and
+; OUT1 to IN0.
+;
+; Rate: eight ticks a bit, as mdb_ctrl (9600 baud: TICK_INT 651, TICK_FRAC
+; 11); the pairs are proved for ticks of 8 clocks or more, and the receive
+; loop meets back-to-back bytes there as mdb_ctrl's header explains (each
+; byte handled before its stop bit, the start bit anchored in the slot
+; after the WAITP that saw it).
+;
+; Settings: three words of data memory the host loads with the image:
+;     0x1D0   GAP, ticks of silence after a byte that end the controller's
+;             block; more than t-inter-byte (3.2: 1.0 ms), and small enough
+;             that the answer still starts within t-response (5.0 ms).
+;             Suggested 80 ticks (1.04 ms at 9600 baud): the answer then
+;             starts about 1.1 ms after the CHK.
+;     0x1D1   TRESP, ticks the device waits for the controller's ACK after
+;             it sent a data block (3.2: 5.0 ms, 384 ticks at 9600 baud)
+;     0x1D2   the address byte's upper five bits, as a byte: 0x10
+; Host decision (INQ[2]), one word per VEND REQUEST, read at the POLLs that
+; follow it: bit 15 clear, VEND APPROVED with the vend amount in bits 14:0;
+; bit 15 set, VEND DENIED. Until the word comes, each POLL is ACKed (7.4.4:
+; "pending information is not yet ready").
+; Events (OUTQ[2]):
+;     0x0010             a RESET was received (and ACKed)
+;     0x0013, P, N       a VEND REQUEST: item price P, item number N
+;     0x0005 or 0x0006   the controller ACKed VEND APPROVED or DENIED
+;     0x0000             the controller ACKed JUST RESET
+; An event that finds OUTQ full is dropped.
+;
+; Weaker than a real reader: only RESET, POLL and VEND REQUEST are
+; understood. Every other command with a good CHK (SETUP, READER ENABLE,
+; the other VEND sub-commands, EXPANSION) is ACKed and does nothing, so a
+; Level 01+ controller's initialisation sequence (7.4.1) would not get its
+; READER CONFIGURATION DATA; the states of 7.2 and the out-of-sequence rule
+; of 7.3 are not kept; RET is treated as NAK (the block comes at the next
+; POLL instead of at once); the vend amount is 15 bits, so the FFFFh token
+; value cannot be sent; a block is ended by silence (GAP), not by its
+; command's length, which costs about 1 ms of the 5 ms t-response; and a
+; RESET does not empty INQ, so the host must not leave a decision there
+; across a reset.
+;
+; Memory: 174 words at 0x100 .. 0x1AD, thread 2's quarter and 46 words of
+; thread 3's, so thread 3 cannot run beside it; data at 0x1D0 .. 0x1FB (the settings,
+; the response buffer of 5 words, the block buffer of 36). With mdb_ctrl
+; (0x000 .. 0x07F, data 0x0C0 .. 0x0E5) both fit one 512-word image.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 2
+        .pins   RX = IN1, TX = OUT1
+        .tick   8                       ; the shortest tick the pairs are proved for
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    DCFG = 0x1D0            ; the settings; r1 holds this address
+        .equ    GAPW = 0
+        .equ    TRSW = 1
+        .equ    ADRW = 2
+        .equ    RSPO = 3                ; the pending response: n, then n bytes
+        .equ    BUFO = 8                ; the block buffer, from DCFG + 8
+        .equ    VENDF = 1               ; r6: a VEND REQUEST awaits the host
+        .equ    RESF = 2                ; r6: a data block is pending
+
+; Registers: r0 a byte or scratch, r1 DCFG, r2 a pointer, r3 scratch, r4 the
+; CHK sum, r5 the sum before the last byte, r6 the state, r7 GAP + OVS / 2.
+
+start:  SETP    TX, 1                   ; idle
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        MOV16   r1, DCFG                ; BE_CFG stays 0: NRZ, LSB first (2.1)
+        LD      r7, r1, GAPW
+        ADDI    r7, OVS / 2             ; r7: GAP, timed from a stop bit's middle
+        LDI     r3, 0                   ; JUST RESET is pending from power-up (7.4.1)
+        CALL    resp1
+
+; -------------------------------------------------------------- a block
+; Every ADDRESS byte is read (2.1); one with this device's address in bits
+; 7:3 and the mode bit set starts a block. DATA bytes follow until a
+; silence of GAP ticks; the last of them is the CHK (2.2).
+idle:   MOV     r2, r1
+        ADDI    r2, BUFO + 1            ; where the block's second byte goes
+        WAITP   RX, 0
+        SETD    0                       ; anchor on the start bit's edge
+        CALL    rxbyte
+; Between the mode bit and the stop bit: store the byte, set up the sums,
+; test the address; RX is watched again a few slots after the stop bit's
+; middle, inside the half bit that back-to-back bytes leave.
+        ST      r0, r1, BUFO
+        MOV     r4, r0
+        LDI     r5, 1                   ; a lone ADDRESS byte (10H .. 17H) fails the CHK test
+        LD      r3, r1, ADRW
+        LDIH    r3, 1                   ; the mode bit
+        XOR     r3, r3, r0
+        SHRI    r3, 3                   ; Z: mode bit set and the address matches
+        WAITD   OVS                     ; the stop bit's middle
+        BNZ     idle
+        JP      RX, 1, arm
+        JMP     idle                    ; a low stop bit: no answer (2.2)
+arm:    CSRR    r3, TD
+        ADD     r3, r3, r7
+        CSRW    TD, r3                  ; the stop bit's end + GAP
+        WAITP   RX, 0, T
+        SETD    0
+        BT      bend
+        CALL    rxbyte
+        MOV     r5, r4
+        ADD     r4, r4, r0
+        ST      r0, r2, 0
+        INC     r2
+        WAITD   OVS                     ; the stop bit's middle
+        JP      RX, 1, arm
+        JMP     idle
+bend:   SUB     r3, r5, r0              ; the sum minus the CHK (2.2)
+        SHLI    r3, 8                   ; Z: their low bytes agree
+        BNZ     nak
+        MOV     r2, r1
+        ADDI    r2, BUFO
+        LD      r0, r2, 0
+        ANDI    r0, 7                   ; the command (2.3)
+        BZ      reset
+        CMPI    r0, 2
+        BZ      poll
+        CMPI    r0, 3
+        BNZ     ack                     ; another command: ACKed, not acted on
+        LD      r0, r2, 1
+        TEST    r0, r0
+        BNZ     ack                     ; another VEND sub-command
+; VEND REQUEST (7.4.5): tell the host, ACK now, answer at a later POLL (7.3).
+        LDI     r0, 0x13
+        CALL    event
+        ADDI    r2, 2
+        CALL    word                    ; the item price
+        CALL    word                    ; the item number
+        ORI     r6, VENDF
+        JMP     ack
+reset:  LDI     r0, 0x10                ; RESET (7.4.1): to the Inactive state
+        CALL    event
+        LDI     r6, 0                   ; any vend is over
+        LDI     r3, 0
+        CALL    resp1                   ; the next POLL gets JUST RESET
+        JMP     ack
+nak:    LDI     r0, 0xFF
+        JMP     one
+ack:    LDI     r0, 0
+one:    LDIH    r0, 1                   ; ACK or NAK alone: mode bit set (2.2)
+        SETD    1
+        CALL    txbyte
+        WAITD   OVS
+        JMP     idle
+
+; ------------------------------------------------------------------ POLL
+; 7.4.4: the pending data block if there is one, else, while a VEND REQUEST
+; awaits the host, its decision once INQ holds it, else ACK.
+poll:   MOV     r0, r6
+        ANDI    r0, RESF
+        BNZ     sendr
+        MOV     r0, r6
+        ANDI    r0, VENDF
+        BZ      ack
+        WAITB   INQ_NE, T               ; TD has passed: a test, not a wait
+        BT      ack                     ; not decided yet
+        .bounded "the WAITB INQ_NE, T just before completed by its condition; only this thread pops INQ"
+        POP     r0
+        LDI     r6, 0
+        MOV     r3, r0
+        SHLI    r3, 1                   ; C: bit 15, denied
+        BC      denied
+        MOV     r2, r1                  ; VEND APPROVED (7.4.5): 05H, amount, CHK*
+        ADDI    r2, RSPO
+        LDI     r3, 4
+        ST      r3, r2, 0
+        LDI     r3, 5
+        ST      r3, r2, 1
+        MOV     r4, r0
+        SHRI    r4, 8
+        ST      r4, r2, 2               ; the amount, high byte first (2.4.2)
+        LDIH    r0, 0
+        ST      r0, r2, 3
+        ADD     r4, r4, r0
+        ADD     r4, r4, r3
+        LDIH    r4, 1                   ; CHK, with the mode bit (2.1)
+        ST      r4, r2, 4
+        ORI     r6, RESF
+        JMP     sendr
+denied: LDI     r3, 6                   ; VEND DENIED (7.4.5): 06H, CHK*
+        CALL    resp1
+
+; The pending block, back to back; then the controller's answer, within
+; TRESP of its CHK: ACK clears it, NAK, RET or silence keep it (2.2).
+sendr:  MOV     r2, r1
+        ADDI    r2, RSPO
+        LD      r5, r2, 0
+        SETD    1
+sloop:  LD      r0, r2, 1
+        INC     r2
+        CALL    txbyte
+        DJNZ    r5, sloop
+        WAITD   OVS                     ; the end of the CHK's stop bit
+        LD      r4, r1, TRSW
+        CSRR    r3, TD
+        ADD     r3, r3, r4
+        CSRW    TD, r3
+        WAITP   RX, 0, T
+        SETD    0
+        BT      idle                    ; silence: repeated at the next POLL
+        CALL    rxbyte
+        WAITD   OVS                     ; past its mode bit, to the stop bit
+        TEST    r0, r0                  ; ACK: 00H, mode bit clear
+        BNZ     idle
+        ANDI    r6, VENDF               ; the block is delivered
+        LD      r0, r1, RSPO + 1        ; its first byte is the event
+        CALL    event
+        JMP     idle
+
+; resp1: a one-byte data block, r3 and its CHK (the same byte, with the
+; mode bit), made pending. The SETD only gives the deadline checker an
+; anchor: its CALL/RET analysis is context-insensitive, and without one the
+; RETs of resp1, word and event make loops with no anchor. Every caller
+; re-anchors or waits untimed afterwards, so the TD it sets is never used.
+resp1:  SETD    2 * OVS
+        MOV     r2, r1
+        ADDI    r2, RSPO
+        LDI     r0, 2
+        ST      r0, r2, 0
+        ST      r3, r2, 1
+        LDIH    r3, 1
+        ST      r3, r2, 2
+        ORI     r6, RESF
+        RET
+
+; word: the event of the two bytes at r2 (high first, 2.4.2); r2 += 2.
+word:   LD      r0, r2, 0
+        SHLI    r0, 8
+        LD      r3, r2, 1
+        OR      r0, r0, r3
+        ADDI    r2, 2
+; event: r0 to OUTQ, dropped if OUTQ is full. The SETD makes the WAITB a
+; test; every caller re-anchors or waits untimed after it.
+event:  SETD    0
+        WAITB   OUTQ_NF, T
+        BT      evx
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r0
+evx:    RET
+
+; txbyte and rxbyte as in mdb_ctrl.loom: nine bits, LSB first, the mode
+; bit ninth (2.1); rxbyte returns at the mode bit's middle and the caller
+; samples the stop bit.
+txbyte: LDSR    r0
+        LDI     r0, 9
+        CSRW    CNT, r0
+        WAITD   OVS
+        SETP    TX, 0                   ; start bit
+tbit:   WAITD   OVS
+        SHO
+        BNZ     tbit
+        WAITD   OVS
+        SETP    TX, 1                   ; the stop bit
+        RET
+rxbyte: WAITD   OVS / 2                 ; TD: SETD 0 just after the WAITP
+        JP      RX, 1, rxbad
+        LDI     r0, 9
+        CSRW    CNT, r0
+rbit:   WAITD   OVS
+        SHI
+        BNZ     rbit
+        STSR    r0
+        SHRI    r0, 7
+        RET
+rxbad:  JMP     idle                    ; a framing error: no answer (2.2)
