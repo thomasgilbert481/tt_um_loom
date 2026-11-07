@@ -1,0 +1,508 @@
+; j1850_vpw.loom
+; An SAE J1850 VPW node (10.4 kbit/s, the GM/Chrysler OBD-II bus) at logic
+; level, on a VPW transceiver's TX and RX pins: it transmits the frames the
+; host gives it (SOF, header and data, the CRC-8 it computes, EOD) with
+; J1850's bitwise arbitration (a loser stops driving and retries once the
+; bus has been idle again), receives every frame on the bus with the CRC
+; check, answers a frame addressed to it with a one-byte in-frame response
+; (IFR) if the host enabled that, and collects the IFR bytes another node
+; sends after its own frames.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): J1850 is in no design
+; document. Hardware used: the timed waits and NOW, the per-thread output
+; group (OUTGRP and OUT, built for parallel buses), so one copy of the code
+; drives a different TX pin in each thread, the FIFOs, LD and ST (built for
+; device emulation, the 24C02) for the frame buffers, and the bit engine's
+; CRC unit (built for USB's CRC5/CRC16 and CAN's CRC15), here fed with SHO
+; to a pin index that is not writable, so it computes J1850's CRC-8
+; without touching a pin. No hardware knows VPW: the symbol coding by
+; pulse length and level, the symbol timing windows, the arbitration by
+; watching every bus edge against the node's own schedule, the
+; synchronisation of every symbol to the last bus edge, EOD and EOF, the
+; normalization bit and the IFR are firmware.
+;
+; Weaker than a dedicated J1850 controller (Motorola's BDLC) in four ways:
+; a node that loses arbitration stops listening until the bus is idle and
+; does not receive the winner's frame (the BDLC does); a node with a frame
+; waiting to go ignores the frames other nodes send meanwhile, unless it
+; joins one of them at its SOF; it is blind for the first 32 us of every
+; symbol (a symbol shorter than 34 us is invalid, and one that ends inside
+; those 32 us is reported as a symbol error, but a glitch that ends and
+; comes back inside them is not seen; the BDLC has a digital noise filter);
+; and its receive windows are the specification's to one tick, 2 us, at
+; either end (the measurement is in ticks). The PUSH of a report waits for
+; room in OUTQ: a host that leaves OUTQ full holds the node between frames.
+;
+; Pins: TX = OUT0 in thread 0 and OUT1 in thread 2 (each node's
+; transceiver transmit input: 1 drives the bus active, through OUT with
+; OUTGRP = OUT<TID/2>), RX = IN0 (the receive output: the bus level, 1
+; active). The bus is a wired OR: active (high, about 7 V on the real
+; wire) dominates passive (pulled low). A second node on the same chip is
+; thread 2, whose reset vector (0x100) jumps to this code: each node has
+; its own TX pin, and the board joins them into one bus, as two
+; transceivers on one wire would (two threads never share an output,
+; SEMANTICS 3, 6.3). Both nodes read the bus on the one input IN0: WAITP
+; and JP take the pin as an immediate, and two copies of the program, one
+; per pin pair, do not fit the 512 words (2 x 290 words and the buffers),
+; so the shared code reads one RX pin. An input cannot contend, so this is
+; the board wiring both transceivers' RX outputs, or one of them, to IN0.
+; Edges are written with OUT in the slot after the deadline (a pin that
+; is not an immediate cannot use the deadline latch, SETP ... D), so each
+; lands 1 to 2 slots after its tick: 4 to 11 clocks late, the same for
+; every edge to within the 0..3 clock slot grid. A symbol that follows a
+; bus edge is timed from the tick at which the node saw that edge, so it
+; can be one tick longer when the edge and its sighting straddle a tick:
+; at 50 MHz (100 clocks a tick, the sighting about 15 clocks after the
+; edge) that is rare; at the tests' 16-clock tick the bus showed short
+; symbols of 63.5 to 66.5 us and long ones of 127.5 to 130.5 us, against
+; AN1731's 49..79 and 112..145.
+;
+; Sources. SAE J1850 itself (not free) was not read; every figure below is
+; secondary. Read on 2026-11-07: Motorola/Freescale application note AN1731,
+; "VPW J1850 Multiplexing and Motorola's Byte Data Link Controller", Table 3
+; (VPW pulse width times, p. 7), Figure 2 (logic 0 and 1, p. 6), Figure 4
+; and the text of pp. 8-9 (message format, arbitration, the CRC
+; polynomial and the receiver's residue $C4, at most 12 data bytes). From
+; search-result extracts only, the pages not opened (UNCHECKED): the
+; normalization bit, short (64 us) for an IFR without CRC and long (128 us)
+; with one (Intel 8XC196Lx user manual, figure 86; ST92F124 data sheet,
+; NBSYMS = 0), and the header's K bit (bit 3 of the first header byte, 0 =
+; IFR required), from memory (SAE J2178), UNCHECKED.
+;   symbol      tx nominal (AN1731 tx min..max)   rx window (AN1731)
+;   short       64 us (49..79)                    > 34 and <= 96 us
+;   long        128 us (112..145)                 > 96 and <= 163 us
+;   SOF, EOD    200 us (182..218)                 > 163 and <= 239 us
+;   EOF         280 us (>= 261)                   > 239 us
+;   IFS         300 us (>= 280)                   > 280 us
+;   a 0 is a short passive or a long active symbol, a 1 a long passive or a
+;   short active one; SOF is active, so the first bit is passive and the
+;   levels alternate; bytes go most significant bit first; active wins,
+;   so a 0 beats a 1 and the lower header wins; the CRC is
+;   x^8+x^4+x^3+x^2+1 over header and data, register preset to all ones,
+;   sent inverted; a receiver that runs the whole frame, CRC included,
+;   through the register finds $C4. After EOD a responder sends the NB
+;   (active) and its IFR byte(s); EOF ends the frame.
+;
+; Timing, in ticks of 2 us (TICK_INT 100 at 50 MHz; the tests run 16
+; clocks a tick with every bus time scaled with it). Every symbol is timed
+; from the bus edge that began it: the node re-anchors TD at each edge it
+; did not make itself (SETD 0 right after the WAITP that saw it) and keeps
+; its own schedule for the edges it makes, so two nodes stay in step
+; however their tick grids lie. Transmit: short 32 ticks, long 64, SOF
+; 100, NB 32 starting 100 ticks after the last fall; IFS 150 ticks of idle
+; bus before a SOF; a SOF that rises after 120 ticks of idle bus (an EOF)
+; but before our IFS has run is joined at once. Arbitration: a passive
+; symbol that the bus ends 8 or more ticks before our own end means a
+; shorter symbol won; an active symbol the bus holds 16 ticks past our
+; fall means a longer one won; either way the node has let go of the bus
+; and retries after the next 150 ticks of idle bus. Receive: an edge is
+; seen by a timed WAITP, at most one slot late, and a symbol's length is
+; the difference of two NOW readings, so +-1 tick: under 16 ticks invalid
+; (seen at the 16-tick check), up to 48 short, 49 to 81 long, 82 to 119
+; SOF or EOD, 120 or more EOF (passive) or a break (active).
+;
+; Host words (INQ). Once, before anything else:
+;   word 1   15:8 this node's address, the IFR byte it answers with; 0 =
+;            never answer (bits 7:0 must be 0)
+; Then any number of frames to send:
+;   word A   n, the header and data bytes, 1 to 15 (the CRC is added)
+;   n words  one byte each, in 7:0, first byte first
+; Reports (OUTQ), one for each frame sent and each frame received:
+;   word 1   status: 15 F_RX (1 a received frame, 0 our own); 12:8 a
+;            received frame's byte count up to EOD, CRC included, or for
+;            our own frame the arbitrations lost before it went (mod 32);
+;            0 CRC error, 1 symbol error (a symbol outside every window, a
+;            break, EOD inside a byte), 2 overflow (over 31 bytes), 3 an
+;            IFR followed (NB seen), 4 we answered with our IFR, 5 our IFR
+;            lost arbitration to another responder's
+;   word 2   m, the bytes that follow
+;   m words  one byte each in 7:0: a received frame's bytes, CRC included,
+;            then the IFR bytes; after our own frame, the IFR bytes only
+; Each report word is a PUSH that waits for room: a host that leaves OUTQ
+; full holds the node between frames.
+;
+; Proved by the deadline checker (.tick 16, the fastest tick it holds for):
+; every edge is followed, within 16 ticks, by the WAITD 16 that opens the
+; next symbol's watch; the work after an edge (decoding the bit, storing a
+; byte, eight SHO through the CRC unit) runs in that interval, and so does
+; the transmit side's choice of the next symbol. The checker's RET goes to
+; every return site in the thread, so a subroutine called both from the
+; timed paths and from a loop around a POP or a PUSH would make every
+; pair unbounded: the receive edge handling is inline, the SHO are unrolled
+; and the host frame's CRC loop has its own copy of them.
+;
+; Memory: 290 words: 0x000 to 0x0FF and 0x101 to 0x124 for the code, all
+; in thread 0's section, and at 0x100 thread 2's reset vector, JMP start.
+; Node data: 0x180 (thread 0) and 0x1C0 (thread 2), 32 words each: the
+; configuration word, then 31 bytes, a byte a word. Threads 1 and 3 must
+; not run.
+;
+; Registers: r0 the byte (sending: shifting out of 15; receiving: built in
+; 7:0), r1 its bits to go, r2 a symbol's length or TD - NOW at an edge,
+; r3 the buffer pointer, r4 the frame's last byte (its CRC), r5 the level
+; of the symbol being sent, r6 the report's status word, r7 scratch and
+; the .csr scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): SAE J1850 was not
+; read; timing from NXP AN1731 (secondary).
+;   Two nodes on one chip share one program and read the bus on the one
+;   input IN0, each driving its own TX pin. The bus is one wire, so one
+;   input for both is how it would be wired; COMMON's rule is about two
+;   threads writing one output, which this does not do.
+;   Edges are ordinary writes 4 to 11 clocks after their tick (the shared
+;   program selects its output group by thread, so SETP ... D on a fixed
+;   pin is not available); every symbol stays inside AN1731's windows.
+;   Short NB means an IFR without CRC; the CRC preset 0xFF and the
+;   inverted CRC byte; the K bit: from memory or search excerpts,
+;   unchecked, though consistent with AN1731's 0xC4 residue.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .tick   16                      ; the fastest tick proved
+        .pins   RX = IN0                ; the bus, for every node
+        .equ    SHORT = 32              ; ticks of 2 us
+        .equ    LONG = 64
+        .equ    SOFL = 100              ; SOF (and EOD)
+        .equ    WATCH = 16              ; blind start of every symbol, 32 us
+        .equ    EODT = 82               ; passive this long: EOD (> 163 us)
+        .equ    EOFT = 120              ; passive this long: EOF (> 239 us)
+        .equ    BITT = 34               ; TD - NOW at the edge >= this: short
+        .equ    SOFT = 39               ; with TD at EOFT: >= this, no SOF
+        .equ    IFS = 150               ; idle before a SOF, 300 us
+        .equ    JOIN = IFS - EOFT + 1   ; IFS left >= this: busy, not a SOF
+        .equ    TIE = 8                 ; a rise this early still ties
+        .equ    MARGIN = 16             ; after our fall the bus falls by then
+        .equ    DATA = 0x180            ; node data: DATA + (TID << 5)
+        .equ    F_CRC = 1               ; report flags
+        .equ    F_SYM = 2
+        .equ    F_OVF = 4
+        .equ    F_IFR = 8
+        .equ    F_SENT = 16
+        .equ    F_LOST = 32
+        .equ    F_RX = 0x8000
+
+start:  CSRR    r7, TID
+        SHRI    r7, 1
+        ORI     r7, (1 << 5) | 16       ; one pin: OUT0 (thread 0), OUT1 (2)
+        CSRW    OUTGRP, r7
+        LDI     r7, 0
+        OUT     r7                      ; TX passive
+        .csr    BE_CFG, 0x202           ; MSB first, CRC_EN; NRZ, no stuffing
+        .csr    BE_PINS, 31             ; SHO's pin write goes nowhere
+        .csr    CRC_POLY, 0x1D00        ; x^8+x^4+x^3+x^2+1, left-aligned
+        .csr    CRC_INIT, 0xFF00        ; all ones
+        CALL    bufp
+        POP     r0                      ; 15:8 own address (0: no IFR)
+        ST      r0, r2, 0
+
+; Idle: watch the bus for a SOF, the INQ for a frame to send.
+idle:   SETD    8
+        WAITP   RX, 1, T                ; 16 us of watch
+        BNT     rxsof                   ; the bus went active
+        SETD    0
+        WAITB   INQ_NE, T               ; a test: TD is reached
+        BT      idle
+
+; A frame from the host: n bytes into the buffer through the CRC unit,
+; then the CRC, inverted.
+        .bounded "guarded by the WAITB above; only this thread pops INQ[t]"
+        POP     r4                      ; n, header and data bytes
+        CALL    bufp
+        ADDI    r2, 1
+        MOV     r3, r2                  ; the first byte's word
+        ANDI    r4, 15
+        ADD     r4, r4, r3              ; where the CRC byte goes
+        CRCI
+        LDI     r6, 0                   ; our frame, no arbitration lost yet
+unpack: CMP     r3, r4
+        BZ      packed
+        POP     r0                      ; a byte in 7:0
+        SHLI    r0, 8
+        ST      r0, r3, 0
+        LDSR    r0
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        ADDI    r3, 1
+        JMP     unpack
+packed: STCRC   r0
+        NOT     r0, r0                  ; sent inverted
+        ST      r0, r3, 0               ; 15:8; the low byte is never sent
+
+; Wait for 300 us of idle bus, or join a SOF that follows an EOF.
+txwait: WAITP   RX, 0                   ; passive (unbounded)
+        SETD    IFS
+        WAITP   RX, 1, T
+        BT      sof                     ; idle for IFS: our SOF
+        CSRR    r2, TD
+        CSRR    r7, NOW
+        SUB     r2, r2, r7              ; IFS ticks still to go
+        CMPI    r2, JOIN
+        BC      txwait                  ; idle < 240 us: inside a frame
+sof:    LDI     r7, 1
+        OUT     r7                      ; our SOF's rise (or with the bus's)
+        SETD    0                       ; TD = its tick
+        CALL    bufp
+        ADDI    r2, 1
+        MOV     r3, r2                  ; the first byte
+        LDI     r5, 1
+        LDI     r2, SOFL
+        CALL    txsym
+        BNZ     lost
+
+; The bytes from r3 to r4, with arbitration on every symbol.
+txnext: LD      r0, r3, 0               ; the byte in 15:8
+txbyte: LDI     r1, 8
+tbit:   LDI     r7, 0
+        SHLI    r0, 1                   ; C = the bit
+        BNC     tb0
+        LDI     r7, 1
+tb0:    XOR     r7, r7, r5              ; 0: the bit equals the level
+        LDI     r2, SHORT               ; passive 0, active 1: short
+        BZ      tgo
+        LDI     r2, LONG
+tgo:    CALL    txsym
+        BNZ     lost
+        DJNZ    r1, tbit
+        CMP     r3, r4
+        BZ      txdone
+        ADDI    r3, 1
+        JMP     txnext
+
+; Sent. Our own frame: listen for IFR bytes after it (the receive loop,
+; from EOD on). Our IFR answer to another node's frame: report that frame.
+txdone: ADD     r7, r6, r6              ; C = F_RX
+        BC      rwait                   ; we answered: wait for EOF, report
+        ADDI    r3, 1                   ; IFR bytes after our CRC byte
+        LDI     r1, 8
+        LDI     r0, 0
+        JMP     rpas                    ; TD is our last fall
+
+; Arbitration lost: txsym has let go of the bus.
+lost:   ADD     r7, r6, r6
+        BC      rlost
+        MOV16   r7, 0x100               ; one more loss, in 12:8
+        ADD     r6, r6, r7
+        JMP     txwait                  ; and retry once the bus is idle
+rlost:  ORI     r6, F_LOST              ; our IFR lost to another responder
+        JMP     rwait
+
+; txsym: one symbol. In: r5 its level, r2 its length in ticks, TD its
+; start (the edge that began it). Out, Z = 1: r5 the next level and TD
+; the next symbol's start. Out, Z = 0: lost, nothing driven any more.
+txsym:  WAITD   WATCH                   ; 32 us into the symbol
+        SUBI    r2, WATCH
+        CSRR    r7, TD
+        ADD     r7, r7, r2
+        CSRW    TD, r7                  ; TD = the symbol's end
+        CMPI    r5, 0
+        BNZ     txact
+        JP      RX, 1, txlost           ; active before 32 us: not ours
+        LDI     r5, 1
+        WAITP   RX, 1, T
+        BT      txup                    ; TD: our rise
+        CSRR    r2, TD                  ; the bus rose first
+        CSRR    r7, NOW
+        SUB     r2, r2, r7              ; by this many ticks
+        CMPI    r2, TIE
+        BC      txlost                  ; a shorter passive symbol: lost
+        SETD    0                       ; a tie: the symbol starts now
+txup:   OUT     r5                      ; the rise
+        XOR     r7, r7, r7              ; Z = 1
+        RET
+txlost: ORI     r7, 1                   ; Z = 0
+        RET
+txact:  LDI     r5, 0
+        WAITD   0                       ; to TD
+        OUT     r5                      ; the fall
+        SETD    MARGIN
+        WAITP   RX, 0, T
+        BT      txlost                  ; still active: a longer symbol, lost
+        SETD    0                       ; the next symbol starts at the fall
+        XOR     r7, r7, r7
+        RET
+
+; Receive. The bus rose at idle: a SOF if it stays active 164 to 239 us.
+rxsof:  SETD    0                       ; the rise, within a slot or two
+        MOV16   r6, F_RX
+        WAITD   WATCH
+        JP      RX, 1, rxs1
+        JMP     idle                    ; under 32 us: noise, ignored
+rxs1:   SETD    EOFT - WATCH
+        WAITP   RX, 0, T
+        BT      rsym                    ; 240 us or more: a break
+        CSRR    r2, TD                  ; the edge: r2 = TD - NOW, the ticks
+        CSRR    r7, NOW                 ; short of the timeout; TD = NOW,
+        SUB     r2, r2, r7
+        SETD    0                       ; the next symbol's start
+        CMPI    r2, SOFT
+        BC      rsym                    ; 163 us or less: not a SOF
+        CALL    bufp
+        ADDI    r2, 1
+        MOV     r3, r2                  ; the first byte's word
+        LDI     r1, 8
+        LDI     r0, 0
+        CRCI
+
+; A passive symbol from TD on: a 0 if short, a 1 if long, else EOD.
+rpas:   WAITD   WATCH
+        JP      RX, 1, rsym             ; under 34 us: invalid
+        SETD    EODT - WATCH            ; TD = start + 82 ticks
+        WAITP   RX, 1, T
+        BT      reod
+        CSRR    r2, TD                  ; the edge: r2 = TD - NOW, the ticks
+        CSRR    r7, NOW                 ; short of the timeout; TD = NOW,
+        SUB     r2, r2, r7
+        SETD    0                       ; the next symbol's start
+        LDI     r7, 1
+        CMPI    r2, BITT
+        BNC     rp1                     ; long: a 1
+        LDI     r7, 0
+rp1:    CALL    rbit
+; An active symbol from TD on: a 1 if short, a 0 if long.
+ract:   WAITD   WATCH
+        JP      RX, 0, rsym
+        SETD    EODT - WATCH
+        WAITP   RX, 0, T
+        BT      rsym                    ; over 163 us inside a frame
+        CSRR    r2, TD                  ; the edge: r2 = TD - NOW, the ticks
+        CSRR    r7, NOW                 ; short of the timeout; TD = NOW,
+        SUB     r2, r2, r7
+        SETD    0                       ; the next symbol's start
+        LDI     r7, 0
+        CMPI    r2, BITT
+        BNC     ra1                     ; long: a 0
+        LDI     r7, 1
+ra1:    CALL    rbit
+        JMP     rpas
+
+; A symbol error: wait for EOF and report what was received.
+rsym:   ORI     r6, F_SYM
+rwait:  WAITP   RX, 0
+        SETD    EOFT
+        WAITP   RX, 1, T
+        BNT     rwait
+        JMP     report
+
+; rbit: the bit in r7 into r0; a whole byte to the buffer (at r3) and
+; through the CRC unit (eight SHO to no pin, unrolled).
+rbit:   ADD     r0, r0, r0
+        OR      r0, r0, r7
+        DJNZ    r1, rbr
+        LDI     r1, 8
+        SHLI    r0, 8                   ; the byte in 15:8
+        ST      r0, r3, 0
+        LDSR    r0
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        LDI     r0, 0
+        ADDI    r3, 1
+        MOV     r7, r3
+        ANDI    r7, 31
+        BNZ     rbr
+        SUBI    r3, 1                   ; full: keep the last word
+        ORI     r6, F_OVF
+rbr:    RET
+
+; EOD: 164 us passive. The first one ends the frame proper: for a received
+; frame its byte count into 12:8, the CRC check, perhaps our IFR. Then an
+; NB may start an IFR, or 240 us of passive bus is EOF.
+reod:   CMPI    r1, 8
+        BZ      re1
+        ORI     r6, F_SYM               ; not on a byte boundary
+re1:    MOV     r7, r6
+        ANDI    r7, F_IFR
+        BNZ     rnb                     ; the EOD after an IFR
+        ADD     r7, r6, r6
+        BNC     rnb                     ; our own frame: nothing to check
+        CALL    bufp                    ; r2 = the configuration word
+        SUB     r0, r3, r2
+        SUBI    r0, 1                   ; the frame's bytes, CRC included
+        SHLI    r0, 8
+        OR      r6, r6, r0
+        STCRC   r7
+        MOV16   r0, 0xC400              ; the residue of a good frame
+        CMP     r7, r0
+        BZ      crcok
+        ORI     r6, F_CRC
+        JMP     rnb
+crcok:  LD      r0, r2, 0               ; own address in 15:8, 0: no IFR
+        CMPI    r0, 0
+        BZ      rnb
+        LD      r7, r2, 2               ; the target byte, the second
+        XOR     r7, r7, r0
+        BNZ     rnb                     ; not addressed to us
+        LD      r7, r2, 1               ; the first header byte
+        SHRI    r7, 11
+        ANDI    r7, 1
+        BNZ     rnb                     ; K = 1: no IFR wanted
+; Our IFR: the NB 200 us after the last fall, then our address byte (r0).
+        ORI     r6, F_SENT
+        LDI     r5, 1
+        WAITD   SOFL - EODT             ; TD was start + 82: to start + 100
+        OUT     r5                      ; the NB's rise
+        MOV     r4, r3                  ; one byte: txbyte ends at txdone
+        LDI     r2, SHORT               ; NB short: an IFR without CRC
+        CALL    txsym
+        BNZ     rlj
+        JMP     txbyte
+rlj:    JMP     lost
+
+        .org    start + 0x101           ; over thread 2's reset vector
+rnb:    SETD    EOFT - EODT             ; to EOF
+        WAITP   RX, 1, T
+        BT      report                  ; EOF: the frame is over
+        CSRR    r2, TD                  ; the edge: r2 = TD - NOW, the ticks
+        CSRR    r7, NOW                 ; short of the timeout; TD = NOW,
+        SUB     r2, r2, r7
+        SETD    0                       ; the next symbol's start
+        MOV     r7, r6
+        ANDI    r7, F_IFR
+        BNZ     rsym                    ; a second NB
+        ORI     r6, F_IFR
+        LDI     r1, 9                   ; the NB enters r0 as a ninth bit
+        JMP     ract                    ; and leaves it with the SHLI 8
+
+; The report: the status word, the byte count, then the bytes, one a word
+; in 7:0: a received frame's from the first byte, the IFR after our own
+; frame from the word after its CRC byte (r4).
+report: CALL    bufp
+        ADDI    r2, 1
+        ADD     r7, r6, r6
+        BC      rp0
+        MOV     r2, r4
+        ADDI    r2, 1
+rp0:    PUSH    r6
+        SUB     r7, r3, r2
+        PUSH    r7
+rpk:    CMP     r2, r3
+        BNZ     rpk1
+        JMP     idle
+rpk1:   LD      r0, r2, 0
+        SHRI    r0, 8
+        PUSH    r0
+        ADDI    r2, 1
+        JMP     rpk
+
+; bufp: r2 = this node's data (the configuration word, then 31 bytes):
+; DATA + 32 * TID, so 0x180 for thread 0, 0x1C0 for thread 2.
+bufp:   CSRR    r2, TID
+        SHLI    r2, 5
+        MOV16   r7, DATA
+        ADD     r2, r2, r7
+        RET
+
+        .thread 2                       ; a second node: the same code
+        JMP     start
