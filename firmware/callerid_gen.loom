@@ -1,0 +1,253 @@
+; callerid_gen.loom
+; An on-hook caller ID transmitter (the North American format: Bell 202 FSK
+; at 1200 baud, mark 1200 Hz, space 2200 Hz, 8N1 characters): takes a
+; message's parameters from the host, buffers them, then sends the channel
+; seizure, the mark signal, the message type, the message length, the
+; parameters and the checksum as one continuous FSK burst, a few mark bits
+; after it, and turns the carrier off.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Caller ID is a layered protocol
+; on top of a Bell 202 modem, and Loom has no modem: nothing in it was built
+; for FSK. The program uses:
+;   - the per-thread fractional tick (TICK_INT/TICK_FRAC, built for UART
+;     baud rates): 1/132 of a bit, so both tones and the bit are whole
+;     numbers of ticks (TICK_INT 315, TICK_FRAC 168 at 50 MHz);
+;   - the deadline schedule (WAITD 1 every tick, proved by the checker) and
+;     the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, built for
+;     clock-exact UART and WS2812 edges);
+;   - the data memory (LD/ST, SEMANTICS 6.11, built for device emulation
+;     such as an EEPROM's contents) as the message buffer.
+; What the firmware does that no hardware does: the tone synthesis (the
+; numerically controlled oscillator of bell202_mod.loom, copied unchanged),
+; the seizure and mark signals, the parameter and message length fields,
+; the checksum, the 8N1 framing, and the carrier on and off.
+;
+; Reuse. This program EXTENDS bell202_mod.loom rather than composing with
+; it: a Loom thread cannot push into another thread's INQ (SEMANTICS 6.7:
+; INQ is host to thread), so a framing thread could only reach the
+; modulator through a mailbox in data memory and a shared flag, and the
+; modulator would have to change to read it. The oscillator (the code from
+; "tick:" to "count:", and the start-bit path) is bell202_mod.loom's, line
+; for line; what changed is where each character comes from.
+;
+; Sources (tools/protomodels/callerid.py gives the clauses and what could
+; not be checked): ETSI EN 300 659-1 V1.3.1 (2001-01) clause 5.2 (channel
+; seizure: 300 continuous bits of alternating 0 and 1, the first a 0, the
+; last a 1; mark signal: 180 +- 25 or 80 +- 25 mark bits; message length =
+; the presentation-layer octets; checksum = the two's complement of the
+; mod-256 sum of the octets from the message type on) and clause 5.3 (8N1,
+; LSB first; "the data signal shall be continuous"; the checksum's stop bit
+; followed by one to ten more mark bits; the modulation stops immediately
+; after); EN 300 659-3 V1.3.1 clauses 5.2.1 (call set-up message 0x80) and
+; 5.3 (parameter types). ETSI's physical layer is V.23; the North American
+; format (Telcordia GR-30-CORE, not free, not read) uses Bell 202 tones with
+; the same framing (secondary: the bell202.py sources). The tones are
+; bell202_mod.loom's.
+;
+; Not here: the ring and the timing against it. EN 300 659-1 clause 6.1.1
+; puts the burst 500 ms to 2 s after the end of the first ring and ends it at
+; least 200 ms before the second; the host (or a ring generator) times the
+; command word, as a line card's controller would. The signal is a
+; logic-level square wave; the filter that makes it a sine and the line
+; level (EN 300 659-1 table 1: -14.5 dBV +- 2.5 dB) belong to the front end.
+;
+; Pins: TX = OUT0 (any output or BIDIR pin with --pin TX=<pin>). Between
+; bursts TX holds its last level and makes no edges: the carrier is off.
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, once, before anything else: the configuration word
+;       bits 5:0    channel seizure length in blocks of 10 bits (30: 300 bits)
+;       bits 13:8   mark signal length in blocks of 10 bits (18: 180 bits,
+;                   8: 80 bits; the ETSI windows are 155..205 and 55..105)
+;     Values below 30 and 18 are a test option, not a standard length: the
+;     RTL test uses them because a full burst is 13 M clocks of simulation.
+;   INQ, then, the message, one word a byte, as many messages as wanted:
+;       bit 9 = 1   start a parameter; bits 7:0 its type (0x01 date and
+;                   time, 0x02 number, 0x04 reason for no number, 0x07 name,
+;                   0x08 reason for no name). The firmware writes its length.
+;       bits 9:8 = 0  a byte of the current parameter's data (bits 7:0)
+;       bit 8 = 1   the end: bits 7:0 the message type (0x80 for MDMF). The
+;                   burst starts now.
+;     Data bytes before any parameter header are sent as they are and counted
+;     in the message length only (an SDMF body, type 0x04, is sent that way).
+;     The buffer holds 124 bytes of parameters, headers and lengths included
+;     (a full MDMF of date, a 10-digit number and a 15-letter name is 39);
+;     bytes past it are dropped.
+;   OUTQ, one word a burst, once its last bit has gone out: the message
+;     length sent (bits 7:0), which tells the host whether bytes were
+;     dropped. The host waits for it before queueing the next message.
+; While the burst goes out the host need not keep up: the whole message is
+; in memory, so the signal is continuous (EN 300 659-1 clause 5.3) whatever
+; the host does. While the program waits for words the carrier is off, so
+; the blocking POPs are free.
+;
+; Rate: the host sets TICK_INT 315, TICK_FRAC 168 before RUN (50 MHz). The
+; schedule is proved for TICK_INT >= the .tick below.
+;
+; Memory: code 122 words, 0x000 to 0x079 of thread 0's quarter (.imem 512).
+; The data spills: two variables at 0x17E and 0x17F and the message buffer
+; at 0x180 to 0x1FF, thread 3's quarter, so thread 3 cannot run a program
+; beside this one (callerid_rx.loom moved to thread 1, 0x080, can).
+;
+; Deadlines: four pairs, all proved, worst slack 0 at .tick 112: the tick
+; that ends the last mark block and starts the message (it loads the end
+; pointer, an LD of two slots) is 28 slots, 112 clocks. TICK_INT 315 at
+; 50 MHz leaves 203 clocks of slack. The mark signal must be 1 to 63 blocks
+; (a 0 there would count down from 65 535 blocks).
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Framing from ETSI EN 300 659-1 and -3 V1.3.1, which specify V.23
+;   tones; the same framing over Bell 202 tones, as North American caller
+;   ID uses it, is secondary (Telcordia GR-30-CORE was not read).
+;   Four trailing mark bits after the checksum.
+;   Seizure and mark lengths are host options: the standard 300 and 180
+;   bits are about 13 M clocks at the 112-clock tick, so the generator is
+;   tested at 40/30 and 10/10 bits (the same counting code) and the
+;   receiver at the standard lengths.
+;   MDMF only; an SDMF message is reported octet by octet for the host.
+
+        .imem   512
+        .thread 0
+        .pins   TX = OUT0
+
+        .equ    BIT_T  = 132                    ; ticks a bit
+        .equ    HALF   = 396                    ; phase units a half-cycle
+        .equ    MARK   = 6                      ; units a tick at 1200 Hz (396 / 66)
+        .equ    SPACE  = 11                     ; units a tick at 2200 Hz (396 / 36)
+        .equ    TAIL   = 4                      ; mark bits after the checksum's stop bit (1..10)
+        .equ    SEIZE  = 63                     ; r6 counts up to this through the seizure
+        .equ    A_CFG  = 0x17E                  ; the configuration word
+        .equ    A_END  = 0x17F                  ; one past the checksum
+        .equ    BUF    = 0x180                  ; type, length, parameters, checksum
+        .equ    LIMIT  = 0x1FE                  ; a byte is stored only below this
+        .tick   112                             ; the fastest tick the schedule is proved for
+
+; Collecting: r6 the next free byte   r7 the open parameter's length word
+;   r0 r3 r4 scratch
+; Sending: r0 phase to go - 1   r1 phase step   r2 ticks left in the bit
+;   r3 the bits still to send, LSB next   r4 how many   r5 HALF
+;   r6 the item: below SEIZE a seizure block, SEIZE the mark signal, from
+;   BUF a byte   r7 mark blocks left, then the end pointer
+
+start:  POP     r3                      ; the configuration word (carrier off)
+        MOV16   r0, A_CFG
+        ST      r3, r0, 0
+reset:  MOV16   r6, BUF + 2             ; the parameters start after type and length
+        MOV16   r7, BUF + 1             ; bytes before a parameter count nowhere
+        LDI     r0, 0
+        ST      r0, r7, 0               ; (the length word, rewritten at the end)
+getw:   POP     r3                      ; carrier off: blocking is free
+        MOV     r4, r3
+        SHRI    r4, 9                   ; C = bit 8: the end; r4 bit 0 = bit 9
+        LDIH    r3, 0                   ; the byte (LDIH keeps C)
+        BC      endm
+        MOV16   r0, LIMIT
+        CMP     r6, r0
+        BC      getw                    ; full: the byte is dropped
+        ST      r3, r6, 0
+        ADDI    r6, 1
+        ANDI    r4, 1
+        BNZ     param
+        LD      r0, r7, 0               ; a data byte: its parameter is one longer
+        ADDI    r0, 1
+        ST      r0, r7, 0
+        JMP     getw
+param:  LDI     r0, 0                   ; a parameter type: its length follows
+        ST      r0, r6, 0
+        MOV     r7, r6
+        ADDI    r6, 1
+        JMP     getw
+
+endm:   MOV16   r0, BUF
+        ST      r3, r0, 0               ; the message type
+        SUB     r4, r6, r0
+        SUBI    r4, 2                   ; the message length: the parameters
+        ST      r4, r0, 1
+        LDI     r2, 0
+sum:    LD      r4, r0, 0               ; type, length and parameters
+        ADD     r2, r2, r4
+        ADDI    r0, 1
+        CMP     r0, r6
+        BNZ     sum
+        NEG     r2, r2                  ; the checksum: the sum is then 0 mod 256
+        ST      r2, r6, 0
+        ADDI    r6, 1
+        MOV16   r0, A_CFG
+        ST      r6, r0, 1               ; A_END
+        LD      r7, r0, 0
+        MOV     r6, r7
+        ANDI    r6, 0x3F                ; seizure blocks
+        NEG     r6, r6
+        ADDI    r6, SEIZE               ; r6 = SEIZE - blocks
+        SHRI    r7, 8
+        ANDI    r7, 0x3F                ; mark blocks (1 or more)
+
+        SETP    TX, 1                   ; carrier on: a half-cycle starts high
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
+        MOV16   r5, HALF
+        MOV16   r0, HALF - 1            ; a whole half-cycle to go
+        LDI     r2, BIT_T
+        SETD    1
+        JMP     nextc
+
+; ---- the oscillator: bell202_mod.loom's, line for line ----
+next:   SUBI    r4, 1
+        SHRI    r3, 1                   ; C = the next bit, LSB first
+        LDI     r1, MARK                ; 1 is mark (LDI keeps C)
+        BC      tick
+        LDI     r1, SPACE               ; 0 is space
+
+tick:   WAITD   1
+        SUB     r0, r0, r1              ; C = 0: this tick ends the half-cycle
+        BC      count
+        ADD     r0, r0, r5              ; the remainder carries into the next one
+        JP      TX, 1, fall
+        SETP    TX, 1, D                ; staged: lands on the next tick exactly
+        JMP     count
+fall:   SETP    TX, 0, D
+count:  DJNZ    r2, tick
+
+        LDI     r2, BIT_T               ; a bit boundary: the tone may change
+        CMPI    r4, 0                   ; here, and only here, phase untouched
+        BNZ     next
+
+; ---- the next block or character, at a block boundary. Each starts its
+; first bit here, as bell202_mod.loom's start bit does: r3 holds the bits
+; after it, r4 their count. ----
+nextc:  LDI     r4, SEIZE
+        CMP     r6, r4                  ; C: r6 >= SEIZE
+        BC      nseize
+        ADDI    r6, 1                   ; a seizure block: 0, 1, 0, 1, ... 1
+        MOV16   r3, 0x2AA >> 1          ; (its first bit, 0, is the space below)
+        JMP     nine
+nseize: BNZ     msg                     ; r6 > SEIZE: the message has begun
+        SUBI    r7, 1                   ; a mark block
+        BNZ     mblock
+        LDI     r6, BUF & 0xFF          ; the last one: then the message
+        LDIH    r6, BUF >> 8
+        MOV16   r7, A_END
+        LD      r7, r7, 0
+mblock: MOV16   r3, 0x1FF               ; ten mark bits, the first below
+        LDI     r4, 9
+mark1:  LDI     r1, MARK
+        JMP     tick
+msg:    CMP     r6, r7                  ; C: r6 >= the end
+        BC      after
+        LD      r3, r6, 0               ; a byte from the buffer
+        ADDI    r6, 1
+        LDIH    r3, 0xFF                ; 8N1: the stop bit (bit 8), then mark
+nine:   LDI     r4, 9                   ; eight data bits and the stop bit
+startb: LDI     r1, SPACE               ; the start bit is a 0: space from this tick
+        JMP     tick
+after:  BNZ     done                    ; past the tail: the burst is over
+        ADDI    r6, 1                   ; the tail: TAIL more mark bits
+        LDI     r3, 0xFF
+        LDI     r4, TAIL - 1
+        JMP     mark1
+
+done:   WAITD   1                       ; the edge staged on the last tick lands
+        MOV16   r0, BUF                 ; carrier off: TX holds, no more edges
+        LD      r3, r0, 1               ; the message length
+        PUSH    r3                      ; blocks while OUTQ is full: carrier off
+        JMP     reset

@@ -1,0 +1,295 @@
+; callerid_rx.loom
+; An on-hook caller ID receiver (the North American format: Bell 202 FSK at
+; 1200 baud, mark 1200 Hz, space 2200 Hz, 8N1 characters): demodulates the
+; burst sent between the first and second ring, finds the channel seizure
+; and the mark signal, takes the message apart into its type, length and
+; parameters, checks the checksum, and hands every field to the host.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; it: there is no frequency discriminator, no PLL, no UART receiver. The
+; program uses:
+;   - the edge wait (WAITE ANY, built for clocked and pulse-width inputs)
+;     with its timeout (the T bit, built for bus time-outs) and NOW, read at
+;     every edge, as a time stamp;
+;   - the per-thread fractional tick, only as the unit of the time stamps
+;     (1/132 of a bit, the same tick as callerid_gen.loom);
+;   - the data memory (LD/ST, SEMANTICS 6.11) for the message state;
+;   - OUTQ for the fields.
+; What the firmware does that no hardware does: the tone decision and the
+; bit clock recovery (bell202_demod.loom's, copied), the carrier-off
+; detection, the 8N1 framing, the seizure and mark detection, the message
+; parser and the checksum.
+;
+; Reuse. This program EXTENDS bell202_demod.loom rather than composing with
+; it: the demodulator hands its characters to the host through OUTQ, and a
+; thread cannot read another thread's OUTQ, so a framing thread would need a
+; mailbox in data memory and the demodulator would have to change to fill it.
+; The edge code from "edge:" to "same:" and the sample loop are
+; bell202_demod.loom's (8N1 only: the 8O1 branch is gone). Two things are
+; new below the parser: bell202_demod assumes a carrier that never stops
+; (HART and Bell 202 data idle on mark), while a caller ID burst starts and
+; stops (EN 300 659-1 clause 5.3: the modulation stops after the last bit),
+; so a silence of GAP ticks ends the burst and the next edge restarts the
+; bit clock from scratch; and while hunting for a start bit the program
+; counts the mark bits it samples, which is how it sees the mark signal.
+;
+; Sources: as callerid_gen.loom (ETSI EN 300 659-1 V1.3.1 clauses 5.2, 5.3;
+; EN 300 659-3 V1.3.1 clauses 5.2.1, 5.3; tools/protomodels/callerid.py).
+; EN 300 659-1 clause 5.2: "a Data Link message ... resulting in an
+; incorrect checksum should be discarded by the TE": this program reports
+; the fields as they arrive and the verdict at the end; the host discards.
+;
+; Detection. The seizure is SMIN or more 0x55 characters in a row (300
+; alternating bits, first a 0, framed as 8N1, are thirty 0x55: any 0 of the
+; pattern taken for a start bit gives 0x55, so a receiver that wakes late
+; still sees it). After it, the first character that is not 0x55 is the
+; message type if MMIN or more mark bits were sampled since the last stop
+; bit, and the receiver goes back to hunting if not. A framing error inside
+; the message, or a silence before its checksum, ends it with a status.
+; SMIN and MMIN come from the host: 10 and 50 suit the standard's 300 bits
+; and 180 +- 25 or 80 +- 25 marks with room for a late wake-up.
+;
+; The tone decision, the bounce filter and the bit clock: as
+; bell202_demod.loom (half-periods of 51 ticks or more are mark, edges less
+; than 12 ticks after the last are ignored, the clock re-timed at every tone
+; change). GAP = 200 ticks (1.26 ms, 1.5 bits) with no edge is carrier off:
+; three times the longest half-period. The standard's one to ten mark bits
+; after the checksum (EN 300 659-1 clause 5.3) are what bring the checksum's
+; stop bit in before the silence.
+;
+; Input: RX = IN0 (any input or BIDIR pin with --pin RX=<pin>), a logic-level
+; signal whose edges are the line's zero crossings (a band-pass filter and a
+; limiter in front; the analog part is not Loom's).
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, once, before anything else: the configuration word
+;       bits 5:0    SMIN, seizure characters needed (10 suggested)
+;       bits 15:8   MMIN, mark bits needed after the seizure (50 suggested)
+;   OUTQ, one word a received byte of the message, tag in bits 15:8:
+;       0x01xx  message type (0x80 MDMF)       0x02xx  message length
+;       0x03xx  parameter type                 0x04xx  parameter length
+;       0x05xx  parameter data
+;       0x06ss  the end: ss = 0 checksum good, 1 checksum bad, 2 framing
+;               error (a stop bit was 0), 3 carrier lost before the checksum
+;   Every byte from the type to the last data byte is reported once, so an
+;   SDMF body (type 0x04, no parameters) can be rebuilt from the words too.
+;   PUSH blocks while OUTQ is full (FIFO_DEPTH 4) and edges are missed while
+;   it does, so the host drains OUTQ within four characters (33 ms).
+;
+; Tick: the host sets TICK_INT 315, TICK_FRAC 168 at 50 MHz (158 400 Hz), or
+; any tick that is 1/132 of a bit at the board's clock. The program has no
+; WAITD (the WAITE's timeout is its only deadline, and nothing is staged on
+; it), so it has no schedule to miss; it needs only to be back at its WAITE
+; before the next crossing, a space half-period (36 ticks) away. The longest
+; edge path, a stop bit that ends a parameter byte, is under 100 slots, 400
+; clocks: 11 000 clocks are available at 50 MHz, and the tests run the
+; program at a tick of 16 clocks (576 clocks a space half-period).
+;
+; Memory: 172 words, more than a quarter. At thread 0 it is 0x000 to 0x0AB,
+; spilling into thread 1's quarter; moved to thread 1 beside
+; callerid_gen.loom it is 0x080 to 0x12B, spilling into thread 2's. The
+; state lives at 0x170 to 0x177 (thread 2's quarter, clear of both placements
+; and of callerid_gen.loom's data at 0x17E). The pair takes the whole memory
+; with two threads; threads 2 and 3 cannot run beside it.
+
+        .imem   512
+        .thread 0
+        .pins   RX = IN0
+
+        .equ    BIT_T  = 132                    ; ticks a bit
+        .equ    HBIT   = 66                     ; half a bit
+        .equ    MK     = 66                     ; a mark half-period
+        .equ    SP     = 36                     ; a space half-period
+        .equ    THRESH = 51                     ; (MK + SP) / 2
+        .equ    BOUNCE = 12                     ; shortest half-period accepted
+        .equ    GAP    = 200                    ; no edge for this long: carrier off
+        .equ    V      = 0x170                  ; the state, 8 words:
+        .equ    STATE  = 0                      ;  0 hunting the seizure, 1 seizure seen,
+                                                ;  2 length next, 3 parameters, 4 a parameter length next
+        .equ    CNT    = 1                      ;  0x55 characters in a row
+        .equ    RUN    = 2                      ;  mark bits before the last start bit
+        .equ    SUM    = 3                      ;  the byte sum so far
+        .equ    MLEFT  = 4                      ;  message bytes still to come
+        .equ    PLEFT  = 5                      ;  bytes left in this parameter
+        .equ    SMIN   = 6
+        .equ    MMIN   = 7
+
+; r0 T0, the last accepted edge   r1 P, the half-period before   r2 S, the
+; next sample time   r3 the tone, 1 mark 0 space   r4 the character's bits,
+; or while hunting the mark bits sampled   r5 bits still to come (0:
+; hunting)   r6 r7 scratch
+
+start:  POP     r6                      ; the configuration word (blocks)
+        MOV16   r7, V
+        MOV     r5, r6
+        ANDI    r5, 0x3F
+        ST      r5, r7, SMIN
+        SHRI    r6, 8
+        ST      r6, r7, MMIN
+        JMP     quiet
+
+lost:   MOV16   r7, V                   ; no edge for GAP ticks: carrier off
+        LD      r6, r7, STATE
+        CMPI    r6, 2
+        BNC     quiet                   ; not in a message: nothing to say
+        MOV16   r6, 0x0603              ; the message ended before its checksum
+        PUSH    r6
+quiet:  LDI     r6, 0
+        ST      r6, r7, STATE
+        ST      r6, r7, CNT
+        WAITE   RX, ANY                 ; the next burst's first edge
+        CSRR    r0, NOW
+        LDI     r1, MK                  ; a fresh start: mark, hunting
+        LDI     r3, 1
+        LDI     r4, 0
+        LDI     r5, 0
+        LDI     r2, HBIT
+        ADD     r2, r2, r0
+
+edge:   LDI     r7, GAP
+        ADD     r7, r7, r0
+        CSRW    TD, r7                  ; the carrier-off deadline: GAP after T0
+        WAITE   RX, ANY, T
+        BT      lost
+        CSRR    r6, NOW                 ; one slot after every edge alike
+        SUB     r7, r6, r0              ; L, this half-period
+        CMPI    r7, BOUNCE
+        BNC     edge                    ; too soon: ignored, T0 kept
+        CMPI    r7, THRESH
+        BC      markhp
+        TEST    r3, r3                  ; a space half-period
+        BZ      same
+        ADD     r2, r0, r1              ; mark to space:
+        ADD     r2, r2, r7              ;   S = T0 + P + 2 L - 2 SP - MK + HBIT
+        ADD     r2, r2, r7
+        SUBI    r2, SP
+        SUBI    r2, SP
+        LDI     r3, 0
+        JMP     same
+markhp: TEST    r3, r3                  ; a mark half-period
+        BNZ     same
+        LDI     r2, MK + 2 * SP + HBIT  ; space to mark:
+        ADD     r2, r2, r0              ;   S = T0 + MK + 2 SP + HBIT - L - 2 P
+        SUB     r2, r2, r7
+        SUB     r2, r2, r1
+        SUB     r2, r2, r1
+        LDI     r3, 1
+same:   MOV     r1, r7                  ; P = L
+        MOV     r0, r6                  ; T0 = this edge
+
+emit:   SUB     r7, r0, r2              ; every sample due by this edge takes
+        SHLI    r7, 1                   ; this half-period's tone; C = 1: S is
+        BC      edge                    ; still ahead (half-window, mod 2^16)
+        TEST    r5, r5
+        BNZ     inchar
+        TEST    r3, r3                  ; hunting: a 0 is a start bit
+        BZ      sbit
+        ADDI    r4, 1                   ; a mark bit: one more (saturating)
+        BNZ     adv
+        SUBI    r4, 1
+adv:    LDI     r7, BIT_T
+        ADD     r2, r2, r7              ; the next sample, a bit later
+        JMP     emit
+sbit:   MOV16   r7, V
+        ST      r4, r7, RUN             ; the marks before this character
+        LDI     r4, 0
+        LDI     r5, 9                   ; 8 data bits and the stop bit
+        JMP     adv
+inchar: SHLI    r4, 1                   ; first bit ends up highest
+        OR      r4, r4, r3
+        SUBI    r5, 1
+        BNZ     adv
+        REV     r4, r4                  ; the stop bit to bit 15, d0 below it
+        SHRI    r4, 7                   ; byte | stop << 8
+        LDI     r6, 1
+        SHLI    r6, 8
+        XOR     r4, r4, r6              ; bit 8 = framing error
+
+; ---- the caller ID layer: r4 = byte | framing error << 8; r5 = 0 ----
+        MOV16   r7, V
+        LD      r6, r7, STATE
+        CMPI    r6, 2
+        BC      inmsg
+        LDI     r5, 0x55                ; before the message: a seizure character?
+        CMP     r4, r5                  ; (a framing error makes it differ)
+        BNZ     notsz
+        LD      r5, r7, CNT
+        ADDI    r5, 1
+        ST      r5, r7, CNT
+        LD      r6, r7, SMIN
+        CMP     r5, r6                  ; C: enough of them
+        BNC     fdone
+        LDI     r6, 1                   ; seizure seen
+        JMP     setst
+notsz:  LDI     r5, 0
+        ST      r5, r7, CNT             ; the run of 0x55 is broken
+        CMPI    r6, 1
+        BNZ     fdone                   ; no seizure yet: ignored
+        MOV     r5, r4
+        SHRI    r5, 9                   ; C = framing error
+        BC      lost0
+        LD      r5, r7, RUN
+        LD      r6, r7, MMIN
+        CMP     r5, r6                  ; C: the mark signal was long enough
+        BNC     lost0
+        ST      r4, r7, SUM             ; the message type: the sum starts
+        LDIH    r4, 0x01
+        PUSH    r4
+        LDI     r6, 2
+        JMP     setst
+lost0:  LDI     r6, 0                   ; not a message: hunt again
+setst:  ST      r6, r7, STATE
+fdone:  LDI     r4, 0                   ; the mark count starts again
+        LDI     r5, 0
+        JMP     adv
+
+inmsg:  MOV     r5, r4                  ; r6 = 2, 3 or 4
+        SHRI    r5, 9                   ; C = framing error
+        LDI     r5, 2                   ; (LDI keeps C)
+        BC      mend
+        LD      r5, r7, SUM
+        ADD     r5, r5, r4
+        ST      r5, r7, SUM             ; the checksum byte included
+        CMPI    r6, 3
+        BC      body
+        ST      r4, r7, MLEFT           ; the message length
+        LDI     r5, 0
+        ST      r5, r7, PLEFT
+        LDIH    r4, 0x02
+        PUSH    r4
+        LDI     r6, 3
+        JMP     setst
+body:   LD      r5, r7, MLEFT
+        CMPI    r5, 0
+        BZ      cksum                   ; all counted: this is the checksum
+        SUBI    r5, 1
+        ST      r5, r7, MLEFT
+        CMPI    r6, 4
+        BZ      plen
+        LD      r5, r7, PLEFT
+        CMPI    r5, 0
+        BZ      ptype
+        SUBI    r5, 1
+        ST      r5, r7, PLEFT
+        LDIH    r4, 0x05                ; parameter data
+        PUSH    r4
+        JMP     fdone
+ptype:  LDIH    r4, 0x03                ; a parameter type: its length next
+        PUSH    r4
+        LDI     r6, 4
+        JMP     setst
+plen:   ST      r4, r7, PLEFT
+        LDIH    r4, 0x04
+        PUSH    r4
+        LDI     r6, 3
+        JMP     setst
+cksum:  LD      r5, r7, SUM
+        SHLI    r5, 8                   ; Z: the sum is 0 mod 256
+        LDI     r5, 0                   ; (LDI keeps Z)
+        BZ      mend
+        LDI     r5, 1
+mend:   LDIH    r5, 0x06                ; the end, with its status
+        PUSH    r5
+        LDI     r6, 0
+        JMP     setst

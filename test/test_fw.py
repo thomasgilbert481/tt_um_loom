@@ -124,6 +124,7 @@ from tools.tests import test_fw_kcs                               # noqa: E402
 from tools.tests import test_fw_j1708                             # noqa: E402
 from tools.tests import test_fw_bldc                              # noqa: E402
 from tools.tests import test_fw_j1850                             # noqa: E402
+from tools.tests import test_fw_callerid                          # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
@@ -148,7 +149,8 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_hub75, test_fw_vga, test_fw_iec62056, test_fw_lego_pf,
            test_fw_dtmf, test_fw_swim, test_fw_centronics, test_fw_gpib,
            test_fw_zxtape, test_fw_cbm_iec, test_fw_irig, test_fw_dcf77,
-           test_fw_kcs, test_fw_j1708, test_fw_bldc, test_fw_j1850)
+           test_fw_kcs, test_fw_j1708, test_fw_bldc, test_fw_j1850,
+           test_fw_callerid)
 
 
 def _make(scenario):
