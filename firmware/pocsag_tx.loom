@@ -1,0 +1,275 @@
+; pocsag_tx.loom
+; POCSAG (ITU-R M.584-2 Annex 1, "Radio-paging code No. 1") transmitter:
+; NRZ data on OUT0 for an FSK transmitter's data input, the transmitter's
+; key (PTT) on OUT1. One numeric page at a time from the host through INQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): POCSAG is in no design
+; document. Hardware reused from other jobs: the CRC unit (SEMANTICS 6.9),
+; built for CRC-5/CRC-16 on USB and the CAN CRC, computes the BCH(31,21)
+; check bits. A BCH generator divides exactly as a CRC polynomial does, and
+; x^10+x^9+x^8+x^6+x^5+x^3+1 is a 10-bit "CRC" left-aligned in the 16-bit
+; register (CRC_POLY = 0x369 << 6 = 0xDA40, CRC_INIT = 0): shift the 21
+; information bits through it with SHO (to no pin) and CRC[15:6] is M.584-2
+; 1.4's remainder. PAR (put in for UART parity) gives the even parity bit.
+; The deadline-latched pin write (SETP ... D, SEMANTICS 6.10, built for
+; WS2812) lands every bit edge on the exact clock of its tick. What the
+; firmware does that no hardware does: the codeword layout, the numeric
+; packing, the preamble, the batch and frame structure, the address
+; placement, idle fill, and the key line.
+;
+; Wire format (M.584-2 Annex 1, sections as tools/protomodels/pocsag.py
+; cites them): preamble of reversals 1010... (1.1, at least 576 bits);
+; batches of the sync codeword 0x7CD215D8 and 16 codewords (1.2); every
+; codeword 32 bits MSB first (1.3): bit 1 the flag (0 address, 1 message),
+; bits 2-21 information, 22-31 BCH check bits, 32 even parity (1.3.2,
+; 1.3.3, 1.4). The address codeword goes in the first codeword of frame
+; RIC & 7 (1.2 allows either codeword of the frame), the message codewords
+; straight after it, past a sync codeword if the batch ends, then idle
+; (0x7A89C197, see QUESTIONS.md on Table 2) to the end of the batch, with
+; at least one idle after the message (1.2: the last codeword of a
+; transmission should be idle). Numeric characters (2.1) are 4-bit codes,
+; each sent least significant bit first, 5 to a codeword, the last
+; codeword filled with spaces (0xC). Rate (M.539-3 4.3): 512 or 1200
+; bit/s +-1e-5.
+;
+; Tick (set by the host before RUN): HALF a bit (TICK_INT is 16 bits and
+; 50 MHz / 512 = 97656.25 clocks does not fit): 48828 + 32/256 at 50 MHz
+; for 512 bit/s (exact), 20833 + 85/256 for 1200 bit/s (6e-8 slow). Every
+; edge is `SETP TXD, v, D` landed by a WAITD, so every bit is exactly two
+; ticks, to the clock. The schedule is proved for ticks of TICKMIN clocks
+; or more (the .tick below).
+;
+; Host words (FIFO space, thread 0), one page:
+;   w0  RIC[15:0]
+;   w1  n (characters) in 15:8, the function bits in 6:5, RIC[20:16] in
+;       4:0. Numeric pages use function bits 00 (2.1).
+;   then ceil(n / 4) words of characters, four to a word, the FIRST in
+;       bits 3:0: read least significant bit first, the words are the
+;       message bits in transmission order. At most 40 characters are sent
+;       (8 message codewords); the program pops every word w1 announces.
+; The page is encoded, check bits and all, before the key goes up, so the
+; host may push at any pace. Nothing is pushed to OUTQ. Between pages the
+; key is down and TXD low.
+;
+; Configuration: the word at `cfg` (data memory, loaded with the image;
+; the host may rewrite it before RUN): the preamble in bit pairs, 1 to
+; 65535. Reset value 288 (576 bits). Read at every page.
+;
+; Registers on the air: r0 r1 the codeword being sent, r2 r3 bit and half
+; counters, r4 its position in the batch (16: a sync comes next), r5 the
+; next page codeword, r6 page codewords left + 1 (the 1 is the idle owed
+; after the message), r7 the position the next page codeword goes in.
+;
+; Size: 202 words, 0x000-0x0C9: 182 of code and 20 of data (9 codewords,
+; 2 x frame, cfg). It spills from thread 0's quarter into thread 1's, so
+; thread 1 must not be started with this image. `--strict`: 13 deadline
+; pairs, worst slack 24 clocks at the 64-clock tick (choosing the next
+; codeword in the last bit time of the one before), no `.bounded`: every
+; POP is in the encoding phase, before the SETD that anchors the air.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Idle codeword 0x7A89C197. The M.584-2 PDF's Table 2 prints 0x7AC9C197,
+;   which fails the BCH check (syndrome 494, odd parity); 0x7A89C197 is a
+;   valid codeword one bit away, and is taken as a misprint.
+;   Bit rate and tolerance from ITU-R M.539-3 (withdrawn 2007), the only
+;   ITU text that gives them; M.584-2 gives no rate.
+;   Numeric codes 1110 and 1111: shown as "]" and "[" in the model, from
+;   memory and unchecked (the glyphs are images in the PDF); the firmware
+;   only moves the 4-bit codes.
+;   The host pops a report's two words together; the receiver keeps
+;   single-bit correction, so the pair fills all 512 words.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TXD = OUT0, TXEN = OUT1
+        .equ    TICKMIN = 64
+        .tick   TICKMIN                 ; the shortest half-bit tick the schedule is proved for
+        .equ    FR2 = 18                ; offsets from cws: 2 x frame,
+        .equ    CFG = 19                ;   the preamble length
+
+start:  SETP    TXD, 0
+        SETP    TXEN, 0
+        .csr    BE_CFG, 0x202           ; DIR = 1 (MSB first), CRC_EN
+        .csr    BE_PINS, 13             ; SHO shifts to no pin: only the CRC sees the bits
+        .csr    CRC_POLY, 0x369 << 6    ; M.584-2 1.4, left-aligned (CRC_INIT = 0)
+
+; ------------------------------------------------------------ encode a page
+page:   POP     r0                      ; RIC[15:0]
+        POP     r1                      ; n, function bits, RIC[20:16]
+        MOV16   r5, cws
+        MOV     r2, r0
+        ANDI    r2, 7
+        SHLI    r2, 1
+        ST      r2, r5, FR2             ; the address goes in codeword 2 x (RIC & 7)
+        MOV     r7, r1
+        SHRI    r7, 8                   ; n
+        MOV     r2, r1
+        SHRI    r2, 5
+        ANDI    r2, 3
+        SHLI    r2, 11                  ; bits 20-21: the function bits
+        MOV     r3, r0
+        SHRI    r3, 3
+        SHLI    r3, 13                  ; bits 17-19: RIC[5:3]
+        OR      r3, r3, r2
+        ANDI    r1, 31
+        SHLI    r1, 10
+        SHRI    r0, 6
+        OR      r0, r0, r1              ; bit 1 = 0, bits 2-16: RIC[20:6]
+        MOV     r1, r3
+        CALL    fin                     ; the address codeword
+        MOV     r3, r7                  ; characters still to pop
+        CMPI    r7, 41
+        BNC     mcw
+        LDI     r7, 40                  ; characters to send
+mcw:    CMPI    r7, 0
+        BZ      drain
+        LDI     r6, 0                   ; bits left in r4
+mcw1:   LDI     r0, 0
+        LDI     r1, 1                   ; the flag, then 20 message bits below it
+        LDI     r2, 20
+mb:     SHLI    r0, 1
+        SHLI    r1, 1
+        BNC     mb0
+        ORI     r0, 1
+mb0:    CMPI    r6, 0
+        BNZ     mbit
+        MOV16   r4, 0xCCCC              ; four spaces, unless a word is due
+        LDI     r6, 16
+        CMPI    r3, 0
+        BZ      mbit
+        POP     r4
+        CMPI    r3, 4                   ; C = (a whole word)
+        BC      mfull
+        LDSR    r2                      ; (SR keeps the bit count)
+        SHLI    r3, 2
+        LDI     r6, 1
+        SHL     r6, r6, r3
+        SUBI    r6, 1                   ; mask of the characters in the word
+        AND     r4, r4, r6
+        NOT     r6, r6
+        MOV16   r2, 0xCCCC
+        AND     r6, r6, r2
+        OR      r4, r4, r6              ; spaces above them (2.1)
+        STSR    r2
+        LDI     r6, 16
+        LDI     r3, 4
+mfull:  SUBI    r3, 4
+mbit:   SUBI    r6, 1
+        SHRI    r4, 1                   ; C = the next message bit
+        BNC     mb1
+        ORI     r1, 1
+mb1:    DJNZ    r2, mb
+        SHLI    r0, 11                  ; align: the flag to bit 1
+        MOV     r2, r1
+        SHRI    r2, 5
+        OR      r0, r0, r2
+        SHLI    r1, 11
+        CALL    fin                     ; a message codeword
+        SUBI    r7, 5
+        BZ      drain
+        BC      mcw1                    ; more characters
+drain:  CMPI    r3, 0                   ; words past the 40th: pop, drop
+        BZ      air
+        POP     r4
+        CMPI    r3, 5
+        BNC     air
+        SUBI    r3, 4
+        JMP     drain
+
+; ------------------------------------------------------------ the air
+air:    MOV16   r2, cws
+        LD      r7, r2, FR2
+        SUB     r6, r5, r2
+        SHRI    r6, 1
+        ADDI    r6, 1                   ; page codewords + the idle owed
+        MOV     r5, r2
+        LDI     r4, 16                  ; a sync codeword first
+        LD      r2, r2, CFG             ; preamble bit pairs
+        SETD    0
+        SETP    TXEN, 1, D              ; key up on a tick, one bit before the preamble
+        WAITD   2
+pre:    SETP    TXD, 1, D               ; 1.1: reversals, a 1 first
+        WAITD   2
+        SETP    TXD, 0, D
+        WAITD   2
+        DJNZ    r2, pre
+; In the last bit time of every codeword (and of the preamble), with TD on
+; that bit's start: pick the next codeword and stage its first bit.
+sel:    CMPI    r4, 16
+        BNZ     body
+        CMPI    r6, 0                   ; a batch boundary
+        BZ      finish                  ; ... after the owed idle: done
+        LDI     r4, 0
+        CMPI    r7, 16
+        BNZ     syn
+        LDI     r7, 0                   ; the message runs on past the sync
+syn:    MOV16   r0, 0x7CD2              ; 1.3.1 Table 1
+        MOV16   r1, 0x15D8
+        JMP     send
+body:   CMPI    r6, 2                   ; C = page codewords left
+        BNC     idle
+        CMP     r4, r7
+        BNZ     idle                    ; not there yet
+        ADDI    r7, 1                   ; the next one goes straight after
+        SUBI    r6, 1
+        LD      r0, r5, 0
+        LD      r1, r5, 1
+        ADDI    r5, 2
+        JMP     go
+idle:   CMPI    r6, 1
+        BNZ     idl
+        LDI     r6, 0                   ; the idle owed after the message
+idl:    MOV16   r0, 0x7A89              ; 1.3.4 (QUESTIONS.md: Table 2)
+        MOV16   r1, 0xC197
+go:     ADDI    r4, 1
+send:   LDI     r3, 2                   ; r0:r1, 32 bits MSB first
+sch:    LDI     r2, 16
+scb:    SHLI    r0, 1                   ; C = the bit
+        BC      sc1
+        SETP    TXD, 0, D
+        WAITD   2                       ; it starts
+        DJNZ    r2, scb
+        JMP     scn
+sc1:    SETP    TXD, 1, D
+        WAITD   2
+        DJNZ    r2, scb
+scn:    MOV     r0, r1
+        DJNZ    r3, sch
+        JMP     sel
+finish: SETP    TXEN, 0, D              ; key down at the end of the last bit
+        WAITD   2
+        SETP    TXD, 0
+        JMP     page
+
+; ------------------------------------------------------------ check bits
+; r0:r1 = bits 1-21, left-aligned (r1[10:0] = 0): the CRC unit divides
+; them (SHO to no pin, CNT counting), its remainder fills bits 22-31,
+; PAR gives bit 32; the codeword is stored at r5, r5 += 2.
+fin:    CRCI
+        LDSR    r0
+        LDI     r2, 16
+        CSRW    CNT, r2
+fi1:    SHO
+        BNZ     fi1
+        LDSR    r1
+        LDI     r2, 5
+        CSRW    CNT, r2
+fi2:    SHO
+        BNZ     fi2
+        STCRC   r2                      ; 1.4: the remainder in CRC[15:6]
+        SHRI    r2, 5
+        OR      r1, r1, r2
+        XOR     r2, r0, r1
+        PAR     r2, r2                  ; C = odd so far
+        BNC     fi3
+        ORI     r1, 1                   ; 1.3.2: even parity
+fi3:    ST      r0, r5, 0
+        ST      r1, r5, 1
+        ADDI    r5, 2
+        RET
+
+; ------------------------------------------------------------ data
+cws:    .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ; 9 codewords
+        .word   0                       ; FR2
+cfg:    .word   288                     ; preamble bit pairs: 576 bits (header)

@@ -1,0 +1,345 @@
+; pocsag_rx.loom
+; POCSAG (ITU-R M.584-2 Annex 1) pager decoder: NRZ data from a receiver's
+; data slicer on IN0. Reports its own address and the message codewords
+; that follow it to the host through OUTQ[2], with single-bit errors
+; corrected.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): POCSAG is in no design
+; document. Hardware reused from other jobs: the bit engine's SHI and the
+; CRC unit (SEMANTICS 6.9), built for USB, CAN and the SPI/UART shift
+; paths. SHI samples the line, shifts the bit into SR (the last 16 bits:
+; one STSR gives either half of a codeword) and divides the codeword by
+; the BCH generator in the same slot (CRC_POLY = 0x369 << 6, the 10-bit
+; "CRC" x^10+x^9+x^8+x^6+x^5+x^3+1 left-aligned), so after the 32nd bit
+; CRC[15:6] is the syndrome, corrected for the parity bit that went
+; through the divider too. The tick restart on a TICK_INT write (SEMANTICS
+; 4, built for UART start bits) is the receiver's bit clock recovery. PAR
+; checks the even parity. What the firmware does that no hardware does:
+; the clock recovery on every edge (NRZ has no start bits), the bit-by-bit
+; search for the sync codeword, batch and frame tracking, the address
+; match in the pager's own frame, the error search, and the message rules
+; of M.584-2 1.2 and 2.5.1.
+;
+; Clock recovery: a tick is a sixteenth of a bit. The thread samples at
+; TD, does that bit's work, and from 6/16 of a bit after the sample to the
+; next sample watches the line with `WAITE RXD, ANY, T`. An edge restarts
+; the tick grid (CSRR/CSRW TICK_INT) and puts the next sample 8 ticks (half
+; a bit) later; with no edge the deadline is the sample, a bit after the
+; last. So every edge re-centres the sampling, and a run of equal bits
+; free-runs on the tick. An edge earlier than 6/16 of a bit after a sample
+; is missed (not acted on): at M.539-3's +-1e-5 that needs 12 500 bits
+; without an edge.
+;
+; Single-bit correction (M.584-2 gives the code, not the decoder): the 31
+; possible syndromes of one error are x^(11+t) mod g for an error t bits
+; from the end of the BCH block (t = 0..30); the program walks them, three
+; a bit, while the next codeword comes in, and a match flips that bit. An
+; error in the parity bit alone leaves the syndrome 0 with odd parity. A
+; non-zero syndrome with even parity, or no match, is two or more errors:
+; the codeword is indecipherable. The report of codeword n is pushed while
+; codeword n+1 arrives, half a codeword (about 31 ms at 512 bit/s) late.
+;
+; Rules kept (M.584-2 Annex 1): the batch is sync + 16 codewords (1.2); the
+; next sync must follow at once or the search starts again (an exact
+; match, no errors allowed, in the search and at a batch boundary); an
+; address codeword is ours when its 18 bits match RIC[20:3] and it sits in
+; frame RIC & 7 (codeword 2f or 2f+1); the message is every codeword with
+; the flag set after it, up to the next address or idle codeword or a lost
+; sync (1.2). An indecipherable codeword inside a message is reported as
+; such and the message goes on; 2.5.1's "desirable" stop after two in a
+; row is left to the host, which sees both.
+;
+; Tick (set by the host before RUN): 1/16 of a bit, 6103 + 132/256 at 50
+; MHz for 512 bit/s, 2604 + 43/256 for 1200 bit/s. The per-bit work is
+; proved for ticks of 32 clocks or more (.tick 32, 512 clocks a bit).
+;
+; Host words (FIFO space, thread 2). Two words per report, nothing in INQ:
+;   A: bits 1-16 of the codeword (corrected);
+;   B: bits 17-21 in 15:11, then a status where the check bits were: 8:5
+;      the codeword's position in its batch, 4 overflow (OUTQ was full and
+;      reports were lost before this one), 3:2 the kind (1 our address, 2 a
+;      message codeword, 3 an indecipherable codeword inside a message), 1
+;      corrected (one bit error was fixed), 0 and 10:9 zero.
+;   So A[14:0] and B[15:11] are the 20 information bits, bit 2 first: the
+;   address and the function bits (kind 1), or the message (kind 2). A full
+;   OUTQ drops the report and sets the overflow bit of the next.
+;
+; Configuration: `cfg` (data memory, loaded with the image, the host may
+; rewrite it before RUN): RIC[15:0], then RIC[20:16]. Read once, at RUN.
+;
+; Registers: r0 r1 the codeword (low, high half) or the search window, r2
+; bits received in this codeword, r3 its position in the batch (16: the
+; sync slot) or 32 while searching, r4 the error search (then the next
+; codeword's high half), r5 the target syndrome (then the report kind,
+; then the report's second word), r6 flags, r7 scratch.
+;
+; Size: 242 words, 0x100-0x1F1 (237 of code, the 5-word cfg). It spills
+; from thread 2's quarter into thread 3's, so thread 3 must not be started
+; with this image; with pocsag_tx.loom (0x000-0x0C9) the two fill the
+; 512-word memory and run as threads 0 and 2. `--strict`: one deadline
+; pair (the sample's SETD 0 to the WAITD 6 that closes every bit's work),
+; worst slack 8 clocks at the 32-clock tick, two `.bounded` PUSHes, each
+; guarded by a `WAITB OUTQ_NF, T` just before it that completed with T = 0.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 2
+        .pins   RXD = IN0
+        .tick   32                      ; the shortest tick (1/16 bit) the work is proved for
+        .equ    PEND = 1                ; r6 flags: a codeword waits to be judged
+        .equ    CORR = 2                ;   one error corrected in it (B bit 1)
+        .equ    BAD = 4                 ;   indecipherable
+        .equ    INMSG = 8               ;   inside a message to us
+        .equ    OVF = 16                ;   a report was lost (B bit 4)
+        .equ    HUNT = 32               ; r3 while searching for a sync codeword
+        .equ    POLY = 0x369 << 6       ; M.584-2 1.4, left-aligned
+        .equ    X11 = 0x1BB << 6        ; x^11 mod g, left-aligned: an error in bit 31
+
+start:  .csr    BE_CFG, 0x202           ; DIR = 1 (MSB first), CRC_EN
+        .csr    BE_PINS, pin(RXD) << 5 | 13  ; SHI reads RXD; SHO (unused) to no pin
+        .csr    CRC_POLY, POLY          ; CRC_INIT = 0
+        MOV16   r7, cfg                 ; the address match, from the RIC:
+        LD      r0, r7, 0               ; RIC[15:0]
+        LD      r1, r7, 1               ; RIC[20:16]
+        SHLI    r1, 10
+        MOV     r2, r0
+        SHRI    r2, 6
+        OR      r1, r1, r2              ; RIC[20:6]: codeword bits 2-16 (flag 0)
+        ST      r1, r7, 2
+        MOV     r2, r0
+        SHRI    r2, 3
+        ANDI    r2, 7                   ; RIC[5:3]: codeword bits 17-19
+        ST      r2, r7, 3
+        ANDI    r0, 7                   ; the frame
+        ST      r0, r7, 4
+        LDI     r3, HUNT
+        LDI     r6, 0
+        SETD    16
+        JMP     wait                    ; (the bit clock is in the middle: branch reach)
+
+; ------------------------------------------------------------ the sync codeword
+; r1:r0 is the last 32 bits: r0 = SR, r1 takes the bit SR dropped.
+hunt:   SHLI    r1, 1
+        SHLI    r0, 1                   ; C = the bit that left the low half
+        BNC     hu0
+        ORI     r1, 1
+hu0:    STSR    r0
+hcmp:   MOV16   r7, 0x15D8              ; 1.3.1 Table 1
+        CMP     r0, r7
+        BNZ     lost
+        MOV16   r7, 0x7CD2
+        CMP     r1, r7
+        BNZ     lost
+        LDI     r3, 0                   ; synchronised: codeword 0 comes next
+        LDI     r2, 0
+        CRCI
+        JMP     done
+lost:   LDI     r3, HUNT                ; (still) searching: no message
+        ANDI    r6, OVF
+        JMP     done
+
+; ------------------------------------------------------------ a codeword ends
+cwend:  CMPI    r5, 0                   ; a report's second word never went:
+        BZ      ce0
+        ORI     r6, OVF                 ; dropped
+ce0:    ANDI    r6, 63 - CORR
+        STSR    r0                      ; bits 17-32
+        MOV     r1, r4                  ; bits 1-16, kept at bit 16
+        STCRC   r5                      ; the remainder of all 32 bits
+        CMPI    r3, 16
+        BZ      hcmp                    ; the sync slot: a sync, or search again
+        CRCI
+        LDI     r2, 0
+        ADDI    r3, 1
+        ORI     r6, PEND                ; judge it while the next comes in
+        JMP     done
+
+; ------------------------------------------------------------ bit 1: the syndrome
+early:  CMPI    r2, 1
+        BNZ     search
+        MOV     r7, r6
+        ANDI    r7, PEND
+        BNZ     syn
+        LDI     r5, 0                   ; nothing to judge (after a sync)
+        JMP     done
+syn:    MOV     r7, r0                  ; the parity bit went through the
+        ANDI    r7, 1                   ; divider too: take its x^10 back out
+        BZ      sy0
+        MOV16   r7, POLY
+        XOR     r5, r5, r7              ; r5 = the syndrome of bits 1-31
+sy0:    XOR     r7, r0, r1
+        PAR     r7, r7                  ; C = odd parity over the 32 bits
+        BC      odd
+        CMPI    r5, 0
+        BZ      done                    ; a codeword
+        ORI     r6, BAD                 ; even parity, syndrome: two errors
+        LDI     r5, 0
+        JMP     done
+odd:    CMPI    r5, 0
+        BNZ     sea
+        ORI     r6, CORR                ; only the parity bit was wrong
+        XORI    r0, 1
+        JMP     done
+sea:    MOV16   r4, X11                 ; one error somewhere: search for it
+        JMP     done
+
+; ------------------------------------------------------------ bits 2-12: the search
+; r4 = x^(11+t) mod g for an error t bits from the end of bits 1-31; three
+; values of t a bit, t = 3 (k - 2) + m, 33 >= 31 in all.
+search: CMPI    r5, 0
+        BZ      done
+        MOV16   r7, POLY
+        CMP     r4, r5
+        BZ      f0
+        SHLI    r4, 1                   ; times x, mod g
+        BNC     s1
+        XOR     r4, r4, r7
+s1:     CMP     r4, r5
+        BZ      f1
+        SHLI    r4, 1
+        BNC     s2
+        XOR     r4, r4, r7
+s2:     CMP     r4, r5
+        BZ      f2
+        SHLI    r4, 1
+        BNC     done
+        XOR     r4, r4, r7
+        JMP     done
+f0:     LDI     r7, 6
+        JMP     fnd
+f1:     LDI     r7, 5
+        JMP     fnd
+f2:     LDI     r7, 4
+fnd:    MOV     r4, r2                  ; t = 3k - 6 + m
+        ADD     r4, r4, r2
+        ADD     r4, r4, r2
+        SUB     r4, r4, r7
+        LDI     r5, 0
+        ORI     r6, CORR
+        LDI     r7, 1
+        CMPI    r4, 15                  ; bits 17-31 are r0[15:1], bits 1-16 r1
+        BC      fhi
+        ADDI    r4, 1
+        SHL     r7, r7, r4
+        XOR     r0, r0, r7
+        JMP     done
+fhi:    SUBI    r4, 15
+        SHL     r7, r7, r4
+        XOR     r1, r1, r7
+        JMP     done
+
+; ------------------------------------------------------------ the bit clock
+wait:   WAITE   RXD, ANY, T             ; an edge, or the sample time
+        BNT     edge
+        SETD    0                       ; the sample: TD = NOW
+        SHI                             ; SR <- the bit; the CRC divides it
+        ADDI    r2, 1
+        CMPI    r3, HUNT                ; C = searching
+        BC      hunt
+        CMPI    r2, 13
+        BNC     early                   ; bits 1..12
+        CMPI    r2, 32
+        BZ      cwend
+        CMPI    r2, 16
+        BZ      k16
+        BC      kb                      ; bits 17..31: a second word still to go?
+        CMPI    r2, 14
+        BZ      k14
+        BC      k15
+        JMP     k13
+done:   WAITD   6                       ; the work fits in 6/16 of a bit
+        SETD    10                      ; the next sample, a bit after this one
+        JMP     wait
+edge:   CSRR    r7, TICK_INT            ; restart the tick grid on the edge
+        CSRW    TICK_INT, r7
+        SETD    8                       ; and sample half a bit later
+        JMP     wait
+
+; ------------------------------------------------------------ bit 13: judge it
+k13:    MOV     r7, r6
+        ANDI    r7, PEND
+        BZ      done
+        XORI    r6, PEND
+        CMPI    r5, 0                   ; the search found nothing:
+        BZ      jok
+        ORI     r6, BAD                 ; indecipherable
+jok:    LDI     r5, 0                   ; r5 = the report kind from here on
+        MOV     r7, r6
+        ANDI    r7, BAD
+        BZ      good
+        XORI    r6, BAD
+        LDI     r5, 1
+        JMP     inmsg                   ; kind 3 if inside our message
+good:   MOV     r7, r1
+        SHLI    r7, 1                   ; C = the flag bit
+        BC      inmsg                   ; a message codeword: kind 2 if ours
+        ANDI    r6, 63 - INMSG          ; an address or idle codeword ends a message
+        LDI     r5, 1                   ; ours? (bit 14)
+        JMP     done
+inmsg:  MOV     r7, r6
+        ANDI    r7, INMSG
+        BZ      done                    ; not ours: kind 0
+        ADDI    r5, 2
+        JMP     done
+
+; ------------------------------------------------------------ bit 14: our address?
+k14:    CMPI    r5, 1
+        BNZ     done
+        MOV16   r7, cfg
+        LD      r4, r7, 2
+        CMP     r1, r4                  ; flag 0 and RIC[20:6]
+        BNZ     nota
+        LD      r4, r7, 4               ; in our frame?
+        MOV     r7, r3
+        SUBI    r7, 1
+        SHRI    r7, 1
+        CMP     r7, r4
+        BNZ     nota
+        MOV16   r7, cfg
+        LD      r4, r7, 3
+        MOV     r7, r0
+        SHRI    r7, 13                  ; bits 17-19
+        CMP     r7, r4
+        BNZ     nota
+        ORI     r6, INMSG               ; a page for us: its message follows
+        JMP     done
+nota:   LDI     r5, 0
+        JMP     done
+
+; ------------------------------------------------------------ bits 15-31: report
+k15:    CMPI    r5, 0
+        BZ      done
+        WAITB   OUTQ_NF, T              ; a test: TD is reached
+        BT      full
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[2] (SEMANTICS 6.7)"
+        PUSH    r1                      ; A: bits 1-16
+        SHLI    r5, 2                   ; B: the kind,
+        MOV     r7, r6
+        ANDI    r7, CORR | OVF
+        OR      r5, r5, r7              ; corrected, overflow,
+        MOV     r7, r3
+        SUBI    r7, 1
+        SHLI    r7, 5
+        OR      r5, r5, r7              ; the position,
+        MOV     r7, r0
+        SHRI    r7, 11
+        SHLI    r7, 11
+        OR      r5, r5, r7              ; bits 17-21
+        JMP     done
+full:   ORI     r6, OVF                 ; dropped: the next report says so
+        LDI     r5, 0
+        JMP     done
+k16:    STSR    r4                      ; bits 1-16 of the codeword coming in
+kb:     CMPI    r5, 0                   ; B, from bit 16 on, until OUTQ has room
+        BZ      done
+        WAITB   OUTQ_NF, T
+        BT      done
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[2] (SEMANTICS 6.7)"
+        PUSH    r5
+        LDI     r5, 0
+        ANDI    r6, 63 - OVF
+        JMP     done
+
+; ------------------------------------------------------------ data
+cfg:    .word   0xD687, 0x0012          ; RIC 1234567 (header); the host may rewrite
+        .word   0, 0, 0                 ; RIC[20:6], RIC[5:3], RIC & 7 (set at RUN)
