@@ -1,0 +1,220 @@
+; psi5_ecu.loom
+; A PSI5 ECU (the receiving end of PSI5, Peripheral Sensor Interface 5) at
+; logic level: it sends the sync pulses of the synchronous modes at a fixed
+; period and decodes the sensor frames of up to two time slots after each,
+; checking the start bits, the Manchester code and the parity or the CRC.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It reuses the deadline latch
+; (built for clock-exact UART and WS2812 edges) for the sync pulse, the
+; shared flags to tell the receiver when a sync went out, the bit engine as
+; a shifter (SHI with INV, built for the M2 serial programs, turns each
+; mid-bit edge's level into the bit), and the CRC unit (built for USB and
+; CAN), which checks PSI5's 3-bit CRC by shifting the received data and CRC
+; through itself to a pin index that does not exist (31). What no hardware
+; does, the firmware does: the slot windows, and a Manchester decoder that
+; follows the sensor's clock. The bit engine's own Manchester decoder samples
+; on a fixed grid; a PSI5 sensor runs on its own oscillator, so this one
+; restarts its window on every mid-bit edge instead, and so does not drift.
+;
+; Sources and the logic-level mapping are those of psi5_sensor.loom (read its
+; header): DATA = 1 is the sensor's high current, a 0 is a rising edge in the
+; middle of the bit and a 1 a falling one, start bits 0 0, LSB first, even
+; parity or the CRC x^3 + x + 1 with seed 111 over D0..D9, sent C2 first.
+;   SYNC = OUT1  the sync pulse to the PHY that makes the voltage pulse:
+;                1 during the pulse. Push-pull, idle 0.
+;   DATA = IN0   the sensor current after the PHY's comparator.
+;
+; Threads. Thread 0 sends the sync pulses and raises shared flag 0 at each
+; rising edge; thread 1 waits for flag 0, then decodes slot 1 and, if asked,
+; slot 2 of that sync period. They share nothing else.
+;
+; Thread 0, host words INQ[0]: the period and the pulse width, both in thread
+; 0's ticks (the host sets TICK_INT; 1 us is 50 clocks at 50 MHz and 16 on
+; a 16 MHz board). Width >= 2, period >= width + 2. Each edge is on the
+; exact clock edge of its tick (SEMANTICS 6.10), so the period is exact. The
+; pulse's shape and width on the wire belong to the PHY; the width here is
+; the host's (the specification's sync pulse figures are unchecked, see
+; QUESTIONS).
+;
+; Thread 1, host words INQ[1]:
+;   1. configuration: bit 0 check (0 parity, 1 CRC), bit 1 slots (0 one,
+;      1 two); other bits ignored. 10-bit data in every slot.
+;   2. slot 1's window, 3. slot 2's window (pushed even for one slot):
+;      bits 7:0 the earliest start and bits 15:8 the latest start of the
+;      frame's first edge (the rising middle of S1), in bit times from the
+;      receiver's sight of the sync (its WAITS, 2 to 9 clocks after the pad
+;      edge). A frame whose first edge comes outside the window is not seen.
+; Thread 1's tick is 1/8 bit (the host sets TICK_INT and TICK_FRAC: 1 us at
+; 125 kbit/s, 50 clocks at 50 MHz and 16 at 16 MHz; at 189 kbit/s 33 + 18/256
+; at 50 MHz).
+;
+; OUTQ[1]: one word a slot and sync period, slot 1 first:
+;   bits 15:6  D9..D0 (0 when bit 3 or bit 4 is set)
+;   bit 0      the slot (0 slot 1, 1 slot 2)
+;   bit 1      check error: the parity or the CRC is wrong
+;   bit 2      start bit error: S2 was not 0
+;   bit 3      Manchester error: a bit had no edge in its middle window;
+;              reception stopped there
+;   bit 4      no frame: no rising edge in the slot's window
+;
+; Decoding. After the first rising edge, each bit's middle edge is looked
+; for between 6/8 and 10/8 of a bit after the previous one (two SETD from
+; the edge just seen; the boundary edges, at 4/8, fall before the window):
+; an edge there is the bit, and its direction is the bit's value. SHI reads
+; the line just after the edge with INV, so a rising edge (level 1) shifts
+; in a 0. SETD m sets a deadline m - 1 to m ticks away (the tick grid's
+; phase is unknown), so the window opens 5/8 to 6/8 and closes 9/8 to 10/8
+; of a bit after the SETD, which is the slot after the edge was seen. On
+; the 16 MHz board (16 clocks a tick at 125 kbit/s) a sensor bit time up to
+; 12 % long or 20 % short is always read; the error does not add up over
+; the frame, since every bit restarts the window. 12 bits follow S1 with parity (S2, D0..D9, P), 14
+; with the CRC.
+;
+; Weaker than a dedicated PSI5 receiver: no current sensing (the PHY's), no
+; per-slot timestamps, no serial messaging (M0, M1) or frame-control fields,
+; 10-bit data only, two slots, no daisy-chain addressing, and a frame that
+; starts outside its window is lost rather than flagged as late.
+;
+; Registers, thread 1: r0 configuration, r1 and r2 the windows, r3 NOW at the
+; sync, r4 window then bit count, r5 the report, r6 the bits, r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   SYNC = OUT1, DATA = IN0
+        .equ    RXPINS = (8 << 5) | 31  ; BE_PINS: in = IN0, out = 31 (no pin)
+        .equ    CFG_RX = 1 << 7         ; NRZ, INV, LSB first
+        .equ    CFG_CRC = 1 << 9        ; NRZ, CRC_EN, LSB first
+        .equ    POLY3 = 0b011 << 13     ; x^3 + x + 1, left-aligned (6.9)
+        .equ    SEED3 = 0b111 << 13
+
+; ------------------------------------------------------- the sync pulses
+        .thread 0
+        .tick   16                      ; 1 us on the 16 MHz board
+        SETP    SYNC, 0
+        POP     r0                      ; period
+        POP     r1                      ; width
+        MOV     r4, r1
+        DEC     r4                      ; width - 1 ticks after the rise
+        SUB     r3, r0, r1
+        DEC     r3                      ; period - width - 1 after the fall
+        SETD    2                       ; anchor (2: the phase is unknown here)
+        LDI     r2, 1
+wl:     WAITD   1                       ; low
+        DJNZ    r2, wl
+        SETP    SYNC, 1, D              ; staged: lands on the next deadline
+        WAITD   1                       ; the rising edge, on its tick
+        SIG     0                       ; tell thread 1
+        MOV     r2, r4
+wh:     WAITD   1                       ; high
+        DJNZ    r2, wh
+        SETP    SYNC, 0, D
+        WAITD   1                       ; the falling edge
+        MOV     r2, r3
+        BRA     wl
+
+; -------------------------------------------------------------- receiver
+        .thread 1
+        .tick   10                      ; 1/8 bit at 189 kbit/s, 16 MHz (10.58)
+        .csr    BE_PINS, RXPINS
+        .csr    CRC_POLY, POLY3
+        .csr    CRC_INIT, SEED3
+        POP     r0                      ; configuration
+        POP     r1                      ; slot 1's window
+        POP     r2                      ; slot 2's window
+
+top:    WAITS   0                       ; a sync pulse went out
+        CSRR    r3, NOW                 ; the slots are timed from here
+        LDI     r5, 0
+        MOV     r4, r1
+        CALL    slot
+        MOV     r7, r0
+        ANDI    r7, 2                   ; two slots?
+        BZ      top
+        LDI     r5, 1
+        MOV     r4, r2
+        CALL    slot
+        BRA     top
+
+; One slot: the window in r4, the slot bit in r5; pushes the report.
+slot:   MOV16   r7, 0xFF
+        AND     r6, r4, r7
+        SHLI    r6, 3                   ; bits to ticks
+        ADD     r6, r6, r3
+        CSRW    TD, r6
+        WAITD   0                       ; the earliest start
+        SHRI    r4, 8
+        SHLI    r4, 3
+        ADD     r4, r4, r3
+        CSRW    TD, r4                  ; the latest start: the timeout below
+        .csr    BE_CFG, CFG_RX
+        MOV     r4, r0
+        ANDI    r4, 1
+        ADD     r4, r4, r4
+        ADDI    r4, 12                  ; bits after S1: 12, or 14 with the CRC
+        WAITE   DATA, RISE, T           ; the middle of S1
+        SETD    6                       ; first, so the window starts from
+        BT      none                    ; the edge (SETD leaves T alone)
+
+bit:    WAITD   0                       ; 5/8 .. 6/8 bit: past the boundary
+        SETD    4                       ; ... to 9/8 .. 10/8
+        WAITE   DATA, ANY, T            ; the middle of the next bit
+        SETD    6                       ; the next window, from this edge
+        BT      merr
+        SHI                             ; ~level: a rise is 0, a fall 1
+        DJNZ    r4, bit
+
+        STSR    r6                      ; the bits, the last in bit 15
+        MOV     r7, r0
+        ANDI    r7, 1
+        BNZ     dcrc
+        SHRI    r6, 4                   ; S2 in bit 0, D0..D9, P in bit 11
+        MOV     r7, r6
+        ANDI    r7, 1
+        BZ      ps
+        ORI     r5, 4                   ; S2 was 1
+ps:     PAR     r7, r6                  ; C = S2 ^ D0 ^ .. ^ D9 ^ P
+        BNC     rep
+        ORI     r5, 2                   ; odd: parity error
+        BRA     rep
+
+; The CRC unit takes D0..D9 and then C2 C1 C0 as received; after a correct
+; CRC the register is 0 (each CRC bit cancels the feedback it meets).
+dcrc:   SHRI    r6, 2                   ; S2 in bit 0, D0..D9, C2 C1 C0
+        MOV     r7, r6
+        ANDI    r7, 1
+        BZ      cs
+        ORI     r5, 4                   ; S2 was 1
+cs:     MOV     r7, r6
+        SHRI    r7, 1
+        LDSR    r7
+        .csr    BE_CFG, CFG_CRC
+        CRCI
+        SHO                             ; 13 bits to pin index 31: no pad
+        SHO                             ; moves, the CRC sees them all
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        STCRC   r7
+        CMPI    r7, 0
+        BZ      rep
+        ORI     r5, 2                   ; CRC error
+
+rep:    SHRI    r6, 1
+        MOV16   r7, 0x3FF
+        AND     r6, r6, r7              ; D0..D9
+        SHLI    r6, 6
+        OR      r5, r5, r6
+push:   PUSH    r5
+        RET
+merr:   ORI     r5, 8
+        BRA     push
+none:   ORI     r5, 16
+        BRA     push

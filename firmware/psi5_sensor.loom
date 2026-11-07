@@ -1,0 +1,197 @@
+; psi5_sensor.loom
+; A PSI5 sensor (Peripheral Sensor Interface 5, the airbag and powertrain
+; sensor bus) at logic level: 10-bit data frames in Manchester code, sent in
+; a time slot after each sync pulse from the ECU, or periodically.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It reuses the bit engine's
+; Manchester encoder (ENC = 2, built for the Manchester loopback) with INV
+; to get PSI5's polarity, and the CRC unit (built for USB and CAN) to make
+; PSI5's 3-bit CRC: the program shifts the data word through the engine to a
+; pin index that does not exist (31), so the CRC sees the bits and no pad
+; moves. What no hardware does, the firmware does: the frame layout (start
+; bits, data, parity or CRC in one 15-bit shift word), the parity (PAR), the
+; time slot after the sync pulse (the tick grid restarted on the sync edge,
+; then a counted wait) and the asynchronous period.
+;
+; Director's decisions (2026-11-07), until the specification is read: the
+; CRC covers D0..D9 and not the start bits; the sync pulse and the slot
+; offsets are host-set, with 40 us and 200 us slots in the tests; the bit
+; tolerance the model checks is ours (12 %), not the specification's; the
+; 228 us asynchronous period is a test choice. All are marked unchecked.
+;
+; Sources (the PSI5 Technical Specification itself is behind a terms page we
+; did not accept; tools/protomodels/psi5.py lists what was checked):
+; 125 kbit/s (8 us a bit) or 189 kbit/s; Manchester per G.E. Thomas, a 0 is
+; a rising edge in the middle of the bit and a 1 a falling edge (Infineon
+; AURIX TC4x PSI5 training, slide 4; Keysight PSI5 application note, p. 3);
+; start bits "00", data LSB first, then one even parity bit or a 3-bit CRC,
+; g(x) = x^3 + x + 1, seed 111, sent MSB first (Infineon slides 4-5,
+; Keysight figure 2, "based on PSI5 Technical Specification v2.2").
+;
+; Logic-level mapping (our choice; the wire is current modulation on the
+; sensor's supply and a voltage sync pulse from the ECU):
+;   DATA = OUT0  the sensor's current: 1 = the high current I_S,high, idle 0
+;                (the quiescent current). A PHY turns it into current.
+;   SYNC = IN1   the ECU's sync pulse after the PHY's comparator: 1 during
+;                the pulse. The slot is timed from its rising edge.
+; So the frame's first edge is the rising middle of start bit S1, and the
+; line goes back to 0 at the end of the last bit.
+;
+; Frame, LSB first: S1 S2 (0 0), D0..D9, then P (even parity over D0..D9,
+; 13 bits) or C2 C1 C0 (the CRC over D0..D9, start bits excluded: an
+; unchecked reading, see QUESTIONS), 15 bits.
+;
+; Host words, INQ[t]:
+;   1. configuration: bit 0 mode (0 synchronous, 1 asynchronous), bit 1
+;      check (0 parity, 1 CRC), bit 2 data source (0 a 10-bit counter that
+;      counts frames from 0, 1 words from the host); other bits ignored.
+;   2. synchronous: the slot offset, half-bit ticks from the sync pulse's
+;      rising edge to the start of S1 (1..65535). Asynchronous: the period,
+;      half-bit ticks from one S1 start to the next, at least 2n + 14 for an
+;      n-bit frame (40 with parity, 44 with CRC).
+;   3.. data words (source 1): bits 9:0 are sent. The program prepares a
+;      frame as soon as the previous one has ended (in synchronous mode,
+;      before the sync that sends it): it takes the next word if INQ holds
+;      one then, else it sends the last one again. The first word is
+;      waited for before anything is sent.
+; OUTQ is not used.
+;
+; Rate: the host writes TICK_INT (and TICK_FRAC) before RUN; one tick is half
+; a bit. 125 kbit/s is TICK_INT 200 at 50 MHz and 64 on a 16 MHz board;
+; 189 kbit/s is TICK_INT 132, TICK_FRAC 72 at 50 MHz (132.28 clocks). The
+; program reads TICK_INT back to restart its tick grid on each sync edge
+; (SEMANTICS 4: a TICK_INT write clears ACC).
+;
+; Timing (SEMANTICS 2, 4, 6.9.1). Synchronous: WAITE sees the sync edge 2 to
+; 6 clocks after the pad (the synchroniser and the slot grid); the restart
+; is the next slot, so S1 starts offset ticks plus 3 to 11 clocks after the
+; edge. Each half-bit edge is one slot after its tick, on a grid that does
+; not drift: with a tick a multiple of 4 clocks every half-bit is exactly
+; one tick. Asynchronous: the frames are on one deadline schedule, so the
+; period is exact.
+;
+; Weaker than a dedicated PSI5 sensor ASIC: no current source (that is the
+; PHY's), no serial messaging bits (M0, M1), no frame control or status
+; fields, no daisy-chain address assignment, and a single 10-bit data field.
+;
+; Registers: r0 configuration, r1 data, r2 offset or period, r3 counter,
+; r4 TICK_INT, r5 frame word, r6 frame bits n, r7 scratch (.csr uses it).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   DATA = OUT0, SYNC = IN1
+        .equ    DATA_IX = 16            ; BE_PINS.out: the index of DATA (OUT0)
+        .equ    NOPIN = 31              ; an index no pin write reaches (6.3)
+        .equ    CFG_TX = (2 << 3) | (1 << 7)    ; Manchester, INV, LSB first
+        .equ    CFG_CRC = 1 << 9                ; NRZ, CRC_EN, LSB first
+        .equ    POLY3 = 0b011 << 13     ; x^3 + x + 1, left-aligned (6.9)
+        .equ    SEED3 = 0b111 << 13
+
+        .thread 0
+        .tick   42                      ; the fastest tick tested: 189 kbit/s
+                                        ; on the 16 MHz board (42.33 clocks)
+        SETP    DATA, 0                 ; idle: the quiescent current
+        .csr    CRC_POLY, POLY3
+        .csr    CRC_INIT, SEED3
+        POP     r0                      ; configuration
+        POP     r2                      ; offset or period
+        CSRR    r4, TICK_INT            ; P, kept for the restarts
+        LDI     r3, 0                   ; the counter
+        LDI     r1, 0                   ; the last host word
+        MOV     r7, r0
+        ANDI    r7, 4                   ; host data: wait for the first word
+        BZ      go
+        POP     r1
+go:     SETD    0                       ; anchor: TD is recent from here on
+
+; ------------------------------------------------- the next frame's word
+frame:  MOV     r7, r0
+        ANDI    r7, 4                   ; data source
+        BZ      count
+        WAITB   INQ_NE, T               ; a test: TD is reached, so it does not wait
+        BT      have                    ; nothing new: send the last word again
+        .bounded "guarded by the WAITB above; only this thread pops INQ"
+        POP     r1
+        BRA     have
+count:  MOV     r1, r3
+        INC     r3
+have:   MOV16   r7, 0x3FF
+        AND     r1, r1, r7              ; D0..D9
+        MOV     r5, r1
+        SHLI    r5, 2                   ; S1 S2 = 0 0 below the data
+        MOV     r7, r0
+        ANDI    r7, 2                   ; check: parity or CRC
+        BNZ     crc
+        PAR     r6, r1                  ; C = XOR of D0..D9: the even parity bit
+        LDI     r6, 13
+        BNC     built
+        MOV16   r7, 1 << 12
+        OR      r5, r5, r7              ; P = 1
+        BRA     built
+
+; The CRC unit sees D0..D9 in the order they will be sent; the pin write of
+; each SHO goes to index 31, which is no pin, so nothing moves on the pads.
+crc:    .csr    BE_PINS, NOPIN
+        .csr    BE_CFG, CFG_CRC
+        CRCI                            ; CRC = 111 in CRC[15:13]
+        LDSR    r1
+        SHO                             ; D0 .. D9, unrolled: a loop with no
+        SHO                             ; deadline in it would leave the pair
+        SHO                             ; around it unproved
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        SHO
+        STCRC   r6                      ; C2 C1 C0 in CRC[15:13]
+        REV     r6, r6                  ; C2 in bit 0: the order they are sent
+        ANDI    r6, 7
+        SHLI    r6, 12
+        OR      r5, r5, r6
+        LDI     r6, 15
+
+built:  .csr    BE_PINS, DATA_IX
+        .csr    BE_CFG, CFG_TX          ; also clears HALF (6.9.1)
+        LDSR    r5
+        CSRW    CNT, r6
+        MOV     r7, r0
+        ANDI    r7, 1                   ; mode
+        BNZ     async
+
+; ------------------------------------------------------------ synchronous
+        WAITE   SYNC, RISE              ; the sync pulse
+        CSRW    TICK_INT, r4            ; ACC <= 0: the tick grid starts here
+        SETD    0
+        MOV     r7, r2                  ; the slot offset, in ticks: S1 starts
+        DEC     r7                      ; on the last, the WAITD in send
+        BZ      send
+off:    WAITD   1
+        DJNZ    r7, off
+
+; ------------------------------------------------------------- the frame
+; One bit is two SHO, one tick apart: the first takes the bit from SR and
+; writes ~b ^ INV = b, the second b ^ 1, so a 0 is low then high (a rising
+; middle) and a 1 high then low. Z after the second half of the last bit.
+; Every SHO is the slot after its WAITD, so all edges have the same lag.
+send:   WAITD   1
+        SHO
+        WAITD   1
+        SHO
+        BNZ     send
+        WAITD   1
+        SETP    DATA, 0                 ; the end of the last bit: idle
+        BRA     frame
+
+; ----------------------------------------------------------- asynchronous
+; The frame started at T0 and ended at T0 + 2n; the next starts at T0 +
+; period = T0 + 2n + 12 + m + 1 (the WAITD in send). The 12 ticks cover
+; the word's preparation.
+async:  ADD     r7, r6, r6              ; 2n
+        ADDI    r7, 13
+        SUB     r7, r2, r7              ; m >= 1
+        WAITD   12
+aw:     WAITD   1
+        DJNZ    r7, aw
+        BRA     send
