@@ -1,0 +1,158 @@
+; irda_sir_tx.loom
+; IrDA SIR (serial infrared, 2.4 to 115.2 kbit/s) transmitter on OUT0, fed
+; by the host through INQ[0].
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses only the core: the
+; FIFOs, the tick generator and the deadline register TD, built for the
+; UART programs. No hardware knows IrDA: the firmware does the encoder
+; (ENDEC) that an IrDA-capable UART or an MCP2120 does in logic.
+;
+; The line code (IrPHY 1.4, as reproduced in Vishay application note 82513
+; rev. 1.5, "Signaling Rate and Pulse Duration" and its table 2). A
+; character is an ordinary UART frame, start bit, eight data bits LSB first,
+; one stop bit; each 0 bit is sent as one light pulse, each 1 bit as no
+; light. The pulse lasts 3/16 of a bit (19.53 us at 9.6 kbit/s, 1.63 us at
+; 115.2 kbit/s), or, at every rate, the 115.2 kbit/s width 1.63 us (the
+; spec's minimum is 1.41 us, its maximum 3/16 of a bit plus the larger of
+; 2.5 % of a bit and 0.6 us). OUT0 is high while the LED is on: it drives a
+; transceiver's TXD (Vishay TFDU4101 and its kin) or an LED transistor.
+;
+; Readings taken on the open spec questions (2026-11-06): the IrPHY 1.4
+; PDF could not be fetched, so every figure is from Vishay application
+; note 82513 rev. 1.5, which reproduces its tables, and is to be checked
+; against IrPHY when it is read. Where the note's table (5.96 and 4.34 us
+; at 38.4 and 57.6 kbit/s) and its written rule (5.53 and 3.86 us) differ
+; on the longest pulse, the stricter rule is taken. The pulse's place in
+; its bit cell is in neither source: the transmitter centres it and the
+; receiver does not depend on it.
+;
+; Host command format (FIFO space, thread 0): one word per command.
+;     bit 15 = 0  a byte to send: bits 7:0 (bits 14:8 ignored)
+;     bit 15 = 1  configuration, applied before the next byte:
+;                 bits 3:0  N, ticks per bit = 16 * N (0 reads as 1)
+;                 bit 4     F: 1 = every pulse is 3 ticks (1.63 us when
+;                           the tick is 1/16 of a 115.2 kbit/s bit),
+;                           0 = every pulse is 3/16 of a bit (3 * N ticks)
+;                 bits 14:5 ignored
+; The reset configuration is N = 1, F = 0. Nothing is ever pushed to OUTQ.
+;
+; Rate. The host sets TICK_INT/TICK_FRAC before RUN, through the debug
+; space. Two ways to use it:
+;   - tick = 1/16 of the bit, N = 1: any rate, 3/16 pulses. At 50 MHz,
+;     115.2 kbit/s: TICK 27 + 33/256 (27.129 clocks, 0.006 % slow);
+;     9.6 kbit/s: TICK 325 + 133/256.
+;   - tick = 1/16 of the 115.2 kbit/s bit (TICK 27 + 33/256 at 50 MHz),
+;     N = 115200 / rate: 1, 2, 3, 6, 12 for 115.2, 57.6, 38.4, 19.2
+;     and 9.6 kbit/s (2.4 kbit/s needs N = 48, past the 4-bit field:
+;     use the first way). With F = 1 the pulse is then 1.63 us at every
+;     rate, like the low-power mode of the PL011-style UART in the EP93xx
+;     (Cirrus DS785UM1 section 15.2.2: 3 periods of a 1.8432 MHz clock).
+; Either way the bit rate is exactly the tick's, so the rate error is the
+; clock's plus the TICK_FRAC rounding, far inside the +-0.87 % of table 2.
+; The schedule is proved for ticks of 16 clocks or more (.tick below);
+; the reset value 1 is far too fast, so always set the rate first.
+;
+; Where the pulse sits. Pulse starts 7 * N ticks into its bit cell: with
+; F = 0 it covers 7/16 .. 10/16, centred on the cell; with F = 1 it starts
+; at the same point and is 3 ticks long. IrPHY's figure (unchecked: the
+; spec itself could not be fetched, QUESTIONS.md) and the PL011 / EP93xx
+; ENDEC place the pulse inside the cell; a receiver looks for a pulse
+; anywhere in the cell, so the position is a choice, stated here.
+;
+; Timing. Every edge is the first instruction after the WAITD that times
+; it, so every edge is 0 to 3 clocks after its deadline (SEMANTICS 2): a
+; pulse is 3 or 3 * N ticks long to within 3 clocks, the cells never drift.
+; Between frames a non-blocking test (WAITB INQ_NE, T, after the stop
+; bit's deadline: T = 0 exactly when a word is queued, SEMANTICS 6.4) sends
+; a queued byte back to back: its start cell begins where the stop cell
+; ends. With nothing queued, POP blocks and SETD 1 re-anchors the schedule,
+; so the start cell is whole whatever point of a tick the POP returned at.
+;
+; Weaker than a dedicated ENDEC: the 1.63 us option is exact only on the
+; 115.2 kbit/s tick grid (N = 1 to 15), and edges sit on the 4-clock slot
+; grid (80 ns), 5 % of a 1.63 us pulse; table 3's rise and fall budget
+; (600 ns) and jitter (+-6.5 %) are the transceiver's to meet.
+;
+; Registers: r0 the frame being sent (start, data, stop; LSB first), r1 the
+; bits left, r2 a loop count, r3 the pulse's WAITD 3 count (N, or 1 when
+; F = 1), r4 the tail's WAITD 6 count (N, or 1), r5 N, r6 the tail's
+; WAITD 9 count (0, or N - 1), r7 = 0x0200 (the stop bit).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   16                      ; the fastest tick the schedule is proved for
+
+start:  SETP    TX, 0                   ; LED off: the line idles low
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
+        LDI     r7, 0
+        LDIH    r7, 2                   ; r7 = 0x0200: the stop bit, bit 9 of a frame
+        LDI     r5, 1                   ; reset configuration: N = 1, F = 0
+        LDI     r3, 1
+        LDI     r4, 1
+        LDI     r6, 0
+        SETD    0                       ; TD reached: the first test below cannot wait
+next:   WAITB   INQ_NE, T               ; TD has passed: T = 0 only if a word is queued
+        BT      idle
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, so INQ holds a word"
+        POP     r0                      ; cannot block
+        JMP     word
+idle:   POP     r0                      ; blocks while INQ is empty
+        SETD    1                       ; the start cell begins at a whole tick
+word:   MOV     r2, r0
+        SHLI    r2, 1                   ; C = bit 15
+        BC      config
+        SHLI    r0, 8                   ; drop bits 15:8
+        SHRI    r0, 7                   ; the byte in bits 8:1, start bit 0 = 0
+        OR      r0, r0, r7              ; stop bit 9 = 1
+        LDI     r1, 10                  ; start, eight data, stop
+
+bit:    SHRI    r0, 1                   ; C = the next bit, LSB first
+        MOV     r2, r5                  ; N (MOV keeps C)
+        BC      one
+
+; A 0: 7 * N ticks dark, the pulse, then the rest of the 16 * N.
+zlead:  DJNZ    r2, zwait               ; N - 1 times round, then fall through
+        WAITD   7
+        SETP    TX, 1                   ; pulse starts, 7 * N ticks into the cell
+        MOV     r2, r3                  ; N, or 1 when F = 1
+plead:  DJNZ    r2, pwait
+        WAITD   3
+        SETP    TX, 0                   ; pulse ends: 3 * N (or 3) ticks
+        MOV     r2, r4                  ; tail: N times 6, or 6 and then
+tail6:  WAITD   6                       ; N - 1 times 9 (F = 1): 9 * N in all
+        DJNZ    r2, tail6
+        MOV     r2, r6
+        TEST    r2, r2
+        BZ      done
+tail9:  WAITD   9
+        DJNZ    r2, tail9
+        JMP     done
+zwait:  WAITD   7
+        JMP     zlead
+pwait:  WAITD   3
+        JMP     plead
+
+; A 1: 16 * N ticks dark.
+one:    WAITD   16
+        DJNZ    r2, one
+
+done:   DJNZ    r1, bit
+        JMP     next                    ; TD is the stop cell's end: reached
+
+config: MOV     r5, r0
+        ANDI    r5, 15                  ; N
+        BNZ     cfgf
+        LDI     r5, 1                   ; N = 0 reads as 1
+cfgf:   MOV     r3, r5                  ; F = 0: pulse 3 * N, tail 6 * N
+        MOV     r4, r5
+        LDI     r6, 0
+        ANDI    r0, 16                  ; F
+        BZ      cfgend
+        LDI     r3, 1                   ; F = 1: pulse 3, tail 6 + 9 * (N - 1)
+        LDI     r4, 1
+        MOV     r6, r5
+        SUBI    r6, 1
+cfgend: SETD    0                       ; re-anchor: a config word ends no bit cell
+        JMP     next

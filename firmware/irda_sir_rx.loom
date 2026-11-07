@@ -1,0 +1,128 @@
+; irda_sir_rx.loom
+; IrDA SIR (serial infrared, 2.4 to 115.2 kbit/s) receiver on IN0,
+; delivering bytes to the host through OUTQ[0].
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses only the core: the
+; edge wait with a deadline timeout (WAITE ... T) and the deadline
+; register TD written at run time (CSRW TD), which were built for the
+; timeouts of the I2C, PS/2 and NEC programs, and the FIFOs. No hardware
+; knows IrDA: the firmware is the decoder half of the ENDEC.
+;
+; The line code (IrPHY 1.4, as reproduced in Vishay application note 82513
+; rev. 1.5, table 2). A character is a UART frame, start bit, eight data
+; bits LSB first, one stop bit, where each 0 bit is one light pulse and
+; each 1 bit is no light. A pulse is 1.41 us at the least and 3/16 of a bit
+; (plus the larger of 2.5 % of a bit and 0.6 us) at the most; the rate is
+; within +-0.87 % (table 2). IN0 is a transceiver's RXD, which goes low
+; for each pulse it sees (Vishay TFDU4101 and its kin; the EP93xx ENDEC,
+; Cirrus DS785UM1 15.2.2, takes the same polarity). The line has no level
+; to read between pulses: a 1 is the absence of a pulse in its bit cell.
+;
+; Readings taken on the open spec questions (2026-11-06): the IrPHY 1.4
+; PDF could not be fetched, so every figure is from Vishay application
+; note 82513 rev. 1.5, which reproduces its tables, and is to be checked
+; against IrPHY when it is read. Where the note's table (5.96 and 4.34 us
+; at 38.4 and 57.6 kbit/s) and its written rule (5.53 and 3.86 us) differ
+; on the longest pulse, the stricter rule is taken. The pulse's place in
+; its bit cell is in neither source: the transmitter centres it and the
+; receiver does not depend on it.
+;
+; Result format (FIFO space read, thread 0): one word per frame.
+;     bits 7:0   the received byte
+;     bit 8      framing error: a pulse in the stop bit's cell (the byte is
+;                still given)
+;     bit 9      overrun: OUTQ was full and at least one earlier frame was
+;                dropped before this one
+;     bits 15:10 zero
+; Nothing is read from INQ.
+;
+; Rate: 16 ticks per bit. The host sets TICK_INT/TICK_FRAC to 1/16 of the
+; bit before RUN, through the debug space: at 50 MHz TICK 27 + 33/256 for
+; 115.2 kbit/s, 325 + 133/256 for 9.6 kbit/s. The program has no WAITD
+; and no deadline pairs, only timeouts; the shortest tick it is tested at
+; is 16 clocks (781 kbit/s, past SIR, as a test rate).
+;
+; How a frame is found and decoded. The falling edge of the start bit's
+; pulse is the reference: NOW is read in the slot after the WAITE that saw
+; it, so the reference is 0 to 1 tick (plus about 10 clocks: synchroniser,
+; slot grid) after the edge. A pulse that is over by that slot (shorter
+; than 2 slots, 8 clocks) is a glitch and is ignored. Each later bit has a
+; window one bit long centred one bit after the last pulse's reference
+; (TD is the window's end, written with CSRW TD); WAITE RX, FALL, T then
+; says 0 (an edge in time) or 1 (the timeout). After a 0 the next window
+; is anchored on that pulse, so a sender's rate error accumulates only
+; across runs of 1 bits; after a 1 it is one bit after the last window.
+; The windows are contiguous: a pulse anywhere from half a bit before to
+; half a bit after its expected place is taken, whatever part of the cell
+; the sender puts its pulses in, as long as it puts them all in the same
+; part. A frame of 0xFF has its stop window centred 9 bits after the start
+; pulse: the sender's rate may be off by +-8 ticks in 144 (+-5.5 %), less
+; the reference's lag of up to a tick and a slot, far more than table 2's
+; +-0.87 %.
+;
+; After the stop window the start-pulse wait is back in 7 slots (28
+; clocks), inside the half bit (8 ticks) that a back-to-back frame leaves.
+; A sender with a pulse out of place by more than half a bit, or a missing
+; pulse, gives a wrong byte, as it would on a dedicated ENDEC; a pulse in
+; the stop cell is the one error a frame can show, bit 8. There is no
+; parity in SIR (IrLAP's FCS checks frames, above this layer).
+;
+; Weaker than a dedicated ENDEC: an edge is seen to the 4-clock slot grid
+; and a pulse under one slot (4 clocks) can be missed (SEMANTICS 6.4); the
+; shortest pulse IrPHY allows, 1.41 us, is 70 clocks at 50 MHz.
+;
+; Registers: r0 the byte, r1 data bits left, r2 = 0x80 (a 1 enters at bit
+; 7), r3 = 0x0100 (framing error), r4 the pending overrun flag, r5 = 16
+; (one bit), r6 the current window's end (the value in TD), r7 = 24 (from
+; a pulse's reference to the end of the next window).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   16                      ; the shortest tick it is tested at (no pairs)
+        .equ    BIT  = 16               ; ticks per bit
+        .equ    NEXT = BIT + BIT / 2    ; reference to the next window's end
+
+start:  LDI     r2, 0x80
+        LDI     r3, 0
+        LDIH    r3, 1                   ; r3 = 0x0100: framing error
+        LDI     r4, 0                   ; no overrun pending
+        LDI     r5, BIT
+        LDI     r7, NEXT
+
+hunt:   WAITE   RX, FALL                ; a start pulse begins
+        CSRR    r6, NOW                 ; its reference
+        JP      RX, 1, hunt             ; over already: a glitch
+        ADD     r6, r6, r7
+        CSRW    TD, r6                  ; data bit 0's window ends at NEXT
+        LDI     r0, 0
+        LDI     r1, 8
+
+bit:    WAITE   RX, FALL, T             ; a pulse in this window?
+        BT      one
+        CSRR    r6, NOW                 ; a 0: re-anchor on its pulse
+        ADD     r6, r6, r7
+        CSRW    TD, r6
+        SHRI    r0, 1                   ; a 0 enters at bit 7
+        DJNZ    r1, bit
+        JMP     stop
+one:    ADD     r6, r6, r5              ; a 1: the next window, one bit on
+        CSRW    TD, r6
+        SHRI    r0, 1
+        OR      r0, r0, r2
+        DJNZ    r1, bit
+
+stop:   WAITE   RX, FALL, T             ; the stop cell must be dark
+        BT      sok
+        OR      r0, r0, r3              ; a pulse: framing error
+sok:    OR      r0, r0, r4              ; carry the overrun flag (bit 9)
+        WAITB   OUTQ_NF, T              ; room? (waits at most to the window's end)
+        BT      full
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out"
+        PUSH    r0
+        LDI     r4, 0
+        JMP     hunt
+full:   LDI     r4, 0
+        LDIH    r4, 2                   ; r4 = 0x0200: bit 9 on the next word
+        JMP     hunt
