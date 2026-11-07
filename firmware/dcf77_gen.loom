@@ -1,0 +1,167 @@
+; dcf77_gen.loom
+; DCF77 time code generator on OUT0: the logic-level signal a DCF77 receiver
+; module outputs, one minute at a time from the host through INQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; DCF77. It uses two pieces of hardware built for other jobs: the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016), built
+; so that WS2812 pulses land on the exact clock, here landing every second's
+; edges on the exact tick of a 1 ms grid; and the FIFOs (POP, WAITB INQ_NE).
+; Nothing in Loom was built for a one-bit-a-second code. What the firmware
+; does that no hardware does: the second grid, the 100 / 200 ms pulse widths,
+; the minute marker, the three even parity bits (computed here, not taken
+; from the host), the 61-second minute of a leap second, and the hand-over
+; from one minute to the next with no gap in the grid. It does not count
+; time itself: a running clock (BCD carries, month lengths, leap years, the
+; CET/CEST change) does not fit a quarter of the memory, so the host sends
+; every minute. A dedicated DCF77 simulator chip would do that; this is weaker.
+;
+; Pin: DCF = OUT0, push-pull, high while the carrier would be reduced (the
+; "pulse"), low otherwise: a non-inverted receiver module's output. For the
+; inverted kind swap PULSE and IDLE below.
+;
+; Host format (FIFO space, thread 0): four words a minute, the 59 bits of
+; seconds 0..58 least significant first, as [PTB-TC] numbers them:
+;   word 0  seconds 0..15       word 1  seconds 16..31
+;   word 2  seconds 32..47      word 3  bits 10:0 seconds 48..58,
+;                                       bit 11 L: a leap second at this
+;                                       minute's end; bits 15:12 ignored.
+; The bits of seconds 28, 35 and 58 are ignored: the program sends P1, P2
+; and P3 itself, even parity over seconds 21..27, 29..34 and 36..57. Every
+; other bit goes out as given, M (second 0, always 0) and S (second 20,
+; always 1) included: the host sends the time of the minute that follows
+; the marker, as DCF77 does. With L set, second 59 carries a 0 pulse and
+; second 60 is the marker [PTB-TC]. Nothing is pushed to OUTQ.
+;
+; The next minute's four words must all be in INQ 200 ms into the marker
+; second (the host has the whole minute: the program pops a minute's words
+; in the marker before it, so INQ, 4 deep, is free for the next one at
+; second 0). If a word is missing then, the signal stops after the marker,
+; as during a transmitter outage, and restarts when the words come: one
+; second with no pulse (at least 1.8 s with none in all), then second 0.
+;
+; Wire format: PTB, "DCF77 amplitude modulation" and "DCF77 time code"
+; (ptb.de, read 2026-11-07); D. Piester, P. Hetzel, A. Bauch, PTB-Mitteilungen
+; 114 (2004) Heft 4, section 4.2 and Bild 5. A pulse starts at the start of
+; every second and lasts 0.1 s (a 0) or 0.2 s (a 1); second 59 has none,
+; marking the next minute's start. Full citations: tools/protomodels/dcf77.py.
+;
+; Tick (set by the host before RUN, the M2 convention): one tick is 1 ms.
+;   50 MHz: TICK_INT 50000, TICK_FRAC 0 (exact). A minute is 60,000 ticks.
+;   Scaled time (the RTL tests): TICK_INT 2, one "millisecond" in 2 clocks,
+;   25,000 times faster than real time at 50 MHz; the program is the same,
+;   a minute 120,000 clocks. Every edge is still on its exact tick.
+; The deadline schedule is proved for ticks of 2 clocks or more (.tick).
+;
+; Timing. Every edge is `SETP DCF, v, D` and the WAITD that lands it, on the
+; exact clock edge of its tick (SEMANTICS 6.10 rule 1), so a pulse is
+; exactly 100 or 200 ticks and the rises are exactly 1000 ticks apart, with
+; no drift: deadlines are absolute. The idle rest of each second is four
+; `WAITD 200`; the next second's bit is worked out in the first of them.
+;
+; Registers: r0..r3 the minute's words, r0 shifted out as it goes; r4 the
+; number of the next second; r5 the parity since second 21; r6 the bit of
+; the next second; r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   DCF = OUT0
+        .tick   2                       ; the shortest tick the schedule is proved for
+        .equ    PULSE = 1               ; the pin while the carrier is reduced
+        .equ    IDLE  = 0
+        .equ    STEP  = 200             ; ticks per WAITD in a second's idle part
+        .equ    W0    = 100             ; a 0's pulse; a 1's is 2 * W0
+        .equ    P1    = 28              ; the parity seconds
+        .equ    P2    = 35
+        .equ    P3    = 58
+
+start:  SETP    DCF, IDLE
+
+; No minute in hand: wait for all four words (blocking), then one second
+; with no pulse before second 0.
+late0:  POP     r0
+late1:  POP     r1
+late2:  POP     r2
+late3:  POP     r3
+        SETD    1                       ; re-anchor after the unbounded POPs
+        LDI     r7, 5
+lw:     WAITD   STEP                    ; 1 s with no pulse
+        DJNZ    r7, lw
+go:     LDI     r4, 0                   ; second 0 next
+        JMP     take
+
+; A second starts: TD is its start and its rise has landed on it. r6 is the
+; second's bit.
+sec:    CMPI    r6, 0
+        BNZ     one
+        SETP    DCF, IDLE, D
+        WAITD   W0                      ; a 0: the fall at 100 ms
+        WAITD   W0
+        JMP     rest
+one:    WAITD   W0
+        SETP    DCF, IDLE, D
+        WAITD   W0                      ; a 1: the fall at 200 ms
+
+; 200 ms into the second, TD there: the next second's bit, into r6.
+rest:   INC     r4
+        MOV     r7, r4
+        ANDI    r7, 15                  ; seconds 16, 32, 48 start a word
+        BNZ     take
+        MOV     r0, r1
+        MOV     r1, r2
+        MOV     r2, r3
+take:   MOV     r6, r0
+        ANDI    r6, 1                   ; the host's bit
+        SHRI    r0, 1
+        CMPI    r4, 21                  ; the parity runs from second 21
+        BNZ     t1
+        LDI     r5, 0
+t1:     CMPI    r4, P1
+        BZ      par
+        CMPI    r4, P2
+        BZ      par
+        CMPI    r4, P3
+        BNZ     t2
+par:    MOV     r6, r5                  ; the parity bit makes the count even,
+t2:     XOR     r5, r5, r6              ; which leaves r5 = 0 after it
+        CMPI    r4, 59
+        BNZ     t3
+        CMPI    r6, 0                   ; second 59: L, the leap flag
+        BZ      marker
+        LDI     r6, 0                   ; a leap second: 59 is a 0, 60 the marker
+        JMP     pulse
+t3:     CMPI    r4, 60
+        BZ      marker
+
+; The rest of this second, then the next one's rise on its start.
+pulse:  WAITD   STEP                    ; 400 ms
+        WAITD   STEP                    ; 600
+        WAITD   STEP                    ; 800
+        SETP    DCF, PULSE, D
+        WAITD   STEP                    ; 1000: the rise
+        JMP     sec
+
+; The marker second follows: no pulse. Its successor's words are popped
+; 200 ms into it, if they are all there.
+marker: LDI     r7, 4
+ml:     WAITD   STEP                    ; to the end of this second
+        DJNZ    r7, ml
+        WAITD   STEP                    ; 200 ms into the marker second
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      late0
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0
+        WAITB   INQ_NE, T
+        BT      late1
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r1
+        WAITB   INQ_NE, T
+        BT      late2
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r2
+        WAITB   INQ_NE, T
+        BT      late3
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r3
+        JMP     go                      ; second 0's rise 800 ms from here

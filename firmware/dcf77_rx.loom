@@ -1,0 +1,256 @@
+; dcf77_rx.loom
+; DCF77 time code decoder on IN0, for the logic output of a DCF77 receiver
+; module, delivering each checked minute (or the fault that ended it) to
+; the host through OUTQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; DCF77. It measures every pulse and every gap with the timed waits
+; (`WAITP ... T`, SEMANTICS 6.4) against deadlines written at run time
+; (`CSRW TD`), built for the timeouts of PS/2 and I2C clock stretching, and
+; filters glitches with `DLY` (DT is separate from TD, so the filter never
+; moves a deadline). Nothing in Loom was built for DCF77. What the firmware
+; does that no hardware does: pulse-width decoding with windows, finding
+; the minute marker, the three even parity checks, the M and S bits, the
+; leap second (a 0 pulse in second 59 when A2 announced it, the marker in
+; 60), and the report. It needs the FIFOs (PUSH) and nothing else. It does
+; not check the BCD digits or that minutes follow each other: the host,
+; which has every minute, does that (a dedicated decoder chip would, and
+; would also use the phase-modulated code, which a logic-level module's
+; output does not carry).
+;
+; Pin: RX = IN0, high during a pulse (the carrier reduced), as
+; dcf77_gen.loom drives it. For an inverted module swap PULSE and IDLE.
+;
+; Result format (FIFO space read, thread 0). Bits 15:14 of the first word
+; give the kind:
+;   minute: four words, in dcf77_gen.loom's layout but word 3 first:
+;           word A  bits 10:0 seconds 48..58; bit 11 L, a leap second was
+;                   in this minute (61 seconds); bits 15:14 = 01, 13:12 0.
+;           words B, C, D  seconds 0..15, 16..31, 32..47.
+;           The minute is reported at its marker, about 1.1 s after its
+;           last pulse started; the time it carries is the next minute's
+;           (it begins at the next pulse) [PTB-TC].
+;   error:  one word, bits 15:14 = 11; bits 11:8 the fault, bits 5:0 the
+;           second it was found in (0..60): 1 a pulse shorter than 40 ms,
+;           2 longer than 255 ms, 3 a pulse early (less than 900 ms after
+;           the one before, 1900 after a marker), 4 a pulse missing (none
+;           1100 ms after the one before, 2100 after a marker), 5 a parity
+;           (second 28, 35 or 58 says which), 6 M not 0 or S not 1 (found
+;           at the marker: second 59, or 60), 7 no minute marker (a pulse
+;           in second 59 without A2, or in second 60) or a leap second's
+;           pulse not a 0 (second 59).
+; After an error the receiver hunts for the next marker; a minute is
+; reported whole or not at all. The host must have read the previous
+; report by the time a minute ends (OUTQ holds exactly one); a full OUTQ
+; blocks the PUSH and the following minute is then lost to a timing error.
+;
+; Wire format: PTB, "DCF77 amplitude modulation" and "DCF77 time code"
+; (ptb.de, read 2026-11-07); PTB-Mitteilungen 114 (2004) Heft 4, section 4.2
+; and Bild 5. Citations and the bit table: tools/protomodels/dcf77.py.
+;
+; Tick (set by the host before RUN): one tick is 1 ms, as for the generator.
+;   50 MHz: TICK_INT 50000, TICK_FRAC 0. Scaled time (the RTL tests):
+;   TICK_INT 2, a "millisecond" in 2 clocks. TICK_INT must be 2 or more:
+;   the longest stretch of code from a confirmed edge to the next window's
+;   CSRW TD is the filter, 6 slots, 22 ticks at 2 clocks a tick, inside the
+;   40 ms of the first window.
+;
+; Windows, in ms from a pulse's start (no source gives a receiver module's
+; pulse width error, so these are chosen; QUESTIONS.md): a 0 is 40..150 ms,
+; a 1 150..255 ms (the threshold the midpoint, 50 ms of margin each side of
+; the nominal 100 and 200 ms; 255 so that it fits an LDI); the next pulse
+; 900..1100 ms after, or 1900..2100 after the last pulse of a minute; an
+; idle stretch of 1500 ms after a pulse is a marker while hunting.
+;
+; Glitch filter. An edge counts only if the new level is still there G =
+; 10 ms later; a spike shorter than that is ignored and the wait it
+; interrupted goes on against the same deadline. The time of the edge,
+; read when it was first seen, is what the windows are measured from, so
+; the filter adds no error. An edge is timed one to two slots late (WAITP
+; sees it, CSRR reads NOW a slot later) and compared with a deadline on the
+; slot grid: within 6 ms at the scaled tick of 2 clocks, under 0.2 us
+; at 50 MHz. After a window ends, the code that sets the next
+; deadline takes 7 slots, during which an edge is seen late: 14 ms at the
+; scaled tick, 0.6 us at 50 MHz.
+; There is no WAITD in the program, so the deadline checker has no pair to
+; prove.
+;
+; Registers: r0 the second number; r1 the bits coming in, shifted in at bit
+; 15; r2, r3, r4 the words of seconds 0..15, 16..31, 32..47 (a queue
+; filled at r4); r5 the start
+; of the last pulse; r6 the parity since second 21; r7 the edge time from
+; widle / wpulse, the bit, scratch.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Second numbers of every field from PTB-Mitteilungen 114 (2004); the
+;   BCD weights inside each field (1, 2, 4, 8, 10, 20, 40, 80) from a
+;   secondary source, unchecked against PTB's figure (Bild 5).
+;   The receiver's windows (40 to 150 ms a 0, 150 to 255 ms a 1, 900 to
+;   1100 ms between pulses, 1900 to 2100 ms across the marker) are this
+;   program's choice; no source gives a receiver module's error.
+;   The pin is high during the carrier drop (two .equ lines swap it).
+;   No running clock in the generator: the host gives every minute.
+;   A pulse in second 59 is accepted only with A2 set (a leap second).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   2                       ; TICK_INT 2 or more (header)
+        .equ    PULSE = 1
+        .equ    IDLE  = 0
+        .equ    G     = 10              ; glitch filter, ticks
+        .equ    MIN0  = 40              ; the windows, ms from a pulse's start
+        .equ    THR   = 150
+        .equ    MAX1  = 255
+        .equ    NEXT0 = 900
+        .equ    NEXT1 = 1100
+        .equ    MARK0 = 1900
+        .equ    MARK1 = 2100
+        .equ    GAP   = 1500            ; hunting: an idle stretch this long
+        .equ    P1    = 28
+        .equ    P2    = 35
+        .equ    P3    = 58
+
+; Hunt for a marker: the end of a pulse, then 1500 ms with none. The next
+; pulse starts second 0.
+hunt:   SETD    255                     ; re-armed every 255 ticks
+        CALL    wpulse
+        BT      hunt
+hu2:    SETD    255
+        CALL    widle                   ; the pulse's end
+        BT      hu2
+        MOV     r5, r7
+        MOV16   r7, GAP
+        CALL    tpulse
+        BNT     hu2                     ; a pulse too soon: not a marker
+h0:     SETD    255
+        CALL    wpulse
+        BT      h0
+        LDI     r0, 0                   ; second 0
+
+; A pulse has started at r7: 40..150 ms is a 0, 150..255 a 1.
+sec:    MOV     r5, r7
+        LDI     r7, MIN0
+        CALL    tidle
+        BNT     eshort                  ; ended too soon
+        LDI     r7, THR
+        CALL    tidle
+        BNT     bit0
+        LDI     r7, MAX1
+        CALL    tidle
+        BT      elong                   ; too long
+        LDI     r7, 1
+        JMP     got
+bit0:   LDI     r7, 0
+
+; File the bit of second r0 (r7) and check the parities.
+got:    CMPI    r0, 59
+        BC      leapb                   ; 59 or 60: a leap second's pulse
+        CMPI    r0, 21
+        BNZ     g3
+        LDI     r6, 0                   ; the parity runs from second 21
+g3:     XOR     r6, r6, r7
+        SHRI    r1, 1
+        SHLI    r7, 15
+        OR      r1, r1, r7              ; the bit in at 15
+        MOV     r7, r0
+        ANDI    r7, 15
+        CMPI    r7, 15                  ; seconds 15, 31, 47 end a word:
+        BNZ     g6                      ; r2 r3 r4 a queue, filled at r4
+        MOV     r2, r3
+        MOV     r3, r4
+        MOV     r4, r1
+g6:     CMPI    r0, P1
+        BZ      chk
+        CMPI    r0, P2
+        BZ      chk
+        CMPI    r0, P3
+        BNZ     g7
+chk:    CMPI    r6, 0                   ; even: the count since 21 is 0
+        BNZ     epar
+g7:     INC     r0
+
+; The gap: the next pulse 900..1100 ms after this one's start.
+gap:    MOV16   r7, NEXT0
+        CALL    tpulse
+        BNT     eearly
+        MOV16   r7, NEXT1
+        CALL    tpulse
+        BT      nopul
+        CMPI    r0, 59                  ; a pulse: second r0
+        BNC     sec                     ; 1..58
+        BNZ     emark                   ; 60: the marker is missing
+        LDI     r6, 8                   ; 59: a leap second only if A2
+        TEST    r3, r6                  ; (second 19, bit 3 of word 1)
+        BNZ     sec
+emark:  LDIH    r0, 0xC7                ; 7: no marker (or a leap pulse not 0)
+        JMP     err
+leapb:  CMPI    r7, 0                   ; the leap second's pulse is a 0
+        BNZ     emark
+        LDI     r0, 60
+        JMP     gap
+
+; No pulse by 1100 ms: the marker if this is second 59 (60 after a leap
+; second), else a pulse is missing. At the marker, M and S.
+nopul:  CMPI    r0, 59
+        BNC     emiss
+        LDI     r6, 1
+        TEST    r2, r6                  ; M, second 0, is 0
+        BNZ     ems
+        LDI     r6, 16
+        TEST    r3, r6                  ; S, second 20 (bit 4 of word 1), is 1
+        BZ      ems
+        SHRI    r1, 5                   ; seconds 48..58 to bits 10:0
+        MOV     r7, r0
+        SUBI    r7, 51                  ; 8, or 9 after a leap second:
+        SHLI    r7, 11                  ; 0x4000, or 0x4800 with L
+        OR      r1, r1, r7
+        PUSH    r1                      ; blocks while OUTQ is full
+        PUSH    r2
+        PUSH    r3
+        PUSH    r4
+        LDI     r0, 0                   ; the next minute's second 0:
+        MOV16   r7, MARK0               ; 1900..2100 ms after the last pulse
+        CALL    tpulse
+        BNT     eearly
+        MOV16   r7, MARK1
+        CALL    tpulse
+        BNT     sec
+
+; Errors: the second in r0, the fault set into its high byte. Then hunt.
+emiss:  LDIH    r0, 0xC4
+        JMP     err
+eshort: LDIH    r0, 0xC1
+        JMP     err
+elong:  LDIH    r0, 0xC2
+        JMP     err
+eearly: LDIH    r0, 0xC3
+        JMP     err
+epar:   LDIH    r0, 0xC5
+        JMP     err
+ems:    LDIH    r0, 0xC6
+err:    PUSH    r0
+        JMP     hunt
+
+; tidle / tpulse: TD = r5 + r7, then widle / wpulse.
+; widle / wpulse: wait until RX is idle / in a pulse, or TD is reached,
+; through the glitch filter. T = 1: TD came first. T = 0: the new level
+; held G ticks; r7 is NOW when the edge was first seen. A level that does
+; not hold is a glitch, and the wait goes on against the same TD.
+tidle:  ADD     r7, r7, r5
+        CSRW    TD, r7
+widle:  WAITP   RX, IDLE, T
+        BT      wir
+        CSRR    r7, NOW
+        DLY     G
+        JP      RX, PULSE, widle        ; back in the pulse: a glitch
+wir:    RET
+tpulse: ADD     r7, r7, r5
+        CSRW    TD, r7
+wpulse: WAITP   RX, PULSE, T
+        BT      wpr
+        CSRR    r7, NOW
+        DLY     G
+        JP      RX, IDLE, wpulse        ; idle again: a glitch
+wpr:    RET
