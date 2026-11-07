@@ -1,0 +1,320 @@
+; ds1302_host.loom
+; Loom as the microcontroller side of a DS1302 trickle-charge timekeeping
+; chip (Dallas/Maxim): single-byte reads and writes of the clock, control,
+; trickle-charger and RAM registers, clock and RAM burst reads and writes,
+; and write-protect handling, at a bit rate set from the data sheet's 5 V
+; or 2 V limits.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The DS1302's three-wire
+; interface looks like SPI and is not: one bidirectional data line, I/O,
+; that turns around in the middle of a read, CE (RST on the older data
+; sheet) high to frame each transfer, every byte LSB first, the command
+; byte's bit 0 selecting a read, and on a read the chip's first data bit
+; driven at the falling edge of the eighth command clock. spi_master.loom
+; cannot be used as it is. The program uses:
+;   - a BIDIR pin with its per-pin output enable (OEP), built for buses whose
+;     data line changes direction (SWD's turnaround), for I/O, push-pull
+;     while the host drives it and released for the chip's bytes;
+;   - OUT and IN on one-pin groups (OUTGRP, INGRP), built for parallel
+;     ports, so a bit goes out from bit 0 of the shifter and comes in to bit
+;     0 of a register with no branch, which keeps every clock phase the same
+;     length;
+;   - the deadline schedule (SETD, WAITD), built for every timed protocol,
+;     for SCLK, CE and the turnaround;
+;   - REV, the 16-bit bit reverse, built for the bit engine's MSB/LSB
+;     conversions, to put the bits sampled first-bit-highest into an LSB-first
+;     byte (as tm1637_controller.loom does).
+; What the firmware does that no hardware does: CE framing and its set-up,
+; hold and inactive times, the LSB-first shifting, the read turnaround, the
+; burst lengths, and the write-protect sequence. Weaker than a dedicated
+; peripheral: every SCLK edge costs the thread a slot, so at 50 MHz the
+; fastest proved clock is 833 kHz, under half the 2.0 MHz the chip allows
+; at 5 V; and SCLK stops, low, while the program waits for the host's next
+; data word or for room in OUTQ (the chip is static: fCLK has no minimum).
+;
+; Source: DS1302 data sheet, Dallas Semiconductor, dated 070900 (14 pages);
+; the Maxim 19-5420 revision the brief names could not be fetched, so its
+; figure and table numbers are not given here. In the 070900 copy: the
+; command byte, p.3 and Figure 2; single-byte read and write, Figure 3
+; (p.6); the register map, Figure 4 (p.7, an image: only what the text says
+; of it is used); read and write timing, Figures 5 and 6 (p.11); the AC
+; characteristics, p.10.
+;
+; Pins: CE = OUT0, SCLK = OUT1, I/O = BIDIR0 (push-pull while driven; the
+; chip has 40 kOhm pull-downs on all three, p.11 note 6).
+;
+; Turnaround rule (no contention cycle): the host drives I/O only from CE
+; rising (after the inactive time tCWH, during which the chip has released
+; it within tCDZ) to CE falling, and on a read only up to the eighth command
+; clock: it releases I/O one tick after that clock's rise (after the chip's
+; hold time tCDH has run) and one tick before its fall, the edge on which
+; the chip starts to drive (p.3: "the first data bit to be transmitted occurs
+; on the first falling edge after the last bit of the command byte"). It
+; takes I/O back only at the next transfer, after CE has been low for tCWH.
+;
+; Host words (FIFO space, thread 0). INQ, one operation per word:
+;   bit 15 = 1, a transfer: bits 15:8 the command byte (p.3: bit 7 = 1, bit
+;     6 RAM, bits 5:1 the address, bit 0 read), bits 7:0 its argument.
+;     A single write (address 0..30): the argument is the data byte.
+;     A single read: the argument is ignored.
+;     A burst (address 31: BEH/BFH clock, FEH/FFH RAM): the argument is the
+;       byte count, 0 meaning the whole burst (8 for the clock, 31 for the
+;       RAM). A burst write's bytes follow in INQ, two per word, the first
+;       in bits 7:0; they are popped as they go out.
+;   bit 15 = 0, a setting, bits 14:12 which:
+;     0x100r  the clock rate: r = 0 the 5 V rate (TICK_INT 12, the reset
+;             choice), r = 1 the 2 V rate (TICK_INT 28). See "Timing".
+;             ds1302_device.loom, a software chip, needs the 2 V rate.
+;     0x200g  write-protect handling: g = 1 wraps every write except one to
+;             the control register in "8EH 00H" before it (clear WP, bit 7
+;             of the control register, p.4) and "8EH 80H" after it (set it
+;             again); a clock burst write is not followed by 8EH 80H, since
+;             its eighth byte is the control register itself. g = 0 sends
+;             each write as it is (the reset choice).
+; OUTQ: a read gives one word per byte, command byte in bits 15:8 and the
+; byte read in 7:0; a write or a setting gives its own word back when it is
+; done. The PUSHes block while OUTQ is full (SCLK waits low).
+;
+; Timing (p.10, the AC table; 2.0 V and 5.0 V figures). One tick is U
+; clocks; a bit is LOW = 3 ticks and HIGH = 2. SCLK falls one slot after
+; its deadline and rises two slots after its own (I/O is sampled in the
+; slot between), so inside a byte SCLK is low 3U + 4 clocks and high 2U - 4:
+;   5 V rate, U = 12 (50 MHz): tCL 800 ns (>= 250), tCH 400 ns (>= 250),
+;     1.2 us, 833 kHz (<= 2.0 MHz); 2 V rate, U = 28: tCL 1.76 us (>= 1.0),
+;     tCH 1.04 us (>= 1.0), 2.8 us, 357 kHz (<= 500 kHz). U is a multiple
+;     of the 4-clock slot, so every edge is late on its deadline by the same
+;     amount and the phases are exact (SEMANTICS 2). Between bytes the low
+;     phase is longer (each byte re-anchors its schedule); SCLK is static,
+;     so that costs only time.
+;   I/O changes a few slots after a fall, at least 480 ns (5 V) and 1.28
+;     us (2 V) before the rise (tDC >= 50 and 200 ns), and holds for the
+;     whole high phase (tCDH >= 70 and 280 ns); the eighth clock of a read's
+;     command holds it one tick, 240 ns and 560 ns, then lets go. The chip's
+;     bit is sampled one slot before the rise, about 660 ns and 1.62 us
+;     after the fall, against its delay tCDD <= 200 ns and 800 ns.
+;   CE to the first rise: CC + LOW = 8 ticks and a few slots, 2.1 us and
+;     4.2 us (tCC >= 1 us and 4 us); the last fall to CE falling: HOLD = 2
+;     ticks and slots, 1.2 us and 1.7 us (tCCH >= 60 and 240 ns, taken from
+;     the last edge); CE low for CWH = 8 ticks or more, 1.9 us and 4.5 us
+;     (tCWH >= 1 us and 4 us).
+; The schedule is proved for ticks of 12 clocks or more.
+;
+; Memory: 167 words. The main loop, 110, in thread 0's quarter
+; (0x000..0x06D) and, from `guarded` on, the subroutines, 56, in thread 3's
+; (0x180..0x1B7), which no program of the pair runs from; the write-protect
+; setting in the last word of the memory (GUARD, 0x1FF). With
+; ds1302_device.loom (thread 1: 0x080..0x168, and 0x1C0..0x1CB between
+; these subroutines and GUARD) the two load together; threads 2 and 3 must
+; not be started.
+;
+; Registers: r0 transmit shifter, r1 bit count, r2 the command byte, r3 the
+; byte received and the result, r4 bytes still to go, r5 scratch, r6 the
+; burst write's data word, r7 the operation word (and the .csr scratch
+; before the first POP).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   CE = OUT0, SCLK = OUT1, IO = BIDIR0
+        .equ    U5 = 12                 ; the 5 V tick, clocks (50 MHz)
+        .equ    U2 = 28                 ; the 2 V tick
+        .equ    LOW = 3                 ; SCLK low, ticks
+        .equ    HIGH = 2                ; SCLK high, ticks
+        .equ    CC = 5                  ; CE high to the first bit's low phase
+        .equ    HOLD = 2                ; the last fall to CE low
+        .equ    CWH = 8                 ; CE low between transfers
+        .equ    WCTRL = 0x8E            ; write the control register (p.4)
+        .equ    WCLKB = 0xBE            ; clock burst write
+        .equ    WP = 0x80               ; the control register's write protect
+        .equ    GUARD = 0x1FF           ; the write-protect setting, 0 or 1
+
+start:  .csr    OUTGRP, (1 << 5) | pin(IO)   ; OUT drives I/O from bit 0
+        .csr    INGRP, (1 << 5) | pin(IO)    ; IN reads I/O into bit 0
+        SETP    CE, 0
+        SETP    SCLK, 0                 ; SCLK low before CE rises (p.3)
+        OEP     IO, 0                   ; released: the chip's pull-down
+        .csr    TICK_INT, U5            ; the 5 V rate; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+
+cmd:    POP     r7                      ; next operation (blocks while INQ is empty)
+        SETD    0                       ; re-anchor after the unbounded POP
+        MOV     r2, r7
+        SHRI    r2, 15
+        BZ      setting                 ; bit 15 clear: a setting
+        MOV     r2, r7
+        SHRI    r2, 8                   ; the command byte
+        MOV     r5, r2
+        ANDI    r5, 1
+        BNZ     read
+        CALL    guarded                 ; Z clear: wrap this write
+        BZ      w_go
+        LDI     r0, WCTRL
+        LDI     r4, 0
+        CALL    wone                    ; 8EH 00H: clear WP first
+w_go:   MOV     r4, r7
+        SHLI    r4, 8
+        SHRI    r4, 8                   ; the argument
+        CALL    isburst
+        BZ      bwrite
+        MOV     r0, r2
+        CALL    wone                    ; command, data
+        JMP     w_end
+bwrite: CALL    begin
+        MOV     r0, r2
+        LDI     r1, 8
+        CALL    byte                    ; the burst command
+bw_w:   POP     r6                      ; two data bytes (SCLK waits low)
+        MOV     r0, r6
+        LDI     r1, 8
+        CALL    byte                    ; bits 7:0
+        SUBI    r4, 1
+        BZ      bw_end
+        MOV     r0, r6
+        SWAP    r0, r0
+        LDI     r1, 8
+        CALL    byte                    ; bits 15:8
+        SUBI    r4, 1
+        BNZ     bw_w
+bw_end: CALL    end
+w_end:  CALL    guarded
+        BZ      ack
+        LDI     r5, WCLKB
+        CMP     r2, r5
+        BZ      ack                     ; a clock burst wrote the control byte
+        LDI     r0, WCTRL
+        LDI     r4, WP
+        CALL    wone                    ; 8EH 80H: set WP again
+ack:    PUSH    r7                      ; the operation word back: done
+        JMP     cmd
+
+; A read, single or burst: the command with the turnaround, then the bytes.
+read:   MOV     r4, r7
+        SHLI    r4, 8
+        SHRI    r4, 8
+        CALL    isburst
+        BZ      r_go                    ; a burst: r4 bytes
+        LDI     r4, 1                   ; a single byte
+r_go:   CALL    begin
+        MOV     r0, r2
+        LDI     r1, 7
+        CALL    byte                    ; command bits 0..6
+        SETD    0
+        OUT     r0                      ; bit 7 (r0 = 1 now)
+        WAITD   LOW
+        SETP    SCLK, 1                 ; the eighth rise: the chip takes bit 7
+        WAITD   1
+        OEP     IO, 0                   ; turnaround: tCDH has run, the fall is a tick off
+        WAITD   1
+        SETP    SCLK, 0                 ; the chip drives its bit 0 from here
+r_byte: LDI     r1, 8
+        CALL    byte
+        MOV     r5, r2
+        SWAP    r5, r5
+        OR      r3, r3, r5              ; command byte << 8 | the byte
+        PUSH    r3                      ; blocks while OUTQ is full: SCLK waits low
+        SUBI    r4, 1
+        BNZ     r_byte
+        CALL    end
+        JMP     cmd
+
+; A setting: the clock rate or the write-protect handling.
+setting: MOV    r5, r7
+        SHRI    r5, 12
+        CMPI    r5, 1
+        BZ      rate
+        CMPI    r5, 2
+        BNZ     ack                     ; not a setting: given back unchanged
+        MOV     r5, r7
+        ANDI    r5, 1
+        MOV16   r3, GUARD
+        ST      r5, r3, 0
+        JMP     ack
+rate:   MOV     r5, r7
+        ANDI    r5, 1
+        LDI     r3, U5                  ; LDI leaves the flags alone
+        BZ      r_set
+        LDI     r3, U2
+r_set:  CSRW    TICK_INT, r3            ; a slower tick: the proof at 12 holds
+        JMP     ack
+
+; ---------------------------------------------------------------------------
+; The spill: the subroutines sit in thread 3's quarter, 0x180 on (see
+; "Memory" above). Thread 3 must not be started with this image.
+; ---------------------------------------------------------------------------
+        .org    0x180
+
+; guarded: Z clear if the write of command r2 is to be wrapped in 8EH 00H and
+; 8EH 80H (handling on, and not the control register itself).
+guarded: MOV16  r5, GUARD
+        LD      r5, r5, 0
+        TEST    r5, r5
+        BZ      g_ret                   ; handling off: Z set
+        LDI     r5, WCTRL
+        CMP     r2, r5                  ; Z set for 8EH
+g_ret:  RET
+
+; isburst: Z set if command r2 addresses 31 (a burst); then r4 = 0 becomes
+; the whole burst, 8 bytes for the clock, 31 for the RAM (p.4, p.5).
+isburst: MOV    r5, r2
+        ANDI    r5, 0x3E
+        CMPI    r5, 0x3E
+        BNZ     ib_ret
+        TEST    r4, r4
+        BNZ     ib_z
+        LDI     r4, 8
+        MOV     r5, r2
+        SHRI    r5, 6
+        ANDI    r5, 1                   ; bit 6: the RAM
+        BZ      ib_z
+        LDI     r4, 31
+ib_z:   CMP     r4, r4                  ; Z set: a burst
+ib_ret: RET
+
+; wone: a single-byte write, command r0, data r4.
+wone:   CALL    begin
+        LDI     r1, 8
+        CALL    byte
+        MOV     r0, r4
+        LDI     r1, 8
+        CALL    byte
+        CALL    end
+        RET
+
+; begin: CE rises with SCLK low; the host drives I/O.
+begin:  SETD    0
+        SETP    CE, 1
+        OEP     IO, 1
+        WAITD   CC                      ; with LOW: tCC before the first rise
+        RET
+
+; byte: r1 bits of r0, LSB first, out on I/O (ignored while I/O is
+; released) and the bits on I/O in; returns the r1 = 8 bits received in r3
+; and SCLK low. Every bit: I/O set after the fall, sampled one slot
+; before the rise.
+byte:   SETD    0                       ; a fresh schedule: SCLK is low
+        LDI     r3, 0
+bloop:  OUT     r0                      ; I/O = the next bit
+        SHRI    r0, 1
+        WAITD   LOW                     ; end of the low phase
+        IN      r5                      ; sample I/O into bit 0
+        SETP    SCLK, 1                 ; the rise: the chip takes I/O
+        WAITD   HIGH
+        SETP    SCLK, 0                 ; the fall: a reading chip drives here
+        ADD     r3, r3, r3
+        OR      r3, r3, r5              ; first bit received ends in bit 7
+        DJNZ    r1, bloop
+        REV     r3, r3                  ; bit i to bit 15 - i
+        SWAP    r3, r3                  ; the byte, first bit in bit 0
+        RET
+
+; end: CE falls after the hold, I/O released, CE low for tCWH.
+end:    SETD    0
+        WAITD   HOLD
+        SETP    CE, 0                   ; the chip releases I/O (tCDZ)
+        OEP     IO, 0
+        WAITD   CWH
+        RET
+
+        .org    GUARD
+        .word   0                       ; write-protect handling off at load

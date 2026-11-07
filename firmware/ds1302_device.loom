@@ -1,0 +1,364 @@
+; ds1302_device.loom
+; Loom as a DS1302 trickle-charge timekeeping chip (Dallas/Maxim), the
+; chip's side of its three-wire interface: the clock/calendar registers,
+; the control register with its write-protect bit, the trickle-charge
+; register and 31 bytes of RAM, answering single-byte reads and writes and
+; clock and RAM bursts. A model of the chip's interface: its time does not
+; advance (no seconds are ticked), the trickle charger switches nothing, and
+; the host sets or reads the registers through the memory (IMEM space).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The DS1302 interface is not
+; SPI: one bidirectional data line, CE (RST on the older data sheet) to
+; frame a transfer, LSB first, and on a read the chip turns I/O round
+; inside the command's eighth clock. The program uses:
+;   - a BIDIR pin with its per-pin output enable (OEP), built for SWD's
+;     turnaround, for I/O: released except while it drives a read's bit;
+;   - OUT and IN on one-pin groups (OUTGRP, INGRP), built for parallel
+;     ports: the next bit is put on the pin's output register while the pin
+;     is released, so at the clock's fall one OEP drives it;
+;   - JP and WAITP on single pins, as i2c_slave_eeprom.loom does, polling
+;     SCLK and CE together while it waits for a rise;
+;   - WAITB with a timeout (SEMANTICS 6.4), built for the FIFO flow control,
+;     as a non-blocking test of OUTQ for the write reports;
+;   - LD and ST (slice B, SEMANTICS 6.11): the registers and the RAM live in
+;     the instruction memory, two banks of the eight burst registers among
+;     them, so a clock burst write lands all eight bytes at once (p.4: "the
+;     first eight registers must be written in order for the data to be
+;     transferred") by switching banks.
+; What the firmware does that no hardware does: CE framing, the command
+; decoding, the LSB-first shifting both ways, the turnaround, the burst
+; addressing, write protect and the all-or-nothing clock burst. Weaker than
+; the real chip: it answers SCLK edges in software, so its delays are in
+; slots, and it meets the data sheet's 2.0 V figures, not its 5 V ones.
+; Measured at 50 MHz against a host at the 2.0 V limits:
+;   - a read's bit reaches I/O 10 clocks (200 ns) after SCLK falls, and 22
+;     (440 ns) for the bit after each rise at which the next byte is
+;     fetched, once per byte (tCDD <= 800 ns at 2 V, 200 ns at 5 V);
+;   - I/O is released within 14 clocks (280 ns) of a rise and of CE falling
+;     (tCCZ and tCDZ <= 280 ns at 2 V, 70 ns at 5 V): from each fall on, CE
+;     is looked at every second slot;
+;   - a written bit is taken from I/O between 8 clocks before the rise and 4
+;     after it, so the host's data must be set up 160 ns and held 80 ns
+;     (tDC >= 200 ns and tCDH >= 280 ns at 2 V; at 5 V tDC is only 50 ns);
+;   - the command is decoded between the sixth SCLK fall and the eighth rise
+;     (the first data bit goes out at the eighth fall), which needs about
+;     150 clocks there (3 us): a host at the 2.0 V figures gives that, as
+;     does ds1302_host.loom at its 2 V rate (228 clocks), but not at its
+;     5 V rate (100 clocks), which this device cannot follow for reads.
+;
+; Director's decisions (2026-11-07): a burst past the last register wraps
+; to the first; a command with bit 7 = 0 is ignored and I/O never driven;
+; the power-on state is CH = 1, WP = 1, trickle 00H; the device is rated
+; at the 2.0 V figures only (it needs about 150 clocks to decode a command
+; between the sixth and eighth SCLK, so a host at the 5 V rate reads it
+; wrongly, as test_fw_ds1302 pins). The figure numbers are the 070900
+; revision's; Maxim 19-5420's are unchecked.
+;
+; Source: DS1302 data sheet, Dallas Semiconductor, dated 070900 (14 pages):
+; the command byte, p.3 and Figure 2; single-byte read and write, Figure 3
+; (p.6); the register map, Figure 4 (p.7, an image); write protect, clock
+; halt, trickle charger and bursts, p.4 and p.5; read and write timing,
+; Figures 5 and 6 (p.11), and the AC table, p.10. The Maxim 19-5420 revision
+; could not be fetched.
+;
+; Pins: CE = IN0, SCLK = IN1, I/O = BIDIR1 (push-pull while driving). With
+; ds1302_host.loom (thread 0: CE = OUT0, SCLK = OUT1, I/O = BIDIR0) the
+; bench joins OUT0 to IN0, OUT1 to IN1 and BIDIR0 to BIDIR1: two Loom
+; threads never share a pin.
+;
+; What it does (070900, p.3 to p.5):
+;   CE high starts a transfer (SCLK low); CE low ends it at any point and
+;     releases I/O; a byte cut short by CE is dropped.
+;   The command byte comes first, LSB first, taken at SCLK rises: bit 7 must
+;     be 1 ("If it is 0, writes to the DS1302 will be disabled"; this
+;     program then ignores the whole transfer, reads included); bit 6 RAM;
+;     bits 5:1 the address; bit 0 read.
+;   A read: the byte goes out LSB first from the fall after the eighth
+;     command rise, a bit at each fall; I/O is released at each rise ("the
+;     I/O pin is tristated upon each rising edge"). More clocks retransmit:
+;     the same byte for a single read, the next register for a burst
+;     (wrapping to the first: the data sheet does not say, QUESTIONS).
+;   A write: the data byte is taken at the next eight rises; more clocks
+;     are ignored.
+;   Clock registers 0..6 (seconds .. year), 7 control, 8 trickle charger;
+;     9..30 hold nothing ("no data storage capacity"): they read 0 and
+;     ignore writes. RAM 0..30. Address 31: the burst, from address 0.
+;   Write protect, control bit 7: while it is 1, writes to every other
+;     register are dropped; the control register stays writable, so WP can
+;     be cleared. Its bits 6:0 are forced to 0. A clock burst write (eight
+;     registers, the control register the eighth) transfers nothing if WP
+;     was set when its command came, and nothing unless all eight bytes
+;     arrive; a RAM burst write stores each byte as it arrives (p.4). The
+;     trickle register is not in the clock burst (p.5).
+;   Power on (p.4: CH, WP "not defined"): this program starts with the
+;     clock halted (seconds 80H), WP set (control 80H) and the trickle
+;     charger disabled (00H), the date 01/01/00, day 1, and RAM 0.
+;
+; Host words (FIFO space, thread 1). OUTQ, after every write transfer, one
+; word if OUTQ has room (else none: the device never blocks the bus): the
+; command byte in bits 15:8 and in 7:0 the number of bytes stored (0 for a
+; write that write protect or an empty address dropped; a clock burst
+; counts 8 when it lands). No INQ words.
+;
+; Rate: the host owns SCLK, so the program has no tick and no deadline pair.
+;
+; Memory: 174 words of code, 57 in thread 1's quarter (0x080..0x0B8), 105
+; in thread 2's (0x100..0x168) and the receive subroutines, 12, in thread
+; 3's at 0x1C0, past ds1302_host.loom's subroutines (0x180..0x1B7); the
+; registers, 49 words at 0x0C0..0x0FE: bank A (0x0C0) and bank B (0x0C8) of
+; the burst registers, the trickle register (TRK), a zero word for the
+; empty addresses (ZERO), and the RAM (0x0E0..0x0FE). The current bank is
+; r7 (readable through the debug space while the thread is halted).
+; Threads 2 and 3 must not be started with this image.
+;
+; Registers: r0 the byte shifter and the command, then a read's byte index;
+; r1 bit count, the RAM register while decoding, a read's rises to the next
+; fetch; r2 the address, then the next byte or the write-protect flag; r3
+; the bits being sent or the count stored; r4 the register (a burst's
+; first); r5 scratch and the sampled bit; r6 the bytes a read cycles
+; through, or the write's command << 8 for the report (0: none); r7 the
+; current bank (0x0C0 or 0x0C8).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   CE = IN0, SCLK = IN1, IO = BIDIR1
+        .equ    BANKA = 0x0C0           ; registers 0..7, one bank
+        .equ    BANKB = 0x0C8           ; the other bank
+        .equ    TRK = 0x0D0             ; register 8, the trickle charger
+        .equ    ZERO = 0x0D1            ; what addresses 9..30 read
+        .equ    RAM = 0x0E0             ; RAM 0..30
+        .equ    CTRL = 7                ; the control register, in a bank
+        .equ    NBURST = 8              ; clock burst registers
+        .equ    NRAM = 31
+
+start:  OEP     IO, 0                   ; released
+        .csr    INGRP, (1 << 5) | pin(IO)    ; IN reads I/O into bit 0
+        .csr    OUTGRP, (1 << 5) | pin(IO)   ; OUT sets I/O from bit 0
+        LDI     r7, BANKA
+
+; Idle: CE low, then a transfer when CE rises.
+idle:   WAITP   CE, 0
+        LDI     r6, 0                   ; no report
+        WAITP   CE, 1                   ; CE high: SCLK is low (p.3)
+        LDI     r0, 0
+        LDI     r1, 6
+        CALL    rbyte                   ; command bits 0..5, to the sixth fall
+; Decode, split round the seventh clock's bit (bit 6, RAM) so that both
+; halves fit a clock at the data sheet's 500 kHz. Before it: r0 = bits
+; 0..5 << 2 (bit 2 read, bits 7:3 the address); r4 the clock-side register,
+; r1 the RAM one, r6 the bytes a read cycles through (1, or 8 for a burst).
+        MOV     r2, r0
+        SHRI    r2, 3                   ; the address
+        MOV     r5, r0
+        ANDI    r5, 4
+        BZ      to_w                    ; a write
+        LDI     r6, 1                   ; a single read: its one byte
+        LDI     r1, RAM                 ; RAM 0 for a burst
+        CMPI    r2, 31
+        BZ      d_bst
+        ADD     r1, r1, r2
+        CMPI    r2, 8
+        BC      d_hi                    ; 8 to 30
+        ADD     r4, r7, r2              ; registers 0..7: the current bank
+        JMP     d_b6
+d_bst:  LDI     r6, NBURST
+        MOV     r4, r7                  ; the clock burst, from register 0
+        JMP     d_b6
+d_hi:   LDI     r4, TRK                 ; LDI leaves the flags of CMPI 8
+        BZ      d_b6                    ; the trickle charger
+        LDI     r4, ZERO                ; 9..30: no storage
+d_b6:   CALL    rbit                    ; bit 6; SCLK still high
+        TEST    r5, r5                  ; rbit left the bit << 7 in r5
+        BZ      d_ld
+        MOV     r4, r1                  ; the RAM side
+        CMPI    r6, NBURST
+        BNZ     d_ld
+        LDI     r6, NRAM                ; the RAM burst
+d_ld:   LD      r3, r4, 0               ; the first byte to send
+        LDI     r1, 1                   ; the next byte joins after one rise
+        OUT     r3                      ; its bit 0, ready on the released pin
+        WAITP   SCLK, 0                 ; the seventh clock ends
+c8r:    IN      r5                      ; I/O, then SCLK: see rbit
+        JP      CE, 0, ignore
+        JP      SCLK, 0, c8r            ; the eighth rise
+        SHRI    r5, 1                   ; C = bit 7, which must be 1
+        BNC     ignore
+        WAITP   SCLK, 0
+        OEP     IO, 1                   ; turnaround: drive bit 0 from this fall
+        LDI     r0, 0                   ; the index of the byte being sent
+        JMP     r_bit
+to_w:   CALL    rbit                    ; a write: bit 6, then bit 7 and the data
+        JMP     c8w
+ignore: JMP     idle                    ; bit 7 clear, or CE fell: not a command
+
+; ---------------------------------------------------------------------------
+; The rest sits in thread 2's quarter, 0x100 on, past the registers (see
+; "Memory").
+; ---------------------------------------------------------------------------
+        .org    0x100
+
+; Sending. A bit is driven from each fall and released at each rise, and
+; from the fall on CE is looked at every two slots, so I/O is let go within
+; 14 clocks of CE falling (tCDZ). r3 bit 0 is the bit on I/O and r3 holds
+; the next byte above the rest of this one: one rise after a byte starts
+; (r1 counts to it), the byte after it is fetched into bits 14:7, index r0
+; + 1 of the r6 bytes from r4, wrapping (a single read: r6 = 1, its own
+; byte again and again, p.3).
+r_bit:  JP      CE, 0, r_end
+        JP      SCLK, 0, r_bit          ; wait for the rise
+        OEP     IO, 0                   ; released at the rise (p.3)
+        SHRI    r3, 1                   ; the next bit to bit 0
+        DJNZ    r1, r_out
+        LDI     r1, 8
+        ADDI    r0, 1
+        CMP     r0, r6
+        BNZ     r_nx
+        LDI     r0, 0                   ; past the last: the first again
+r_nx:   ADD     r5, r4, r0
+        LD      r2, r5, 0
+        SHLI    r2, 7
+        OR      r3, r3, r2              ; the next byte, after this one's rest
+r_out:  OUT     r3                      ; set while released
+        WAITP   SCLK, 0
+        OEP     IO, 1                   ; driven from the fall
+        JMP     r_bit
+r_end:  OEP     IO, 0                   ; CE fell: release first
+        JMP     ended
+
+; A write: bit 7 first, then the data.
+c8w:    WAITP   SCLK, 0                 ; the seventh clock ends
+        CALL    rbit                    ; bit 7; r0 = the command byte
+        TEST    r5, r5                  ; rbit left bit 7 << 7 in r5
+        BZ      ignore
+        MOV     r6, r0
+        SWAP    r6, r6                  ; the report: command << 8 (bit 15 set)
+        LDI     r3, 0                   ; bytes stored
+        LD      r2, r7, CTRL
+        SHRI    r2, 7                   ; r2 = WP, as the command found it
+        MOV     r5, r0
+        SHRI    r5, 1
+        ANDI    r5, 31
+        CMPI    r5, 31
+        BNZ     w_one
+        MOV     r5, r0
+        SHRI    r5, 6
+        ANDI    r5, 1
+        BNZ     w_ram                   ; the RAM burst
+        JMP     w_clk                   ; the clock burst
+
+; A single-byte write: the byte, then the rules (more clocks are ignored).
+w_one:  LDI     r1, 8
+        CALL    rbyte                   ; r0 = the data byte
+        MOV     r5, r6
+        SHRI    r5, 9
+        ANDI    r5, 31                  ; the address
+        MOV     r1, r6
+        SHRI    r1, 14
+        ANDI    r1, 1
+        BNZ     w_r1                    ; a RAM byte
+        ADD     r4, r7, r5              ; in the current bank
+        CMPI    r5, CTRL
+        BZ      w_ctl                   ; the control register: always writable
+        CMPI    r5, 9
+        BC      w_skip                  ; 9..30: no storage
+        CMPI    r5, 8
+        BNZ     w_chk
+        LDI     r4, TRK                 ; the trickle charger
+        JMP     w_chk
+w_r1:   LDI     r4, RAM
+        ADD     r4, r4, r5
+w_chk:  TEST    r2, r2
+        BNZ     w_skip                  ; write protected
+w_st:   ST      r0, r4, 0
+        LDI     r3, 1
+        JMP     w_skip
+w_ctl:  SHRI    r0, 7
+        SHLI    r0, 7                   ; bits 6:0 read 0 (p.4)
+        JMP     w_st
+
+; The RAM burst: each byte stored as it arrives, up to 31.
+w_ram:  LDI     r4, RAM
+w_rb:   LDI     r1, 8
+        CALL    rbyte
+        TEST    r2, r2
+        BNZ     w_rb                    ; write protected: clocked, dropped
+        ST      r0, r4, 0
+        ADDI    r4, 1
+        ADDI    r3, 1
+        CMPI    r3, NRAM
+        BNZ     w_rb
+        JMP     w_skip
+
+; The clock burst: eight bytes into the other bank, which becomes the
+; current one only when the eighth has arrived.
+w_clk:  TEST    r2, r2
+        BNZ     w_skip                  ; WP set: nothing transferred (p.5)
+        MOV     r4, r7
+        XORI    r4, 8                   ; the other bank
+        LDI     r2, NBURST
+w_cb:   LDI     r1, 8
+        CALL    rbyte
+        ST      r0, r4, 0
+        ADDI    r4, 1
+        DJNZ    r2, w_cb
+        SHRI    r0, 7
+        SHLI    r0, 7                   ; the control register's bits 6:0 read 0
+        SUBI    r4, 1
+        ST      r0, r4, 0               ; over the eighth as stored
+        XORI    r7, 8                   ; all eight: switch banks
+        LDI     r3, NBURST
+
+; The rest of a write is ignored until CE falls.
+w_skip: WAITP   CE, 0
+
+; CE fell: release I/O, report a write if OUTQ has room, wait for the next.
+ended:  OEP     IO, 0
+        MOV     r5, r6
+        SHRI    r5, 15
+        BZ      e_idle                  ; a read or nothing: no report
+        OR      r6, r6, r3
+        SETD    0                       ; TD = NOW: the WAITB below is a test
+        WAITB   OUTQ_NF, T
+        BT      e_idle                  ; OUTQ full: the report is dropped
+        PUSH    r6                      ; cannot block: OUTQ has room
+e_idle: JMP     idle
+
+; ---------------------------------------------------------------------------
+; The receive subroutines sit in thread 3's quarter at 0x1C0, past the end of
+; ds1302_host.loom's subroutines there (0x180..0x1B7) and before its GUARD
+; word (0x1FF): the pair loads together.
+; ---------------------------------------------------------------------------
+        .org    0x1C0
+
+; ---------------------------------------------------------------------------
+; rbyte: r1 bits into r0, LSB first (a bit enters at bit 7); returns after
+; the last bit's fall. rbit: one bit, returning while SCLK is still high,
+; with the bit << 7 in r5. CE low leaves for ended (the return addresses
+; left on the stack are overwritten by the next CALL).
+; ---------------------------------------------------------------------------
+rbyte:  CALL    rbit
+        WAITP   SCLK, 0
+        DJNZ    r1, rbyte
+        RET
+rbit:   IN      r5                      ; I/O first, then SCLK: when SCLK is
+        JP      CE, 0, rb_end           ; seen high, r5 was taken between 8
+        JP      SCLK, 0, rbit           ; clocks before the rise and 4 after
+        SHRI    r0, 1
+        SHLI    r5, 7
+        OR      r0, r0, r5
+        RET
+rb_end: JMP     ended                   ; CE fell
+
+; ---------------------------------------------------------------------------
+; The registers at power on (see "What it does"); the host may rewrite them
+; through the IMEM space before RUN.
+; ---------------------------------------------------------------------------
+        .org    BANKA
+        .word   0x80, 0x00, 0x00, 0x01, 0x01, 0x01, 0x00, 0x80   ; bank A
+        .word   0x80, 0x00, 0x00, 0x01, 0x01, 0x01, 0x00, 0x80   ; bank B
+        .word   0x00                    ; TRK: trickle charger disabled
+        .word   0x00                    ; ZERO
+        .org    RAM
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
