@@ -1,0 +1,504 @@
+; bridge_nmea_lcd.loom
+; A GPS-to-LCD bridge: thread 1 receives the NMEA 0183 sentences of a GPS
+; receiver (8N1, 4800 or 9600 baud) and parses them; thread 0 drives an
+; HD44780U character LCD (2x16) over its 4-bit bus and shows the UTC time,
+; the fix status and the position of the last good RMC sentence. No host
+; in the loop: the host loads the image, sets thread 1's tick for the baud
+; rate and starts both threads.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Thread 0 is
+; firmware/bridge_uart_lcd.loom's LCD thread (hd44780_4bit.loom's
+; initialization, byte, nibble and busy-flag code, unchanged) with its
+; terminal replaced by a layout interpreter; thread 1 is uart_rx.loom's
+; receiver (the slow entry) with its PUSH replaced by the parser below. It
+; uses the OUT and IN pin groups and OEP for the LCD's 4-bit bus, the
+; deadline schedule on both threads, LD/ST to data memory (SEMANTICS 6.11,
+; built so device emulators can keep a register file) for the parsed
+; fields, and a shared flag (SIG, WAITS: 6.4, 6.5) to wake the LCD thread.
+; No hardware knows NMEA: the sentence framing, the checksum, the field
+; split and the sentence-type test are all firmware.
+;
+; Pins: thread 0: D4..D7 = BIDIR0..BIDIR3, RS = OUT0, R/W = OUT1,
+; E = OUT2 (as hd44780_4bit.loom); thread 1: RX = IN0 (the GPS's TX).
+;
+; The sentence (SiRF NMEA Reference Manual, 1050-0042 Rev 2.1, Table 1-11
+; and Table 2-1 note 3; a secondary source, NMEA 0183 itself is not free):
+;   $GPRMC,161229.487,A,3723.2475,N,12158.3416,W,0.13,309.62,120598,,*hh
+; '$', the address field (talker, then RMC), comma-separated fields, '*',
+; two hex digits: the XOR of every character between '$' and '*'.
+;
+; The parser (thread 1), one character at a time between stop bit and the
+; next start bit (state in r4: field 0..7, 0x20/0x21 the checksum digits,
+; 0x30 idle):
+;   '$'                  starts a sentence anywhere (resynchronizes);
+;   field 0              kept in SCR; at its comma it must be five
+;                        characters ending in RMC (any talker), or the
+;                        sentence is dropped (GGA, GSV...: ignored);
+;   fields 1..6          time, status, latitude, N/S, longitude, E/W, kept
+;                        in the work buffer at fixed slots, cut to the slot's
+;                        width, a 0 after a field shorter than its slot;
+;   fields 7 on          only checksummed (speed, course, date, ...);
+;   '*'                  needs seven commas at least, then two hex digits
+;                        (0-9, A-F) that must XOR the sum to 0;
+;   a control character before '*', a bad hex digit, a framing error:
+;                        the sentence is dropped.
+; A good RMC is published: if its status is not A (V: "data not valid"),
+; the four position slots are emptied first, so the display shows the time
+; and the status and no position. Then PUB = the buffer, and SIG 0.
+;
+; Triple buffering: three 26-word buffers. At '$' thread 1 picks the one
+; that is neither PUB (published, not yet shown) nor CUR (being shown), so
+; the LCD thread never reads a buffer that is being written: CUR only ever
+; becomes PUB, and only thread 1 changes PUB.
+;
+; The display (thread 0), after Figure 24's initialization and display on:
+;   row 0  hhmmss lat(8) N/S     161229 3723.247N
+;   row 1  status, 5 spaces, lon(9) E/W
+;                                A     12158.341W
+; Fields are cut to their slots (no rounding) and padded with spaces.
+; Thread 0 waits on flag 0, copies PUB to CUR and runs the layout LAY; a
+; sentence published while it draws sets the flag again, so the next good
+; sentence is never lost, and only the newest is drawn.
+;
+; Timing: the parser runs between the stop bit's middle and the next start
+; bit's edge, half a bit. Its longest path (the first comma, with the
+; sentence-type test) is 55 slots, 220 clocks: at 9600 baud and 50 MHz half
+; a bit is 2604 clocks. The deadline checker does not see this interval
+; (it ends at the unbounded WAITP), so it is counted by hand. Past the
+; start edge, WAITP would find the line low and SETD anchor late by the
+; overrun; the tests run 57600 baud at 25 MHz (half a bit 217 clocks), where
+; the first comma overruns by under a slot and the next characters (80
+; clocks each) catch up.
+;
+; UART rate: 8 ticks a bit. The host sets thread 1's TICK_INT/TICK_FRAC to
+; one eighth of a bit before RUN (9600 baud at 50 MHz: 651 + 11/256; 4800
+; baud: 1302 + 22/256). Thread 0 sets its own 1 us tick (US).
+;
+; Memory: thread 0's quarter (initialization, layout interpreter), thread
+; 1's (receiver, parser), thread 2's (the parser's spill, the three
+; buffers), thread 3's (hd44780_4bit.loom's subroutines, PUB, CUR, SCR, the
+; field table, the layout). Threads 2 and 3 must not be started.
+;
+; Registers, thread 0: as hd44780_4bit.loom (r0 the byte, r1 counts, r2
+; scratch, r3 the error and AC, r4 the mode, r5 RS), r6 the layout
+; pointer, r7 the item being drawn. Thread 1: r0 the byte, r1 the bit count
+; then scratch, r2 0x80 then scratch, r3 the checksum, r4 the state, r5
+; the next slot, r6 the end of the field's slot, r7 the work buffer.
+;
+; Readings taken on the open spec questions (2026-11-07): NMEA 0183 was not
+; read; sentence formats from the SiRF NMEA Reference Manual (Rev 2.1) and
+; gpsd's "NMEA Revealed" (secondary).
+;   The SiRF manual's RMC example has a space in an empty field as
+;   extracted; without it the printed checksum 0x10 is right, so the
+;   space is taken as typesetting.
+;   Upper-case hex checksums only; any status but A (an empty one too)
+;   shows no fix; the NMEA 2.3 mode field is not checked; a sentence
+;   needs at least seven commas; long fields are cut, not rounded.
+;   The parser's time per character is counted by hand (55 slots at the
+;   first comma); it ends at a WAITP, which the checker cannot bound.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   D4 = BIDIR0, D5 = BIDIR1, D6 = BIDIR2, D7 = BIDIR3
+        .pins   RS = OUT0, RW = OUT1, E = OUT2
+        .pins   RX = IN0
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    GRP = pin(D4) | (4 << 5)        ; D4..D7: four pins from D4
+        .equ    BFMAX = 1250            ; polls, over 4 us each: 5 ms > 2.16 ms
+        .equ    T_BYTE = 62             ; DLY: more than 61 us
+        .equ    T_LONG = 200            ; DLY, 11 times: more than 2.18 ms
+        .equ    N_LONG = 11
+        .equ    BOOT = 0x0008           ; initialize: two lines, busy flag, cold
+        .equ    OVS = 8                 ; thread 1: ticks per bit
+        .equ    SIGB = 0                ; the shared flag: a sentence is published
+        ; A buffer's slots (offsets) and widths.
+        .equ    TIME = 0                ; hhmmss (the fraction dropped)
+        .equ    STAT = 6                ; A or V
+        .equ    LAT = 7                 ; ddmm.mmm
+        .equ    NS = 15
+        .equ    LON = 16                ; dddmm.mmm
+        .equ    EW = 25
+        .equ    BLEN = 26               ; words a buffer
+        .equ    NFLD = 7                ; field 7 and on: not kept
+        ; Layout items: (count << 10) | address; bit 9: spaces, not chars;
+        ; bit 15: an instruction byte; 0: the end.
+        .equ    SP = 0x200
+        .equ    INSN = 0x8000
+
+start:  .csr    OUTGRP, GRP             ; OUT r writes D4..D7 from r[3:0]
+        .csr    INGRP, GRP              ; IN r reads them into r[3:0]
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        SETP    E, 0                    ; E low: the LCD ignores the bus
+        SETP    RS, 0
+        SETP    RW, 0                   ; write: the LCD never drives D4..D7
+        OUT     r7                      ; D4..D7 low,
+        CALL    drive                   ; and driven
+        LDI     r4, 0
+        LDI     r3, 0                   ; no error
+        LDI     r7, BOOT
+        JMP     init                    ; from power on; returns to "on"
+
+; The display on, then one drawing per published sentence.
+on:     LDI     r0, 0x0C
+        CALL    wins                    ; display on, no cursor, no blink
+wait:   WAITS   SIGB                    ; until thread 1 publishes a sentence
+        MOV16   r6, PUB
+        LD      r2, r6, 0
+        ST      r2, r6, 1               ; CUR = PUB: thread 1 keeps off it
+        MOV16   r6, LAY
+item:   LD      r7, r6, 0               ; the next layout item
+        INC     r6
+        TEST    r7, r7
+        BZ      wait                    ; the end of the layout
+        MOV     r2, r7
+        SHLI    r2, 1
+        BC      insn                    ; bit 15: an instruction
+        MOV16   r2, CUR
+        LD      r2, r2, 0
+        ADD     r7, r7, r2              ; the slot's address in the buffer shown
+ch:     MOV     r2, r7
+        SHRI    r2, 10                  ; characters left in the item
+        BZ      item
+        MOV16   r2, 0x400
+        SUB     r7, r7, r2
+        LDI     r0, ' '
+        MOV     r2, r7
+        SHRI    r2, 9
+        ANDI    r2, 1
+        BNZ     ch_put                  ; spaces: a pad, or after the field's end
+        LD      r0, r7, 0               ; the slot (address bits 8:0 of r7)
+        TEST    r0, r0
+        BNZ     ch_inc
+        MOV16   r2, SP                  ; a 0: the field ended, spaces from here
+        OR      r7, r7, r2
+        LDI     r0, ' '
+        JMP     ch_put
+ch_inc: INC     r7
+ch_put: LDI     r3, 0                   ; a failed byte does not stop the next
+        CALL    wdat
+        JMP     ch
+insn:   LDI     r3, 0
+        MOV     r0, r7
+        CALL    wins                    ; Set DDRAM address (r0[7:0])
+        JMP     item
+
+; Initializing by instruction, 4-bit interface (Figure 24, p.46).
+init:   MOV     r4, r7
+        ANDI    r4, 1                   ; the timed path?
+        SETP    RS, 0
+        MOV     r2, r7
+        ANDI    r2, 2
+        BNZ     in_warm                 ; the supply is already up
+        LDI     r1, 165
+in_pwr: DLY     250                     ; 165 * 250 us: more than 41 ms
+        DJNZ    r1, in_pwr
+in_warm: LDI    r2, 3
+        CALL    wnib                    ; function set, 8 bits (one nibble)
+        LDI     r1, 20
+in_41:  DLY     210                     ; 20 * 210 us: more than 4.18 ms
+        DJNZ    r1, in_41
+        LDI     r2, 3
+        CALL    wnib                    ; function set, 8 bits
+        DLY     102                     ; more than 101 us
+        LDI     r2, 3
+        CALL    wnib                    ; function set, 8 bits
+        DLY     T_BYTE                  ; its execution time (BF not yet usable)
+        LDI     r2, 2
+        CALL    wnib                    ; function set: 4 bits from now on
+        DLY     T_BYTE
+        LDI     r2, 0x80
+        SWAP    r2, r2
+        OR      r4, r4, r2              ; bit 15: initialized
+        MOV     r0, r7
+        ANDI    r0, 0x0C                ; N and F
+        ORI     r0, 0x20
+        CALL    wins                    ; function set 0x2n, two nibbles
+        LDI     r0, 0x08
+        CALL    wins                    ; display off
+        LDI     r0, 0x01
+        CALL    wins                    ; display clear
+        LDI     r0, 0x06
+        CALL    wins                    ; entry mode: increment, no shift
+        JMP     on                      ; the display
+
+; ---------------------------------------------------------------------------
+; Thread 1: the UART receiver (uart_rx.loom's slow entry: the start bit
+; sampled OVS / 2 ticks after its edge, then every OVS ticks), then the
+; parser on each good character, before the next start bit.
+; ---------------------------------------------------------------------------
+        .thread 1
+        .tick   16                      ; the shortest tick the pairs are proved for
+rx:     LDI     r4, 0x30                ; idle until a '$'
+rearm:  LDI     r2, 0x80                ; a received 1 enters at bit 7
+        WAITP   RX, 0                   ; start bit (or already low)
+        SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; middle of the start bit
+        JP      RX, 1, rearm            ; high again: a glitch, not a start bit
+        LDI     r0, 0
+        LDI     r1, 8
+bit:    WAITD   OVS                     ; middle of the next data bit
+        JP      RX, 1, one              ; sample
+        SHRI    r0, 1                   ; a 0 enters at bit 7
+        DJNZ    r1, bit
+        JMP     stop
+one:    SHRI    r0, 1
+        OR      r0, r0, r2
+        DJNZ    r1, bit
+stop:   WAITD   OVS                     ; middle of the stop bit
+        JP      RX, 1, got              ; high: a good frame
+        LDI     r4, 0x30                ; low: framing error, the sentence dropped
+        WAITP   RX, 1                   ; wait for the line to return to idle
+        JMP     rearm
+
+; The parser. A character in a field: XOR it into the sum, keep it if its
+; field has a slot with room.
+got:    CMPI    r0, '$'
+        BZ      begin                   ; a new sentence, whatever came before
+        CMPI    r4, 0x20
+        BC      tail                    ; idle, or the checksum digits
+        CMPI    r0, '*'
+        BZ      star
+        CMPI    r0, 0x20
+        BNC     abort                   ; CR, LF or noise before '*': cut short
+        XOR     r3, r3, r0
+        CMPI    r0, ','
+        BZ      comma
+        CMP     r5, r6
+        BZ      rearm                   ; the slot is full, or there is none
+        ST      r0, r5, 0
+        INC     r5
+        JMP     rearm
+
+; A comma ends field r4: a 0 after it if it is shorter than its slot, the
+; type test after field 0, then the next field's slot from the table.
+comma:  CMP     r5, r6
+        BZ      c_next
+        LDI     r1, 0
+        ST      r1, r5, 0               ; the end of a short field
+c_next: TEST    r4, r4
+        BZ      c_type                  ; the address field: RMC?
+c_adv:  CMPI    r4, NFLD
+        BC      rearm                   ; field 7 on: nothing is kept
+        INC     r4
+        MOV16   r1, TBL
+        ADD     r1, r1, r4
+        LD      r5, r1, 0               ; the slot's start,
+        LD      r6, r1, 8               ; and its end
+        ADD     r5, r5, r7
+        ADD     r6, r6, r7
+        JMP     rearm
+
+; '*': the fields end; at least seven commas (through E/W), or dropped.
+star:   CMPI    r4, NFLD
+        BNZ     abort
+        LDI     r4, 0x20                ; the first checksum digit next
+        JMP     rearm
+abort:  LDI     r4, 0x30                ; dropped: idle until the next '$'
+        JMP     rearm
+
+; The checksum digits (r4 = 0x20, 0x21), or idle (0x30).
+tail:   CMPI    r4, 0x30
+        BC      rearm                   ; idle: wait for '$'
+        SUBI    r0, '0'
+        BNC     abort                   ; below '0'
+        CMPI    r0, 10
+        BNC     t_val                   ; 0-9
+        SUBI    r0, 'A' - '0' - 10
+        CMPI    r0, 10
+        BNC     abort                   ; between '9' and 'A'
+        CMPI    r0, 16
+        BC      abort                   ; above 'F' (lower case included)
+t_val:  CMPI    r4, 0x20
+        BNZ     t_lo
+        SHLI    r0, 4                   ; the high digit first
+        XOR     r3, r3, r0
+        INC     r4
+        JMP     rearm
+t_lo:   LDI     r4, 0x30                ; the sentence ends here, good or not
+        XOR     r3, r3, r0
+        BNZ     rearm                   ; the sum and the digits differ: dropped
+        LD      r1, r7, STAT
+        LDI     r2, 'A'
+        CMP     r1, r2
+        BZ      publish                 ; a valid fix
+        LDI     r1, 0                   ; V (or anything else): no position
+        ST      r1, r7, LAT
+        ST      r1, r7, NS
+        ST      r1, r7, LON
+        ST      r1, r7, EW
+publish: MOV16  r1, PUB
+        ST      r7, r1, 0               ; PUB = this buffer,
+        SIG     SIGB                    ; and wake thread 0
+        JMP     rearm
+
+; ---------------------------------------------------------------------------
+; The spill: from here on thread 1's code sits in thread 2's quarter, 0x100
+; on, then the three buffers. Thread 2 must not be started with this image.
+; ---------------------------------------------------------------------------
+        .org    0x100
+
+; '$': the work buffer is the one of the three that is neither PUB nor CUR
+; (their sum is buf0 + buf1 + buf2), or the one after PUB if they are equal.
+begin:  MOV16   r1, PUB
+        LD      r2, r1, 0               ; PUB
+        LD      r1, r1, 1               ; CUR
+        CMP     r1, r2
+        BZ      b_one
+        ADD     r1, r1, r2
+        MOV16   r7, 3 * buf0 + 3 * BLEN
+        SUB     r7, r7, r1
+        JMP     b_go
+b_one:  MOV     r7, r2
+        ADDI    r7, BLEN
+        MOV16   r1, buf0 + 3 * BLEN
+        CMP     r7, r1
+        BNZ     b_go
+        MOV16   r7, buf0                ; past the last: the first
+b_go:   LDI     r3, 0                   ; the sum starts after '$'
+        LDI     r4, 0                   ; field 0, the address field,
+        MOV16   r5, SCR                 ; kept in SCR (six slots: five and
+        MOV16   r6, SCR + 6             ; a sixth to see a longer one)
+        JMP     rearm
+
+; The address field: exactly five characters, the last three RMC.
+c_type: MOV16   r1, SCR
+        SUB     r2, r5, r1
+        CMPI    r2, 5
+        BNZ     abort
+        LD      r2, r1, 2
+        LDI     r0, 'R'
+        CMP     r2, r0
+        BNZ     abort
+        LD      r2, r1, 3
+        LDI     r0, 'M'
+        CMP     r2, r0
+        BNZ     abort
+        LD      r2, r1, 4
+        LDI     r0, 'C'
+        CMP     r2, r0
+        BNZ     abort
+        JMP     c_adv
+
+; The three buffers (BLEN words each: TIME, STAT, LAT, NS, LON, EW).
+buf0:   .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+buf1:   .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+buf2:   .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+; ---------------------------------------------------------------------------
+; Thread 0's spill, in thread 3's quarter, 0x180 on (see "Memory" above).
+; Thread 3 must not be started with this image.
+; ---------------------------------------------------------------------------
+        .thread 0                       ; back to thread 0's section
+        .org    0x180
+; ---------------------------------------------------------------------------
+; wins, wdat: send the byte r0[7:0] as an instruction (RS = 0) or as data
+; (RS = 1), high nibble first (p.22), then wait until the LCD is ready:
+; the busy-flag poll, or the timed wait. Keeps r0. Skips everything if an
+; earlier byte of the operation failed (r3 bit 15).
+; ---------------------------------------------------------------------------
+wins:   SETP    RS, 0
+        LDI     r5, 0
+        JMP     wbyte
+wdat:   SETP    RS, 1
+        LDI     r5, 1
+wbyte:  MOV     r2, r3
+        SHLI    r2, 1
+        BC      wb_ret                  ; the operation has failed already
+        MOV     r2, r0
+        SHRI    r2, 4
+        CALL    wnib                    ; D7..D4 of the byte
+        MOV     r2, r0
+        CALL    wnib                    ; D3..D0 (OUT takes bits 3:0)
+        MOV     r2, r4
+        ANDI    r2, 1
+        BZ      bfpoll                  ; R/W wired: read the busy flag
+        TEST    r5, r5
+        BNZ     wb_short                ; data: 37 us
+        MOV     r2, r0
+        SHLI    r2, 8
+        SHRI    r2, 10                  ; byte >> 2 (the byte alone)
+        BNZ     wb_short                ; not Clear display or Return home
+        LDI     r1, N_LONG
+wb_long: DLY    T_LONG
+        DJNZ    r1, wb_long
+wb_ret: RET
+wb_short: DLY   T_BYTE
+        RET
+
+; wnib: one nibble, r2[3:0] on D4..D7, RS and R/W already set. E rises
+; more than a tick after the data is set, stays high one tick, and falls;
+; nothing else changes in that slot.
+wnib:   SETD    1
+        OUT     r2
+        WAITD   1                       ; more than a tick: t_AS, t_DSW
+        SETP    E, 1
+        WAITD   1                       ; PW_EH
+        SETP    E, 0                    ; the LCD takes D4..D7 here
+        RET
+
+; ---------------------------------------------------------------------------
+; bfpoll: read the busy flag and the address counter (RS = 0, R/W = 1, two
+; nibbles: Figure 9, p.22) until BF = 0, at most BFMAX times. Returns r3 =
+; AC (bits 6:0), or 0x8100 if the flag never cleared. D4..D7 are driven
+; again on return.
+; ---------------------------------------------------------------------------
+bfpoll: CALL    release                 ; D4..D7 to the LCD
+        SETP    RS, 0
+        SETP    RW, 1                   ; read: the LCD drives while E is high
+        MOV16   r1, BFMAX
+bf_lp:  SETD    1
+        WAITD   1                       ; more than a tick since R/W or E fell
+        SETP    E, 1
+        WAITD   1                       ; t_DDR <= 360 ns: valid by now
+        IN      r3                      ; BF, AC6, AC5, AC4
+        SETP    E, 0
+        WAITD   1
+        SETP    E, 1
+        WAITD   1
+        IN      r2                      ; AC3..AC0
+        SETP    E, 0
+        SHLI    r3, 4
+        OR      r3, r3, r2              ; BF and AC in bits 7:0
+        MOV     r2, r3
+        SHRI    r2, 7                   ; BF
+        BZ      bf_end                  ; ready
+        DJNZ    r1, bf_lp
+        LDI     r3, 0x81                ; never ready: report 0x1
+        SWAP    r3, r3                  ; 0x8100
+bf_end: DLY     2                       ; E low more than a tick (t_DHR)
+        SETP    RW, 0                   ; then back to write,
+                                        ; and fall through to drive D4..D7
+
+; drive, release: the output enables of D4..D7, one pin at a time (OEP
+; touches only its pin, so another thread's BIDIR pins keep theirs).
+drive:  OEP     D4, 1
+        OEP     D5, 1
+        OEP     D6, 1
+        OEP     D7, 1
+        RET
+release: OEP    D4, 0
+        OEP     D5, 0
+        OEP     D6, 0
+        OEP     D7, 0
+        RET
+
+
+; Shared words, after the code: PUB (written by thread 1 only) and CUR
+; (thread 0 only), the buffer's addresses; SCR, thread 1's address field.
+PUB:    .word   buf0
+CUR:    .word   buf0                    ; PUB + 1
+SCR:    .word   0, 0, 0, 0, 0, 0
+; The field table: entry f, the slot of field f (start; end eight words on).
+TBL:    .word   0, TIME, STAT, LAT, NS, LON, EW, 0
+        .word   0, STAT, LAT, NS, LON, EW, BLEN, 0
+; The layout: row 0 "hhmmss lat N", row 1 "S     lon E".
+LAY:    .word   INSN | 0x80, (6 << 10) | TIME, (1 << 10) | SP
+        .word   (8 << 10) | LAT, (1 << 10) | NS
+        .word   INSN | 0xC0, (1 << 10) | STAT, (5 << 10) | SP
+        .word   (9 << 10) | LON, (1 << 10) | EW, 0
