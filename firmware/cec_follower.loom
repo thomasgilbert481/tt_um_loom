@@ -1,0 +1,281 @@
+; cec_follower.loom
+; An HDMI-CEC follower at logic level, on one open-drain wire: it receives
+; every frame on the bus, checks the start bit's and every data bit's
+; timing, keeps the frames sent to its logical address or broadcast,
+; acknowledges each block of a frame sent to it by stretching the ACK bit
+; to a 0, on time, and reports every kept frame, and every error, to OUTQ.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): CEC is in no design document.
+; Hardware used: the M2 core only, plus the data memory of M3 slice B for
+; the frame buffer: an open-drain BIDIR pin (OD_MASK, built for I2C), the
+; timed waits with their timeout (WAITP ... T, built for I2C's clock
+; stretching), NOW and TD, the tick restart on a TICK_INT write (built so
+; a UART receiver can synchronise to its start bit), the FIFOs, LD and ST.
+; No hardware knows CEC: the start bit's two windows, the sample point,
+; the bit period limits, the blocks with EOM and ACK, the address filter
+; and the ACK itself are firmware. It is weaker than a dedicated CEC
+; controller in two ways: it measures each bit with three timed waits, so
+; a glitch between them is not seen, and it does not answer a frame that
+; follows its report too closely (below); see firmware/README.md.
+;
+; Pin: CEC = BIDIR1, open drain (OD_MASK bit 1). The program only pulls the
+; line low or lets it go; the pull-up makes the high level. An initiator on
+; the same chip (cec_initiator.loom, thread 0) has its own pin, BIDIR0, and
+; the board wires the two into one bus.
+;
+; Sources: the figures and the windows of cec_initiator.loom's header
+; (HDMI 1.3a Supplement 1, not read; the bit timings checked on 2026-11-06
+; against the Linux kernel's drivers/media/cec/core/cec-pin.c, the rest
+; unchecked). A follower's own rules:
+;   sample      a data bit is the line 1.05 ms after its fall
+;   ACK         for a block of a frame sent to its own address the follower
+;               holds the ACK bit low for the 1.5 ms of a 0 from its fall;
+;               for a broadcast it would hold it low to reject the frame,
+;               which this follower never does
+;   errors      the specification has a follower ignore a frame with a bit
+;               outside its windows; this one reports it, as the Linux
+;               kernel's cec-pin framework does
+;
+; Host words (INQ[1]). Once, before anything else:
+;   word 1   this follower's logical address, bits 3:0 (0 to 14: 15 is the
+;            broadcast address and no device's own)
+; Report (OUTQ[1]), for every frame sent to it or broadcast, and for every
+; frame that ended in an error before its header was complete:
+;   status   4:0 the blocks received (header included, at most 16); 5
+;            BCAST, the header's destination is 15; 6 DIRECT, it is this
+;            follower's address (every block ACKed); 7 SHORT, a bit period
+;            shorter than 2.05 ms; 8 LONG, a data bit still low 1.8 ms after
+;            its fall (a 0 is at most 1.7 ms); 9 NOEOM, the line stayed
+;            high for 2.85 ms inside a block, or after a block whose EOM
+;            was 0 (the frame ended without its EOM); 10 OVERFLOW, more
+;            than 16 blocks (the rest were followed and not kept); 15:11 0
+;   data     ceil(blocks / 2) words, the header byte first in 15:8, the
+;            next in 7:0 (an odd last byte in 15:8, 7:0 = 0)
+; A frame for another follower is followed to its end and not reported.
+; After SHORT or LONG it stops at that bit and waits for the line to idle.
+; The report is pushed after the frame, and the PUSHes wait for room: a
+; host that leaves OUTQ full holds the follower, which then misses frames.
+; The next frame cannot start for 3 bit periods (7.2 ms, the shortest
+; signal free time), which is the host's time to take a report of up to
+; nine words.
+;
+; Timing, in ticks of 50 us (48 ticks a bit). Every fall restarts the tick
+; grid (a TICK_INT write), so every time below is from the fall, late by
+; the fall's detection, 2 to 6 clocks, plus two slots:
+;   start bit   still low at 69 ticks (3.45 ms) and high by 79 (3.95 ms);
+;               the next fall not before 85 (4.25 ms) and by 95 (4.75 ms).
+;               The specification's windows are 3.5 to 3.9 and 4.3 to 4.7;
+;               each is widened by one tick for the 50 us grid. A low that
+;               fails is not a start bit and is ignored
+;   data bit    sampled at 21 (1.05 ms); LONG if still low at 36 (1.8 ms);
+;               SHORT if the next fall comes before 41 (2.05 ms); no next
+;               fall by 57 (2.85 ms, the specification's 2.75 widened by two
+;               ticks) is the end of the frame
+;   ACK         the follower pulls the line low two slots after it sees the
+;               ACK bit's fall (the initiator holds it low then for 0.6 ms
+;               in any case) and lets go at 30 ticks (1.5 ms)
+;
+; Rate: as cec_initiator.loom, the host writes TICK_INT and TICK_FRAC
+; before RUN, 50 us (2500 at 50 MHz); the RTL tests run 32 clocks a tick.
+;
+; Memory: 153 words: thread 1's quarter, 0x080 to 0x0FF, and 0x100 to
+; 0x118 in thread 2's; the frame buffer, 16 words, at 0x1F0 to 0x1FF in thread 3's
+; (one block a word, the byte in 7:0). Threads 2 and 3 must not run.
+;
+; Registers: r0 the own address, r1 the frame's flags (bit 0 BCAST, 1
+; DIRECT, 2 SHORT, 3 LONG, 4 NOEOM, 5 OVERFLOW: the status bits 5 to 10),
+; r2 the buffer pointer, r3 the bit counter and scratch, r4 the shifter,
+; r5 the ACK state (0, 1 drive the next bit, 2 driving this one), r6 NOW
+; at the last fall (TICK_INT while a fall is awaited), r7 scratch and
+; rxt's result (0 a bit started, 4 SHORT, 8 LONG, 16 no next bit).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .tick   32                      ; the fastest tick proved
+        .equ    CECPIN = 1              ; BIDIR1
+        .pins   CEC = CECPIN
+        .equ    CECBIT = 1 << CECPIN    ; its bit in OD_MASK
+        .equ    BUF = 0x1F0             ; the frame, one block a word
+        .equ    ST_MIN = 69             ; in ticks of 50 us from the fall
+        .equ    ST_MAX = 79
+        .equ    SP_MIN = 85
+        .equ    SP_MAX = 95
+        .equ    SAMPLE = 21
+        .equ    LO0 = 30
+        .equ    LONG = 36
+        .equ    MINP = 41
+        .equ    MAXP = 57
+        .equ    F_BCAST = 1             ; r1, the frame's flags
+        .equ    F_DIRECT = 2
+        .equ    E_NOEOM = 16
+        .equ    E_OVER = 32
+        .equ    NONE = 16               ; rxt: no next bit
+
+; OD_MASK first, read back three slots later (BUGS 14, dht22_host.loom).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, CECBIT
+        CSRW    OD_MASK, r7             ; CEC open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, CECBIT
+        BZ      start                   ; lost to the other thread's write
+        SETP    CEC, 1                  ; let go of the line
+        LDI     r7, (1 << 5) | CECPIN
+        CSRW    INGRP, r7               ; IN reads CEC into bit 0
+        POP     r0                      ; the own logical address
+        LDI     r5, 0
+
+; Idle: a fall that may be a start bit.
+idle:   WAITP   CEC, 1                  ; the line is high (unbounded)
+        CSRR    r6, TICK_INT
+        WAITP   CEC, 0                  ; a fall (unbounded)
+        CSRW    TICK_INT, r6            ; the tick grid restarts at the fall
+        SETD    0
+        CSRR    r6, NOW                 ; F
+        WAITD   ST_MIN
+        JP      CEC, 1, idle            ; high already: too short
+        SETD    ST_MAX - ST_MIN
+        WAITP   CEC, 1, T
+        BT      idle                    ; still low: too long
+        MOV     r7, r6
+        ADDI    r7, 63
+        ADDI    r7, SP_MIN - 63
+        CSRW    TD, r7
+        WAITP   CEC, 0, T
+        BNT     idle                    ; the next fall came too soon
+        ADDI    r7, SP_MAX - SP_MIN
+        CSRW    TD, r7
+        CSRR    r6, TICK_INT
+        WAITP   CEC, 0, T
+        BT      idle                    ; no first bit: not a frame
+        CSRW    TICK_INT, r6            ; the first data bit's fall
+        SETD    0
+        CSRR    r6, NOW
+
+; A frame: blocks of 8 bits, EOM, ACK.
+        LDI     r1, 0
+        LDI     r5, 0                   ; no ACK pending from a broken frame
+        MOV16   r2, BUF
+block:  LDI     r3, 8
+        LDI     r4, 0
+dbit:   CALL    rxs
+        CALL    rxt
+        CMPI    r7, 0
+        BNZ     err                     ; SHORT, LONG, or the frame stopped
+        DJNZ    r3, dbit
+        CALL    rxs                     ; EOM, the byte now in 8:1
+        MOV16   r7, BUF
+        CMP     r2, r7
+        BNZ     ackdec                  ; not the header
+        MOV     r7, r4
+        SHRI    r7, 1
+        ANDI    r7, 15                  ; the destination
+        CMPI    r7, 15
+        BNZ     h_own
+        ORI     r1, F_BCAST
+h_own:  CMP     r7, r0
+        BNZ     ackdec
+        ORI     r1, F_DIRECT
+ackdec: MOV     r7, r1
+        ANDI    r7, F_DIRECT
+        BZ      ackbit                  ; not ours to acknowledge
+        LDI     r5, 1                   ; drive the ACK bit at its fall
+ackbit: CALL    rxt
+        CMPI    r7, 0
+        BNZ     err
+        CALL    rxs                     ; the ACK bit, as the line shows it
+        CALL    rxt                     ; r7: 0 the next block, NONE the end
+        MOV     r3, r2
+        SHRI    r3, 9                   ; the pointer has reached 0x200:
+        BNZ     b_over                  ; 16 blocks kept already
+        MOV     r3, r4
+        SHRI    r3, 2                   ; the byte (r4 = byte, EOM, ACK)
+        ST      r3, r2, 0
+        ADDI    r2, 1
+        JMP     b_next
+b_over: ORI     r1, E_OVER
+b_next: MOV     r3, r4
+        ANDI    r3, 2
+        BNZ     report                  ; EOM: the frame is complete
+        CMPI    r7, 0
+        BZ      block                   ; the next block has started
+err:    OR      r1, r1, r7              ; SHORT, LONG, or NONE = NOEOM
+
+; The report: kept when the header is incomplete, or addressed here or to all.
+report: MOV16   r7, BUF
+        SUB     r3, r2, r7              ; the blocks kept
+        BZ      r_go
+        MOV     r7, r1
+        ANDI    r7, F_BCAST | F_DIRECT
+        BZ      idle                    ; another follower's frame
+r_go:   MOV     r7, r1
+        SHLI    r7, 5
+        OR      r7, r7, r3
+        PUSH    r7                      ; the status
+        MOV16   r2, BUF
+r_word: CMPI    r3, 0
+        BZ      idle
+        LD      r7, r2, 0
+        SWAP    r7, r7                  ; the first byte in 15:8
+        ADDI    r2, 1
+        DEC     r3
+        BZ      r_push
+        LD      r4, r2, 0
+        OR      r7, r7, r4              ; the second in 7:0
+        ADDI    r2, 1
+        DEC     r3
+r_push: PUSH    r7
+        JMP     r_word
+
+; rxs: the sample. TD is the bit's fall F; waits to F + 1.05 ms and shifts
+; the line into r4 bit 0.
+rxs:    WAITD   SAMPLE
+        IN      r7
+        SHLI    r4, 1
+        OR      r4, r4, r7
+        RET
+
+; rxt: the rest of the bit and the next fall. Releases the ACK at 1.5 ms if
+; it drives this bit, checks the bit is high by LONG and that no fall comes
+; before MINP, then waits for the next fall until MAXP. At the fall it
+; restarts the tick grid, drives the ACK low if asked (r5 = 1), sets TD and
+; r6 to the fall and returns r7 = 0; otherwise r7 = 4 (SHORT), 8 (LONG) or
+; NONE.
+rxt:    CMPI    r5, 2
+        BNZ     rxt_h
+        WAITD   LO0 - SAMPLE            ; 1.5 ms after the fall
+        SETP    CEC, 1                  ; the ACK's 0 ends
+        LDI     r5, 0
+rxt_h:  MOV     r7, r6
+        ADDI    r7, LONG
+        CSRW    TD, r7
+        WAITP   CEC, 1, T
+        BT      rxt_lo                  ; still low at 1.8 ms
+        ADDI    r7, MINP - LONG
+        CSRW    TD, r7
+        WAITP   CEC, 0, T
+        BNT     rxt_sh                  ; a fall before 2.05 ms
+        ADDI    r7, MAXP - MINP
+        CSRW    TD, r7
+        CSRR    r6, TICK_INT
+        WAITP   CEC, 0, T
+        BT      rxt_no                  ; no next bit by 2.85 ms
+        CSRW    TICK_INT, r6            ; the tick grid restarts at the fall
+        CMPI    r5, 1
+        BNZ     rxt_s
+        SETP    CEC, 0                  ; the ACK: hold the bit low
+        LDI     r5, 2
+rxt_s:  SETD    0
+        CSRR    r6, NOW
+        LDI     r7, 0
+        RET
+rxt_lo: LDI     r7, 8
+        JMP     rxt_e
+rxt_sh: LDI     r7, 4
+        JMP     rxt_e
+rxt_no: LDI     r7, NONE
+rxt_e:  SETD    0                       ; an anchor on the way out: the
+        RET                             ; caller stops at r7 != 0, which
+                                        ; the deadline checker cannot see

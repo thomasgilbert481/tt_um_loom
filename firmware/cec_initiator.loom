@@ -1,0 +1,272 @@
+; cec_initiator.loom
+; An HDMI-CEC initiator at logic level, on one open-drain wire: it sends
+; the messages the host gives it (a header block with its own and the
+; destination's logical address, then up to 15 data blocks: the opcode and
+; its operands), after the signal free time, with CEC's bitwise
+; arbitration (it stops at the first 1 it sends that reads back 0 and
+; reports the loss), checks the follower's ACK in every block, and
+; retransmits a NACKed message up to 5 times.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): CEC is in no design document.
+; Hardware used: the M2 core only, plus the data memory of M3 slice B for
+; the message buffer: an open-drain BIDIR pin (OD_MASK, built for I2C), the
+; timed waits and NOW, the FIFOs, LD and ST (built for device emulation,
+; the 24C02). No hardware knows CEC: the bit coding by the low time, the
+; start bit, the blocks with EOM and ACK, the signal free time, the
+; arbitration by reading back every 1 it sends and the retransmission are
+; firmware. It is weaker than a dedicated CEC controller in one way: it
+; reads its own bits once, at the follower's sample point, and does not
+; watch the line between samples for a second initiator's glitch; see
+; firmware/README.md.
+;
+; Pin: CEC = BIDIR0, open drain (OD_MASK bit 0). The program only pulls the
+; line low or lets it go; the board's pull-up (27 kOhm to 3.3 V in the
+; specification, inside the sink) makes the high level. A follower on the
+; same chip (cec_follower.loom, thread 1) has its own pin, BIDIR1, and the
+; board wires the two pins into one bus: two threads never share a pin as
+; a wired-AND (SEMANTICS 3, 6.3).
+;
+; Sources. HDMI Specification 1.3a, Supplement 1 (Consumer Electronics
+; Control) was not read. On 2026-11-06 the bit timings below were checked
+; against the Linux kernel's CEC pin framework
+; (drivers/media/cec/core/cec-pin.c, CEC_TIM_START_BIT_LOW 3700 (3500 to
+; 3900), _START_BIT_TOTAL 4500 (4300 to 4700), _DATA_BIT_0_LOW 1500 (1300
+; to 1700), _DATA_BIT_1_LOW 600 (400 to 800), _DATA_BIT_TOTAL 2400 (2050
+; to 2750), _DATA_BIT_SAMPLE 850, the earliest safe sample): all agree.
+; On 2026-11-07 the signal free times were checked against
+; include/media/cec.h (CEC_SIGNAL_FREE_TIME_RETRY 3, _NEW_INITIATOR 5,
+; _NEXT_XFER 7 bit periods): they agree. Director's decision on the
+; retransmission limit: keep 5 retransmissions, the reading of the 1.3a
+; supplement this program targets; Linux's cec-adap.c uses 4 attempts in
+; all, citing a CEC 2.0 suggestion, so a CEC 2.0 build would set
+; RETRIES = 3. The frame, ACK and arbitration rules stay unchecked:
+;   start bit   low 3.7 ms (3.5 to 3.9), period 4.5 ms (4.3 to 4.7)
+;   data bit    period 2.4 ms (2.05 to 2.75); a 0 is low 1.5 ms (1.3 to
+;               1.7), a 1 is low 0.6 ms (0.4 to 0.8); a follower samples
+;               at 1.05 ms (0.85 to 1.25)
+;   frame       start bit, header block, data blocks; a block is 8 bits,
+;               most significant first, then EOM (1 in the last block) and
+;               ACK; the header's bits 7:4 are the initiator's logical
+;               address, 3:0 the destination's (15 = broadcast)
+;   ACK         the initiator sends a 1 and a follower stretches it to a 0
+;               to acknowledge a directly addressed block; for a broadcast
+;               the sense is inverted: a 0 is a follower's NACK
+;   signal free time  the line idle for 3 bit periods before a
+;               retransmission, 5 before a new initiator's frame, 7 before
+;               the present initiator's next frame
+;   arbitration  every initiator watches the line; one that reads 0 where
+;               it sent a 1 has lost and stops driving
+;   retransmission  up to 5 times after a NACK
+;
+; Host words (INQ[0]). Once, before anything else:
+;   word 1   this initiator's logical address, bits 3:0
+; Then any number of messages:
+;   word A   11:8 the destination's logical address (15 = broadcast), 3:0
+;            n, the number of data blocks (0 is a polling message, the
+;            header alone; at most 15); the other bits 0
+;   data     ceil(n / 2) words, the first byte in 15:8, the second in 7:0
+;            (an odd last byte in 15:8)
+; Report (OUTQ[0]), one word a message:
+;   1:0      1 ACKED (every block acknowledged), 2 NACKED (still NACKed
+;            after 5 retransmissions), 3 LOST (arbitration lost: nothing
+;            more was driven, nothing is retried, the host decides)
+;   7:4      the block the last attempt ended in (0 is the header): the
+;            last block for ACKED, the NACKed block, the block it lost in
+;   10:8     the retransmissions made, 0 to 5
+;   other bits 0
+; The report is one PUSH, which waits for room: a host that leaves OUTQ
+; full holds the initiator between messages, never inside one.
+;
+; Timing, in ticks of 50 us (48 ticks a bit). Every edge is the slot after
+; its tick, so each low time and bit period is exact to the slot grid's
+; 0..3 clocks, and the start of a bit follows the end of the one before by
+; a whole number of ticks:
+;   start bit  low 74 ticks (3.70 ms), period 90 (4.50 ms)
+;   a 0        low 30 (1.50 ms), period 48 (2.40 ms)
+;   a 1        low 12 (0.60 ms), period 48; read back 21 ticks (1.05 ms)
+;              after the fall, the follower's sample point, which is also
+;              where a follower's ACK and a second initiator's 0 are surely
+;              on the line
+;   free time  the line high, polled once a tick, for 7 bit periods (336
+;              ticks) before every new message and 3 (144) before a
+;              retransmission. Seven is the specification's figure for the
+;              present initiator's next frame and is longer than the 5 a new
+;              initiator needs, so it is used for the first message too:
+;              the specification's times are minimums. After its own frame
+;              the count starts at the end of the last bit period, as the
+;              specification counts; after another initiator's frame it
+;              starts when the line is first seen high, which is later
+;              than that period's end by up to 1.8 ms. The count's anchor
+;              (SETD 1) and one more tick before the fall, so that the start
+;              bit's fall is the slot after a tick like every other edge,
+;              add two ticks: the free time is 7 or 3 bit periods and 0.1
+;              ms (measured 3.04 periods), never less
+;
+; Rate: the host writes TICK_INT and TICK_FRAC before RUN, 50 us: at 50 MHz
+; TICK_INT 2500, TICK_FRAC 0. The RTL tests run a faster tick, 32 clocks,
+; with every time in the bus model scaled with it; the program counts in
+; ticks, so only the speed changes. The deadline checker proves the
+; schedule for ticks of 32 clocks or more (.tick below; the idle poll is 3
+; slots a tick).
+;
+; Memory: 114 words of code in thread 0's quarter, 0x000 to 0x071; the
+; message buffer, 16 words, at 0x1E0 to 0x1EF in thread 3's quarter (one
+; block a word, the byte in bits 15:8). Thread 1 may run
+; cec_follower.loom beside it; threads 2 and 3 must not run.
+;
+; Registers: r0 the own address in 15:12, r1 the destination (3:0), r2 the
+; bit counter and scratch, r3 the buffer pointer of the block being sent,
+; r4 the bit shifter (the next bit in 15), r5 the pointer of the last
+; block, r6 the retransmissions, r7 scratch, the bit's result and the
+; `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .tick   32                      ; the fastest tick proved (header)
+        .equ    CECPIN = 0              ; BIDIR0
+        .pins   CEC = CECPIN
+        .equ    CECBIT = 1 << CECPIN    ; its bit in OD_MASK
+        .equ    BUF = 0x1E0             ; the message, one block a word
+        .equ    START_LO = 74           ; in ticks of 50 us
+        .equ    BIT = 48
+        .equ    LO0 = 30
+        .equ    LO1 = 12
+        .equ    SAMPLE = 21
+        .equ    END = 32                ; where txbit returns, after LO0
+        .equ    SFT_NEW = 7 * BIT       ; signal free time, new message
+        .equ    SFT_RETRY = 3 * BIT     ; and before a retransmission
+        .equ    RETRIES = 5
+        .equ    R_ACK = 1
+        .equ    R_NACK = 2
+        .equ    R_LOST = 3
+
+; OD_MASK first, read back three slots later (BUGS 14, dht22_host.loom):
+; another thread's read-modify-write of OD_MASK can overwrite this one.
+start:  CSRR    r7, OD_MASK
+        ORI     r7, CECBIT
+        CSRW    OD_MASK, r7             ; CEC open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, CECBIT
+        BZ      start                   ; lost to the other thread's write
+        SETP    CEC, 1                  ; let go of the line
+        LDI     r7, (1 << 5) | CECPIN
+        CSRW    INGRP, r7               ; IN reads CEC into bit 0
+        POP     r0                      ; the own logical address
+        SHLI    r0, 12                  ; in 15:12, the header's high nibble
+
+; A message: the header and the data blocks into the buffer.
+msg:    POP     r1                      ; 11:8 the destination, 3:0 n
+        MOV16   r3, BUF
+        MOV     r5, r1
+        ANDI    r5, 15
+        ADD     r5, r5, r3              ; the pointer of the last block
+        SHRI    r1, 8
+        ANDI    r1, 15                  ; the destination
+        MOV     r4, r1
+        SHLI    r4, 8
+        OR      r4, r4, r0              ; the header byte in 15:8
+        ST      r4, r3, 0
+        MOV     r2, r3
+unpack: CMP     r2, r5
+        BZ      packed
+        POP     r4                      ; two data bytes
+        ADDI    r2, 1
+        ST      r4, r2, 0               ; the first, in 15:8
+        CMP     r2, r5
+        BZ      packed
+        SWAP    r4, r4
+        ADDI    r2, 1
+        ST      r4, r2, 0               ; the second
+        JMP     unpack
+packed: LDI     r6, 0                   ; no retransmission yet
+        MOV16   r2, SFT_NEW
+
+; The signal free time: r2 ticks of idle line, counted again from the start
+; whenever the line goes low (another initiator took the bus).
+free:   WAITP   CEC, 1                  ; the line is high (unbounded)
+        SETD    1                       ; re-anchor
+        MOV     r7, r2
+fcount: WAITD   1
+        JP      CEC, 0, free            ; busy: start over
+        DJNZ    r7, fcount
+
+; The frame: the start bit, then the blocks.
+        WAITD   1                       ; so the fall is the slot after a tick
+        SETP    CEC, 0                  ; the start bit's fall
+        WAITD   START_LO
+        SETP    CEC, 1                  ; 3.7 ms; txbit's first wait ends
+                                        ; the start bit at 4.5 ms
+blk:    LD      r4, r3, 0               ; the block's byte in 15:8
+        LDI     r2, 8
+bits:   CALL    txbit
+        CMPI    r7, 1
+        BZ      lost                    ; a 1 read back 0
+        DJNZ    r2, bits
+        LDI     r4, 0                   ; EOM 0 ...
+        CMP     r3, r5
+        BNZ     eom
+        LDIH    r4, 0x80                ; ... and 1 in the last block
+eom:    CALL    txbit
+        CMPI    r7, 1
+        BZ      lost
+        LDIH    r4, 0x80                ; the ACK bit: send a 1
+        CALL    txbit                   ; r7 = 1: a follower held it low
+        CMPI    r1, 15
+        BNZ     direct
+        XORI    r7, 1                   ; broadcast: a 0 is a NACK
+direct: CMPI    r7, 1
+        BNZ     nack
+        CMP     r3, r5
+        BZ      acked
+        ADDI    r3, 1
+        JMP     blk
+
+; NACKed: retransmit after 3 bit periods of idle line, at most RETRIES times.
+nack:   CMPI    r6, RETRIES
+        BZ      gaveup
+        ADDI    r6, 1
+        WAITD   BIT - END               ; to the end of the ACK bit's period
+        MOV16   r2, SFT_RETRY
+        MOV16   r3, BUF
+        JMP     free
+
+acked:  LDI     r7, R_ACK
+        JMP     report
+lost:   LDI     r7, R_LOST              ; released since that bit's 1
+        JMP     report
+gaveup: LDI     r7, R_NACK
+report: WAITD   BIT - END               ; to the end of the last bit period
+        MOV16   r2, BUF
+        SUB     r2, r3, r2              ; the block it ended in
+        SHLI    r2, 4
+        OR      r7, r7, r2
+        MOV     r2, r6
+        SHLI    r2, 8
+        OR      r7, r7, r2
+        PUSH    r7
+        JMP     msg
+
+; txbit: one bit, the bit in r4 bit 15 (r4 shifts left). Entered with TD at
+; END ticks after the fall of the bit before (or at the start bit's
+; release, END + 16 = 48 and 74 + 16 = 90 both being bit periods); returns
+; with TD at END after this bit's fall, and r7 = 1 if it sent a 1 that read
+; back 0 (a second initiator's 0; in the ACK bit, a follower's), else 0.
+txbit:  WAITD   BIT - END
+        SETP    CEC, 0                  ; the fall
+        SHLI    r4, 1                   ; C = the bit
+        BC      tx1
+        LDI     r7, 0                   ; a 0: nothing to read back
+        WAITD   LO0
+        SETP    CEC, 1                  ; release at 1.5 ms
+        WAITD   END - LO0
+        RET
+tx1:    WAITD   LO1
+        SETP    CEC, 1                  ; release at 0.6 ms
+        WAITD   SAMPLE - LO1
+        IN      r7                      ; the line at 1.05 ms
+        XORI    r7, 1                   ; 1: it reads 0
+        WAITD   END - SAMPLE
+        RET
