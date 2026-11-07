@@ -1,0 +1,203 @@
+; microwire_host.loom
+;
+; Source caveat (director, 2026-11-07): Microchip's DS21749H was fetched
+; but its PDF is encrypted and its text could not be extracted here, so
+; every timing figure in this program, microwire_device.loom and
+; tools/protomodels/microwire.py is as recalled from that data sheet and
+; UNCHECKED (QUESTIONS for W-061 lists them). The instruction set is the
+; 93x46 family's. Decisions: x16 organisation only; a refused write is
+; reported as a ready/busy timeout.
+;
+; A Microwire host for the 93C46 serial EEPROM (Microchip 93AA46/93LC46/
+; 93C46, and the same instruction set in other vendors' 93x46 parts):
+; READ, sequential READ, WRITE, ERASE, ERAL, WRAL, EWEN and EWDS in the x16
+; organisation (ORG high: 64 words of 16 bits, six address bits), with the
+; ready/busy poll and a timeout after every instruction that starts a
+; self-timed cycle.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): Microwire is in no design
+; document. It looks like SPI and is not: chip select is active high, every
+; instruction starts with a start bit (the first 1 clocked in while CS is
+; high), the two-bit op code and the address follow, a READ answers with a
+; dummy 0 before the data, and after a write the part shows ready/busy on DO
+; once CS has gone low and high again, with no clock at all.
+; The program uses:
+;   - the bit engine in manual mode (SHO, SHI, SEMANTICS 6.9), built for the
+;     shift registers of SPI, UART and CAN: SHO puts the next instruction or
+;     data bit on DI, SHI shifts the part's DO in, MSB first, one slot each;
+;   - the deadline schedule (WAITD), so half an SK period is one tick that
+;     the host sets and the deadline checker proves at the shortest one;
+;   - JP on DO and WAITD for the ready/busy poll, counted against a timeout.
+; What the firmware does that no hardware does: the start bit and the
+; framing of each instruction, SK itself, chip select and its deselect time,
+; the dummy-bit check, sequential reads of any length, the choice of which
+; instructions carry data and which start a write cycle, and the poll.
+;
+; Pins: CS = OUT0, SK = OUT1, DI = OUT2 (the part's DI, our output), DO =
+; IN0 (the part's DO, our input). All push-pull; CS and SK idle low. The
+; ORG pin, if the board has one, is tied high (x16); x8 is not done (see
+; FW_README.md: one more address bit and 8-bit data, a second build of this
+; file, nothing new in the hardware).
+;
+; Memory: thread 0's quarter (.imem 512), 0x000..0x07F. The device program
+; (microwire_device.loom) moved to thread 1 fits beside it.
+;
+; Host commands (FIFO space, thread 0). Once after RUN: one word, the poll
+; timeout in ticks (1..65535; one poll per tick). Then per instruction:
+;     word 1  bits 8:0   the instruction as it goes on the wire, MSB first:
+;                        bit 8 the start bit (1), 7:6 the op code, 5:0 the
+;                        address, or for op code 00 the extension in 5:4
+;                        (11 EWEN, 00 EWDS, 10 ERAL, 01 WRAL) and don't-care
+;             bits 15:9  READ only: the number of words - 1 (a sequential
+;                        read of 1..128 words; the address wraps 3F -> 00)
+;     word 2  WRITE and WRAL only: the data word
+; Results (FIFO space read): READ: the words, then the status. Every other
+; instruction: one word, the status. Status bits:
+;     bit 0  timeout: DO did not go high within the timeout after a WRITE,
+;            ERASE, ERAL or WRAL (the part is still busy, or it refused the
+;            instruction because erase/write was disabled: a refused
+;            instruction never starts a cycle, so DO never shows ready)
+;     bit 1  READ: the bit before D15 was not the dummy 0 (no part, or a
+;            framing error)
+;
+; Rate (93C46 AC table; tools/protomodels/microwire.py gives the source and
+; what could not be read). One tick is half an SK period: every bit is one
+; turn of the loop
+;     SHO or SHI ; WAITD 1 ; SETP SK, 1 ; WAITD 1 ; SETP SK, 0 ; DJNZ
+; so SK is low for one tick and high for one tick. The schedule is proved
+; for 16 clocks or more (.tick below): at 50 MHz SK is then 1.56 MHz, high
+; and low 320 ns each. The 2.5..4.5 V row of the data sheet (FCLK <= 2 MHz,
+; TCKH >= 250 ns, TCKL >= 200 ns) is met from TICK_INT 16; the 1.8..2.5 V
+; row (FCLK <= 1 MHz, TCKH and TCKL >= 450 ns) from TICK_INT 24 (1.04 MHz,
+; so 28 for margin: 893 kHz); the 4.5..5.5 V row (3 MHz) is not reached.
+; With the synchroniser (SEMANTICS 3: a SETP in X cycle y moves the pad
+; from y + 2; an SHI in y reads the pad of y - 2), for tick P clocks:
+;     DI changes 2 slots after the fall: set-up P - 8 clocks before the
+;     rise (TDIS >= 50, 100 or 250 ns by row: 160 ns at P = 16, so the
+;     1.8 V row's 250 ns needs P >= 21, which its clock already asks), hold
+;     P + 8 (TDIH >= 50 .. 250 ns);
+;     DO is sampled 2 slots after the fall, the pad P + 4 clocks after the
+;     rise (TPD <= 100, 250 or 400 ns by row: 400 ns at P = 16). A
+;     dedicated host samples at the next rise, a whole period later.
+; CS rises at least one tick before the first SK rise (TCSS >= 50 .. 250
+; ns), falls after the last fall (TCSH >= 0) and stays low two ticks before
+; it rises again (TCSL >= 250 ns). The poll raises CS and samples DO one
+; tick later and then once a tick (TSV <= 100 .. 500 ns by row).
+; Between instructions, and while the result FIFO is full in a long
+; sequential read, SK stops low (the part is static; no maximum low time).
+
+; Registers: r0 the command word, r1 a loop's bit count, r2 the data, r3
+; words left in a READ, r4 the poll timeout, r5 scratch, r6 the status, r7
+; the poll count and the .csr scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   CS = OUT0, SK = OUT1, DI = OUT2, DO = IN0
+        .tick   16                      ; the shortest half SK period proved
+        .equ    IBITS = 9               ; start bit, op code, six address bits
+
+start:  SETP    CS, 0                   ; deselected
+        SETP    SK, 0                   ; SK idles low
+        SETP    DI, 0
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, NRZ
+        .csr    BE_PINS, (pin(DO) << 5) | pin(DI)
+        POP     r4                      ; the poll timeout, in ticks
+
+; ------------------------------------------------------- one instruction
+cmd:    POP     r0
+        MOV     r5, r0
+        SHRI    r5, 4
+        ANDI    r5, 15                  ; r5 = op code : extension (4 bits)
+        MOV     r7, r5
+        SHRI    r7, 2                   ; r7 = op code
+        CMPI    r7, 1
+        BZ      getd                    ; 01 WRITE carries data
+        CMPI    r5, 1
+        BNZ     go                      ; 00 01 WRAL carries data too
+getd:   POP     r2
+go:     SETP    CS, 1                   ; selected: the start bit may follow
+        MOV     r6, r0
+        SHLI    r6, 16 - IBITS          ; the start bit to SR[15]
+        LDSR    r6
+        LDI     r1, IBITS
+        CALL    send                    ; SB, OP, A5..A0 (first rise a tick on)
+        LDI     r6, 0                   ; the status
+        CMPI    r5, 8
+        BNC     lo                      ; op code 0x
+        CMPI    r5, 12
+        BC      poll                    ; 11 ERASE: no data, a write cycle
+
+; 10 READ: the dummy 0, then words, each 16 bits MSB first, for as long as
+; SK runs (sequential read): the part moves to the next address itself.
+        LDI     r1, 1
+        CALL    recv                    ; the dummy bit
+        STSR    r3
+        ANDI    r3, 1
+        BZ      rd_ok
+        LDI     r6, 2                   ; not the dummy 0
+rd_ok:  MOV     r3, r0
+        SHRI    r3, 9
+        ADDI    r3, 1                   ; words to read: 1..128
+rd_w:   LDI     r1, 16
+        CALL    recv
+        STSR    r2
+        PUSH    r2                      ; blocks while OUTQ is full: SK waits
+        DJNZ    r3, rd_w
+        JMP     fin
+
+lo:     CMPI    r5, 4
+        BC      wr                      ; 01 WRITE
+        CMPI    r5, 1
+        BZ      wr                      ; 00 01 WRAL
+        CMPI    r5, 2
+        BZ      poll                    ; 00 10 ERAL
+        JMP     fin                     ; 00 11 EWEN, 00 00 EWDS: done
+wr:     LDSR    r2
+        LDI     r1, 16
+        CALL    send                    ; D15..D0
+
+; The self-timed cycle: deselect for two ticks (TCSL), select again with SK
+; low and no clock, and wait for DO to go high (ready), once a tick, for
+; at most r4 ticks.
+poll:   SETP    CS, 0
+        SETD    0
+        WAITD   2
+        SETP    CS, 1
+        MOV     r7, r4
+        WAITD   1                       ; TSV: status valid
+p_lp:   JP      DO, 1, fin              ; ready
+        WAITD   1
+        DJNZ    r7, p_lp
+        ORI     r6, 1                   ; still busy, or never started
+
+fin:    SETP    CS, 0                   ; end of instruction; DO floats
+        SETD    0
+        WAITD   2                       ; TCSL before the next select
+        PUSH    r6
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; send, recv: r1 SK cycles, each one tick low then one tick high. On entry
+; SK is low; on exit it is low again, after a fall, and DI holds the last
+; bit sent. send changes DI with SHO two slots after the fall (set-up P - 8
+; clocks); recv samples DO with SHI there (the pad P + 4 clocks after the
+; rise). The SETD 1 at the top makes the first low phase at least a tick.
+; ---------------------------------------------------------------------------
+send:   SETD    1
+s_bit:  SHO                             ; DI = SR[15]
+        WAITD   1                       ; low phase
+        SETP    SK, 1                   ; the part samples DI here
+        WAITD   1                       ; high phase
+        SETP    SK, 0
+        DJNZ    r1, s_bit
+        RET
+
+recv:   SETD    1
+r_bit:  SHI                             ; SR = {SR[14:0], DO}
+        WAITD   1
+        SETP    SK, 1                   ; the part puts out its next bit
+        WAITD   1
+        SETP    SK, 0
+        DJNZ    r1, r_bit
+        RET

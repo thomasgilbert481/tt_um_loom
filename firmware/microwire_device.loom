@@ -1,0 +1,245 @@
+; microwire_device.loom
+;
+; A 93C46 serial EEPROM on Microwire (the part of microwire_host.loom, x16
+; organisation): 64 words of 16 bits in data memory, READ with sequential
+; read, WRITE, ERASE, ERAL, WRAL, EWEN and EWDS, erase/write disabled at
+; power-up as on the real part, a self-timed write cycle of a length the
+; host sets, and ready/busy on DO while CS is high during and after it.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): Microwire is in no design
+; document. The program uses:
+;   - the bit engine in manual mode (SHO, SHI, SEMANTICS 6.9), built for the
+;     shift registers of SPI, UART and CAN: SHI takes the op code, address
+;     and data bits from DI, SHO puts the data out on DO, MSB first;
+;   - a BIDIR pin with its output enable (OEP), so DO is high impedance
+;     whenever the part is not talking, as a 93C46's DO is;
+;   - the data memory (LD, ST, SEMANTICS 6.11), built for device emulation
+;     (the 24C02 of i2c_slave_eeprom.loom): the 64 words are 0x180..0x1BF,
+;     in thread 3's quarter, which the host loads and dumps over IMEM;
+;   - JP on the pins, built for bit tests in protocol loops: every wait is
+;     a two-slot loop "JP CS, 0, quit ; JP SK, level, again", so the part
+;     follows SK by its levels (an edge cannot be lost or counted twice)
+;     and notices CS fall within two slots wherever it is.
+; What the firmware does that no hardware does: start-bit detection, the
+; instruction decode, the dummy bit, the address counter of a sequential
+; read, the write-enable latch, the self-timed cycle and ready/busy.
+;
+; Pins: CS = IN1, SK = IN2, DI = IN3 (inputs: the host owns them), DO =
+; BIDIR0 (push-pull while enabled, released otherwise). The ORG pin is
+; taken as tied high (x16); x8 is not done.
+;
+; Memory: thread 0's quarter (.imem 512) for the code (127 words), the
+; array at 0x180..0x1BF (word n at 0x180 + n). Moved to thread 1 it fits
+; beside microwire_host.loom on thread 0. The array image below is all
+; 0xFFFF, the erased state; the host loads its own over IMEM.
+;
+; Host command: one word after RUN, before anything else: the write cycle
+; time in units of 16 clocks (1..65535; 320 ns each at 50 MHz, so up to
+; 21 ms: the data sheet's TWC, TEC and TWL are milliseconds; tests use
+; microseconds). WRITE and ERASE store their word at once (the array
+; changes at the start of the cycle, not the end); ERAL and WRAL store the
+; 64 words first, 28 clocks each (1,792 clocks more, DO busy throughout).
+; There are no results: the host reads the array back with IMEM.
+;
+; The instruction (93C46 instruction set table, x16): CS high, then on
+; successive SK rises any number of 0s, the start bit 1, OP1 OP0 and six
+; address bits; WRITE and WRAL then take D15..D0. READ: after the A0 rise
+; DO drives the dummy 0, then D15..D0 one bit after each rise, and on
+; through the next words for as long as SK runs (the address wraps 3F ->
+; 00) until CS falls. WRITE, ERASE, ERAL and WRAL start their cycle when CS
+; falls after the instruction, if EWEN has been given since power-up or the
+; last EWDS; otherwise they are ignored and DO stays released. During the
+; cycle DO is 0 (busy) whenever CS is high; after it, DO is 1 (ready) while
+; CS is high, until CS falls. Instructions during the cycle are ignored.
+;
+; Timing (93C46 AC table; tools/protomodels/microwire.py gives the source).
+; The program follows SK, so it has no deadline pair and no tick. A pad
+; change at edge e is seen by pin_in from X cycle e+2 (SEMANTICS 3); a
+; two-slot wait loop sees it in an X cycle e+2 .. e+9. So:
+;   a bit the part puts out (OEP or SHO the slot after the loop) changes DO
+;   8 to 15 clocks after the rise, D15 of each word 12 to 19 (an LDSR goes
+;   first): 160 to 380 ns at 50 MHz. That meets the 1.8..2.5 V row's TPD
+;   <= 400 ns, not the 250 ns of 2.5..4.5 V or the 100 ns of 4.5..5.5 V;
+;   a bit it takes (SHI the slot after the loop) is DI as it was 5 to 12
+;   clocks after the rise, so the host must hold DI 12 clocks (240 ns;
+;   TDIH asks only 50 to 250 ns of the host; microwire_host.loom holds a
+;   tick and two slots);
+;   the longest stretch between two waits (from the last op-code bit to
+;   the first address bit's wait: twelve slots) must end inside the next
+;   low phase, so SK must have a period of 64 clocks or more (780 kHz).
+;   (On the model it still reads right at 56 clocks, which the worst-case
+;   synchroniser phases do not guarantee, and fails at 52.) The tests run
+;   it at 500 kHz (1 us high and low); the rating is 500 kHz,
+;   under the 1.8..2.5 V row's FCLK of 1 MHz. The part answers like a
+;   93LC46 at low Vcc;
+;   CS falling is seen within two slots, and DO is released about four
+;   slots later: about 25 clocks (500 ns), where TCZ asks 100 to 200 ns.
+;   On a board where DI and DO share one wire (three-wire Microwire) the
+;   host must wait that long before it drives the line;
+;   ready/busy follows CS within the four-slot busy loop: about 25 clocks
+;   (500 ns; TSV <= 100 .. 500 ns by row: the 1.8 V row, just).
+
+; Registers: r0 the word address (0x180 + n), r1 a loop's bit count, r2
+; data, r3 the op code then scratch, r4 the write time, r5 0x180, r6 the
+; write-enable latch, r7 the bit count of a read word and the busy count.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   CS = IN1, SK = IN2, DI = IN3, DO = BIDIR0
+        .equ    MEM = 0x180             ; the array, thread 3's quarter
+
+start:  SETP    DO, 0
+        OEP     DO, 0                   ; released
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, NRZ
+        .csr    BE_PINS, (pin(DI) << 5) | pin(DO)
+        POP     r4                      ; the write time from the host
+        MOV16   r5, MEM
+        LDI     r6, 0                   ; erase/write disabled at power-up
+
+idle:   OEP     DO, 0                   ; DO high impedance
+        SETP    DO, 0                   ; the next dummy bit
+        WAITP   CS, 1
+hunt:   JP      CS, 0, idle             ; leading 0s, then the start bit
+        JP      SK, 1, hunt
+h_hi:   JP      CS, 0, idle
+        JP      SK, 0, h_hi
+        JP      DI, 0, hunt
+        LDI     r2, 0
+        LDSR    r2
+        LDI     r1, 2
+        CALL    rx                      ; OP1 OP0
+        STSR    r3
+        LDI     r2, MEM >> 6
+        LDSR    r2                      ; six address bits make 0x180 + n
+        CMPI    r3, 2
+        BZ      read
+        LDI     r1, 6
+        CALL    rx
+        STSR    r0
+        CMPI    r3, 1
+        BZ      write
+        CMPI    r3, 3
+        BZ      erase
+        MOV     r3, r0                  ; op code 00: A5 A4 say which
+        SHRI    r3, 4
+        ANDI    r3, 3
+        CMPI    r3, 2
+        BZ      eral
+        BC      ewen                    ; 11
+        CMPI    r3, 0
+        BZ      ewds
+        LDI     r1, 16                  ; 01 WRAL
+        CALL    rx
+        STSR    r2
+        JMP     all
+
+ewen:   LDI     r6, 1
+        JMP     endcs
+ewds:   LDI     r6, 0
+endcs:  WAITP   CS, 0
+        JMP     idle
+
+eral:   MOV16   r2, 0xFFFF
+all:    WAITP   CS, 0                   ; the cycle starts when CS falls
+        CMPI    r6, 0
+        BZ      idle                    ; disabled: refused
+        MOV     r0, r5
+        LDI     r1, 64
+a_lp:   JP      CS, 1, a_hi             ; ready/busy while storing
+        OEP     DO, 0
+        JMP     a_nx
+a_hi:   OEP     DO, 1                   ; DO = 0: busy
+        NOP
+a_nx:   ST      r2, r0, 0
+        ADDI    r0, 1
+        DJNZ    r1, a_lp
+        JMP     busy
+
+erase:  MOV16   r2, 0xFFFF
+        JMP     one
+write:  LDI     r1, 16
+        CALL    rx                      ; D15..D0
+        STSR    r2
+one:    WAITP   CS, 0                   ; the cycle starts when CS falls
+        CMPI    r6, 0
+        BZ      t_idle                  ; disabled: refused
+        ST      r2, r0, 0
+busy:   MOV     r7, r4                  ; four slots a count: 16 clocks
+b_lp:   JP      CS, 1, b_hi
+        OEP     DO, 0
+        JMP     b_nx
+b_hi:   OEP     DO, 1                   ; DO = 0: busy
+        NOP
+b_nx:   DJNZ    r7, b_lp
+        SETP    DO, 1                   ; ready
+r_lp:   JP      CS, 0, r_end
+        OEP     DO, 1
+        JMP     r_lp
+r_end:  JMP     idle                    ; trampoline: JP reaches 31 words
+
+; ------------------------------------------------------------------ read
+; A5..A1 by rx; A0 inline, because the dummy 0 goes out at its rise and the
+; first word is fetched in the same bit. Each SK rise is waited for as a
+; level (SK low, then SK high: a timeout cannot lose or double an edge),
+; and each data bit is SHO two slots after the wait that sees SK high.
+; The first bit of each word fetches the next word (the address wraps in
+; the 64), the last loads it into SR.
+read:   LDI     r1, 5
+        CALL    rx                      ; A5..A1
+ra0:    JP      CS, 0, r_end
+        JP      SK, 1, ra0
+ra_hi:  JP      CS, 0, r_end
+        JP      SK, 0, ra_hi
+        OEP     DO, 1                   ; the dummy 0 (DO's register is 0)
+        SHI                             ; A0
+        STSR    r0                      ; 0x180 + n
+        LD      r2, r0, 0               ; the first word
+rd15:   JP      CS, 0, t_idle
+        JP      SK, 1, rd15
+d15_hi: JP      CS, 0, t_idle
+        JP      SK, 0, d15_hi
+        LDSR    r2
+        SHO                             ; D15
+        LDI     r7, 15
+        MOV     r3, r0
+        ADDI    r3, 1
+        ANDI    r3, 63
+        OR      r0, r3, r5              ; the next address
+        LD      r2, r0, 0               ; and its word
+rdm:    JP      CS, 0, t_idle
+        JP      SK, 1, rdm
+dm_hi:  JP      CS, 0, t_idle
+        JP      SK, 0, dm_hi
+        SHO                             ; D14..D0
+        DJNZ    r7, rdm
+        JMP     rd15
+t_idle: JMP     idle                    ; trampoline: JP reaches 31 words
+
+; ---------------------------------------------------------------------------
+; rx: shift r1 bits from DI into SR, one per SK rise (SK low, then high).
+; If CS falls first the instruction is abandoned (back to idle; the return
+; stack entry is left behind, which is harmless: it holds two and drops
+; the oldest).
+; ---------------------------------------------------------------------------
+rx:     JP      CS, 0, t_idle
+        JP      SK, 1, rx
+x_hi:   JP      CS, 0, t_idle
+        JP      SK, 0, x_hi
+        SHI
+        DJNZ    r1, rx
+        RET
+
+; ---------------------------------------------------------------------------
+; The array: 64 words in thread 3's quarter, erased (0xFFFF).
+; ---------------------------------------------------------------------------
+        .thread 3
+        .org    MEM
+mem:    .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+        .word   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
