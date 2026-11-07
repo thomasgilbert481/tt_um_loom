@@ -1,0 +1,221 @@
+; zxtape_save.loom
+; ZX Spectrum cassette saver: one block (flag byte, data from the host, the
+; XOR checksum computed here) on OUT0, as the Spectrum ROM's SA-BYTES writes
+; it to the MIC socket, with the timings taken from a table the host may
+; rewrite (the fields of a TZX "turbo speed data" block, ID 0x11).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names the
+; Spectrum tape format. It uses the deadline-latched pin write (SETP ... D,
+; SEMANTICS 6.10), built so WS2812 and UART edges land on the exact clock,
+; for every edge; the deadline register written at run time (CSRW TD, 6.6),
+; built so a receiver can time a silence, to make a wait of any length up
+; to 32767 ticks land on one exact tick; the data memory (LD, 6.11), built
+; for device emulation, for the timing table; and the FIFOs (6.7). No
+; hardware knows the format: the pilot, the two sync pulses, the pulse-width
+; bit code, MSB first, the ROM's pilot-length rule and the checksum are
+; firmware. A Spectrum does the same job with its whole CPU and interrupts
+; off; here it takes one of four threads and about 35 slots per edge.
+;
+; Format. Sources, both secondary to Sinclair's ROM itself, which was not
+; read: [TZX] the TZX format specification, worldofspectrum.net/
+; TZXformat.html (read 2026-11-07), section 2 ("1 T state = (1/3500000)s";
+; the level rules at a block's end) and blocks ID 10 and 11; [ROM] "The
+; Complete Spectrum ROM Disassembly" (Logan and O'Hara) as published by
+; SkoolKit, skoolkid.github.io/rom/asm/04C2.html, SA-BYTES (read
+; 2026-11-07). Every pulse is one half-period of the square wave: a level
+; held for a time, ended by an edge. A block is a pilot tone of 2168 T
+; pulses, 8063 of them before a header block (flag < 128) and 3223 before a
+; data block [TZX ID 10]; sync pulses of 667 and 735 T; then every byte,
+; flag first and checksum last, most significant bit first, each bit two
+; equal pulses, 855 T for a 0 and 1710 T for a 1 [TZX table, ROM]; the
+; checksum is the XOR of the flag and the data bytes [ROM SA-START,
+; SA-PARITY]. No gaps between the sync and the flag or between bytes [ROM].
+; After the last pulse the level changes once more, so the last pulse is
+; ended by an edge, and the line holds that level at least 1 ms before it
+; goes low [TZX section 2]. (The ROM's leader loop runs 0x1F80 = 8064 and
+; 0x0C98 = 3224 passes, one more than TZX's counts; QUESTIONS.md.)
+;
+; Tick: one clock (TICK_INT 1, its reset value; the host need not write
+; it). The table holds every pulse in clocks, so at 50 MHz each pulse is
+; the whole number of clocks nearest its T-state length (one T-state is
+; 100/7 clocks), exact on the pin to the clock:
+;   pulse     T      clocks (ideal)        error
+;   pilot   2168   30971 (30971.43)   -0.43 clk = -0.030 T   -14 ppm
+;   sync 1   667    9529 ( 9528.57)   +0.43 clk = +0.030 T   +45 ppm
+;   sync 2   735   10500 (10500.00)    0
+;   zero     855   12214 (12214.29)   -0.29 clk = -0.020 T   -23 ppm
+;   one     1710   24429 (24428.57)   +0.43 clk = +0.030 T   +18 ppm
+; Every edge falls exactly that many clocks after the one before, so the
+; errors do not accumulate within a kind of pulse; a Spectrum's own 3.5 MHz
+; crystal is worse than any of them. A board clocked at 3.5 MHz (the RTL
+; tests) loads the T-state values themselves and is exact.
+;
+; Timing table (data memory at the label `tbl`, eight words after the code; the
+; image holds the 50 MHz values; the host may rewrite any word while no
+; block is going out, e.g. for a turbo block, TZX ID 0x11):
+;   tbl+0 PILOT  pilot pulse            tbl+5 PHDR   pilot pulses, flag < 128
+;   tbl+1 SYNC1  first sync pulse       tbl+6 PDATA  pilot pulses, flag >= 128
+;   tbl+2 SYNC2  second sync pulse      tbl+7 HOLD   the hold after the last
+;   tbl+3 ZERO   each pulse of a 0 bit               edge, in steps of 255 ticks
+;   tbl+4 ONE    each pulse of a 1 bit               (200: 51000 clocks, 1.02 ms)
+; Pulses in ticks, 256 .. 32767 (a WAITD 255 lands each edge; TD's 2^15
+; half-window, SEMANTICS 4, bounds the rest); pulse counts 0 .. 65534;
+; HOLD 1 .. 255.
+;
+; Host interface, INQ[0]: a block is 0x00ff (ff the flag), then n (the
+; data bytes, 0 .. 65534), then n words each with a data byte in bits 7:0
+; (bits 15:8 ignored). The pilot starts at once; the data words may follow
+; while it plays, but each must be queued by the time its byte starts
+; (about 2.9 ms after the one before at the ROM's timings; INQ holds four).
+; OUTQ[0], one word per block when it is over: the checksum sent, 0x00cc;
+; or 0x8000 at once if a data byte was late (an underrun: the line goes low,
+; the block is cut short, and the program then drops that block's remaining
+; data words as they come, so the next block's words are read as a block).
+;
+; Timing. Every edge is `edge`: TD = TD + H - 255 (TD holds the tick of the
+; edge before), the latched write, WAITD 255. The latch fires when NOW
+; ticks to the new deadline (6.10 rule 1), so the edge lands H ticks after
+; the one before, on the exact clock. The deadline checker sees a WAITD 255
+; after a WAITD 255 and proves 255 ticks; the real interval is H, at least
+; 256, so its proof is the stronger claim. The next pulse's bookkeeping
+; (the next bit, the next byte, the INQ test) runs between the WAITD and
+; the next CSRW TD: right after the WAITD, TD is reached, so `WAITB INQ_NE,
+; T` is a test that does not wait.
+;
+; Pin: MIC = OUT0, push-pull, idle low.
+;
+; Registers: r0 the byte going out (its bits shifted out of bit 15); r1
+; bits left, or pilot pulses or hold steps left; r2 bytes left (data and
+; the checksum); r3 the checksum; r4 = 255; r5 the line level (0 or 1); r6
+; the current pulse length; r7 the table address, and `edge`'s scratch.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Pilot counts 8063 and 3223 as the TZX specification tabulates them;
+;   the ROM loop's constants are 0x1F80 and 0x0C98 (8064 and 3224), and
+;   the counts are table words the host can change.
+;   The block ends with an edge after the last pulse, then the level is
+;   held 1.02 ms and the line goes low (TZX section 2).
+;   Timings sit in a table, not fixed constants, so one program serves
+;   the 50 MHz board and the 3.5 MHz RTL board.
+;   The loader ends a block on silence (the ROM is told the length):
+;   blocks recorded with no gap would run together.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   MIC = OUT0
+        .tick   1                       ; TICK_INT 1: one tick per clock
+        .equ    K = 255                 ; the WAITD that lands every edge
+        .equ    OPIL = 0                ; table offsets
+        .equ    OS1 = 1
+        .equ    OS2 = 2
+        .equ    OZERO = 3
+        .equ    OONE = 4
+        .equ    OPHDR = 5
+        .equ    OPDAT = 6
+        .equ    OHOLD = 7
+
+start:  SETP    MIC, 0                  ; idle low
+        LDI     r4, K
+
+; A block: the flag, the count, then the pilot at once.
+idle:   LDI     r5, 0                   ; the line is low
+        POP     r0                      ; the flag (blocks while INQ is empty)
+        POP     r2                      ; n, the data bytes
+        LDI     r7, 0xFF
+        AND     r0, r0, r7
+        INC     r2                      ; data bytes and the checksum
+        MOV     r3, r0                  ; the checksum starts at the flag
+        MOV16   r7, tbl
+        LD      r1, r7, OPHDR           ; flag < 128: a header's pilot
+        LDI     r6, 0x80
+        TEST    r0, r6
+        BZ      hdr
+        LD      r1, r7, OPDAT           ; flag >= 128: a data block's
+hdr:    INC     r1                      ; one more edge: the pilot's first
+        LD      r6, r7, OPIL
+        SETD    K                       ; re-anchor after the unbounded POPs
+pil:    CALL    edge                    ; the first edge starts the pilot; each
+        DJNZ    r1, pil                 ; later one ends a pilot pulse
+        MOV16   r7, tbl
+        LD      r6, r7, OS1
+        CALL    edge                    ; ends sync 1
+        MOV16   r7, tbl
+        LD      r6, r7, OS2
+        CALL    edge                    ; ends sync 2; the flag (r0) follows
+
+; A byte, MSB first: each bit two equal pulses, each ended by an edge.
+byte:   SWAP    r0, r0                  ; the byte to bits 15:8
+        LDI     r1, 8
+bit:    SHLI    r0, 1                   ; C = this bit
+        MOV16   r7, tbl                 ; (LDI, LDIH: flags unchanged)
+        BC      one
+        LD      r6, r7, OZERO
+        JMP     two
+one:    LD      r6, r7, OONE
+two:    CALL    edge                    ; ends this bit's first pulse
+        CALL    edge                    ; and its second
+        DJNZ    r1, bit
+
+; The next byte: data from INQ, then the checksum, then the end.
+next:   CMPI    r2, 0
+        BZ      end                     ; the checksum is out
+        DEC     r2
+        BZ      cks
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      under
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0
+        LDI     r7, 0xFF
+        AND     r0, r0, r7
+        XOR     r3, r3, r0
+        JMP     byte
+cks:    MOV     r0, r3
+        JMP     byte
+
+; The last bit's second pulse has been ended by an edge; the line holds
+; that level HOLD x 255 ticks, then goes low [TZX section 2].
+end:    MOV16   r7, tbl
+        LD      r1, r7, OHOLD
+hold:   WAITD   K
+        DJNZ    r1, hold
+        SETP    MIC, 0
+        PUSH    r3                      ; the block is out (blocks while OUTQ is full)
+        JMP     idle
+
+; Underrun: a data byte was not queued in time. The line goes low, 0x8000
+; reports it at once, and the block's remaining data words are dropped as
+; they come.
+under:  SETP    MIC, 0
+        LDI     r0, 0
+        LDIH    r0, 0x80
+        PUSH    r0                      ; (blocks while OUTQ is full)
+drop:   POP     r0                      ; the late byte and the rest
+        DEC     r2
+        BNZ     drop
+        JMP     idle
+
+; edge: one edge, r6 ticks after the one before (TD holds that one's tick,
+; reached). r5 is the level before it; it toggles. Clobbers r7.
+edge:   CSRR    r7, TD
+        ADD     r7, r7, r6
+        SUB     r7, r7, r4              ; TD = the edge's tick less 255
+        CSRW    TD, r7
+        XORI    r5, 1                   ; the new level; Z: low
+        BZ      e0
+        SETP    MIC, 1, D               ; staged: TD is not reached
+        WAITD   K                       ; the latch fires as NOW ticks to TD + 255
+        RET
+e0:     SETP    MIC, 0, D
+        WAITD   K
+        RET
+
+; The timing table, in ticks of one clock at 50 MHz (header above).
+tbl:    .word   30971                   ; PILOT  2168 T
+        .word   9529                    ; SYNC1   667 T
+        .word   10500                   ; SYNC2   735 T
+        .word   12214                   ; ZERO    855 T
+        .word   24429                   ; ONE    1710 T
+        .word   8063                    ; PHDR   pilot pulses, flag < 128
+        .word   3223                    ; PDATA  pilot pulses, flag >= 128
+        .word   200                     ; HOLD   x 255 ticks: 1.02 ms

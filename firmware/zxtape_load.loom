@@ -1,0 +1,210 @@
+; zxtape_load.loom
+; ZX Spectrum cassette loader: finds a block's pilot tone on IN0 (the EAR
+; signal, squared up), its sync pulses, then times every bit's two pulses
+; against a threshold, as the ROM's LD-BYTES edge-timing loop does, checks
+; the XOR checksum and hands every byte to the host through OUTQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names the
+; Spectrum tape format. It measures every pulse with the edge wait and its
+; timeout (`WAITE ... ANY, T`, SEMANTICS 6.4), built for PS/2 and the I2C
+; and SWD timeouts, against a deadline written at run time (CSRW TD, 6.6)
+; so that a timeout can be up to 32767 ticks; it reads NOW (section 4) at
+; every edge; it keeps its windows in the data memory (LD, 6.11), built for
+; device emulation, so the host can retune them; and it uses the FIFOs
+; (6.7). No hardware knows the format: the pilot count, the sync test, the
+; pulse-width decision, the byte assembly, the checksum and the end of a
+; block are firmware. Like the ROM it has no glitch filter: a noise pulse
+; inside a block ends it as a fault, and the host's player decides whether
+; to rewind; a dedicated tape interface would filter and use a PLL.
+;
+; Format and sources: as zxtape_save.loom ([TZX] the TZX format
+; specification, worldofspectrum.net/TZXformat.html; [ROM] "The Complete
+; Spectrum ROM Disassembly" as published by SkoolKit, skoolkid.github.io/
+; rom/asm/0556.html LD-BYTES and 05E3.html LD-EDGE-2/LD-EDGE-1; both read
+; 2026-11-07, both secondary to Sinclair's ROM). Pulses (half-periods) of
+; 2168 T pilot, 667 and 735 T sync, two of 855 T for a 0 and two of 1710 T
+; for a 1, MSB first, flag first and checksum last, the XOR of every byte
+; of the block zero. The ROM loader [ROM 0556, 05E3] wants 256 pairs of
+; pilot edges, each "within about 3,000 T states" of the last; takes as
+; sync the first pulse shorter than about 1100 T after them; and decides a
+; bit on the length of its two pulses together against "approx. 2,400 T
+; states". The ROM is told the block's length by its caller; this loader is
+; not, and ends a block on silence.
+;
+; Tick: one T-state, set by the host before RUN (the M2 convention):
+;   50 MHz: TICK_INT 14, TICK_FRAC 73: 14.2852 clocks, 39 ppm short of
+;     100/7, far inside a tape player's own speed error.
+;   3.5 MHz (the RTL tests): TICK_INT 1, TICK_FRAC 0 (exact).
+; An edge is timed to the slot it is seen in: within 4 clocks and one tick
+; (0.4 T at 50 MHz, 5 T at 3.5 MHz).
+;
+; Windows (the data memory at `tbl`, in ticks; the image holds the values
+; below; the host may rewrite any word while no block is coming in):
+;   tbl+0 PMIN   1300  a pilot pulse is PMIN .. PMAX
+;   tbl+1 PMAX   3000  [ROM]; also the timeout while hunting
+;   tbl+2 NPIL    512  pilot pulses before a sync counts [ROM: 256 pairs]
+;   tbl+3 SMIN    300  each sync pulse is SMIN .. SMAX (shorter: noise)
+;   tbl+4 SMAX   1100  [ROM]
+;   tbl+5 BMAX1  2500  a bit's first pulse at most; silence this long at a
+;                      byte boundary ends the block
+;   tbl+6 BTH    2400  a bit's two pulses: under BTH a 0, else a 1 [ROM]
+;   tbl+7 BMAX2  5000  a bit's two pulses at most
+; Speed tolerance: every pulse may be scaled by any k from 0.71 to 1.38
+; (a player running 41 % fast to 27 % slow) and still be read; the tightest
+; limits are a 1's two pulses against BTH (k >= 0.702) and the pilot
+; against PMAX (k <= 1.384). Pulses vary independently within those limits
+; (jitter). A 1's pulses (1710 T) fall in the pilot window, as they pass
+; the ROM's own leader test (a pair of edges over about 3,370 T; my count
+; from [ROM 0556], B from 0x9C to 0xC6 at 58 T a pass, unchecked): a hunt
+; that starts inside a block, after a fault, can take NPIL of them in a
+; row (32 bytes of 0xFF at the default 512) for a pilot and the next 0 for
+; a sync. Between blocks the line must be silent BMAX1 (0.7 ms) or more;
+; the saver holds 1 ms, the ROM about a second.
+;
+; Real time. There is no WAITD, so the deadline checker has no pair to
+; prove; the argument is by hand. From the slot that sees an edge to the
+; next WAITE the longest path is 28 slots (112 clocks: the end of a byte,
+; with its PUSH), and the next edge is at least 600 T away (0.71 of an
+; 855 T pulse): 600 clocks at 3.5 MHz, 8,600 at 50 MHz.
+;
+; Result format, OUTQ[0] (nothing is read from INQ):
+;   0x00bb  each byte as it is completed: the flag first, the checksum last
+;   0x4nnn  the block has ended and its checksum is right; n = the bytes
+;           received (flag and checksum included), bits 12:0, modulo 8192
+;   0x8nnn  the block has ended and its checksum is wrong
+;   0xCnnn  a fault: the line went silent inside a byte, or before the
+;           first one; the block is abandoned
+;   0xEnnn  OUTQ was full when a byte was completed (the host fell more
+;           than four bytes, 11 ms at the ROM's speed, behind); abandoned
+; After a block's last word the program hunts for the next pilot. A report
+; word waits for room in OUTQ; edges in that time are lost, as a ROM loader
+; with BREAK held loses them.
+;
+; Pin: EAR = IN0 (a comparator's output; either polarity: only edges count).
+;
+; Registers: r0 the byte coming in; r1 its bits left; r2 the tick of the
+; last edge (or of the start of the bit being timed); r3 the XOR of the
+; block's bytes; r4 pilot pulses seen, then bytes received; r5 a pulse
+; length; r6 scratch; r7 the table address.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   EAR = IN0
+        .tick   14                      ; no WAITD: no deadline pair to prove
+        .equ    OPMIN = 0               ; table offsets
+        .equ    OPMAX = 1
+        .equ    ONPIL = 2
+        .equ    OSMIN = 3
+        .equ    OSMAX = 4
+        .equ    OBMAX1 = 5
+        .equ    OBTH = 6
+        .equ    OBMAX2 = 7
+
+start:  MOV16   r7, tbl
+
+; Hunt: count pilot pulses; a short pulse after NPIL of them is sync 1.
+hunt:   CSRR    r2, NOW                 ; time from here
+        LDI     r4, 0
+hl:     LD      r6, r7, OPMAX
+        CALL    edge
+        BT      hunt                    ; silence: start again
+        LD      r6, r7, OPMIN
+        CMP     r5, r6
+        BNC     short                   ; under PMIN
+        INC     r4                      ; a pilot pulse (the count saturates)
+        BNZ     hl
+        DEC     r4
+        JMP     hl
+short:  LD      r6, r7, ONPIL
+        CMP     r4, r6
+        BNC     hunt                    ; too little pilot before it
+        LD      r6, r7, OSMIN
+        CMP     r5, r6
+        BNC     hunt                    ; noise
+        LD      r6, r7, OSMAX
+        CMP     r6, r5
+        BNC     hunt                    ; between sync and pilot
+        LD      r6, r7, OSMAX           ; sync 1 is good: now sync 2
+        CALL    edge
+        BT      hunt
+        LD      r6, r7, OSMIN
+        CMP     r5, r6
+        BNC     hunt
+        LDI     r3, 0
+        LDI     r4, 0
+
+; A byte: eight bits, MSB first; a bit is its two pulses together.
+byte:   LDI     r0, 0
+        LDI     r1, 8
+bit:    LD      r6, r7, OBMAX1
+        CALL    mid                     ; the edge between its two pulses
+        BT      bend                    ; silence
+        LD      r6, r7, OBMAX2
+        CALL    edge                    ; r5 = both pulses, from the bit's start
+        BT      etrunc
+        SHLI    r0, 1
+        LD      r6, r7, OBTH
+        CMP     r5, r6                  ; C: BTH or longer, a 1
+        BNC     b0
+        ORI     r0, 1
+b0:     DJNZ    r1, bit
+        XOR     r3, r3, r0
+        INC     r4
+        CSRR    r6, NOW
+        CSRW    TD, r6                  ; TD reached: the WAITB below is a test
+        WAITB   OUTQ_NF, T
+        BT      eover
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only the host pops OUTQ, which only makes more (SEMANTICS 6.7)"
+        PUSH    r0
+        JMP     byte
+
+; Silence at the first pulse of a bit: at a byte boundary, after a byte,
+; the block has ended; anywhere else it is a fault.
+bend:   CMPI    r1, 8
+        BNZ     etrunc
+        CMPI    r4, 0
+        BZ      etrunc
+        LDI     r6, 0
+        LDIH    r6, 0x40                ; ended, checksum right
+        CMPI    r3, 0
+        BZ      rep
+        LDIH    r6, 0x80                ; ended, checksum wrong
+        JMP     rep
+etrunc: LDI     r6, 0
+        LDIH    r6, 0xC0
+        JMP     rep
+eover:  LDI     r6, 0
+        LDIH    r6, 0xE0
+rep:    LDI     r5, 0xFF
+        LDIH    r5, 0x1F
+        AND     r5, r4, r5              ; the byte count, modulo 8192
+        OR      r6, r6, r5
+        PUSH    r6                      ; waits for room in OUTQ
+        JMP     hunt
+
+; edge: wait for an edge on EAR, at most r6 ticks after r2. T = 1: none
+; came (r2 is left alone). T = 0: r5 = its distance from r2, and r2 = its
+; tick. mid: the same wait, measuring nothing and leaving r2 alone.
+edge:   ADD     r6, r6, r2
+        CSRW    TD, r6
+        WAITE   EAR, ANY, T
+        BT      er
+        CSRR    r6, NOW
+        SUB     r5, r6, r2
+        MOV     r2, r6
+er:     RET
+mid:    ADD     r6, r6, r2
+        CSRW    TD, r6
+        WAITE   EAR, ANY, T
+        RET
+
+; The windows, in ticks of one T-state (header above).
+tbl:    .word   1300                    ; PMIN
+        .word   3000                    ; PMAX
+        .word   512                     ; NPIL
+        .word   300                     ; SMIN
+        .word   1100                    ; SMAX
+        .word   2500                    ; BMAX1
+        .word   2400                    ; BTH
+        .word   5000                    ; BMAX2
