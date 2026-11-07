@@ -184,7 +184,7 @@ def test_nack_and_retry(backend):
     assert_timing(bus, us)
 
 
-def test_arbitration_lost(backend):
+def test_cec_arbitration_lost(backend):
     """A model initiator at address 1 starts its start bit in the same clock
     as the chip (address 4). They agree on the first header bit; in the
     second the chip sends a 1 and reads the model's 0: it stops driving and
