@@ -1,0 +1,620 @@
+; rdm_responder.loom
+; An RDM responder (ANSI E1.20, Remote Device Management over DMX512) on
+; an RS-485 half-duplex line: it finds RDM packets among the DMX512
+; packets, checks their checksum, takes part in discovery (DISC_UNIQUE_
+; BRANCH, DISC_MUTE, DISC_UN_MUTE), answers GET DEVICE_INFO and GET / SET
+; IDENTIFY_DEVICE, NACKs what it does not support, turns the line round
+; with a DE pin as a real responder does, and reports every packet meant
+; for it to the host. RX comes from the RO output of an RS-485 transceiver,
+; TX goes to its DI input and DE to its driver enable (1 = drive the line).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, timed waits, NOW, the FIFOs), LD/ST of slice B (SEMANTICS
+; 6.11, built for the I2C EEPROM's array) for the packet buffer, and the
+; bit engine's shift register in manual mode (SEMANTICS 6.9, built for the
+; synchronous serial programs and USB's and CAN's encoders): SHI samples
+; each received data bit and SHO sends the eleven bits of each 8N2 slot.
+; No hardware knows DMX, RDM or even a UART: break detection, the slots,
+; the additive checksum both ways, the UID match, the discovery range test,
+; the encoded-UID reply, the parameter handlers, the responder delay and
+; the DE turn-around are all firmware.
+;
+; Specification: ANSI E1.20 (RDM). tools/protomodels/rdm.py is the
+; reference model written from it and cites each figure used here. The
+; standard itself could not be fetched (ESTA's TSP refused the download):
+; the timings come from the Open Lighting Project's code documentation,
+; which quotes E1.20's tables by line, and are marked so in the model.
+; The E1.20 section numbers in this file are from memory, unchecked.
+;
+; Pins: RX = IN0, TX = OUT0 (idle high: mark), DE = OUT1 (1 = drive the
+; line), IDENT = OUT2 (high while IDENTIFY_DEVICE is on: the "identify"
+; lamp). All four move with the assembler's --pin.
+;
+; Host command (INQ[0]), once, after RUN: the responder's UID, three words,
+; most significant first: the manufacturer ID, then the device ID's high
+; and low halves. DEVICE_INFO's 19 bytes (below, one per word at DEVINFO)
+; are loaded with the image; the host may change them before RUN.
+;
+; Report (OUTQ[0]), per RDM packet with a good checksum that is addressed
+; to this UID or broadcast (all devices, or this manufacturer's):
+;     word 1    bits 15:8 the command class, bits 7:0 the flags:
+;               bit 0  a response was sent (break, ACK or NACK)
+;               bit 1  a DISC_UNIQUE_BRANCH response was sent (no break)
+;               bit 2  the response was a NACK
+;               bit 3  broadcast
+;               bit 4  IDENTIFY_DEVICE is on (after the packet)
+;               bit 5  muted (after the packet)
+;     word 2    the parameter ID
+; and a lone word 0x0080 for an RDM packet whose checksum is wrong or
+; whose message length does not match its parameter data length. Packets
+; for other UIDs and DMX512 packets of other start codes (dimmer data
+; included) are ignored and not reported. A word that finds OUTQ full is
+; dropped: the responder never stalls.
+;
+; Responses, E1.20 sections 6 and 7 (the model cites them):
+;     DISC_UNIQUE_BRANCH  unmuted and lower bound <= UID <= upper bound:
+;                         seven 0xFE, 0xAA, the UID's six bytes each sent
+;                         as (b | 0xAA, b | 0x55), the checksum of those
+;                         twelve bytes encoded the same way; no break
+;     DISC_MUTE, UN_MUTE  muted / unmuted; to this UID: ACK, a control
+;                         field of 0x0000
+;     GET DEVICE_INFO     ACK, the 19 bytes
+;     GET IDENTIFY        ACK, one byte 0 or 1
+;     SET IDENTIFY        0 or 1: ACK, no data, and IDENT follows it;
+;                         other values NACK NR_DATA_OUT_OF_RANGE
+;     other parameters    NACK NR_UNKNOWN_PID (NR_UNSUPPORTED_COMMAND_CLASS
+;                         for SET DEVICE_INFO); NR_FORMAT_ERROR for a
+;                         wrong data length; NR_SUB_DEVICE_OUT_OF_RANGE for
+;                         a sub-device other than the root (0xFFFF too,
+;                         except for SET)
+; Broadcast packets are acted on and never answered, except DISC_UNIQUE_
+; BRANCH, which is always broadcast.
+;
+; Rate: eight ticks a bit. The host sets TICK_INT = 25, TICK_FRAC = 0
+; before RUN (3.125 MHz at 50 MHz: 200 clocks, 4 us, a bit). The deadline
+; pairs are proved for that tick (.tick below).
+;
+; Timing (the figures and the tables they come from are in the model):
+;   - Receive (Table 3-3 line 1): a low run of 175 ticks (87.5 us) or more
+;     is a break; the mark after break is not checked. Slots are sampled
+;     as in dmx_fixture, 4 ticks into the start bit and 8 apart; a slot
+;     must start within 2.1 ms (4200 ticks) of the last one, or the packet
+;     is dropped. A break inside a packet starts a new one.
+;   - Responder delay (Table 3-4, 176 us .. 2 ms): the response's first
+;     falling edge (its break, or a DUB response's first start bit) comes
+;     DELAY ticks after the middle of the request's last first stop bit:
+;     200 us after the end of the request's last slot, to within a tick.
+;   - DE rises one bit (4 us) before that first edge and falls at the end
+;     of the response's last stop bit.
+;   - The response (Table 3-1): break 46 bits (184 us, 176 .. 352), mark
+;     after break 4 bits (16 us, 12 .. 88), slots back to back.
+;
+; Memory: words 0x001 .. 0x04B are data (the JMP at 0 skips them; only
+; DEVICE_INFO, 0x039 .. 0x04B, is loaded with the image), the code follows
+; to 0x1E9; the program spans all four quarters, so only thread 0 may be
+; started. The buffer holds the first 44 bytes of a request (every request
+; this program answers fits) and is rewritten in place into the response.
+;
+; Readings taken on the open spec questions (2026-11-07): ANSI E1.20 itself
+; was not read (the download was refused). Timing from the Open Lighting
+; Project's documentation, which quotes E1.20 tables 3-1 to 3-4; packet
+; layout, PIDs and NACK codes from its source code. Secondary throughout.
+;   A partial responder: E1.20 also requires SUPPORTED_PARAMETERS,
+;   SOFTWARE_VERSION_LABEL and DMX_START_ADDRESS (from memory), which
+;   this program NACKs as unknown; 22 words are left.
+;   Unchecked: where the responder delay is measured from, the order of
+;   the 0xAA and 0x55 halves of each encoded UID byte, and the section
+;   numbers in the comments. The DE timing rule is this program's own.
+;   Dimmer data is not passed to the host.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0, TX = OUT0, DE = OUT1, IDENT = OUT2
+        .tick   25                      ; eight ticks a bit at 250 kbit/s
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    BRKT = 175              ; ticks of low run that make a break
+        .equ    ISTO = 4200 + 12        ; ticks from a first stop bit's middle:
+                                        ; 2.1 ms of mark after the slot, at most
+        .equ    DELAY = 404             ; ticks from the last stop bit's middle
+        .equ    BRKH = 184              ; half the response's break, in ticks
+        .equ    MABT = 32               ; the response's mark after break
+        .equ    BUF = 0x001             ; the packet, byte i at BUF + i
+        .equ    BUFN = 44               ; bytes kept
+        .equ    UID = 0x02D             ; the UID, 6 bytes MSB first
+        .equ    CSUM = 0x033            ; then the DUB checksum, 2 bytes
+        .equ    MUTED = 0x035
+        .equ    IDENTW = 0x036
+        .equ    TXAT = 0x037            ; the tick the response starts at
+        .equ    PIDW = 0x038            ; the request's PID, for the report
+        .equ    DEVINFO = 0x039         ; DEVICE_INFO's 19 bytes
+        .equ    PD = BUF + 24           ; parameter data
+        .equ    SENT = 0x01             ; report flags (word 1, bits 7:0)
+        .equ    DUBF = 0x02
+        .equ    NACKF = 0x04
+        .equ    BCASTF = 0x08
+        .equ    IDF = 0x10
+        .equ    MUTEF = 0x20
+
+        JMP     start
+; BUF, UID, CSUM, MUTED, IDENTW, TXAT and PIDW (0x001 .. 0x038) are written
+; by the program before it reads them, so the image does not load them.
+        .org    DEVINFO
+; DEVICE_INFO (E1.20 10.5.1, unchecked): RDM protocol version 1.0; model ID
+; 0x0001; product category 0x0000 (not declared); software version ID
+; 0x00000001; DMX512 footprint 0; personality 1 of 1; DMX512 start address
+; 0xFFFF (no footprint); no sub-devices; no sensors.
+        .word   0x01, 0x00, 0x00, 0x01, 0x00, 0x00
+        .word   0x00, 0x00, 0x00, 0x01, 0x00, 0x00
+        .word   0x01, 0x01, 0xFF, 0xFF, 0x00, 0x00, 0x00
+
+; ------------------------------------------------------------------ start
+start:  SETP    TX, 1                   ; mark
+        OEP     TX, 1                   ; (no-ops unless moved to BIDIR pins)
+        SETP    DE, 0                   ; the driver off: listen
+        OEP     DE, 1
+        SETP    IDENT, 0
+        OEP     IDENT, 1
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0               ; NRZ, LSB first, no CRC
+        LDI     r2, UID
+        LDI     r3, 3
+uidw:   POP     r0                      ; the UID, a 16-bit word at a time
+        MOV     r1, r0
+        SHRI    r1, 8
+        ST      r1, r2, 0
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r2, 1
+        ADDI    r2, 2
+        DJNZ    r3, uidw
+        LDI     r0, 0
+        ST      r0, r2, MUTED - CSUM    ; r2 = CSUM here: unmuted
+        ST      r0, r2, IDENTW - CSUM   ; identify off
+
+; ---------------------------------------------------------------- hunting
+; Time every low run until one is a break (Table 3-3: 88 us at least).
+hunt:   WAITP   RX, 0                   ; a fall
+        CSRR    r6, NOW
+; The low run that started at r6 ends.
+low:    WAITP   RX, 1
+        CSRR    r0, NOW                 ; the rise
+        SUB     r1, r0, r6
+        LDI     r7, BRKT
+        CMP     r1, r7                  ; C = a break
+        BNC     hunt
+
+; ------------------------------------------------------------- the packet
+; Registers: r0 the byte, r1 scratch, r2 bytes so far, r3 their sum, r4 the
+; last two bytes (the checksum, at the end), r5 the message length + 2
+; once byte 2 is in (0 before), r6 NOW at the slot's start edge, r7 scratch.
+brk:    LDI     r2, 0
+        LDI     r3, 0
+        LDI     r5, 0
+        WAITP   RX, 0                   ; the start code's start bit
+slot:   SETD    0                       ; anchor on its edge
+        CSRR    r6, NOW                 ; and keep it, to time a break
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 0, sok
+        JMP     hunt                    ; high again: a glitch
+sok:    LDI     r1, 8
+        CSRW    CNT, r1
+sbit:   WAITD   OVS
+        SHI                             ; a data bit, LSB first
+        BNZ     sbit
+        WAITD   OVS                     ; the middle of the first stop bit
+        JP      RX, 1, stopok
+; The first stop bit is low: a framing error, or a break if the line stays
+; low long enough (timed from the slot's start edge, r6, by low).
+        JMP     low
+stopok: STSR    r0
+        SHRI    r0, 8                   ; the byte (SR 15:8)
+        CMPI    r2, BUFN
+        BC      nost                    ; past the buffer: summed, not kept
+        ST      r0, r2, BUF
+nost:   CMPI    r2, 3
+        BC      sum                     ; the header's first three bytes:
+        CMPI    r2, 1
+        BZ      hsub
+        BC      hlen
+        LDI     r1, 0xCC                ; byte 0, the start code: RDM's,
+        CMP     r0, r1                  ; or the packet is not ours (DMX512
+        BNZ     hunt1                   ; dimmer data, any other start code)
+        JMP     sum
+hsub:   CMPI    r0, 0x01                ; byte 1: SUB_START_CODE
+        BNZ     hunt1
+        JMP     sum
+hlen:   CMPI    r0, 24                  ; byte 2: the message length, 24 at least
+        BNC     hunt1
+        MOV     r5, r0
+        ADDI    r5, 2                   ; and the checksum after it
+sum:    ADD     r3, r3, r0
+        SHLI    r4, 8
+        OR      r4, r4, r0
+        INC     r2
+        CMP     r2, r5
+        BZ      done
+        CSRR    r1, TD                  ; the next start bit within 2.1 ms
+        MOV16   r7, ISTO
+        ADD     r1, r1, r7
+        CSRW    TD, r1
+        WAITP   RX, 0, T
+        BNT     slot
+hunt1:  JMP     hunt                    ; timed out: the packet is dropped
+
+; ------------------------------------------------------------- the request
+; The last byte is in. TD is the middle of its first stop bit: the response
+; starts DELAY ticks on (TXAT). r3 is the sum of every byte, the checksum's
+; two included; r4 the checksum (E1.20 6.2.8: the 16-bit sum of every
+; byte from the start code to the parameter data, high byte first).
+done:   CSRR    r1, TD
+        MOV16   r7, DELAY
+        ADD     r1, r1, r7
+        LDI     r7, TXAT
+        ST      r1, r7, 0
+        MOV     r1, r4
+        SHRI    r1, 8
+        SUB     r3, r3, r1
+        MOV     r1, r4
+        SHLI    r1, 8
+        SHRI    r1, 8
+        SUB     r3, r3, r1              ; the sum before the checksum
+        CMP     r3, r4
+        BNZ     bad1
+        LDI     r0, 0
+        LD      r1, r0, BUF + 2         ; the message length
+        SUBI    r1, 24
+        LD      r4, r0, BUF + 23        ; the parameter data length, PDL
+        CMP     r1, r4
+        BNZ     bad1                    ; the two disagree
+
+; The destination: this UID, or a broadcast (E1.20 5.1: device ID
+; 0xFFFFFFFF, manufacturer 0xFFFF for all, or this one's).
+        LDI     r6, 0                   ; the report's flags
+        LDI     r0, BUF + 3
+        LDI     r1, UID
+        LDI     r2, 6
+dmatch: LD      r3, r0, 0
+        LD      r5, r1, 0
+        CMP     r3, r5
+        BNZ     dbc
+        INC     r0
+        INC     r1
+        DJNZ    r2, dmatch
+        JMP     mine
+dbc:    LDI     r0, 0
+        LD      r3, r0, BUF + 5
+        LD      r5, r0, BUF + 6
+        AND     r3, r3, r5
+        LD      r5, r0, BUF + 7
+        AND     r3, r3, r5
+        LD      r5, r0, BUF + 8
+        AND     r3, r3, r5
+        LDI     r5, 0xFF
+        CMP     r3, r5
+        BNZ     other                   ; another device's packet
+        LD      r3, r0, BUF + 3
+        LD      r1, r0, BUF + 4
+        AND     r2, r3, r1
+        CMP     r2, r5
+        BZ      isbc                    ; all devices
+        LDI     r2, UID
+        LD      r5, r2, 0
+        CMP     r3, r5
+        BNZ     other
+        LD      r5, r2, 1
+        CMP     r1, r5
+        BNZ     other                   ; another manufacturer's devices
+isbc:   LDI     r6, BCASTF
+
+; Registers from here: r0 0, r3 the command class, r4 PDL, r5 the PID,
+; r6 the report.
+mine:   LDI     r0, 0
+        LD      r3, r0, BUF + 20        ; the command class
+        SWAP    r1, r3
+        OR      r6, r6, r1              ; into the report's 15:8
+        LD      r5, r0, BUF + 21
+        SWAP    r5, r5
+        LD      r1, r0, BUF + 22
+        OR      r5, r5, r1              ; the parameter ID
+        LDI     r1, PIDW
+        ST      r5, r1, 0
+        CMPI    r3, 0x10                ; DISCOVERY_COMMAND
+        BZ      disc
+        CMPI    r3, 0x20                ; GET_COMMAND
+        BZ      get
+        CMPI    r3, 0x30                ; SET_COMMAND
+        BZ      set
+        JMP     report                  ; another class: not answered
+other:  JMP     hunt
+bad1:   JMP     bad
+
+; Discovery (E1.20 7): DISC_UNIQUE_BRANCH 0x0001, DISC_MUTE 0x0002,
+; DISC_UN_MUTE 0x0003; the last two take no data and answer with a
+; control field (7.6.1), 0x0000 here: no proxy, no sub-devices.
+disc:   CMPI    r5, 1
+        BZ      dub1
+        TEST    r4, r4
+        BNZ     report1
+        LDI     r1, 1                   ; muted
+        CMPI    r5, 2
+        BZ      mset
+        CMPI    r5, 3
+        BNZ     report1
+        LDI     r1, 0                   ; unmuted
+mset:   LDI     r2, MUTED
+        ST      r1, r2, 0
+        LDI     r1, 0
+        ST      r1, r0, PD
+        ST      r1, r0, PD + 1
+        LDI     r4, 2
+        JMP     ack
+dub1:   JMP     dub
+report1:
+        JMP     report
+
+; GET: the root device only (sub-device 0), no parameter data.
+get:    LD      r1, r0, BUF + 18
+        LD      r2, r0, BUF + 19
+        OR      r1, r1, r2
+        BNZ     nsub
+        TEST    r4, r4
+        BNZ     nfmt
+        LDI     r1, 0x60                ; DEVICE_INFO
+        CMP     r5, r1
+        BZ      dinfo
+        MOV16   r1, 0x1000              ; IDENTIFY_DEVICE
+        CMP     r5, r1
+        BNZ     npid
+        LDI     r1, IDENTW
+        LD      r1, r1, 0
+        ST      r1, r0, PD              ; 0 or 1
+        LDI     r4, 1
+        JMP     ack
+dinfo:  LDI     r1, DEVINFO
+        LDI     r2, PD
+        LDI     r4, 19
+dic:    LD      r3, r1, 0
+        ST      r3, r2, 0
+        INC     r1
+        INC     r2
+        DJNZ    r4, dic
+        LDI     r4, 19
+        JMP     ack
+
+; SET: the root device, or all of them (0xFFFF), which here is the root.
+set:    LD      r1, r0, BUF + 18
+        LD      r2, r0, BUF + 19
+        AND     r7, r1, r2
+        OR      r1, r1, r2
+        BZ      sroot
+        LDI     r2, 0xFF
+        CMP     r7, r2
+        BNZ     nsub
+sroot:  MOV16   r1, 0x1000              ; IDENTIFY_DEVICE
+        CMP     r5, r1
+        BZ      sident
+        LDI     r1, 0x60                ; DEVICE_INFO cannot be set
+        CMP     r5, r1
+        BNZ     npid
+        LDI     r1, 5                   ; NR_UNSUPPORTED_COMMAND_CLASS
+        JMP     nack
+sident: CMPI    r4, 1
+        BNZ     nfmt                    ; one byte of data
+        LD      r1, r0, PD
+        CMPI    r1, 2
+        BC      nrange                  ; 0 (off) or 1 (on) only
+        LDI     r2, IDENTW
+        ST      r1, r2, 0
+        TEST    r1, r1
+        BZ      idoff
+        SETP    IDENT, 1
+        JMP     idack
+idoff:  SETP    IDENT, 0
+idack:  LDI     r4, 0
+        JMP     ack
+
+nsub:   LDI     r1, 0x09                ; NR_SUB_DEVICE_OUT_OF_RANGE
+        JMP     nack
+nfmt:   LDI     r1, 0x01                ; NR_FORMAT_ERROR
+        JMP     nack
+nrange: LDI     r1, 0x06                ; NR_DATA_OUT_OF_RANGE
+        JMP     nack
+npid:   LDI     r1, 0x00                ; NR_UNKNOWN_PID
+nack:   LDI     r2, 0
+        ST      r2, r0, PD              ; the reason code, high byte first
+        ST      r1, r0, PD + 1
+        LDI     r4, 2
+        LDI     r3, 2                   ; response type NACK_REASON
+        JMP     reply
+ack:    LDI     r3, 0                   ; response type ACK
+
+; reply: r3 the response type, r4 PDL, the data at PD. The request becomes
+; the response in place: destination <= source, source <= this UID, the
+; transaction number, sub-device and PID kept, the command class + 1,
+; message count 0.
+reply:  MOV     r1, r6
+        ANDI    r1, BCASTF
+        BNZ     report                  ; a broadcast is never answered
+        TEST    r3, r3
+        BZ      rack
+        ORI     r6, NACKF
+rack:   ORI     r6, SENT
+        LDI     r0, 0
+        ST      r3, r0, BUF + 16        ; response type (the port ID's place)
+        ST      r0, r0, BUF + 17        ; message count
+        LD      r1, r0, BUF + 20
+        INC     r1
+        ST      r1, r0, BUF + 20        ; GET_COMMAND_RESPONSE and the like
+        ST      r4, r0, BUF + 23
+        ADDI    r4, 24
+        ST      r4, r0, BUF + 2         ; the message length
+        LDI     r0, BUF + 3
+        LDI     r1, UID
+        LDI     r2, 6
+rcp:    LD      r5, r0, 6
+        ST      r5, r0, 0
+        LD      r5, r1, 0
+        ST      r5, r0, 6
+        INC     r0
+        INC     r1
+        DJNZ    r2, rcp
+        JMP     txgo
+
+; report: the flags and the PID. TD has passed on every path here (the
+; request's last stop bit, or the response's), so each WAITB is a test.
+report: LDI     r0, MUTED
+        LD      r1, r0, 0
+        TEST    r1, r1
+        BZ      rp1
+        ORI     r6, MUTEF
+rp1:    LD      r1, r0, IDENTW - MUTED
+        TEST    r1, r1
+        BZ      rp2
+        ORI     r6, IDF
+rp2:    WAITB   OUTQ_NF, T              ; T = 1 only if OUTQ is full
+        BT      rdone
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out of OUTQ"
+        PUSH    r6
+        LDI     r1, PIDW
+        LD      r1, r1, 0
+        WAITB   OUTQ_NF, T
+        BT      rdone
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out of OUTQ"
+        PUSH    r1
+rdone:  JMP     hunt
+bad:    LDI     r6, 0x80                ; a bad checksum or length
+        WAITB   OUTQ_NF, T
+        BT      rdone
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, and only the host takes words out of OUTQ"
+        PUSH    r6
+        JMP     hunt
+
+; DISC_UNIQUE_BRANCH (E1.20 7.5): PDL 12, the lower bound then the upper
+; bound, each a UID MSB first. Unmuted and lower <= UID <= upper: answer.
+dub:    LDI     r1, MUTED
+        LD      r1, r1, 0
+        TEST    r1, r1
+        BNZ     report
+        CMPI    r4, 12
+        BNZ     report
+        LDI     r1, UID                 ; UID >= lower, MSB first
+        LDI     r2, PD
+        LDI     r4, 6
+dlo:    LD      r3, r1, 0
+        LD      r5, r2, 0
+        CMP     r3, r5                  ; C = (uid byte >= bound byte)
+        BNZ     dlo1                    ; they differ: C decides
+        INC     r1
+        INC     r2
+        DJNZ    r4, dlo
+        JMP     dhi                     ; equal
+dlo1:   BNC     report                  ; below the lower bound
+dhi:    LDI     r1, PD + 6              ; upper >= UID
+        LDI     r2, UID
+        LDI     r4, 6
+dhl:    LD      r3, r1, 0
+        LD      r5, r2, 0
+        CMP     r3, r5
+        BNZ     dhi1
+        INC     r1
+        INC     r2
+        DJNZ    r4, dhl
+        JMP     dfill
+dhi1:   BNC     report                  ; above the upper bound
+
+; The response: seven 0xFE, 0xAA, then the UID and the sum of its encoded
+; bytes, each byte b as b | 0xAA then b | 0x55. CSUM follows UID in memory,
+; so one loop of eight encodes both; the sum is stored after six.
+dfill:  LDI     r0, BUF
+        LDI     r1, 0xFE
+        LDI     r2, 7
+dpre:   ST      r1, r0, 0
+        INC     r0
+        DJNZ    r2, dpre
+        LDI     r1, 0xAA
+        ST      r1, r0, 0
+        INC     r0
+        LDI     r2, 8
+        LDI     r3, 0                   ; the sum of the encoded UID
+        LDI     r4, UID
+denc:   CMPI    r2, 2
+        BNZ     denc1
+        MOV     r1, r3                  ; the UID is done: CSUM <= the sum
+        SHRI    r1, 8
+        ST      r1, r4, 0
+        SHLI    r3, 8
+        SHRI    r3, 8
+        ST      r3, r4, 1
+denc1:  LD      r1, r4, 0
+        INC     r4
+        LDI     r5, 0xAA
+        OR      r5, r5, r1
+        ST      r5, r0, 0
+        ADD     r3, r3, r5
+        LDI     r5, 0x55
+        OR      r5, r5, r1
+        ST      r5, r0, 1
+        ADD     r3, r3, r5
+        ADDI    r0, 2
+        DJNZ    r2, denc
+        ORI     r6, DUBF
+        LDI     r4, 24
+
+; ---------------------------------------------------------------- respond
+; r4 bytes from BUF, then the checksum high byte first, except after a DUB
+; response, which carries its own. Every pin write is the instruction
+; right after the WAITD that times it, so every edge lands the same few
+; clocks after its tick.
+txgo:   LDI     r1, TXAT
+        LD      r1, r1, 0
+        CSRW    TD, r1
+        WAITD   0                       ; until TXAT
+        SETD    0                       ; and anchor there
+        SETP    DE, 1                   ; drive the line
+        LDI     r1, 0
+        LDIH    r1, 6                   ; r1 = 0x0600: the stop bits
+        LDI     r2, BUF
+        LDI     r3, 0                   ; the checksum
+        MOV     r0, r6
+        ANDI    r0, DUBF
+        BNZ     txl                     ; a DUB response has no break
+        WAITD   OVS
+        SETP    TX, 0                   ; break
+        WAITD   BRKH
+        WAITD   BRKH
+        SETP    TX, 1                   ; mark after break
+        WAITD   MABT - OVS              ; the start bit one bit on, in txb
+txl:    LD      r0, r2, 0
+        ADD     r3, r3, r0
+        CALL    txb
+        INC     r2
+        DJNZ    r4, txl
+        MOV     r0, r6
+        ANDI    r0, DUBF
+        BNZ     txend
+        MOV     r0, r3
+        SHRI    r0, 8
+        CALL    txb                     ; the checksum's high byte
+        MOV     r0, r3
+        SHLI    r0, 8
+        SHRI    r0, 8
+        CALL    txb                     ; and its low byte
+txend:  WAITD   OVS                     ; the end of the last stop bit
+        SETP    DE, 0                   ; release the line
+        JMP     report
+
+; txb: one 8N2 slot of the byte in r0 (bits 15:8 zero), its start bit OVS
+; ticks after TD. SR holds {stop, stop, data 7:0, start}, CNT = 11; the
+; eleventh SHO is the second stop bit. The only CALLed routine: the
+; deadline checker sends every RET to every CALL site.
+txb:    SHLI    r0, 8
+        SHRI    r0, 7                   ; data in 8:1, the start bit 0 in bit 0
+        OR      r0, r0, r1              ; the stop bits
+        LDSR    r0
+        LDI     r0, 11
+        CSRW    CNT, r0
+tbit:   WAITD   OVS
+        SHO                             ; Z = (CNT == 0): the slot is out
+        BNZ     tbit
+        RET
