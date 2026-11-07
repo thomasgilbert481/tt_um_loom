@@ -1,0 +1,186 @@
+; bell202_demod.loom
+; A Bell 202 FSK demodulator (1200 baud, mark 1200 Hz, space 2200 Hz): times
+; the zero crossings of a limited FSK signal, tells the tones apart by the
+; length of each half-period, recovers the bits with a bit clock re-timed
+; at every tone change, and frames them as 8N1 or HART's 8O1 characters.
+; Bytes, framing errors and parity errors go to the host through OUTQ.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; it: there is no frequency discriminator, no PLL, no UART receiver. The
+; program uses:
+;   - the edge wait (WAITE ANY, built for clocked and pulse-width inputs)
+;     and NOW, read at every edge, as a time stamp (the interval idiom of
+;     ir_sirc_rx and quad_decoder);
+;   - the per-thread fractional tick, here only as the unit of the time
+;     stamps (1/132 of a bit, the same tick as bell202_mod.loom);
+;   - OUTQ for the received characters.
+; What the firmware does that no hardware does: the tone decision, the bit
+; clock recovery (a software DPLL that re-times on each tone change, from an
+; estimate of where in the mixed half-period the change fell), the
+; character framing, the odd-parity check and the error report. There is
+; no WAITD in the program: it is driven by edges alone, so it has no
+; deadline to miss, and needs only to finish with one edge before the next
+; (a space half-period is 36 ticks, 11 000 clocks at 50 MHz; the longest
+; path from one WAITE to the next, a mark-to-space change that completes an
+; 8O1 character, is 56 slots, 224 clocks).
+;
+; Input: a logic-level signal on RX whose edges are the zero crossings of
+; the line signal, as a comparator or limiter after a band-pass filter
+; makes it (the receive side of a HART or Bell 202 modem front end; the
+; analog part is not Loom's). bell202_mod.loom's square wave is exactly
+; such a signal, so the two programs can be wired pin to pin.
+;
+; Standards: as bell202_mod.loom (PUB 41212, HCF_SPEC-54, HCF_SPEC-81;
+; tools/protomodels/bell202.py says what could not be checked).
+;
+; Tick: the host sets TICK_INT 315, TICK_FRAC 168 at 50 MHz (158 400 Hz,
+; 1.0 ppm fast), or any tick that is 1/132 of a bit at the board's clock.
+; Then a bit is 132 ticks, a mark half-period 66 and a space half-period 36.
+;
+; The tone decision. A half-period of 51 ticks or more is mark, a shorter
+; one space: 51 is the midpoint of 36 and 66, so a tone may be off by 15
+; ticks, 23 % of mark and 42 % of space, against HART's +-1 %. Edges less
+; than 12 ticks (76 us) after the last accepted one are ignored, which
+; absorbs a bounce right after a crossing; a glitch in the middle of a
+; half-period is not filtered and may cost the character it falls in,
+; which is then reported with a framing or parity error, or not at all if
+; the bad bit happens to be a valid one (the limits of a zero-crossing
+; detector, which a band-pass filter in front is there to avoid).
+;
+; Bit clock. With the phase continuous, the half-period that holds a tone
+; change is a mix: between 36 and 66 ticks, its length says where the
+; change fell. If it was classed as the new tone the change is that far
+; into it, else that far before the end of the previous one. Let T0 be the
+; start of the half-period that ended (length L), P the one before it. The
+; change B is estimated as
+;     mark to space:  B = T0 + 2 (L - 36) - (66 - P)
+;     space to mark:  B = T0 + (66 - L) - 2 (P - 36)
+; (one term is zero but for rounding; the exact factors are 66/30 and
+; 36/30, so the estimate is within 3 ticks), and the next sample is due at
+; B + 66, a bit's centre. Every edge emits the samples that fell into the
+; half-period it ended, with that half-period's tone, so a sample is
+; decided only once the half-period that holds it is known. Between tone
+; changes the samples run on at 132 ticks; the longest run in a character
+; is nine equal bits, which at a 1 % rate error moves the sample 12 ticks
+; (9 %) from the centre.
+;
+; Framing. A 0 sample while idle is a start bit; then 8 data bits LSB first,
+; in 8O1 the parity bit, and the stop bit. The start bit is not checked
+; again at its centre (it was sampled there). No end-of-carrier detection:
+; HART and Bell 202 idle on mark, which keeps the bits coming; a carrier
+; that stops leaves the last character undelivered until the next edges.
+;
+; Pins: RX = IN0 (any input or BIDIR pin with --pin RX=<pin>).
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, once, before anything else: the configuration word, bit 0 = 1 for
+;     8O1 (HART), 0 for 8N1; other bits ignored. The program waits for it.
+;   OUTQ, one word a character:
+;     bits 7:0   the byte
+;     bit 8      framing error (the stop bit was 0)
+;     bit 9      parity error (8O1 only: the parity was even)
+;   PUSH blocks while OUTQ is full (FIFO_DEPTH 4), and edges are missed
+;   while it does, so the host drains OUTQ within four characters (33 ms).
+;
+; Memory: 81 words, 0x000 to 0x050 of thread 0's quarter (.imem 512); moved
+; to thread 1 (0x080 to 0x0D0) it fits beside bell202_mod.loom (41 words).
+
+        .imem   512
+        .thread 0
+        .pins   RX = IN0
+
+        .equ    BIT_T  = 132                    ; ticks a bit
+        .equ    HBIT   = 66                     ; half a bit
+        .equ    MK     = 66                     ; a mark half-period
+        .equ    SP     = 36                     ; a space half-period
+        .equ    THRESH = 51                     ; (MK + SP) / 2
+        .equ    BOUNCE = 12                     ; shortest half-period accepted
+
+; r0 T0, the last accepted edge   r1 P, the half-period before   r2 S, the
+; next sample time   r3 the tone, 1 mark 0 space   r4 the character's bits
+; r5 mode << 8 | bits still to come (0: hunting)   r6 r7 scratch
+
+start:  POP     r5                      ; the configuration word (blocks)
+        ANDI    r5, 1
+        SHLI    r5, 8                   ; mode in bit 8, no character yet
+        LDI     r3, 1                   ; assume mark (the line idles on it)
+        LDI     r1, MK
+        CSRR    r0, NOW
+        LDI     r2, HBIT
+        ADD     r2, r2, r0
+
+edge:   WAITE   RX, ANY
+        CSRR    r6, NOW                 ; one slot after every edge alike
+        SUB     r7, r6, r0              ; L, this half-period
+        CMPI    r7, BOUNCE
+        BNC     edge                    ; too soon: ignored, T0 kept
+        CMPI    r7, THRESH
+        BC      markhp
+        TEST    r3, r3                  ; a space half-period
+        BZ      same
+        ADD     r2, r0, r1              ; mark to space:
+        ADD     r2, r2, r7              ;   S = T0 + P + 2 L - 2 SP - MK + HBIT
+        ADD     r2, r2, r7
+        SUBI    r2, SP
+        SUBI    r2, SP
+        LDI     r3, 0
+        JMP     same
+markhp: TEST    r3, r3                  ; a mark half-period
+        BNZ     same
+        LDI     r2, MK + 2 * SP + HBIT  ; space to mark:
+        ADD     r2, r2, r0              ;   S = T0 + MK + 2 SP + HBIT - L - 2 P
+        SUB     r2, r2, r7
+        SUB     r2, r2, r1
+        SUB     r2, r2, r1
+        LDI     r3, 1
+same:   MOV     r1, r7                  ; P = L
+        MOV     r0, r6                  ; T0 = this edge
+
+emit:   SUB     r7, r0, r2              ; every sample due by this edge takes
+        SHLI    r7, 1                   ; this half-period's tone; C = 1: S is
+        BC      edge                    ; still ahead (half-window, mod 2^16)
+        MOV     r6, r5
+        ANDI    r6, 0x3F                ; bits still to come
+        BNZ     inchar
+        TEST    r3, r3                  ; hunting: a 0 is a start bit
+        BNZ     adv
+        MOV     r6, r5
+        SHRI    r6, 8                   ; the mode
+        ADDI    r6, 9                   ; 8 data bits, the stop bit, the parity
+        OR      r5, r5, r6
+        LDI     r4, 0
+        JMP     adv
+inchar: SHLI    r4, 1                   ; first bit ends up highest
+        OR      r4, r4, r3
+        SUBI    r5, 1
+        MOV     r6, r5
+        ANDI    r6, 0x3F
+        BNZ     adv
+        REV     r4, r4                  ; the stop bit to bit 15, d0 below it
+        CMPI    r5, 0                   ; Z: 8N1
+        BNZ     odd
+        SHRI    r4, 7                   ; byte | stop << 8
+        LDI     r6, 1
+        SHLI    r6, 8
+        XOR     r4, r4, r6              ; bit 8 = framing error
+        JMP     push
+odd:    SHRI    r4, 6                   ; byte | parity << 8 | stop << 9
+        MOV     r6, r4
+        SHLI    r6, 7                   ; the byte and the parity bit only
+        PAR     r6, r6                  ; C = 1: odd, as HART wants
+        LDI     r6, 0
+        BC      parok
+        LDI     r6, 2                   ; parity error, bit 9 after the shift
+parok:  MOV     r7, r4
+        SHRI    r7, 9
+        XORI    r7, 1                   ; framing error
+        OR      r6, r6, r7
+        SHLI    r6, 8
+        SHLI    r4, 8
+        SHRI    r4, 8                   ; the byte alone
+        OR      r4, r4, r6
+push:   PUSH    r4                      ; blocks while OUTQ is full
+adv:    LDI     r7, BIT_T
+        ADD     r2, r2, r7              ; the next sample, a bit later
+        JMP     emit
