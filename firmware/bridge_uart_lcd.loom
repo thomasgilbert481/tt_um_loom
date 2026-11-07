@@ -1,0 +1,339 @@
+; bridge_uart_lcd.loom
+; A UART-to-LCD bridge: thread 1 receives a serial stream (8N1, for
+; example 9600 or 115200 baud from a microcontroller or a USB serial
+; adapter) into a ring buffer in data memory; thread 0 drives an HD44780U
+; character LCD (2x16) over its 4-bit bus and shows the stream on it like a
+; small terminal. No host in the loop: the host loads the image, sets
+; thread 1's tick for the baud rate and starts both threads.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Thread 0 is
+; firmware/hd44780_4bit.loom (its initialization, byte, nibble and
+; busy-flag code, unchanged) with its INQ operations replaced by the
+; terminal below; thread 1 is firmware/uart_rx.loom's receiver (the slow
+; entry only) with its PUSH replaced by a store into the ring. It uses the
+; OUT and IN pin groups and OEP for the LCD's 4-bit bus (see
+; hd44780_4bit.loom), the deadline schedule on both threads, LD/ST to data
+; memory (SEMANTICS 6.11, built so device emulators can keep a register
+; file) for the ring, and a shared flag (SIG, WAITS: 6.4, 6.5) to wake the
+; LCD thread. No hardware knows either protocol or the bridge between
+; them.
+;
+; Pins: thread 0: D4..D7 = BIDIR0..BIDIR3, RS = OUT0, R/W = OUT1,
+; E = OUT2 (as hd44780_4bit.loom); thread 1: RX = IN0.
+;
+; The terminal (thread 0): at start it runs Figure 24's initialization
+; from power on (41 ms, busy flag on, two lines, 5x8 font), clears the
+; display and turns it on (0x0C, no cursor). Then, for each byte received:
+;   0x20 and up   a character at the cursor; after the 16th of a line the
+;                 cursor moves to the start of the other line first (and
+;                 what was there stays until it is overwritten);
+;   0x0A (LF)     the cursor to the start of the other line;
+;   0x0D (CR)     the cursor to the start of its own line;
+;   0x0C (FF)     Clear display (1.52 ms), the cursor home;
+;   other codes   ignored.
+; The cursor is the DDRAM address (row 0 from 0x00, row 1 from 0x40,
+; Figure 4, p.11), kept in r6 and sent with Set DDRAM address only when it
+; jumps; characters advance it in the LCD and in r6 together.
+;
+; The ring (SEMANTICS 6.11): 32 bytes, one a word, at 0x1E0..0x1FF; HEAD
+; at 0x1DE (written by thread 1 only: the next slot it fills) and TAIL at
+; 0x1DF (thread 0 only: the next slot it reads). Empty when HEAD == TAIL,
+; full when HEAD + 1 == TAIL (mod 32): a byte that arrives with the ring
+; full is dropped. Thread 1 stores the byte, then HEAD, then SIG 0; thread 0
+; reads HEAD and TAIL, and if they are equal waits on flag 0 (WAITS clears
+; it atomically), then reads them again, so a SIG between its check and its
+; WAITS is not lost and a stale flag costs one loop. An LD or ST is one
+; access at one edge, so neither thread ever sees a half-written word.
+; Throughput: a character costs the LCD 37 us (Table 6) and the program
+; about 60 us with the busy-flag polls at 190 kHz; at 115200 baud a byte
+; arrives every 87 us, so a sustained stream keeps up, and the 32 bytes
+; absorb a Clear display (about 2.2 ms, 25 bytes at 115200 baud).
+;
+; UART rate: 8 ticks a bit. The host sets thread 1's TICK_INT/TICK_FRAC to
+; one eighth of a bit before RUN (115200 baud at 50 MHz: 54 + 64/256; 9600
+; baud: 651 + 11/256). Thread 0 sets its own 1 us tick (US).
+;
+; Memory: thread 0's quarter (the terminal and the initialization), thread
+; 1's (the receiver), thread 3's (hd44780_4bit.loom's subroutines, then
+; the ring). Threads 2 and 3 must not be started.
+;
+; Registers, thread 0: as hd44780_4bit.loom (r0 the byte, r1 counts, r2
+; scratch, r3 the error and AC, r4 the mode, r5 RS), and r6 the cursor's
+; DDRAM address, r7 the ring's base (0x1DE) after the initialization.
+; Thread 1: r0 the byte being received, r1 the bit count, r2 0x80, r3
+; HEAD, r4 TAIL, r5 the slot's address, r7 the ring's base.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   D4 = BIDIR0, D5 = BIDIR1, D6 = BIDIR2, D7 = BIDIR3
+        .pins   RS = OUT0, RW = OUT1, E = OUT2
+        .pins   RX = IN0
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    GRP = pin(D4) | (4 << 5)        ; D4..D7: four pins from D4
+        .equ    BFMAX = 1250            ; polls, over 4 us each: 5 ms > 2.16 ms
+        .equ    T_BYTE = 62             ; DLY: more than 61 us
+        .equ    T_LONG = 200            ; DLY, 11 times: more than 2.18 ms
+        .equ    N_LONG = 11
+        .equ    BOOT = 0x0008           ; initialize: two lines, busy flag, cold
+        .equ    COLS = 16               ; visible columns
+        .equ    BASE = 0x1DE            ; HEAD, TAIL, then the ring
+        .equ    RING = 0x1E0
+        .equ    MASK = 31               ; 32 slots
+        .equ    OVS = 8                 ; thread 1: ticks per bit
+        .equ    SIGB = 0                ; the shared flag: a byte is in the ring
+
+start:  .csr    OUTGRP, GRP             ; OUT r writes D4..D7 from r[3:0]
+        .csr    INGRP, GRP              ; IN r reads them into r[3:0]
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        SETP    E, 0                    ; E low: the LCD ignores the bus
+        SETP    RS, 0
+        SETP    RW, 0                   ; write: the LCD never drives D4..D7
+        OUT     r7                      ; D4..D7 low,
+        CALL    drive                   ; and driven
+        LDI     r4, 0
+        LDI     r3, 0                   ; no error
+        LDI     r7, BOOT
+        JMP     init                    ; from power on; returns to "on"
+
+; The terminal: the display on, then one byte from the ring at a time.
+on:     LDI     r0, 0x0C
+        CALL    wins                    ; display on, no cursor, no blink
+        LDI     r6, 0                   ; the cursor: row 0, column 0
+        MOV16   r7, BASE
+next:   LD      r2, r7, 0               ; HEAD
+        LD      r1, r7, 1               ; TAIL
+        CMP     r2, r1
+        BNZ     have
+        WAITS   SIGB                    ; empty: until thread 1 stores a byte
+        JMP     next
+have:   ADD     r2, r7, r1
+        LD      r0, r2, RING - BASE     ; the byte at TAIL
+        LDI     r3, 0                   ; a failed byte does not stop the next
+        CMPI    r0, 0x20
+        BNC     control                 ; below 0x20: a control code
+        MOV     r2, r6
+        ANDI    r2, 0x3F                ; the column
+        CMPI    r2, COLS
+        BZ      wrap                    ; past the line: move first, keep the byte
+        CALL    take                    ; the byte is consumed
+        CALL    wdat                    ; the character, at the cursor
+        INC     r6
+        JMP     next
+wrap:   CALL    other
+        JMP     next                    ; and the same byte again, at column 0
+control: CALL   take
+        CMPI    r0, 0x0A
+        BZ      lf
+        CMPI    r0, 0x0D
+        BZ      cr
+        CMPI    r0, 0x0C
+        BNZ     next                    ; nothing else is a command
+        LDI     r0, 0x01
+        CALL    wins                    ; FF: Clear display, AC = 0
+        LDI     r6, 0
+        JMP     next
+lf:     CALL    other
+        JMP     next
+cr:     LDI     r2, 0x40
+        AND     r6, r6, r2              ; the start of this line
+        CALL    goto
+        JMP     next
+
+; take: TAIL = TAIL + 1 (r1 holds TAIL). other: the cursor to the start of
+; the other line. goto: Set DDRAM address r6.
+take:   ADDI    r1, 1
+        ANDI    r1, MASK
+        ST      r1, r7, 1
+        RET
+other:  LDI     r2, 0x40
+        XOR     r6, r6, r2
+        AND     r6, r6, r2              ; 0x00 <-> 0x40
+goto:   LDI     r0, 0x80
+        OR      r0, r0, r6
+        JMP     wins                    ; wins returns to goto's caller
+
+; Initializing by instruction, 4-bit interface (Figure 24, p.46).
+init:   MOV     r4, r7
+        ANDI    r4, 1                   ; the timed path?
+        SETP    RS, 0
+        MOV     r2, r7
+        ANDI    r2, 2
+        BNZ     in_warm                 ; the supply is already up
+        LDI     r1, 165
+in_pwr: DLY     250                     ; 165 * 250 us: more than 41 ms
+        DJNZ    r1, in_pwr
+in_warm: LDI    r2, 3
+        CALL    wnib                    ; function set, 8 bits (one nibble)
+        LDI     r1, 20
+in_41:  DLY     210                     ; 20 * 210 us: more than 4.18 ms
+        DJNZ    r1, in_41
+        LDI     r2, 3
+        CALL    wnib                    ; function set, 8 bits
+        DLY     102                     ; more than 101 us
+        LDI     r2, 3
+        CALL    wnib                    ; function set, 8 bits
+        DLY     T_BYTE                  ; its execution time (BF not yet usable)
+        LDI     r2, 2
+        CALL    wnib                    ; function set: 4 bits from now on
+        DLY     T_BYTE
+        LDI     r2, 0x80
+        SWAP    r2, r2
+        OR      r4, r4, r2              ; bit 15: initialized
+        MOV     r0, r7
+        ANDI    r0, 0x0C                ; N and F
+        ORI     r0, 0x20
+        CALL    wins                    ; function set 0x2n, two nibbles
+        LDI     r0, 0x08
+        CALL    wins                    ; display off
+        LDI     r0, 0x01
+        CALL    wins                    ; display clear
+        LDI     r0, 0x06
+        CALL    wins                    ; entry mode: increment, no shift
+        JMP     on                      ; the terminal
+
+; ---------------------------------------------------------------------------
+; Thread 1: the UART receiver (uart_rx.loom's slow entry: the start bit
+; sampled OVS / 2 ticks after its edge, then every OVS ticks), each good
+; byte stored at HEAD unless the ring is full.
+; ---------------------------------------------------------------------------
+        .thread 1
+        .tick   16                      ; the shortest tick the pairs are proved for
+rx:     LDI     r2, 0x80                ; a received 1 enters at bit 7
+        MOV16   r7, BASE
+rearm:  WAITP   RX, 0                   ; start bit (or already low)
+        SETD    0                       ; re-anchor on the start edge
+        WAITD   OVS / 2                 ; middle of the start bit
+        JP      RX, 1, rearm            ; high again: a glitch, not a start bit
+        LDI     r0, 0
+        LDI     r1, 8
+bit:    WAITD   OVS                     ; middle of the next data bit
+        JP      RX, 1, one              ; sample
+        SHRI    r0, 1                   ; a 0 enters at bit 7
+        DJNZ    r1, bit
+        JMP     stop
+one:    SHRI    r0, 1
+        OR      r0, r0, r2
+        DJNZ    r1, bit
+stop:   WAITD   OVS                     ; middle of the stop bit
+        JP      RX, 0, ferr             ; low: framing error, the byte dropped
+        LD      r3, r7, 0               ; HEAD
+        LD      r4, r7, 1               ; TAIL
+        ADD     r5, r7, r3
+        ADDI    r3, 1
+        ANDI    r3, MASK                ; the next HEAD
+        CMP     r3, r4
+        BZ      rearm                   ; full: the byte dropped
+        ST      r0, r5, RING - BASE     ; the byte, then HEAD: thread 0 reads
+        ST      r3, r7, 0               ; HEAD first, so it never sees a slot
+        SIG     SIGB                    ; before its byte; wake thread 0
+        JMP     rearm
+ferr:   WAITP   RX, 1                   ; wait for the line to return to idle
+        JMP     rearm
+
+; ---------------------------------------------------------------------------
+; The spill: from here on the program sits in thread 3's quarter, 0x180 on
+; (see "Memory" above). Thread 3 must not be started with this image.
+; ---------------------------------------------------------------------------
+        .thread 0                       ; back to thread 0's section
+        .org    0x180
+
+; ---------------------------------------------------------------------------
+; wins, wdat: send the byte r0[7:0] as an instruction (RS = 0) or as data
+; (RS = 1), high nibble first (p.22), then wait until the LCD is ready:
+; the busy-flag poll, or the timed wait. Keeps r0. Skips everything if an
+; earlier byte of the operation failed (r3 bit 15).
+; ---------------------------------------------------------------------------
+wins:   SETP    RS, 0
+        LDI     r5, 0
+        JMP     wbyte
+wdat:   SETP    RS, 1
+        LDI     r5, 1
+wbyte:  MOV     r2, r3
+        SHLI    r2, 1
+        BC      wb_ret                  ; the operation has failed already
+        MOV     r2, r0
+        SHRI    r2, 4
+        CALL    wnib                    ; D7..D4 of the byte
+        MOV     r2, r0
+        CALL    wnib                    ; D3..D0 (OUT takes bits 3:0)
+        MOV     r2, r4
+        ANDI    r2, 1
+        BZ      bfpoll                  ; R/W wired: read the busy flag
+        TEST    r5, r5
+        BNZ     wb_short                ; data: 37 us
+        MOV     r2, r0
+        SHLI    r2, 8
+        SHRI    r2, 10                  ; byte >> 2 (the byte alone)
+        BNZ     wb_short                ; not Clear display or Return home
+        LDI     r1, N_LONG
+wb_long: DLY    T_LONG
+        DJNZ    r1, wb_long
+wb_ret: RET
+wb_short: DLY   T_BYTE
+        RET
+
+; wnib: one nibble, r2[3:0] on D4..D7, RS and R/W already set. E rises
+; more than a tick after the data is set, stays high one tick, and falls;
+; nothing else changes in that slot.
+wnib:   SETD    1
+        OUT     r2
+        WAITD   1                       ; more than a tick: t_AS, t_DSW
+        SETP    E, 1
+        WAITD   1                       ; PW_EH
+        SETP    E, 0                    ; the LCD takes D4..D7 here
+        RET
+
+; ---------------------------------------------------------------------------
+; bfpoll: read the busy flag and the address counter (RS = 0, R/W = 1, two
+; nibbles: Figure 9, p.22) until BF = 0, at most BFMAX times. Returns r3 =
+; AC (bits 6:0), or 0x8100 if the flag never cleared. D4..D7 are driven
+; again on return.
+; ---------------------------------------------------------------------------
+bfpoll: CALL    release                 ; D4..D7 to the LCD
+        SETP    RS, 0
+        SETP    RW, 1                   ; read: the LCD drives while E is high
+        MOV16   r1, BFMAX
+bf_lp:  SETD    1
+        WAITD   1                       ; more than a tick since R/W or E fell
+        SETP    E, 1
+        WAITD   1                       ; t_DDR <= 360 ns: valid by now
+        IN      r3                      ; BF, AC6, AC5, AC4
+        SETP    E, 0
+        WAITD   1
+        SETP    E, 1
+        WAITD   1
+        IN      r2                      ; AC3..AC0
+        SETP    E, 0
+        SHLI    r3, 4
+        OR      r3, r3, r2              ; BF and AC in bits 7:0
+        MOV     r2, r3
+        SHRI    r2, 7                   ; BF
+        BZ      bf_end                  ; ready
+        DJNZ    r1, bf_lp
+        LDI     r3, 0x81                ; never ready: report 0x1
+        SWAP    r3, r3                  ; 0x8100
+bf_end: DLY     2                       ; E low more than a tick (t_DHR)
+        SETP    RW, 0                   ; then back to write,
+                                        ; and fall through to drive D4..D7
+
+; drive, release: the output enables of D4..D7, one pin at a time (OEP
+; touches only its pin, so another thread's BIDIR pins keep theirs).
+drive:  OEP     D4, 1
+        OEP     D5, 1
+        OEP     D6, 1
+        OEP     D7, 1
+        RET
+release: OEP    D4, 0
+        OEP     D5, 0
+        OEP     D6, 0
+        OEP     D7, 0
+        RET
+
+; The ring and its two indices, in thread 3's quarter after the code.
+        .org    BASE
+        .word   0, 0                    ; HEAD, TAIL
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0

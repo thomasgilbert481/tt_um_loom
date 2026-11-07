@@ -1,0 +1,347 @@
+; hd44780_4bit.loom
+; Loom drives an HD44780U character LCD controller (Hitachi, the LCD-II of
+; most 16x2 modules) over its 4-bit parallel bus: the power-on
+; initialization by instruction, then instructions, data bytes and "print
+; this string at this DDRAM address" from the host, with the busy flag read
+; back over the same data pins after every byte.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The HD44780 bus is not serial
+; and is in no design document: a register select (RS), a direction (R/W)
+; and an enable strobe (E) frame a 4-bit data nibble, with set-up and hold
+; windows around E, waits of milliseconds during the power-on sequence, and
+; a busy-flag read that turns the data pins around. The program uses:
+;   - the OUT and IN pin groups (OUTGRP, INGRP), built to change or read
+;     several pins in one slot (spi_master.loom writes {CS_n, SCK, MOSI}
+;     with one OUT), to put a nibble on D4..D7 in one slot and to read one
+;     back in one slot: a 4-bit parallel port;
+;   - OEP, the per-pin output enable of the BIDIR pins, to hand D4..D7 to
+;     the LCD for the busy-flag read and take them back (the bus
+;     turnaround swd_master.loom does on SWDIO, four pins wide);
+;   - the deadline schedule (SETD, WAITD) on a 1 us tick for the E strobe,
+;     and DLY, built for timeouts, for the long waits of the datasheet.
+; What the firmware does that no hardware does: the E strobe and its
+; set-up and hold, the nibble order, the initialization flowchart, the
+; busy-flag poll (two reads per poll, Figure 9), the execution-time waits
+; of the timed path, the DDRAM addressing of a 2-line display and the
+; host's string transfers. Weaker than a dedicated peripheral: the bus runs
+; at one tick per E phase, 2 us a nibble against the 1 us t_cycE the
+; datasheet allows, which costs nothing next to the 37 us an instruction
+; takes inside the LCD; and while the LCD is busy the thread polls.
+;
+; Source: the HD44780U datasheet, ADE-207-272(Z), '99.9, Rev. 0.0 (printed
+; page numbers). The I/O is 3.3 V, so the program keeps to the VCC = 2.7 to
+; 4.5 V column (p.49): t_cycE >= 1000 ns, PW_EH >= 450 ns, t_Er/t_Ef <= 25
+; ns, t_AS >= 60 ns, t_AH >= 20 ns, t_DSW >= 195 ns, t_H >= 10 ns, t_DDR
+; <= 360 ns, t_DHR >= 5 ns (Figures 25 and 26, p.58). A 5 V module (p.52's
+; column) would drive 5 V into Loom's pins during a read: use a 3.3 V
+; module, or the timed path with R/W tied low.
+;
+; Pins: D4 = BIDIR0, D5 = BIDIR1, D6 = BIDIR2, D7 = BIDIR3 (consecutive:
+; one OUT group and one IN group), RS = OUT0, R/W = OUT1, E = OUT2. D0..D3
+; of the module are not connected (p.22: "Bus lines DB0 to DB3 are
+; disabled" in 4-bit mode). Seven pins: the pin budget allows R/W, so the
+; busy flag is read; the timed path is there for boards that tie R/W low.
+;
+; Host words (FIFO space, thread 0). INQ, one operation per word, bits
+; 15:12 the operation:
+;   0x00nm  initialize (Figure 24, p.46). m = bit 0: timed path (R/W tied
+;           low: wait the execution times instead of reading the busy flag);
+;           bit 1: the supply has been up for more than 40 ms already (a
+;           re-initialization), skip the power-on wait. n = bits 3:2: N and
+;           F of the function set (bit 3 two lines, bit 2 the 5x10 font),
+;           so 0x0008 is a 2-line display, busy flag, from power-on. Any
+;           other operation before the first initialize is refused.
+;   0x1 0ii instruction ii (bits 7:0), RS = 0 (Table 6, p.24).
+;   0x2 0dd data byte dd, RS = 1: a character code into DDRAM (or CGRAM).
+;   0x3 print: bits 11:7 n (0..31 characters), bits 6:0 the DDRAM address
+;           (p.11, Figure 4: row 0 from 0x00, row 1 from 0x40, so row r,
+;           column c is 0x40 * r + c), followed in INQ by ceil(n / 2) data
+;           words, character 2k in bits 7:0 and 2k+1 in bits 15:8 of word
+;           k. Sends Set DDRAM address (0x80 + address), then the n data
+;           bytes; the address counter increments in the entry mode the
+;           initialization set (I/D = 1).
+;   0x4000  read the busy flag and address counter (needs R/W).
+; OUTQ, one result word per operation: bits 15:12 the operation, and for
+; operation 4 bits 6:0 the address counter (bit 7 the busy flag, 0 by then).
+; Bit 15 set: an error, bits 11:8 say which. 0x1: the busy flag stayed set
+; for BFMAX polls (no LCD, or a dead one), the operation abandoned (data
+; words still in INQ dropped); 0xF: not an operation, or not now (operation
+; 4 on the timed path, anything before the first initialize).
+;
+; Timing, with a 1 us tick (TICK_INT = US, set here; 50 at 50 MHz):
+;   - a nibble: RS and R/W set, then D4..D7, then E high for one tick and
+;     low again; the next nibble re-anchors, so E is low for more than one
+;     tick and rises at most every two. Each edge lands 0 to 3 clocks
+;     after its tick (the slot grid, SEMANTICS 2), so t_cycE is two ticks
+;     less up to 3 clocks (1.92 us measured at 25 MHz, 2.0 at 50) and
+;     PW_EH one tick less up to 3 clocks (0.96 us); t_AS and t_DSW are
+;     more than a tick (the data is set more than a tick before E rises
+;     and held until after it falls); t_AH and t_H one slot (4 clocks) or
+;     more: nothing changes in the slot that drops E (0.88 and 0.40 us
+;     measured at 50 MHz);
+;   - a busy-flag read: D4..D7 released, RS = 0, R/W = 1, more than a tick,
+;     then two E pulses of one tick, D4..D7 sampled at the end of each
+;     (t_DDR <= 360 ns after the rise), BF = D7 of the first; then more than
+;     a tick with E low before R/W falls and D4..D7 are driven again (the
+;     datasheet gives t_DHR >= 5 ns but no maximum: a tick is the margin);
+;   - the timed path: 61 us after a byte, 2.2 ms after Clear display or
+;     Return home, from Table 6 (p.24, 37 us and 1.52 ms at fOSC = 270 kHz)
+;     scaled to the slowest oscillator of p.49 (190 kHz): 37 * 270 / 190 =
+;     52.6 us, plus t_ADD = 1.5 / fOSC = 7.9 us (p.25, Figure 10), and 1.52
+;     ms * 270 / 190 = 2.16 ms. Table 6 prints no time for Clear display;
+;     the program gives it Return home's (QUESTIONS.md);
+;   - initialization: more than 40 ms (the 2.7 V line of Figure 24: the
+;     program cannot see the supply rise, so it waits from the operation),
+;     0x3, more than 4.1 ms, 0x3, more than 100 us, 0x3, then 0x2 (one
+;     nibble each, the LCD still in 8-bit mode: "BF cannot be checked
+;     before this instruction"), each of the last two followed by the
+;     timed 61 us; then function set 0x2n (two nibbles), display off 0x08,
+;     clear 0x01 and entry mode 0x06 (increment, no shift), each with the
+;     busy flag (or the timed waits). Display on is the host's: 0x100C.
+; The schedule is proved for ticks of 12 clocks or more (US below 12 fails
+; the checker), so the program runs from a 12 MHz clock up with US set to
+; the clock in MHz; the tests run the RTL with US 25, a 25 MHz clock.
+;
+; Memory: 181 words. The operations and the initialization in thread 0's
+; quarter (0x000..0x06D), the byte, nibble and busy-flag subroutines in
+; thread 3's (0x180..0x1C6), as tm1637_controller.loom does: threads 1 and
+; 2 keep their quarters, which bridge_uart_lcd.loom's receiver uses.
+;
+; Registers: r0 the byte being sent, r1 counts (polls, wait loops), r2
+; scratch and the nibble, r3 the busy flag and AC read, r4 the mode (bit 0
+; timed, bit 15 initialized), r5 RS of the byte (1 data), r6 characters
+; still to print, r7 the operation word.
+;
+; Errors: r3 bit 15 is sticky within an operation. Once a byte's busy-flag
+; poll times out, the operation's later bytes are not sent, but their data
+; words are still taken from INQ, so the next word read is an operation.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   D4 = BIDIR0, D5 = BIDIR1, D6 = BIDIR2, D7 = BIDIR3
+        .pins   RS = OUT0, RW = OUT1, E = OUT2
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    GRP = pin(D4) | (4 << 5)        ; D4..D7: four pins from D4
+        .equ    BFMAX = 1250            ; polls, over 4 us each: 5 ms > 2.16 ms
+        .equ    T_BYTE = 62             ; DLY: more than 61 us
+        .equ    T_LONG = 200            ; DLY, 11 times: more than 2.18 ms
+        .equ    N_LONG = 11
+        .equ    OP_INIT = 0
+        .equ    OP_INST = 1
+        .equ    OP_DATA = 2
+        .equ    OP_PRINT = 3
+        .equ    OP_READ = 4
+
+start:  .csr    OUTGRP, GRP             ; OUT r writes D4..D7 from r[3:0]
+        .csr    INGRP, GRP              ; IN r reads them into r[3:0]
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        SETP    E, 0                    ; E low: the LCD ignores the bus
+        SETP    RS, 0
+        SETP    RW, 0                   ; write: the LCD never drives D4..D7
+        OUT     r7                      ; D4..D7 low,
+        CALL    drive                   ; and driven
+        LDI     r4, 0                   ; not initialized
+
+cmd:    POP     r7                      ; next operation (blocks while INQ is empty)
+        LDI     r3, 0                   ; no error yet
+        MOV     r2, r7
+        SHRI    r2, 12                  ; the operation
+        CMPI    r2, OP_INIT
+        BZ      init
+        TEST    r4, r4
+        BZ      bad                     ; nothing before the first initialize
+        CMPI    r2, OP_INST
+        BZ      inst
+        CMPI    r2, OP_DATA
+        BZ      data
+        CMPI    r2, OP_PRINT
+        BZ      print
+        CMPI    r2, OP_READ
+        BNZ     bad
+        MOV     r2, r4                  ; read BF and AC: R/W must be wired
+        ANDI    r2, 1
+        BNZ     bad
+        CALL    bfpoll                  ; r3 = AC, or the error
+        JMP     done
+
+inst:   MOV     r0, r7
+        CALL    wins
+        JMP     ok
+data:   MOV     r0, r7
+        CALL    wdat
+        JMP     ok
+
+; Print: Set DDRAM address (0x80 + bits 6:0), then n characters, two a word.
+print:  MOV     r6, r7
+        SHRI    r6, 7
+        ANDI    r6, 31                  ; n
+        MOV     r0, r7
+        SHLI    r0, 9
+        SHRI    r0, 9                   ; the address
+        LDI     r2, 0x80
+        OR      r0, r0, r2
+        CALL    wins
+pr_word: TEST   r6, r6
+        BZ      ok                      ; every character sent
+        POP     r0                      ; two characters; E waits low meanwhile
+        CALL    wdat                    ; character 2k (wbyte keeps r0)
+        DEC     r6
+        BZ      ok                      ; n odd: the high byte unused
+        SWAP    r0, r0
+        CALL    wdat                    ; character 2k + 1
+        DEC     r6
+        JMP     pr_word
+
+bad:    LDI     r3, 0x8F                ; not an operation, or not now
+        SWAP    r3, r3                  ; 0x8F00
+        JMP     done
+ok:     MOV     r2, r3
+        SHLI    r2, 1                   ; C = bit 15: an error to report?
+        BC      done
+        LDI     r3, 0                   ; no: the AC a poll left is not a result
+done:   MOV     r2, r7                  ; result = operation << 12 | r3
+        SHRI    r2, 12
+        SHLI    r2, 12
+        OR      r3, r3, r2
+        PUSH    r3                      ; blocks while OUTQ is full: E stays low
+        JMP     cmd
+
+; Initializing by instruction, 4-bit interface (Figure 24, p.46).
+init:   MOV     r4, r7
+        ANDI    r4, 1                   ; the timed path?
+        SETP    RS, 0
+        MOV     r2, r7
+        ANDI    r2, 2
+        BNZ     in_warm                 ; the supply is already up
+        LDI     r1, 165
+in_pwr: DLY     250                     ; 165 * 250 us: more than 41 ms
+        DJNZ    r1, in_pwr
+in_warm: LDI    r2, 3
+        CALL    wnib                    ; function set, 8 bits (one nibble)
+        LDI     r1, 20
+in_41:  DLY     210                     ; 20 * 210 us: more than 4.18 ms
+        DJNZ    r1, in_41
+        LDI     r2, 3
+        CALL    wnib                    ; function set, 8 bits
+        DLY     102                     ; more than 101 us
+        LDI     r2, 3
+        CALL    wnib                    ; function set, 8 bits
+        DLY     T_BYTE                  ; its execution time (BF not yet usable)
+        LDI     r2, 2
+        CALL    wnib                    ; function set: 4 bits from now on
+        DLY     T_BYTE
+        LDI     r2, 0x80
+        SWAP    r2, r2
+        OR      r4, r4, r2              ; bit 15: initialized
+        MOV     r0, r7
+        ANDI    r0, 0x0C                ; N and F
+        ORI     r0, 0x20
+        CALL    wins                    ; function set 0x2n, two nibbles
+        LDI     r0, 0x08
+        CALL    wins                    ; display off
+        LDI     r0, 0x01
+        CALL    wins                    ; display clear
+        LDI     r0, 0x06
+        CALL    wins                    ; entry mode: increment, no shift
+        JMP     ok
+
+; ---------------------------------------------------------------------------
+; The spill: from here on the program sits in thread 3's quarter, 0x180 on
+; (see "Memory" above). Thread 3 must not be started with this image.
+; ---------------------------------------------------------------------------
+        .org    0x180
+
+; ---------------------------------------------------------------------------
+; wins, wdat: send the byte r0[7:0] as an instruction (RS = 0) or as data
+; (RS = 1), high nibble first (p.22), then wait until the LCD is ready:
+; the busy-flag poll, or the timed wait. Keeps r0. Skips everything if an
+; earlier byte of the operation failed (r3 bit 15).
+; ---------------------------------------------------------------------------
+wins:   SETP    RS, 0
+        LDI     r5, 0
+        JMP     wbyte
+wdat:   SETP    RS, 1
+        LDI     r5, 1
+wbyte:  MOV     r2, r3
+        SHLI    r2, 1
+        BC      wb_ret                  ; the operation has failed already
+        MOV     r2, r0
+        SHRI    r2, 4
+        CALL    wnib                    ; D7..D4 of the byte
+        MOV     r2, r0
+        CALL    wnib                    ; D3..D0 (OUT takes bits 3:0)
+        MOV     r2, r4
+        ANDI    r2, 1
+        BZ      bfpoll                  ; R/W wired: read the busy flag
+        TEST    r5, r5
+        BNZ     wb_short                ; data: 37 us
+        MOV     r2, r0
+        SHLI    r2, 8
+        SHRI    r2, 10                  ; byte >> 2 (the byte alone)
+        BNZ     wb_short                ; not Clear display or Return home
+        LDI     r1, N_LONG
+wb_long: DLY    T_LONG
+        DJNZ    r1, wb_long
+wb_ret: RET
+wb_short: DLY   T_BYTE
+        RET
+
+; wnib: one nibble, r2[3:0] on D4..D7, RS and R/W already set. E rises
+; more than a tick after the data is set, stays high one tick, and falls;
+; nothing else changes in that slot.
+wnib:   SETD    1
+        OUT     r2
+        WAITD   1                       ; more than a tick: t_AS, t_DSW
+        SETP    E, 1
+        WAITD   1                       ; PW_EH
+        SETP    E, 0                    ; the LCD takes D4..D7 here
+        RET
+
+; ---------------------------------------------------------------------------
+; bfpoll: read the busy flag and the address counter (RS = 0, R/W = 1, two
+; nibbles: Figure 9, p.22) until BF = 0, at most BFMAX times. Returns r3 =
+; AC (bits 6:0), or 0x8100 if the flag never cleared. D4..D7 are driven
+; again on return.
+; ---------------------------------------------------------------------------
+bfpoll: CALL    release                 ; D4..D7 to the LCD
+        SETP    RS, 0
+        SETP    RW, 1                   ; read: the LCD drives while E is high
+        MOV16   r1, BFMAX
+bf_lp:  SETD    1
+        WAITD   1                       ; more than a tick since R/W or E fell
+        SETP    E, 1
+        WAITD   1                       ; t_DDR <= 360 ns: valid by now
+        IN      r3                      ; BF, AC6, AC5, AC4
+        SETP    E, 0
+        WAITD   1
+        SETP    E, 1
+        WAITD   1
+        IN      r2                      ; AC3..AC0
+        SETP    E, 0
+        SHLI    r3, 4
+        OR      r3, r3, r2              ; BF and AC in bits 7:0
+        MOV     r2, r3
+        SHRI    r2, 7                   ; BF
+        BZ      bf_end                  ; ready
+        DJNZ    r1, bf_lp
+        LDI     r3, 0x81                ; never ready: report 0x1
+        SWAP    r3, r3                  ; 0x8100
+bf_end: DLY     2                       ; E low more than a tick (t_DHR)
+        SETP    RW, 0                   ; then back to write,
+                                        ; and fall through to drive D4..D7
+
+; drive, release: the output enables of D4..D7, one pin at a time (OEP
+; touches only its pin, so another thread's BIDIR pins keep theirs).
+drive:  OEP     D4, 1
+        OEP     D5, 1
+        OEP     D6, 1
+        OEP     D7, 1
+        RET
+release: OEP    D4, 0
+        OEP     D5, 0
+        OEP     D6, 0
+        OEP     D7, 0
+        RET
