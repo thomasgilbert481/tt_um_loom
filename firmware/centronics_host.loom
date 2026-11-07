@@ -1,0 +1,158 @@
+; centronics_host.loom
+;
+; A Centronics parallel printer port, host side, in the compatibility mode
+; of IEEE 1284-1994 (the original Centronics byte handshake): bytes from
+; the host FIFO go to a printer over eight data lines and nSTROBE, paced by
+; BUSY, with a timeout on BUSY and the printer's five status lines reported
+; after every byte.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the parallel printer port is
+; in no design document. The program uses:
+;   - the OUT pin group (OUTGRP), built for parallel buses such as the
+;     HD44780's: one OUT puts a byte on D0..D7 at one edge, and, with the
+;     group moved for two instructions, the four control lines at one edge;
+;   - the IN pin group (INGRP): one IN reads BUSY, nACK, PE, SELECT and
+;     nERROR together;
+;   - the deadline schedule (WAITD), so data set-up, the strobe and the hold
+;     are each one tick that the host sets and the deadline checker proves;
+;   - the FIFOs for the bytes and the status words.
+; What the firmware does that no hardware does: the whole handshake (wait
+; for BUSY low and nACK high, data, set-up, strobe, hold), the BUSY timeout,
+; the nINIT pulse and the nSELECTIN and nAUTOFD levels. There is no
+; parallel-port peripheral on the chip. A dedicated port (a PC's LPT
+; controller) does the same with a hardware strobe; this one is slower per
+; byte (about seven ticks and the host's FIFO round trip) and is not
+; ECP or EPP: only the compatibility mode is done.
+;
+; Timing sources (tools/protomodels/centronics.py gives them in full; all
+; secondary, IEEE 1284 itself was not read): data set-up before nSTROBE
+; falls, nSTROBE width and data hold after it rises, each >= 0.5 us
+; (Tektronix wiki "Parallel port"; Lexmark C760 Technical Reference table
+; 8-1, times A, B, C), and BUSY low and nACK high >= 0.5 us before nSTROBE
+; falls (table 8-1, time G). The Solaris ecpp driver notes 1 us for the
+; strobe in "the Centronics specification" (unchecked). So the tick is >= 28
+; clocks at 50 MHz (0.56 us with the 3-clock slot dither), and 50 (1 us)
+; meets the 1 us reading too.
+;
+; Pins (the host side of the full interface; 17 of Loom's 19 pads):
+;     D0..D7     = BIDIR0..7, driven push-pull (PIN_OE = 0xFF)
+;     nSTROBE    = OUT0, idle high
+;     nINIT      = OUT1, idle high (low resets the printer)
+;     nSELECTIN  = OUT2, low (selects the printer); host-settable
+;     nAUTOFD    = OUT3, high (no automatic line feed); host-settable
+;     BUSY       = IN0, nACK = IN1, PE = IN2, SELECT = IN3, nERROR = IN4
+;
+; Memory: thread 0's quarter (.imem 512), 0x000..0x07F.
+;
+; Host commands (FIFO space, thread 0). Once after RUN: one word, the BUSY
+; timeout in ticks (1..65535; BUSY is polled once a tick). Then:
+;     bit 15 = 0   a byte: bits 7:0 go to the printer. Reply: a status word.
+;     bit 15 = 1   control. bits 13:12 the levels of nAUTOFD and nSELECTIN;
+;                  bit 14 = 1 also pulses nINIT low for n to n + 1 ticks,
+;                  n = bits 7:0 (1..255; 50 at TICK 50 gives the 50 us of
+;                  the unchecked reading). Reply: a status word (so bit
+;                  14 = 0 is a status query).
+; Status word: bits 4:0 the levels of BUSY, nACK, PE, SELECT, nERROR as read
+; at the end (for a byte: one tick after nSTROBE rose); bit 5 timeout: BUSY
+; did not go low (with nACK high) within the timeout and the byte was NOT
+; sent. Paper out, offline or a fault reach the host this way: a printer
+; that holds BUSY high times the byte out, and the status says why.
+;
+; The handshake, for tick P clocks (every edge is the first slot after a
+; WAITD, so each phase is P clocks, exact when P is a multiple of 4, else
+; P - 3 .. P + 3):
+;     poll BUSY and nACK once a tick until BUSY = 0 and nACK = 1;
+;     one tick (G >= 0.5 us), D0..D7, one tick (set-up), nSTROBE low, one
+;     tick (width), nSTROBE high, one tick (the data hold, and time for the
+;     printer to raise BUSY: STROBE low to BUSY high is <= 0.5 us in table
+;     8-1, time D), then the status; the data stay until the next byte.
+; The program trusts time D: it does not wait for BUSY to rise or for the
+; nACK pulse, as a PC's BIOS printer routine does not. A printer slower
+; than two ticks to raise BUSY could take a second byte too early.
+;
+; Readings taken on the open spec questions (2026-11-07): every timing is
+; secondary (IEEE 1284 was not read). A tick of 32 clocks gives a 0.64 us
+; strobe, above the 0.5 us minimum the Tektronix and Lexmark tables give
+; but short of the 1 us a Solaris driver note attributes to the standard;
+; on a real printer use a tick of 50 (1 us) or more. The 50 us nINIT
+; width is from memory, unchecked.
+
+; Registers: r0 the command word, r4 the timeout, r5 status and scratch,
+; r6 group values, r7 the poll and pulse count and the .csr scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   D0 = BIDIR0, NSTROBE = OUT0, NINIT = OUT1, NSELIN = OUT2
+        .pins   NAUTOFD = OUT3, BUSY = IN0
+        .tick   24                      ; the shortest tick proved (use >= 28)
+        .equ    DGRP = pin(D0) | (8 << 5)       ; OUT r: D0..D7 from r[7:0]
+        .equ    CGRP = pin(NSTROBE) | (4 << 5)  ; OUT r: the four controls
+        .equ    SGRP = pin(BUSY) | (5 << 5)     ; IN r: the five status lines
+        .equ    TMO = 0x20                      ; status bit 5
+
+start:  SETP    NSTROBE, 1              ; first: the pads come out of reset low
+        SETP    NINIT, 1
+        SETP    NSELIN, 0               ; printer selected
+        SETP    NAUTOFD, 1              ; no auto line feed
+        .csr    PIN_OE, 0xFF            ; D0..D7 driven
+        .csr    OUTGRP, DGRP
+        .csr    INGRP, SGRP
+        POP     r4                      ; the BUSY timeout, in ticks
+
+; ------------------------------------------------------------ one command
+cmd:    POP     r0
+        MOV     r5, r0
+        SHRI    r5, 15
+        BNZ     ctrl
+
+; A byte. Wait for BUSY = 0 and nACK = 1, once a tick, for r4 ticks.
+        MOV     r7, r4
+        SETD    1                       ; after the POP: re-anchor
+poll:   IN      r5
+        ANDI    r5, 3                   ; {nACK, BUSY}
+        CMPI    r5, 2                   ; nACK high, BUSY low
+        BZ      ready
+        WAITD   1
+        DJNZ    r7, poll
+        IN      r5                      ; timed out: the byte is not sent
+        ORI     r5, TMO
+        PUSH    r5
+        JMP     cmd
+
+ready:  WAITD   1                       ; G: ready a tick before the strobe
+        OUT     r0                      ; D0..D7
+        WAITD   1                       ; set-up
+        SETP    NSTROBE, 0
+        WAITD   1                       ; strobe width
+        SETP    NSTROBE, 1
+        WAITD   1                       ; hold; the printer raises BUSY
+        IN      r5
+        PUSH    r5
+        JMP     cmd
+
+; Control: nAUTOFD and nSELECTIN from bits 13:12 (written with nSTROBE and
+; nINIT high through the control group, at one edge), then an optional
+; nINIT pulse of bits 7:0 to one more ticks.
+ctrl:   MOV     r5, r0
+        SHRI    r5, 10
+        ANDI    r5, 0x0C                ; {nAUTOFD, nSELECTIN} to bits 3:2
+        ORI     r5, 3                   ; nINIT, nSTROBE high
+        .csr    OUTGRP, CGRP, r6
+        OUT     r5
+        .csr    OUTGRP, DGRP, r6
+        MOV     r5, r0
+        SHLI    r5, 1
+        SHRI    r5, 15                  ; bit 14: pulse nINIT
+        BZ      status
+        MOV     r7, r0
+        SHLI    r7, 8
+        SHRI    r7, 8                   ; the width in ticks
+        SETP    NINIT, 0
+        SETD    1
+i_lp:   WAITD   1
+        DJNZ    r7, i_lp
+        SETP    NINIT, 1
+status: IN      r5
+        PUSH    r5
+        JMP     cmd

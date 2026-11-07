@@ -1,0 +1,138 @@
+; centronics_printer.loom
+;
+; A Centronics parallel printer port, printer side, in the compatibility
+; mode of IEEE 1284-1994: takes a byte on every nSTROBE, answers with BUSY
+; and an nACK pulse, and shows paper out, offline and fault on PE, SELECT
+; and nERROR as the host (the FIFO host, standing for the print engine)
+; sets them. Every byte goes to the host FIFO with the control lines.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the parallel printer port is
+; in no design document. The program uses:
+;   - the IN pin group (INGRP), built for parallel buses such as the
+;     HD44780's: one IN reads D0..D7 and the four host controls together;
+;   - the OUT pin group (OUTGRP): one OUT sets BUSY, nACK, PE, SELECT and
+;     nERROR at one edge, so nACK rises and BUSY falls together;
+;   - WAITP with its timeout, the strobe detector: a level wait that gives
+;     up every POLL ticks so the program can look at nINIT and the FIFO;
+;   - the deadline schedule (WAITD) for the nACK width, and the FIFOs.
+; What the firmware does that no hardware does: the whole handshake (BUSY,
+; the data latch, nACK), the busy-while-full rule, the status lines and the
+; nINIT reset. A dedicated printer interface latches the data on the
+; strobe edge in hardware; this one samples the lines 13 to 36 clocks
+; after nSTROBE falls (see the timing below), inside the strobe width plus
+; the hold that the host must keep the data for anyway (>= 50 clocks at
+; 50 MHz), but later than a hardware latch would.
+;
+; Timing sources (tools/protomodels/centronics.py; all secondary): the host
+; holds data from >= 0.5 us before nSTROBE falls to >= 0.5 us after it rises,
+; and nSTROBE is low >= 0.5 us (Tektronix wiki "Parallel port"; Lexmark C760
+; Technical Reference table 8-1, times A, B, C); nACK is low >= 0.5 us (time
+; E) and STROBE low to BUSY high is <= 0.5 us (time D: a figure of that
+; printer, which the host program relies on). nINIT width: >= 50 us, from
+; memory, unchecked.
+;
+; Pins (the printer side of the full interface; 17 of Loom's 19 pads):
+;     D0..D7     = BIDIR0..7, inputs (PIN_OE stays 0)
+;     nSTROBE    = IN0, nINIT = IN1, nSELECTIN = IN2, nAUTOFD = IN3
+;     BUSY       = OUT0, nACK = OUT1, PE = OUT2, SELECT = OUT3, nERROR = OUT4
+;
+; Memory: thread 0's quarter (.imem 512), 0x000..0x07F.
+;
+; Host commands (FIFO space, thread 0). Once after RUN: one word, the nACK
+; width in ticks (1..255; the pulse is that many ticks to one more). BUSY
+; is high until it arrives. Then, at any time, a status word, the levels
+; written to the status group (bit 1, nACK, is forced high):
+;     bit 0 HOLD: BUSY high (buffer full; the next byte is not taken)
+;     bit 2 PE, bit 3 SELECT, bit 4 nERROR
+; so 0x18 is ready, 0x05 paper out (BUSY, PE high; SELECT, nERROR low).
+; Results (FIFO space read), one word per event:
+;     a byte: bits 7:0 D7..D0, bits 11:8 nAUTOFD, nSELECTIN, nINIT, nSTROBE
+;             (nSTROBE reads 0) as sampled with the data
+;     nINIT:  0x8000, once nINIT has gone high again
+; A full result FIFO holds BUSY high, so the host FIFO is the buffer full
+; condition too: the byte waits in the PUSH and nACK follows when it is in.
+;
+; Timing (tick P clocks, host-set; .tick 8 is the shortest proved):
+;     nSTROBE is seen within 24 clocks while the program waits (the WAITP
+;     and the five slots of its timeout path; a status word adds about
+;     eight more slots), and within 4 clocks inside the WAITP, plus the
+;     2-clock synchroniser. BUSY rises 2 slots after that and the data are
+;     sampled in the slot after: BUSY is high 12 to 35 clocks after nSTROBE
+;     falls, 0.24 to 0.70 us at 50 MHz (time D asks <= 0.5 us, 25 clocks:
+;     met inside the WAITP, 15 clocks at most, not always on the timeout
+;     path; see FW_README.md). The data are sampled as BUSY rises (the IN
+;     reads the pads of the edge after the BUSY write lands).
+;     After nSTROBE rises (and the byte is in the FIFO), nACK low for
+;     ACKW to ACKW + 1 ticks plus at most 16 clocks, then nACK high and
+;     BUSY low at one edge.
+;     A strobe shorter than 24 clocks (0.48 us at 50 MHz) can be missed.
+;     nINIT is looked at once every POLL ticks (with P = 25, 8 us).
+;
+; Readings taken on the open spec questions (2026-11-07): BUSY falls on
+; the edge nACK rises; the host-set status survives nINIT; a strobe while
+; BUSY is high is taken anyway. The 0.5 us strobe-to-BUSY figure is one
+; Lexmark printer's, not a stated host requirement; this program can be
+; up to 10 clocks past it when a strobe lands on its nINIT and FIFO check.
+
+; Registers: r0 the byte, r1 the nACK count, r4 the nACK width, r6 the
+; status group image, r7 the .csr scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   D0 = BIDIR0, NSTROBE = IN0, NINIT = IN1
+        .pins   BUSY = OUT0, NACK = OUT1
+        .tick   8                       ; the shortest tick proved
+        .equ    IGRP = pin(D0) | (12 << 5)      ; IN r: D0..D7, IN0..IN3
+        .equ    SGRP = pin(BUSY) | (5 << 5)     ; OUT r: the five status lines
+        .equ    POLL = 16                       ; ticks between looks at nINIT
+        .equ    READY = 0x1A                    ; nERROR, SELECT, nACK high
+
+start:  .csr    OUTGRP, SGRP
+        LDI     r6, READY | 1           ; BUSY high until the nACK width is in
+        OUT     r6
+        .csr    INGRP, IGRP
+        POP     r4                      ; the nACK width, in ticks
+        LDI     r6, READY
+        OUT     r6                      ; ready: BUSY low
+
+; ---------------------------------------------------------------- waiting
+; A level wait on nSTROBE that gives up every POLL ticks. Outside the WAITP
+; the path back to it is five slots (BNT, JP, WAITB, BT, SETD), so a strobe
+; low for 24 clocks or more is always seen.
+idle:   SETD    POLL
+        WAITP   NSTROBE, 0, T
+        BNT     got                     ; nSTROBE low
+        JP      NINIT, 0, init
+        WAITB   INQ_NE, T               ; TD is reached: a test, not a wait
+        BT      idle
+        POP     r6                      ; a new status image from the host
+        ORI     r6, 2                   ; nACK stays high
+        ANDI    r6, 0x1F
+        OUT     r6
+        JMP     idle
+
+; ------------------------------------------------------------------ a byte
+got:    SETP    BUSY, 1
+        IN      r0                      ; D0..D7 and the controls
+        WAITP   NSTROBE, 1              ; the end of the strobe
+        PUSH    r0                      ; blocks while the FIFO is full: busy
+        SETP    NACK, 0
+        SETD    1
+        MOV     r1, r4
+a_lp:   WAITD   1                       ; nACK width: r4 to r4 + 1 ticks
+        DJNZ    r1, a_lp
+        OUT     r6                      ; nACK high, BUSY = HOLD, one edge
+        JMP     idle
+
+; ------------------------------------------------------------------ nINIT
+; BUSY high while nINIT is low, then report it and go back to the status
+; the host set.
+init:   MOV     r1, r6
+        ORI     r1, 1
+        OUT     r1
+        WAITP   NINIT, 1
+        MOV16   r0, 0x8000
+        PUSH    r0
+        OUT     r6
+        JMP     idle

@@ -114,6 +114,7 @@ from tools.tests import test_fw_iec62056                          # noqa: E402
 from tools.tests import test_fw_lego_pf                           # noqa: E402
 from tools.tests import test_fw_dtmf                              # noqa: E402
 from tools.tests import test_fw_swim                              # noqa: E402
+from tools.tests import test_fw_centronics                        # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
@@ -136,7 +137,7 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_morse, test_fw_microwire, test_fw_baudot, test_fw_x10,
            test_fw_padctl, test_fw_em4100, test_fw_ax25, test_fw_pocsag,
            test_fw_hub75, test_fw_vga, test_fw_iec62056, test_fw_lego_pf,
-           test_fw_dtmf, test_fw_swim)
+           test_fw_dtmf, test_fw_swim, test_fw_centronics)
 
 
 def _make(scenario):
