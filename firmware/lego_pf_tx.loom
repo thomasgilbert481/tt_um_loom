@@ -1,0 +1,217 @@
+; lego_pf_tx.loom
+; LEGO Power Functions infrared transmitter on OUT0, fed by the host through
+; INQ[0]: one word per message, the LRC computed here, the five
+; transmissions with their channel-dependent spacing.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names LEGO
+; Power Functions. Nothing in Loom was built for infrared: there is no PWM
+; and no carrier generator. The program makes the 38 kHz carrier itself, as
+; ir_nec_tx.loom does, with two pieces of hardware built for other jobs: the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016),
+; built so that WS2812 pulses land on the exact clock, and the fractional
+; tick divider (TICK_FRAC, SEMANTICS 4), built for UART rates. Power
+; Functions codes a bit in the time from one 6-cycle mark to the next, where
+; NEC codes the space after a 22-cycle mark and SIRC the mark: here that is
+; only a different WAITD after the same burst. What the firmware does that
+; no hardware does: the carrier, the pulse-distance code, the LRC, the five
+; transmissions spaced by the channel, the hold stream and the pre-emption
+; by a new command. It needs the FIFOs (POP, WAITB INQ_NE) and the latch.
+;
+; Pin: LED = OUT0, push-pull, high = LED on, through a transistor (a pad
+; cannot drive an IR LED's 50..100 mA itself). Idle low: the LED is off.
+;
+; Host command format (FIFO space, thread 0), one word per command:
+;   bits 15:4  nibbles 1, 2 and 3 of the message exactly as they go on the
+;              wire (toggle or address, escape, channel, address, mode,
+;              data: the host owns every field, the toggle included, because
+;              combo PWM mode has no toggle bit, LEGO document section
+;              "Combo PWM mode");
+;   bits 3:0   not sent: the program puts the LRC there. Bit 0 is HOLD: after
+;              the fifth transmission the message goes on at the spacing of
+;              the fourth to the fifth until the next word comes (a key held
+;              down, section "Transmitting Messages"). Bits 3:1 are ignored.
+; Nothing is ever pushed to OUTQ.
+;
+; Wire format (LEGO Power Functions RC, v1.20, 26.02.2010). Section "LEGO
+; Power Functions RC Encoding": a mark is six cycles of 38 kHz; a bit is
+; timed from the start of its mark to the start of the next mark: a low bit
+; 16 cycles (421 us), a high bit 27 (711 us), the start and stop bits 45
+; (1184 us). Section "LEGO Power Functions RC Protocol": a message is the
+; start bit, 16 bits (nibble 1, nibble 2, nibble 3, LRC, each most
+; significant bit first) and the stop bit; LRC = 0xF xor nibble 1 xor nibble
+; 2 xor nibble 3. So a message is 18 marks: the start mark, one mark before
+; each data bit, and the stop mark, which ends the last data bit.
+;
+; Retransmission (section "Transmitting Messages"). With tm = 16 ms, the
+; maximum message length, and Ch the channel 1..4 (CC + 1): the first
+; message after (4 - Ch) tm, the next two 5 tm start to start, the
+; following ones (6 + 2 Ch) tm start to start; five in all, and while a key
+; is held the message goes on at the last spacing. A new command pre-empts
+; the copies still to come ("five exactly matching messages, if no other
+; buttons are pressed or released"). Here tm = 608 carrier cycles, exactly
+; 16 ms, so every start is on the carrier grid:
+;   Ch  first delay   1-2, 2-3     3-4, 4-5 and the hold stream
+;   1   3 tm  48 ms   5 tm 80 ms    8 tm 128 ms
+;   2   2 tm  32 ms                10 tm 160 ms
+;   3   1 tm  16 ms                12 tm 192 ms
+;   4   0                          14 tm 224 ms
+; The first delay counts from the word's arrival plus K = 4 cycles (105 us)
+; of set-up; the starts after it are exact. A word queued while copies are
+; still to come is checked LEAD ticks before each copy's start: it ends the
+; sequence there and its own first delay starts. The first message of every
+; word always goes out.
+;
+; Tick (set by the host before RUN, the M2 convention: the clock is the
+; board's): one tick is a third of a carrier period, TICK = f_clk / 114 kHz.
+;   50 MHz: TICK_INT 438, TICK_FRAC 153: 438.59765625 clocks (ideal
+;     438.5965, +2.7 ppm): 37,999.90 Hz, every edge within one clock of the
+;     ideal grid.
+;   1.824 MHz (the RTL tests): TICK_INT 16, TICK_FRAC 0: exactly 38 kHz.
+; The deadline schedule is proved for ticks of 16 clocks or more (.tick).
+;
+; Duty 1/3: high one tick, low two. The LEGO document does not state a duty
+; (QUESTIONS.md); 1/3 is what ir_nec_tx uses for the same 38 kHz receivers.
+; A mark of six cycles lasts 16 ticks from its first rise to its last fall
+; (158 us less the last cycle's dark two ticks).
+;
+; Timing. Each carrier edge is `SETP LED, v, D` and the WAITD that lands
+; it, on the exact clock edge of its tick (SEMANTICS 6.10 rule 1). The burst
+; loop is the subroutine of ir_nec_tx: SETP 1 D, WAITD 2 (the rise), SETP 0
+; D, WAITD 1 (the fall), DJNZ. It returns with TD at the last fall, 16 ticks
+; after the first rise, so a bit of n cycles is one WAITD 3n - 18 before the
+; next burst's WAITD 2 lands the next rise.
+;
+; Registers: r0 the host word; r1 the copies of it sent so far; r2 the
+; message on the wire; r3 carrier cycles, then scratch; r4 data bits left,
+; then scratch; r5 cycles to the next start; r6 (6 + 2 Ch) tm in cycles;
+; r7 the bits being shifted out, then scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): the first delay
+; is (4 - Ch) tm. In the v1.20 PDF's text layer the operator is a glyph
+; that does not extract ("(4  Ch)*tm"), while the "+" of the next formula,
+; "(6 + 2*Ch)*tm", does; a typeset minus is the reading that fits. The
+; director checked the extracted text on 2026-11-07; the printed page was
+; not seen. The 6-cycle marks are shorter than the TSOP382 minimum burst,
+; so a stock receiver module may not respond (see lego_pf_rx.loom).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   LED = OUT0
+        .tick   16                      ; the shortest tick the schedule is proved for
+        .equ    TM    = 608             ; tm = 16 ms in carrier cycles
+        .equ    MARKC = 6               ; carrier cycles in a mark
+        .equ    BIT0  = 16              ; cycles from mark to mark: a low bit
+        .equ    BIT1  = 27              ; a high bit
+        .equ    BITSS = 45              ; the start and stop bits
+        .equ    K     = 4               ; cycles of every gap after its loop
+        .equ    LEAD  = 8               ; ticks between the decision and a start
+
+start:  SETP    LED, 0                  ; LED off
+idle:   POP     r0                      ; blocks while INQ is empty
+
+; A new word: the LRC and its channel's spacings, then its first message
+; (4 - Ch) tm + K cycles after the SETD below.
+new:    MOV     r7, r0
+        SHRI    r7, 4                   ; nibbles 1..3 in bits 11:0
+        MOV     r3, r7
+        SHRI    r3, 8                   ; nibble 1 in bits 3:0
+        XOR     r7, r7, r3              ; bits 3:0: n3 ^ n1
+        MOV     r3, r7
+        SHRI    r3, 4                   ; bits 3:0: n2
+        XOR     r7, r7, r3              ; bits 3:0: n3 ^ n2 ^ n1
+        XORI    r7, 0xF
+        ANDI    r7, 0xF                 ; the LRC
+        MOV     r2, r0
+        SHRI    r2, 4
+        SHLI    r2, 4
+        OR      r2, r2, r7              ; the message as it goes out
+        MOV     r3, r0
+        SHRI    r3, 12
+        ANDI    r3, 3                   ; CC = Ch - 1; Z: channel 1
+        MOV16   r5, 3 * TM              ; the first delay, (4 - Ch) tm
+        MOV16   r6, 8 * TM              ; (6 + 2 Ch) tm
+        BZ      ch1
+        MOV16   r4, TM
+chl:    SUB     r5, r5, r4              ; one channel up: tm less first,
+        ADD     r6, r6, r4
+        ADD     r6, r6, r4              ; 2 tm more between the later copies
+        DJNZ    r3, chl
+ch1:    LDI     r1, 0                   ; no copy sent yet
+        SETD    1                       ; the anchor
+
+; The gap: r5 cycles in steps of 63, then K cycles less LEAD ticks, which
+; leaves TD LEAD ticks before the next start. Entered with TD at the anchor.
+gap:    SUBI    r5, 63                  ; C = (r5 >= 63)
+        BNC     grest
+        WAITD   3 * 63
+        JMP     gap
+grest:  ADDI    r5, 63                  ; 0 .. 62 cycles left; Z: none
+        BZ      gend
+gcyc:   WAITD   3
+        DJNZ    r5, gcyc
+gend:   WAITD   3 * K - LEAD            ; LEAD ticks before the start
+
+; LEAD ticks before a start: a word queued behind ends the sequence (not
+; before its first copy); else this copy goes out, with r5 set to the cycles
+; from its start to the next copy's.
+        TEST    r1, r1
+        BZ      go                      ; the first copy always goes out
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BNT     pre                     ; a new word: it pre-empts the rest
+go:     ADDI    r1, 1                   ; this copy's number, 1 .. 5
+        MOV16   r5, 5 * TM              ; after copies 1 and 2: 5 tm
+        CMPI    r1, 3
+        BNC     sched                   ; r1 < 3
+        MOV     r5, r6                  ; after 3 and 4: (6 + 2 Ch) tm
+        CMPI    r1, 5
+        BNZ     sched
+        MOV     r7, r0
+        SHRI    r7, 1                   ; C = HOLD
+        BNC     sched                   ; the fifth without HOLD: the last
+        LDI     r1, 4                   ; HOLD: every later copy is a fifth
+sched:  WAITD   LEAD - 2                ; the burst's WAITD 2 lands the start
+
+; One message, r2, most significant bit first. Entered with TD two ticks
+; before the start mark's first rise; r5 = cycles from that rise to the next
+; copy's, counted down as the bits go out.
+msg:    LDI     r3, MARKC
+        CALL    burst                   ; the start mark
+        SUBI    r5, BITSS
+        MOV     r7, r2
+        LDI     r4, 16
+        WAITD   3 * BITSS - 18          ; the start bit: 45 cycles
+bit:    LDI     r3, MARKC
+        CALL    burst                   ; this bit's mark
+        SHLI    r7, 1                   ; C = the bit
+        BC      one
+        SUBI    r5, BIT0
+        WAITD   3 * BIT0 - 18           ; a low bit: 16 cycles
+        DJNZ    r4, bit
+        JMP     stop
+one:    SUBI    r5, BIT1
+        WAITD   3 * BIT1 - 18           ; a high bit: 27 cycles
+        DJNZ    r4, bit
+stop:   LDI     r3, MARKC
+        CALL    burst                   ; the stop mark; TD at its last fall
+        CMPI    r1, 5
+        BNZ     more
+        WAITD   3 * BITSS - 18          ; the fifth: the stop bit's pause,
+        JMP     idle                    ; so no message starts inside it
+more:   WAITD   2                       ; TD six cycles after the stop mark's start
+        SUBI    r5, MARKC + K           ; what the gap waits in its loop
+        JMP     gap
+
+; A word queued behind the sequence: the guard above saw it.
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+pre:    POP     r0
+        JMP     new
+
+; The carrier: r3 cycles, each a rise, one tick high, two ticks low. Entered
+; with TD two ticks before the first rise; returns with TD at the last fall.
+burst:  SETP    LED, 1, D
+        WAITD   2                       ; the rise lands here
+        SETP    LED, 0, D
+        WAITD   1                       ; the fall, one tick later
+        DJNZ    r3, burst
+        RET

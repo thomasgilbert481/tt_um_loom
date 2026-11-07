@@ -1,0 +1,212 @@
+; lego_pf_rx.loom
+; LEGO Power Functions infrared receiver on IN0, for the output of a
+; demodulating receiver module (low while a 38 kHz burst is present):
+; decodes each message, checks its LRC, drops the copies of a message it
+; has already delivered, and pushes each new message to the host on OUTQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names LEGO
+; Power Functions. Nothing in Loom was built for infrared. As in
+; ir_nec_rx.loom, the program times every interval with the timed waits
+; (`WAITP ... T` against a `SETD` deadline, SEMANTICS 6.4), built for the
+; timeouts of PS/2 and I2C clock stretching, and restarts its tick grid on
+; every falling edge it accepts (a `CSRW TICK_INT` clears ACC, SEMANTICS 4),
+; the hard synchronisation built for the UART, CAN and Manchester
+; receivers. What the firmware does that no hardware does: the
+; mark-to-mark decoding and its windows, the glitch filter, the start and
+; stop bits, the LRC and the repeat filter. It needs the FIFOs (PUSH) and
+; nothing else: no bit engine, no latch.
+;
+; Pin: RX = IN0, idle high (the module's output; it has its own pull-up).
+;
+; Result format (FIFO space read, thread 0): one word per new message, the
+; 16 bits as received (nibble 1 in bits 15:12 .. the LRC in bits 3:0), whose
+; LRC is right. Nothing else is ever pushed: a message with a bad LRC, a bit
+; out of every window or a missing stop bit is dropped, and the receiver
+; looks for a new start bit, as the LEGO receiver does (section "Receiving
+; Messages": "a new start bit is searched for"). The program blocks on a
+; full OUTQ; a host has the 5 tm (80 ms) to the next copy to empty it.
+; Nothing is read from INQ.
+;
+; Decoding (LEGO Power Functions RC, v1.20, 26.02.2010, section "LEGO Power
+; Functions RC Decoding"): a bit is the time from the start of one mark
+; to the start of the next, "using only one, the active edge", so a receiver
+; module's pulse-width error does not enter it. The windows of section
+; "Receiving Messages": low bit 316 .. 526 us, high bit 526 .. 947 us, start
+; and stop bit 947 .. 1579 us. In carrier cycles of 38 kHz (one tick, below)
+; they are 12 .. 20, 20 .. 36 and 36 .. 60, within 1 us of the document's
+; figures; nominal 16, 27 and 45.
+;   start   the interval after a mark is 36 .. 60: a start bit; anything else
+;           makes the mark that ended it the next candidate;
+;   data    16 intervals, each 12 .. 20 (0) or 20 .. 36 (1), most
+;           significant first; a 36 .. 60 interval is taken as a new start
+;           bit (the message so far is dropped); an interval under 12 makes
+;           its end mark the next candidate; none by 60 ends the message;
+;   stop    the mark that ends the last data bit is the stop mark; no mark
+;           may follow it within 36 ticks (the stop bit's lower bound);
+;   mark    every mark must end within 12 ticks of its start (a mark is
+;           six cycles; a receiver module can lengthen it by five, below).
+;
+; Repeats. The transmitter sends every message five times and, for a held
+; key, on and on (section "Transmitting Messages"); the toggle bit changes
+; for every new command (section "LEGO Power Functions RC Protocol"). So a
+; message equal, toggle included, to the last one delivered is a copy and
+; is dropped. The last message is forgotten when the line has been dark
+; (no mark) for 36 x 255 ticks = 241.6 ms, longer than the longest dark
+; time inside a sequence (224 ms start to start on channel 4, less the
+; message). A key released and pressed again sends a new toggle anyway.
+; Combo PWM mode has no toggle bit (bit 15 is the address there): two equal
+; combo PWM commands less than 241.6 ms apart are delivered once, which is
+; what a motor driver would do with them.
+;
+; Tick (set by the host before RUN, the M2 convention): one tick is one
+; carrier period, 1/38 kHz = 26.32 us.
+;   50 MHz: TICK_INT 1315, TICK_FRAC 202 (1315.789, ideal 1315.789).
+;   1.824 MHz (the RTL tests): TICK_INT 48, TICK_FRAC 0 (exact).
+; TICK_INT must be 32 or more (the filter, below, is TICK_INT / 4 - 4 slots).
+; The program reads TICK_INT once at start.
+;
+; Glitch filter. An edge counts only if the new level is still there one
+; tick (26 us) later; a shorter pulse of either level is ignored and the
+; wait it interrupted goes on against the same deadline. A falling edge
+; that counts restarts the grid and sets the first deadline in the next
+; slot, so every window is measured from the edge plus the filter's tick,
+; which the deadlines take off (11 = 12 - 1).
+;
+; Receiver modules. Vishay's TSOP382.. datasheet (document 82491) gives the
+; output pulse width as the burst length -5/f0 .. +5/f0 and asks for bursts
+; of 10 cycles or more (as read for ir_nec_rx.loom and protomodels/ir_nec.py,
+; not re-read here): LEGO's six-cycle marks are below that, so the
+; module must be one made for short bursts (QUESTIONS.md). Since only the
+; falling edges are timed, any output pulse from one tick (the filter) to 12
+; ticks long decodes.
+;
+; Registers: r0 the message being received; r1 the last message delivered
+; (0: none; 0x0000 has a bad LRC, so it is never a message); r2 the dark
+; counter; r3 the filter's delay counter and scratch; r4 data bits left; r5
+; the filter delay in slots; r6 = TICK_INT for the restarts; r7 the
+; interval class, then scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   32                      ; TICK_INT 32 or more (header)
+        .equ    W12   = 12 - 1          ; the windows' edges in ticks, less the filter
+        .equ    W20   = 20 - 1
+        .equ    W36   = 36 - 1
+        .equ    W60   = 60 - 1
+        .equ    DARK  = 36              ; dark periods of 255 ticks that forget r1
+        .equ    C_SHORT = 0             ; interval classes returned by meas
+        .equ    C_LOW   = 1
+        .equ    C_HIGH  = 2
+        .equ    C_SS    = 3
+        .equ    C_NONE  = 4
+        .equ    C_LONG  = 5
+
+start:  CSRR    r6, TICK_INT            ; P, kept for the restarts
+        MOV     r5, r6
+        SHRI    r5, 2                   ; P / 4 slots = one tick: the glitch filter,
+        SUBI    r5, 4                   ; less the 4 other slots of wlow / whigh
+        LDI     r1, 0                   ; no message delivered yet
+
+; Hunt: an idle (high) line, then a confirmed mark, counting dark time.
+hunt:   WAITP   RX, 1
+        LDI     r2, DARK
+h2:     SETD    255
+        CALL    wlow
+        BNT     cand                    ; a mark: perhaps the start mark
+        DJNZ    r2, h2
+        LDI     r1, 0                   ; 241.6 ms dark: forget the last message
+        JMP     hunt
+
+; A candidate start mark has just been confirmed (the grid restarted on it).
+cand:   CALL    meas
+        CMPI    r7, C_SS
+        BZ      sbit                    ; a start bit
+        BC      hunt                    ; no mark by 60 ticks, or a mark too long
+        JMP     cand                    ; a shorter interval: its end mark is the candidate
+
+; The 16 data bits, most significant first, into r0.
+sbit:   LDI     r4, 16
+dbit:   CALL    meas
+        SUBI    r7, 1                   ; 0 a low bit, 1 a high bit; C = (class >= 1)
+        BNC     cand                    ; too short: the new mark is the candidate
+        CMPI    r7, C_SS - 1
+        BZ      sbit                    ; a start bit's length: a new message
+        BC      hunt                    ; no mark, or a mark too long
+        SHLI    r0, 1
+        OR      r0, r0, r7              ; the bit
+        DJNZ    r4, dbit
+
+; The stop mark has just started: no mark may follow within 36 ticks.
+        CALL    meas
+        CMPI    r7, C_SS
+        BNC     cand                    ; a mark too soon: the candidate
+        CMPI    r7, C_LONG
+        BZ      hunt                    ; the stop mark did not end
+
+; A whole message: the four nibbles must XOR to 0xF.
+        MOV     r7, r0
+        MOV     r3, r0
+        SWAP    r3, r3
+        XOR     r7, r7, r3              ; bits 7:0: high byte ^ low byte
+        MOV     r3, r7
+        SHRI    r3, 4
+        XOR     r7, r7, r3              ; bits 3:0: n1 ^ n2 ^ n3 ^ LRC
+        ANDI    r7, 0xF
+        CMPI    r7, 0xF
+        BNZ     hunt                    ; a bad LRC: dropped
+        CMP     r0, r1
+        BZ      hunt                    ; the last message again: a copy, dropped
+        MOV     r1, r0
+        PUSH    r0                      ; blocks while OUTQ is full
+        JMP     hunt
+
+; meas: the interval from the mark just confirmed (the grid restarted on it,
+; TD = W12 set) to the next mark's start. Returns its class in r7: C_SHORT
+; (a mark before 12 ticks), C_LOW (12 .. 20), C_HIGH (20 .. 36), C_SS
+; (36 .. 60), C_NONE (no mark by 60), C_LONG (the mark did not end by 12).
+; For the first four the new mark is confirmed and the grid restarted on it.
+meas:   LDI     r7, C_LONG
+        CALL    whigh                   ; the mark's end, before W12
+        BT      mret
+        LDI     r7, C_SHORT
+        CALL    wlow
+        BNT     mret                    ; a mark before 12 ticks
+        LDI     r7, C_LOW
+        SETD    W20 - W12
+        CALL    wlow
+        BNT     mret
+        LDI     r7, C_HIGH
+        SETD    W36 - W20
+        CALL    wlow
+        BNT     mret
+        LDI     r7, C_SS
+        SETD    W60 - W36
+        CALL    wlow
+        BNT     mret
+        LDI     r7, C_NONE
+mret:   RET
+
+; wlow / whigh: wait until RX is low / high or TD is reached, through the
+; glitch filter. T = 1: TD came first. T = 0: the new level held for r5
+; slots (one tick). A level that does not hold is a glitch, and the wait
+; goes on against the same TD.
+; A confirmed fall restarts the tick grid (CSRW TICK_INT clears ACC): its X
+; cycle is 4 + r5 slots = P clocks after the WAITP that saw the edge, one
+; tick. The SETD in the next slot, before the grid's first tick, sets the
+; first window edge: TD = W12 ticks after the restart.
+wlow:   WAITP   RX, 0, T
+        BT      wlr
+        MOV     r3, r5
+wld:    DJNZ    r3, wld
+        JP      RX, 1, wlow             ; high again: a glitch
+        CSRW    TICK_INT, r6            ; the next interval starts here
+        SETD    W12
+wlr:    RET
+whigh:  WAITP   RX, 1, T
+        BT      whr
+        MOV     r3, r5
+whd:    DJNZ    r3, whd
+        JP      RX, 0, whigh            ; low again: a glitch
+whr:    RET
