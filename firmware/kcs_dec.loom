@@ -1,0 +1,210 @@
+; kcs_dec.loom
+; A Kansas City Standard cassette decoder (300 baud, a 0 four cycles of
+; 1200 Hz, a 1 eight cycles of 2400 Hz), with the 1200 baud CUTS variant
+; (one cycle of 1200 Hz, two of 2400 Hz): counts the zero crossings of the
+; squared-up tape signal, lets the count of crossings, not a clock, say
+; where each bit ends, frames characters of a start bit, eight data bits
+; LSB first and two stop bits, and reports each byte to the host with a
+; framing-error bit and a dropout bit.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; it: there is no frequency discriminator, no PLL and no UART receiver. The
+; program uses:
+;   - the edge wait with a timeout (WAITE ANY, T, built for clocked and
+;     pulse-width inputs; the timeout against TD finds a dropout) and NOW,
+;     read at every edge, as a time stamp (the interval idiom of
+;     bell202_demod and ir_sirc_rx);
+;   - the per-thread fractional tick, here only as the unit of the time
+;     stamps and the dropout timeout (1/32 of a 1200 Hz half-period);
+;   - OUTQ for the received characters.
+; What the firmware does that no hardware does: the half-period decision,
+; the cycle counting that re-times every bit from the tape itself, the
+; character framing, the stop-bit check and the dropout report. Its only
+; deadline is the dropout timeout, a WAITE T against a SETD made at each
+; edge: no WAITD, so no pair for the checker.
+;
+; Input: a logic-level signal on RX whose edges are the zero crossings of
+; the playback signal, as a comparator after the cassette's output makes it
+; (the analog part is not Loom's). kcs_enc.loom's square wave is exactly
+; such a signal, so the two programs can be wired pin to pin.
+;
+; Standard: as kcs_enc.loom (BYTE, February 1976, pp. 72-73; CUTS from a
+; secondary source; tools/protomodels/kcs.py says what could not be
+; checked). BYTE: "Bit clocking information may be extracted from the
+; recorded waveform, which is always an integer multiple of the bit rate,
+; regardless of tape speed." That sentence is this decoder's design.
+;
+; Tick: the host sets TICK_INT 651, TICK_FRAC 11 at 50 MHz (76 800 Hz, 2 ppm
+; slow), or any tick of 1/76 800 s at the board's clock. Then a 2400 Hz
+; half-period is 16 ticks and a 1200 Hz one 32.
+;
+; Counting. Each half-period between two accepted edges is long (24 ticks
+; or more, a 1200 Hz half) or short (under 24, a 2400 Hz half); 24 is the
+; midpoint of 16 and 32. A long half counts 2 units, a short one 1, and a
+; bit is complete when its units reach 16 (300 baud: eight long halves or
+; sixteen short ones) or 4 (CUTS: two or four). Its value is 0 when at
+; least half its units came from long halves. The bit time is therefore
+; whatever the tape makes it: a constant speed error, or a slow drift
+; inside a character, does not move a bit boundary off the crossings,
+; because the boundary is a crossing. A count that overshoots (a long half
+; that straddles the boundary, only after a disturbance) carries its extra
+; unit into the next bit.
+;
+; A pure fixed-window counter (a clock's bit time, crossings counted inside
+; it, re-anchored at each start bit) was the other reading of "count the
+; crossings in a bit time". It was rejected: at 5 % speed error the window
+; slides 0.45 bit by the eighth data bit, and a 0 there followed by the
+; stop bit's marks counts 4.4 + 7.2 = 11.6 crossings against a threshold of
+; 12, a coin toss. Counting crossings until a bit's worth is the same
+; counter, with the window's length taken from the tape.
+;
+; Speed tolerance. Only the long/short decision depends on speed: a 1200 Hz
+; half stays long down to 32 / 1.33 = 24 ticks, a 2400 Hz half stays short
+; up to 16 / 0.67 = 24, so the limit is a tape running 33 % fast or slow,
+; less the edge jitter (each half's error is the sum of two edges'). The
+; tests run +-5 % on the RTL and +-25 % with +-10 us of jitter on the model;
+; BYTE asks only that "long and short term tape speed variation" be
+; provided for, with no figure.
+;
+; Framing. While hunting, short halves (the leader, the marks between
+; characters) are counted for nothing, and the first long half starts a
+; start bit; if that bit's count comes out a 1 it was noise and hunting
+; goes on, with nothing reported. Then eight data bits LSB first and the
+; two stop bits; a 0 in either sets the framing-error bit (BYTE: "two or
+; more marks as stop bits"). After the second stop bit the decoder hunts
+; again, so a third or later stop bit is just more marks.
+;
+; Edges less than 4 ticks (52 us) after the last accepted one are ignored,
+; which absorbs a bounce right after a crossing. A glitch in the middle of
+; a half-period is not filtered: it splits a long half into short ones, may
+; cost the character it falls in, and is reported with a framing error or
+; not at all if the bits still look valid (the limits of a zero-crossing
+; detector, which the comparator's hysteresis is there to avoid).
+;
+; Dropout. A half-period of 48 ticks (1.5 times a 1200 Hz half) with no
+; crossing ends the character: the decoder pushes a word with the dropout
+; bit and hunts again; the first edge after the silence only starts a
+; half-period. A dropout while hunting reports nothing.
+;
+; Pins: RX = IN0 (any input or BIDIR pin with --pin RX=<pin>).
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, once, before anything else: the configuration word, bit 0 = 1 for
+;     CUTS at 1200 baud, 0 for 300 baud; other bits ignored. The program
+;     waits for it.
+;   OUTQ, one word a character:
+;     bits 7:0   the byte (undefined when bit 9 is set)
+;     bit 8      framing error (a stop bit was 0)
+;     bit 9      dropout (no crossing for 48 ticks inside the character)
+;   PUSH blocks while OUTQ is full (FIFO_DEPTH 4), and edges are missed
+;   while it does, so the host drains OUTQ within four characters (147 ms
+;   at 300 baud, 37 ms at 1200).
+;
+; Timing: the longest path from one WAITE to the next (the edge that ends
+; the second stop bit with a framing error: 46 slots, 184 clocks, counted
+; by hand from the listing) must end before the next crossing: a 2400 Hz
+; half-period is 16 ticks, 10 400 clocks at 50 MHz (512 on the RTL tests'
+; 2.4576 MHz board), or 12 ticks on a tape 33 % fast (384 clocks there).
+;
+; Memory: 72 words, 0x000 to 0x047 of thread 0's quarter (.imem 512); moved
+; to thread 1 (0x080 to 0x0C7) it fits beside kcs_enc.loom (49 words).
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   "Count crossings in a bit time" is read as counting crossings until
+;   they make a whole bit, so the tape sets the bit time; a fixed clock
+;   window fails at about 5 % speed error (the arithmetic is above).
+;   Both stop bits are checked; no parity. BYTE (February 1976) was read
+;   as OCR text, not the page scan; the CUTS figures are from a
+;   secondary source, unchecked.
+
+        .imem   512
+        .thread 0
+        .pins   RX = IN0
+
+        .equ    UNITS300  = 16                  ; units a bit at 300 baud
+        .equ    UNITS1200 = 4                   ; units a bit at 1200 baud (CUTS)
+        .equ    THRESH    = 24                  ; a half-period this long or longer is 1200 Hz
+        .equ    BOUNCE    = 4                   ; shortest half-period accepted
+        .equ    DROP      = 48                  ; no crossing this long: a dropout
+        .equ    NCHAR     = 11                  ; start, eight data bits, two stop bits
+
+; r0 T0, the last accepted edge   r1 units in this bit   r2 long units in
+; this bit   r3 the character's bits, first highest   r4 bits still to come
+; (0: hunting)   r5 units a bit   r6 the last half's units, then scratch
+; r7 scratch
+
+start:  POP     r5                      ; the configuration word (blocks)
+        ANDI    r5, 1
+        LDI     r5, UNITS300            ; LDI keeps Z
+        BZ      cfg
+        LDI     r5, UNITS1200
+cfg:    LDI     r4, 0                   ; hunting
+        CSRR    r6, NOW
+quiet:  MOV     r0, r6                  ; as if the last edge were DROP ago, so
+        SUBI    r0, DROP                ; the next one only starts a half-period
+        SETD    DROP
+lost:   TEST    r4, r4                  ; inside a character: report the dropout
+        BZ      edge
+        LDI     r4, 0
+        LDI     r7, 0
+        LDIH    r7, 0x02                ; bit 9
+        PUSH    r7                      ; blocks while OUTQ is full
+
+edge:   WAITE   RX, ANY, T              ; T = 1: DROP ticks with no crossing
+        CSRR    r6, NOW                 ; one slot after every edge alike
+        BT      quiet
+        SUB     r7, r6, r0              ; L, this half-period
+        CMPI    r7, BOUNCE
+        BNC     edge                    ; too soon: ignored, T0 and TD kept
+        MOV     r0, r6                  ; T0 = this edge
+        SETD    DROP                    ; the dropout timeout from here
+        CMPI    r7, DROP
+        BC      lost                    ; the line had been quiet
+        LDI     r6, 1                   ; a short half: 1 unit
+        CMPI    r7, THRESH
+        BNC     count
+        LDI     r6, 2                   ; a long half: 2 units
+        TEST    r4, r4
+        BNZ     long
+        LDI     r4, NCHAR               ; hunting: a long half starts a start bit
+        LDI     r1, 0
+        LDI     r2, 0
+long:   ADD     r2, r2, r6
+count:  TEST    r4, r4
+        BZ      edge                    ; hunting, a short half: nothing
+        ADD     r1, r1, r6
+        CMP     r1, r5
+        BNC     edge                    ; the bit is not complete yet
+        SUB     r1, r1, r5              ; a bit: any overshoot opens the next one
+        ADD     r7, r2, r2              ; twice the long units
+        LDI     r2, 0
+        CMPI    r6, 2
+        BNZ     value
+        MOV     r2, r1                  ; a long half's overshoot is long too
+value:  SHLI    r3, 1
+        CMP     r7, r5                  ; C = 1: half or more of it long, a 0
+        BC      zero
+        ORI     r3, 1
+zero:   SUBI    r4, 1
+        BZ      done
+        CMPI    r4, NCHAR - 1
+        BNZ     edge
+        MOV     r7, r3                  ; the start bit is complete:
+        ANDI    r7, 1                   ; a 1 means the long half was noise
+        BZ      edge
+        LDI     r4, 0
+        JMP     edge
+
+done:   MOV     r7, r3                  ; start at bit 10, d0 at 9 .. d7 at 2,
+        ANDI    r7, 3                   ; the stop bits at 1 and 0
+        XORI    r7, 3                   ; Z: both stop bits are 1
+        REV     r3, r3                  ; d0 at bit 6 .. d7 at 13
+        SHRI    r3, 6
+        SHLI    r3, 8
+        SHRI    r3, 8                   ; the byte alone
+        TEST    r7, r7
+        BZ      push
+        LDIH    r3, 0x01                ; bit 8: framing error
+push:   PUSH    r3                      ; blocks while OUTQ is full
+        JMP     edge

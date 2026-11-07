@@ -1,0 +1,155 @@
+; kcs_enc.loom
+; A Kansas City Standard cassette encoder (300 baud: a 0 is four cycles of
+; 1200 Hz, a 1 eight cycles of 2400 Hz), with the 1200 baud CUTS variant (a
+; 0 is one cycle of 1200 Hz, a 1 two cycles of 2400 Hz): sends bytes from
+; the host as characters of a start bit, eight data bits LSB first and two
+; stop bits, a leader of marks as long as the host asks, and marks while
+; idle, as a square wave whose every bit is a whole number of cycles.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The Kansas City Standard is an
+; audio recording format for cassette tape, not a wire protocol, and nothing
+; in Loom was built for it: there is no oscillator, no tone generator and no
+; UART. The program uses:
+;   - the per-thread fractional tick (TICK_INT/TICK_FRAC, built for UART
+;     baud rates): one tick is a 2400 Hz half-period, 1/4800 s, so the two
+;     tones and both bit rates are whole numbers of ticks;
+;   - the deadline schedule (WAITD 1 every tick, proved by the checker);
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, built for
+;     clock-exact UART and WS2812 edges): every edge lands on the exact
+;     clock of a tick, whatever path the code took to decide it.
+; What the firmware does that no hardware does: the tone synthesis (a tick
+; counter whose bits are the two square waves), the cycle-exact bits, the
+; asynchronous framing with two stop bits, and the leader.
+;
+; The signal is a logic-level square wave on TX. A cassette wants a small
+; audio signal: an external divider and coupling capacitor (and, if wanted,
+; a low-pass near 3 kHz to round the square wave) belong to the board, not
+; to Loom. BYTE gives no recording level and no tone tolerance.
+;
+; Standard: "Report: BYTE's Audio Cassette Standards Symposium", Manfred and
+; Virginia Peschke, BYTE vol. 1 no. 6, February 1976, pp. 72-73 (read in the
+; archive.org text of the issue; tools/protomodels/kcs.py quotes it and
+; marks what could not be checked). It gives: a mark (1) is eight cycles of
+; 2400 Hz, a space (0) four cycles of 1200 Hz; up to 300 baud; a character
+; is a space start bit, eight data bits LSB first, "two or more marks" as
+; stop bits; marks between characters; a block is preceded by at least five
+; seconds of marks. CUTS (Processor Technology, 1976) keeps the tones and
+; the framing at four times the rate; its source was not read (Wikipedia
+; only, unchecked; QUESTIONS.md).
+;
+; Tick arithmetic. The tick rate is 4800 Hz. Then
+;   2400 Hz half-period    1 tick
+;   1200 Hz half-period    2 ticks
+;   bit at 300 baud       16 ticks   (8 x 2 = 4 x 4)
+;   bit at 1200 baud       4 ticks   (2 x 2 = 1 x 4)
+; At 50 MHz the exact divider is 10 416.667 clocks; TICK_INT 10416 with
+; TICK_FRAC 171 gives 10 416.668, 0.1 ppm slow.
+;
+; The oscillator is the tick counter. r0 counts ticks; the level for tick n
+; is high when (n AND mask) is 0, with mask 1 for 2400 Hz (high one tick,
+; low the next) and 2 for 1200 Hz (two and two). A bit is 16 or 4 ticks, a
+; multiple of 4, and the counter runs on across bits, so every bit starts
+; at n = 0 mod 4: on a rising edge, with whole cycles of its tone, whatever
+; the tones before and after (the phase never jumps, and each bit is
+; exactly BYTE's cycle count). The level is staged with SETP ... D and lands
+; on the next tick, so every edge is one tick after the tick that decided
+; it; the only error left is the fractional tick's one-clock dither.
+;
+; Pins: TX = OUT0 (any output or BIDIR pin with --pin TX=<pin>; JP is not
+; used, the level comes from the counter).
+;
+; Host command format (FIFO space, thread 0):
+;   INQ, once, before anything else: the configuration word, bit 0 = 1 for
+;     CUTS at 1200 baud, 0 for 300 baud; other bits ignored. The line is
+;     held low until it arrives; then the tone starts with a mark.
+;   INQ, then, one word per command:
+;     bit 15 = 0: a character; bits 7:0 the byte (bits 14:8 ignored).
+;     bit 15 = 1: a leader; bits 14:0 the number of mark bits (5 s is 1500
+;       at 300 baud, 6000 at 1200; 0 sends nothing).
+; Characters queued back to back go out eleven bits apart (two stop bits);
+; an empty queue at a bit boundary sends one more mark bit and looks again,
+; so the line always carries the mark tone between commands. Nothing is
+; ever pushed to OUTQ.
+;
+; Rate: the host sets TICK_INT 10416, TICK_FRAC 171 before RUN (50 MHz), or
+; any tick of 1/4800 s at the board's clock. The schedule is proved for
+; TICK_INT >= the .tick below (tools/tests/test_fw_kcs.py runs the RTL at a
+; 2.4576 MHz board clock, tick 512 clocks).
+;
+; Memory: 49 words, 0x000 to 0x030 of thread 0's quarter (.imem 512). With
+; kcs_dec.loom moved to thread 1 (0x080) the two fit together.
+;
+; Deadlines: two pairs, both proved. The worst is a tick that ends a bit and
+; starts a leader: 27 slots = 108 clocks, under the .tick 120 below (TICK_INT
+; 10416 at 50 MHz leaves over 10 000 clocks of slack; the RTL board's 512,
+; 404).
+
+        .imem   512
+        .thread 0
+        .pins   TX = OUT0
+
+        .equ    BITS300  = 16                   ; ticks a bit at 300 baud
+        .equ    BITS1200 = 4                    ; ticks a bit at 1200 baud (CUTS)
+        .equ    MARKM    = 1                    ; tick-counter mask of 2400 Hz (a 1)
+        .equ    SPACEM   = 2                    ; tick-counter mask of 1200 Hz (a 0)
+        .equ    NCHAR    = 11                   ; start, eight data bits, two stop bits
+        .tick   120                             ; the fastest tick the schedule is proved for
+
+; r0 the tick counter   r1 the tone's mask   r2 ticks left in the bit
+; r3 the bits still to send, LSB next   r4 how many   r5 1   r6 the word
+; r7 ticks a bit
+
+start:  SETP    TX, 0                   ; quiet until configured
+        OEP     TX, 1                   ; drive it (a no-op unless TX is a BIDIR pin)
+        POP     r7                      ; the configuration word (blocks)
+        ANDI    r7, 1
+        LDI     r7, BITS300             ; LDI keeps Z
+        BZ      cfg
+        LDI     r7, BITS1200
+cfg:    LDI     r5, 1
+        LDI     r1, MARKM               ; the first bit is a mark,
+        LDI     r4, 0                   ; and then the queue is looked at
+        MOV     r2, r7
+        LDI     r0, 0xFF
+        LDIH    r0, 0xFF                ; -1: the first level staged is tick 0's
+        SETD    1
+        JMP     tick
+
+idle:   LDI     r3, 1                   ; nothing queued: one bit of mark,
+        LDI     r4, 1                   ; then look again
+next:   SUBI    r4, 1
+        ROR     r3, r3, r5              ; C = the next bit, LSB first
+        LDI     r1, MARKM               ; 1 is 2400 Hz (LDI keeps C)
+        BC      tick
+        LDI     r1, SPACEM              ; 0 is 1200 Hz
+
+tick:   WAITD   1                       ; the level staged last time lands now
+        ADDI    r0, 1                   ; the index of the next tick
+        TEST    r0, r1
+        BNZ     low
+        SETP    TX, 1, D                ; staged: lands on the next tick exactly
+        JMP     count
+low:    SETP    TX, 0, D
+count:  DJNZ    r2, tick
+
+        MOV     r2, r7                  ; a bit boundary: the next tick's level,
+        CMPI    r4, 0                   ; already staged, is high in either tone
+        BNZ     next
+        WAITB   INQ_NE, T               ; TD has passed: T = 0 only if a word is queued
+        BT      idle
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, so INQ holds a word; only this thread pops INQ"
+        POP     r6                      ; cannot block
+        MOV     r3, r6
+        SHLI    r6, 1                   ; C = bit 15: a leader
+        BC      leader
+        LDIH    r3, 0xFF                ; the byte with ones above it
+        SHLI    r3, 1                   ; start bit 0, the byte LSB first, stop bits
+        LDI     r4, NCHAR
+        JMP     next
+leader: SHRI    r6, 1                   ; the count, bits 14:0 (Z: none)
+        BZ      idle
+        MOV     r4, r6
+        LDI     r3, 0xFF
+        LDIH    r3, 0xFF                ; all marks
+        JMP     next
