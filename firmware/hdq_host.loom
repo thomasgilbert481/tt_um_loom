@@ -1,0 +1,226 @@
+; hdq_host.loom
+; A host for TI's HDQ single-wire interface, the one the bq27000 family of
+; battery fuel gauges speaks: the break, register writes and register reads
+; with the gauge's answer sampled bit by bit, a timeout and a recovery break.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). HDQ is not 1-Wire: there is no
+; reset or presence pulse, every bit is a fixed cell whose low time is the
+; bit (a short low a 1, a long one a 0, "return to one"), the bytes go LSB
+; first, the command byte is a 7-bit register address with a write/read bit
+; on top, and after a read command the gauge turns the line round and sends
+; eight bits with its own timing. The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the host only pulls
+;     the line low or lets it go, the board's pull-up makes the high level;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every fall and release the host makes
+;     lands on the clock of its deadline, so each low time and bit cell is
+;     exact to 20 ns;
+;   - the bit engine's SHI (SEMANTICS 6.9), built for the clocked serial
+;     protocols, here sampling the gauge's bits LSB first at a time the
+;     firmware picks inside each of the gauge's cells;
+;   - CSRW TD (SEMANTICS 6.6), to put each timeout on the gauge's own fall
+;     without waiting for it.
+; What the firmware does that no hardware does: the bit cells, the break,
+; the turnaround and the decision between a gauge 1 and 0 by the time of a
+; sample after each fall, and the timeouts.
+;
+; Source: TI SLUS556D (bq27000/bq27200 datasheet, rev. March 2006), page 4,
+; "Standard HDQ serial communication timing (bq27000 only)", Figure 1, and
+; "Communicating with the bq27000 (HDQ interface)", pages 24-25:
+;     t_B    break                     >= 190 us
+;     t_BR   break recovery            >= 40
+;     t_CYCH host bit window           >= 190
+;     t_HW1  host sends 1 (low)        0.5 .. 50
+;     t_HW0  host sends 0 (low)        86 .. 145
+;     t_RSPS gauge to host response    190 .. 320
+;     t_CYCD gauge bit window          190 .. 250
+;     t_DW1  gauge sends 1 (low)       32 .. 50
+;     t_DW0  gauge sends 0 (low)       80 .. 145
+; Command byte, bit 7 W/R (1 write, 0 read), bits 6:0 the address; every
+; byte LSB first, so W/R is the eighth bit on the wire. The datasheet asks
+; for a break before the first access and after a timeout.
+;
+; Timing, in ticks of 1 us, from a cell's fall F (every host edge latched):
+;     host 1     low HW1 = 25 (window 0.5..50)
+;     host 0     low HW0 = 115 (86..145)
+;     host cell  CYCH = 205 (>= 190): the next fall CYCH - HW0 = 90 after a
+;                0's release point, whatever the bit was
+;     break      low B = 250 (>= 190), then the next fall 90 after the
+;                release (t_BR >= 40)
+;     gauge bit  sampled SAMPLE = 65 after its fall G is seen: a 1 has ended
+;                (<= 50), a 0 has not (>= 80); 15 us of margin each side
+;     timeouts   the first gauge fall by F7 + CYCH + 320 + 15, F7 the R/W
+;                bit's fall (QUESTIONS.md item 1: covers t_RSPS measured from
+;                either end of the R/W cell); each rise by G + 145 + 15; each
+;                next fall by G + 250 + 15; after the eighth bit the host
+;                waits to G + 250 before its next cell can start
+; The gauge's fall is seen 2 to 9 clocks late (the synchroniser, the slot
+; grid and the SETD's own slot after the WAITP, SEMANTICS 2 and 3) and
+; SETD 0 takes the tick under way, so the sample is 64.0 to 65.3 us after
+; the fall: far from both edges.
+;
+; Readings taken on the open spec questions (2026-11-06): t_RSPS is
+; counted from the fall that starts the R/W bit's cell (its minimum, 190
+; us, equals t_CYCH's), and the host accepts a gauge that counts from the
+; cell's end as well; t_B, t_BR and t_CYCH have minimums only (break 250
+; us, recovery 90 us, cell 205 us); a low between 145 and 190 us is in no
+; window, and the gauge takes over 168 us as a break; the gauge backs
+; registers 0x00 to 0x0F (others are ignored on write and read as 0x00).
+;
+; Host words (FIFO space, thread 0), one per operation:
+;     1aaaaaaa dddddddd  WRITE: the command byte (W/R = 1, address a) and
+;                        the data byte d, exactly the 16 bits sent. No result.
+;     0aaaaaaa 00000000  READ the register at address a. One result.
+;     0xxxxxxx 00000001  BREAK: a break and its recovery. No result.
+;     anything else      ignored.
+; Results (FIFO space read, thread 0), one per READ:
+;     0x00dd     the byte d the gauge sent
+;     0x8001     NO ANSWER: no fall within the response window
+;     0x8002     SHORT BYTE: a later bit's fall did not come within t_CYCD
+;     0x8003     STUCK LOW: the line did not rise within t_DW0
+; After a timeout the host sends a break by itself (the datasheet's
+; recovery), so the gauge is back in step before the next command.
+; The program also sends one break at start, before the first access.
+;
+; Rate: the program sets its own tick, TICK_INT = 50 (1 us at 50 MHz): the
+; datasheet gives every time in microseconds; the host must not set it.
+; Another board clock: change US (the checker proves the schedule at 10 too,
+; and the long tests run on that build).
+;
+; OD_MASK (BUGS 14): CSRR, ORI, CSRW is not atomic across threads, and
+; hdq_gauge.loom sets its bit the same way. Both programs read OD_MASK back
+; three slots after their write and set it again if their bit is missing,
+; as dht22_host.loom does. No pad is driven before the check passes.
+;
+; Memory: thread 0's quarter, 0x000..0x07F. With hdq_gauge.loom (thread 1,
+; 0x080) the two load together.
+;
+; Registers: r0 the bits to send, r1 a bit count, r3 r4 r5 timeout offsets,
+; r6 the host word, r7 scratch and the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    HDQPIN = 0              ; BIDIR0
+        .pins   HDQ = HDQPIN
+        .equ    HDQBIT = 1 << HDQPIN    ; its bit in OD_MASK
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    HW1 = 25                ; SLUS556D p.4, in us (header)
+        .equ    HW0 = 115
+        .equ    CYCH = 205
+        .equ    B = 250
+        .equ    BGAP = 10               ; a break's fall, after the last deadline
+        .equ    SAMPLE = 65             ; a gauge bit: after DW1 max, before DW0 min
+        .equ    M = 15                  ; margin on every timeout
+        .equ    RSPS_MAX = 320
+        .equ    DW0_MAX = 145
+        .equ    CYCD_MAX = 250
+        .equ    RSPS_TO = CYCH + RSPS_MAX + M   ; from the R/W fall (header)
+        .equ    RISE_TO = DW0_MAX + M           ; from a gauge fall
+        .equ    FALL_TO = CYCD_MAX + M          ; from a gauge fall
+        .equ    E_NOANSWER = 1
+        .equ    E_SHORT = 2
+        .equ    E_STUCK = 3
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, HDQBIT
+        CSRW    OD_MASK, r7             ; HDQ open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, HDQBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        CSRW    BE_CFG, r7              ; SHI LSB first, no CRC
+        LDI     r7, HDQPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples HDQ
+        MOV16   r5, RSPS_TO - HW0       ; TD offsets for the timeouts (header)
+        LDI     r4, RISE_TO - SAMPLE
+        LDI     r3, FALL_TO - RISE_TO
+        SETP    HDQ, 1                  ; released: the pull-up holds it high
+        SETD    0
+        CALL    brk                     ; a break before the first access
+
+cmd:    POP     r6                      ; the next host word (blocks)
+        SETD    0                       ; re-anchor after the unbounded POP
+        SWAP    r0, r6                  ; the command byte in 7:0, data in 15:8
+        MOV     r7, r6
+        SHLI    r7, 1                   ; C = W/R
+        BC      c_write
+        MOV     r7, r6
+        SHLI    r7, 8                   ; Z: bits 7:0 are 0, a READ
+        BZ      c_read
+        SHRI    r7, 8
+        CMPI    r7, 1
+        BNZ     cmd                     ; not a command: ignored
+        CALL    brk
+        JMP     cmd
+c_write: LDI    r1, 16                  ; command byte, then data byte
+        JMP     send
+c_read: LDI     r1, 8                   ; the command byte only
+send:   SHRI    r0, 1                   ; C = the next bit, LSB first
+        CALL    hbit
+        DJNZ    r1, send
+        MOV     r7, r6
+        SHLI    r7, 1
+        BC      cmd                     ; a write is done
+
+; A read: the turnaround. TD is F7 + HW0 here (the R/W bit's release point).
+        CSRR    r7, TD
+        ADD     r7, r7, r5
+        CSRW    TD, r7                  ; TD = F7 + RSPS_TO
+        WAITP   HDQ, 1, T               ; our own release, through the synchroniser
+        LDI     r7, E_NOANSWER
+        WAITP   HDQ, 0, T               ; the gauge's first fall
+        BT      tmo
+        LDI     r1, 8
+rbit:   SETD    0                       ; G: the gauge's fall, seen
+        WAITD   SAMPLE
+        SHI                             ; the line at G + 65: the bit
+        CSRR    r7, TD
+        ADD     r7, r7, r4
+        CSRW    TD, r7                  ; TD = G + RISE_TO
+        LDI     r7, E_STUCK
+        WAITP   HDQ, 1, T               ; the end of the bit's low
+        BT      tmo
+        CMPI    r1, 1
+        BZ      r_end
+        CSRR    r7, TD
+        ADD     r7, r7, r3
+        CSRW    TD, r7                  ; TD = G + FALL_TO
+        LDI     r7, E_SHORT
+        WAITP   HDQ, 0, T               ; the next bit's fall
+        BT      tmo
+        DJNZ    r1, rbit
+r_end:  WAITD   CYCD_MAX - RISE_TO      ; G8 + 250: the gauge's last cell is over
+        STSR    r7
+        SHRI    r7, 8                   ; the byte, from SR[15:8]
+        PUSH    r7
+        JMP     cmd
+tmo:    LDIH    r7, 0x80                ; 0x8000 | the code
+        PUSH    r7
+        SETD    0                       ; re-anchor after the unbounded PUSH
+        CALL    brk                     ; the datasheet's recovery
+        JMP     cmd
+
+; hbit: one host bit cell. C = the bit. The fall is CYCH - HW0 ticks after
+; the last deadline; returns at F + HW0, with the line released.
+hbit:   SETP    HDQ, 0, D               ; stage the fall
+        WAITD   CYCH - HW0              ; F: the fall lands
+        BNC     h_0
+        SETP    HDQ, 1, D               ; a 1: released at F + HW1
+h_0:    WAITD   HW1                     ; a 0 stays low (nothing staged)
+        SETP    HDQ, 1, D
+        WAITD   HW0 - HW1               ; F + HW0: a 0 is released
+        RET
+
+; brk: a break. The fall BGAP ticks after the last deadline, B low; returns
+; at the release, so the next cell's fall comes CYCH - HW0 = 90 later (t_BR).
+brk:    SETP    HDQ, 0, D
+        WAITD   BGAP                    ; F: the fall lands
+        SETP    HDQ, 1, D
+        WAITD   B                       ; F + B: released
+        RET

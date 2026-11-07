@@ -1,0 +1,184 @@
+; hdq_gauge.loom
+; The gauge side of TI's HDQ single-wire interface (bq27000 family): a
+; register file of 16 bytes that an HDQ host writes and reads, break
+; detection at any point with a resynchronisation, and the answer to a read
+; inside the response window, with the gauge's own bit timing.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): each of the gauge's bit cells and low
+;     times is exact to the clock, and its first fall is placed exactly on
+;     a deadline taken from the host's last fall;
+;   - SHI (SEMANTICS 6.9), built for the clocked serial protocols, sampling
+;     each host bit LSB first at a fixed time after its fall;
+;   - CSRW TD (SEMANTICS 6.6) to put the break test on the host's fall;
+;   - LD/ST (slice B, SEMANTICS 6.11), built for the I2C EEPROM, for the
+;     register file.
+; What the firmware does that no hardware does: telling a 1, a 0 and a
+; break apart by the length of a low, the command byte's W/R and address,
+; the turnaround, and the gauge's cells.
+;
+; Source: TI SLUS556D page 4 table and Figure 1 (hdq_host.loom's header has
+; the table). Timing, in ticks of 1 us from L, the moment the gauge sees a
+; host fall (2 to 9 clocks after it: the synchroniser, the slot grid and
+; the SETD's slot after the WAITP; SETD 0 takes the tick under way, so up
+; to one tick short):
+;     host bit   sampled GS = 68 after L: a host 1 has ended (t_HW1 <= 50),
+;                a 0 has not (t_HW0 >= 86); 18 us of margin each side
+;     break      a low still there BDET = 168 after L is a break: longer
+;                than any 0 (145), shorter than any break (t_B >= 190);
+;                the gauge waits for its end and takes the next fall as
+;                the first bit of a command byte (QUESTIONS.md item 3)
+;     response   the first data fall BDET + GAPD = 266 after L7, the R/W
+;                bit's fall (t_RSPS 190..320, measured from that fall:
+;                QUESTIONS.md item 1)
+;     gauge 1    low DW1 = 41 (t_DW1 32..50)
+;     gauge 0    low DW0 = 112 (t_DW0 80..145)
+;     gauge cell CYCD = GAPD + DW0 = 210 fall to fall (t_CYCD 190..250)
+; Every host fall is caught by WAITP HDQ, 0 (a level, not an edge), so a
+; fall that came while the gauge was busy is still caught while it lasts.
+; Break at any time: every low is measured, in a command byte or in a data
+; byte; and before each of its own falls the gauge looks at the line: low
+; there means the host is breaking, and the gauge stops sending. A break
+; the host starts while the gauge holds a 0 low is found at the next bit.
+;
+; Register file: 16 bytes at addresses 0x00..0x0F, one per word at REGS
+; (0x0F0..0x0FF, bits 7:0), initialised by the image, which the host may
+; rewrite through the debug space while the thread is halted. A write to
+; another address is ignored, a read of one answers 0x00 (QUESTIONS.md
+; item 4). Not a bq27000's register map: the gauge holds what it is given.
+;
+; Readings taken on the open spec questions (2026-11-06): t_RSPS is
+; counted from the fall that starts the R/W bit's cell (its minimum, 190
+; us, equals t_CYCH's), and the host accepts a gauge that counts from the
+; cell's end as well; t_B, t_BR and t_CYCH have minimums only (break 250
+; us, recovery 90 us, cell 205 us); a low between 145 and 190 us is in no
+; window, and the gauge takes over 168 us as a break; the gauge backs
+; registers 0x00 to 0x0F (others are ignored on write and read as 0x00).
+;
+; Host words (FIFO space read, thread 1): after each write the gauge
+; pushes the 16 bits it received, {command byte, data byte}, if OUTQ has
+; room (a WAITB OUTQ_NF, T test: a full OUTQ drops the report, the write
+; still happens). No words to the gauge.
+;
+; Rate: the program sets its own tick, TICK_INT = 50 (1 us at 50 MHz); the
+; host must not. Another board clock: change US (proved at 10 too).
+;
+; OD_MASK (BUGS 14): set first and read back three slots later, as
+; hdq_host.loom does.
+;
+; Memory: thread 1's quarter, 0x080..0x0FF, the register file at its end.
+; With hdq_host.loom (thread 0) the two load together.
+;
+; Registers: r0 a byte, r1 a bit count, r2 the address, r5 BDET - GS,
+; r6 the command byte, r7 scratch and the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    HDQPIN = 1              ; BIDIR1
+        .pins   HDQ = HDQPIN
+        .equ    HDQBIT = 1 << HDQPIN
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    GS = 68                 ; in us, after L (header)
+        .equ    BDET = 168
+        .equ    DW1 = 41
+        .equ    DW0 = 112
+        .equ    CYCD = 210
+        .equ    GAPD = CYCD - DW0       ; a cell's fall after the last deadline
+        .equ    REGS = 0x0F0            ; the register file, one byte a word
+        .equ    NREGS = 16
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, HDQBIT
+        CSRW    OD_MASK, r7             ; HDQ open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, HDQBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, US            ; one tick = 1 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        CSRW    BE_CFG, r7              ; SHI LSB first, no CRC
+        LDI     r7, HDQPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples HDQ
+        LDI     r5, BDET - GS
+        SETP    HDQ, 1                  ; let go of the line
+
+; A command byte: W/R in bit 7, the address in 6:0.
+rxcmd:  CALL    rxbyte
+        MOV     r6, r0
+        LDI     r7, 0x7F
+        AND     r2, r0, r7              ; the address
+        SHRI    r0, 7                   ; Z: W/R = 0, a read
+        BNZ     write
+
+; A read: the register's byte, LSB first, the first fall GAPD after the
+; break-test deadline that the R/W bit's rise came before.
+        LDI     r0, 0
+        CMPI    r2, NREGS
+        BC      r_send                  ; outside the file: 0x00
+        LDI     r7, lo8(REGS)
+        ADD     r7, r7, r2
+        LD      r0, r7, 0
+r_send: LDI     r1, 8
+s_bit:  SHRI    r0, 1                   ; C = the next bit
+        CALL    gbit
+        DJNZ    r1, s_bit
+        JMP     rxcmd
+
+; A write: the data byte, into the file, and a report to the host.
+write:  CALL    rxbyte
+        CMPI    r2, NREGS
+        BC      w_rep                   ; outside the file: ignored
+        LDI     r7, lo8(REGS)
+        ADD     r7, r7, r2
+        ST      r0, r7, 0
+w_rep:  SWAP    r7, r6                  ; the command byte in 15:8
+        OR      r7, r7, r0              ; ... the data byte in 7:0
+        WAITB   OUTQ_NF, T              ; room? (TD is at most BDET away)
+        BT      rxcmd                   ; full: the report is dropped
+        PUSH    r7                      ; cannot stall: room was just seen
+        JMP     rxcmd
+
+; rxbyte: eight host bits, LSB first, into r0; a low past BDET is a break.
+; Clobbers r1, r7. One loop, no nested CALL: the deadline checker's RET
+; flows to every call site, and a nested call would give it a loop with
+; no anchor that cannot run.
+rxbyte: LDI     r1, 8
+rxbit:  WAITP   HDQ, 0                  ; L: a fall, seen
+        SETD    0
+        WAITD   GS
+        SHI                             ; the line at L + 68: the bit
+        CSRR    r7, TD
+        ADD     r7, r7, r5
+        CSRW    TD, r7                  ; TD = L + BDET
+        WAITP   HDQ, 1, T               ; the end of the low ...
+        BT      brk                     ; ... or a break
+        DJNZ    r1, rxbit
+        STSR    r0
+        SHRI    r0, 8                   ; the byte, from SR[15:8]
+        RET
+brk:    WAITP   HDQ, 1                  ; the end of the break
+        JMP     rxcmd                   ; resynchronised: a command byte next
+
+; gbit: one gauge bit cell. C = the bit. The fall GAPD after the last
+; deadline; returns at F + DW0 with the line released. A low line before
+; the fall is the host breaking.
+gbit:   JP      HDQ, 0, brk
+        SETP    HDQ, 0, D               ; stage the fall
+        WAITD   GAPD                    ; F: the fall lands
+        BNC     g_0
+        SETP    HDQ, 1, D               ; a 1: released at F + DW1
+g_0:    WAITD   DW1
+        SETP    HDQ, 1, D
+        WAITD   DW0 - DW1               ; F + DW0: a 0 is released
+        RET
+
+; The register file (header). Initial values: 0x11 times the address.
+        .org    REGS
+        .word   0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77
+        .word   0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
