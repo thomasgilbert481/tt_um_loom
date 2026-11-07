@@ -1,0 +1,369 @@
+; adb_device.loom
+; Loom as an Apple Desktop Bus (ADB) device, keyboard- or mouse-like: it
+; answers Talk register 0 with two bytes the host on the SPI side gives it,
+; Talk register 3 with its address and handler ID, takes Listen register 3
+; (the address change, with the collision rule) and Listen to registers 0
+; to 2, Flush, SendReset and the global reset, and asks for service (SRQ)
+; when it has data and the command is for another device.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). A device makes every edge of
+; its reply on a schedule set by the host's stop bit, and must decide in
+; that stop bit's 65 us low whether to stretch it to 300 us. The program
+; uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the device pulls the
+;     line low or lets it go, as the host does;
+;   - WAITP on that pin, untimed while idle and with a timeout everywhere
+;     else, so a command cut short sends the device back to idle;
+;   - the tick restart (a write of TICK_INT, SEMANTICS 4), built for UART
+;     receivers: each cell's fall restarts the 5 us tick grid, and the
+;     sample 50 us later decides the bit (the bus's rise before a reply
+;     restarts it too, so Tlt is 200 us to a slot), by SHI (the bit engine, built for
+;     the serial protocols, here a one-bit sampler with CNT counting);
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every edge of a reply, and the end of an
+;     SRQ, lands on the clock of its deadline;
+;   - WAITB INQ_NE and OUTQ_NF with a reached deadline (SEMANTICS 6.4), a
+;     test rather than a wait, so the host's data is taken, and Listen data
+;     handed over, without ever blocking on the wire.
+; What the firmware does that no hardware does: the attention and reset
+; detection by the length of a low; the command decode; the 65/35 cell
+; coding; Tlt; the SRQ; the collision detection while sending (a 1 cell
+; whose line is low at 50 us means another device is sending a 0: stop at
+; once) and the address rules that follow from it; the random address of
+; Talk register 3, from a seed and the free-running NOW (Loom has no random
+; source: two Loom devices with the same seed started on the same clock
+; would collide for ever, so the seeds must differ).
+;
+; Readings taken on the open spec questions (2026-11-06):
+;   - Apple's Guide to the Macintosh Family Hardware was not read; the
+;     timings rest on Microchip AN591B, Apple HW01 and TMK adb.c (secondary)
+;     and are to be checked against the Guide's table when it is read.
+;   - Sync: 65 us sent (TMK); the checker accepts 63 to 72.1 us, which
+;     covers AN591's 70 us.
+;   - Tlt is the bus-high time from the stop bit's release (or an SRQ's end)
+;     to the reply's start bit; the device answers at 200 us.
+;   - After an SRQ the addressed device still answers Tlt after it (TMK);
+;     a device that stays silent reads as no reply with SRQ set.
+;   - A low over 1040 us is a reset at the device.
+;   - The bit is read at 50 us after each fall (AN591's receiver): cells of
+;     about 77 to 125 us, not the full +-30 %. A low/high ratio decoder
+;     would cost about six slots a cell; not done for the word budget.
+;   - No random source: the device's address field mixes a host seed with
+;     NOW; two Loom devices must be given different seeds.
+;
+; Pin: AD = BIDIR1, open drain (OD_MASK bit 1). With adb_host.loom on
+; BIDIR0 (thread 0) the bench joins the pins as one line: two Loom threads
+; never share a pin (a pin's output register holds whichever thread wrote
+; last).
+;
+; Host words (FIFO space, thread 1).
+;   INQ: first two words of configuration, then data.
+;     1. register 3 after a reset: bits 11:8 the default address (2 for a
+;        keyboard, 3 for a relative pointer, Apple HW01), bits 7:0 the
+;        handler ID; bits 15:12 are ignored and SRQ enable (bit 13) is set,
+;        as a reset leaves it;
+;     2. the seed of the random address;
+;     then one word per register-0 report: the two bytes Talk register 0
+;     answers with, MSB first (for a keyboard, two key transitions; for a
+;     mouse, the buttons and moves). The device holds one word at a time:
+;     it takes the next from INQ when the one it holds has been sent, at a
+;     command's stop bit, and asks for service while it holds one.
+;   OUTQ: for each Listen to register 0, 1 or 2, its first two bytes as one
+;     word (a keyboard's LED state is Listen register 2), dropped if OUTQ is
+;     full.
+;
+; Behaviour, ADB as tools/protomodels/adb.py cites it:
+;   - a low of 560 to 1040 us is an attention (TMK adb.c), longer is a
+;     reset; anything shorter is ignored;
+;   - the command byte AAAA CC RR: SendReset (low nibble 0000) resets the
+;     device; for its own address, Talk (CC = 11) of register 0 sends the
+;     word it holds or stays silent if it holds none (HW01: "the bus times
+;     out"), of register 3 sends the register with a random address field,
+;     of registers 1 and 2 stays silent; Listen (10) takes two bytes; Flush
+;     (CC RR = 0001) drops the word it holds;
+;   - Listen register 3 by its low byte (the handler ID field): 0xFE moves
+;     the device to the new address unless it saw a collision since its last
+;     whole Talk register 3 (HW01); 0x00 sets the address and the SRQ enable
+;     bit from the data; other values (0xFD activator, 0xFF self-test, a
+;     handler change) are ignored: this device has one handler;
+;   - the reply: the bus high Tlt = 200 us after the stop bit's release
+;     (HW01's nominal), a 1 start bit, 16 bits MSB first, a 0 stop bit;
+;   - SRQ: for a command not to its address (and not SendReset), when it
+;     holds a word and SRQ is enabled, the device holds the stop bit's low
+;     until 300 us after its fall.
+;
+; Rate: TICK_INT = TK = 5 x US clocks, 5 us at US = 50, as adb_host.loom.
+;
+; OD_MASK (BUGS 14): set first and read back three slots later, as
+; adb_host.loom does and for the same reason (its header).
+;
+; Memory: 223 words from 0x080, thread 1's quarter and 95 words of thread
+; 2's (0x100..0x15E), so thread 2 must not be started with this program, as
+; the listing says. With adb_host.loom (0x000..0x071 and 0x180..0x1C5) the
+; two load together and leave threads 2 and 3 unstartable: the second
+; device of the collision tests is the reference model.
+;
+; Registers: r0 register 3, r1 the word held, r2 the default register 3 in
+; bits 11:0 and two flags, bit 15 a word is held and bit 14 a collision was
+; seen, r3 the random state, r4 the command byte, r5 a bit count and data,
+; r6 TK (the tick restart), r7 the bits being sent and scratch, also the
+; `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .equ    ADPIN = 1               ; BIDIR1
+        .pins   AD = ADPIN
+        .equ    ADBIT = 1 << ADPIN      ; its bit in OD_MASK
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    TK = 5 * US             ; one tick = 5 us
+        .equ    ATT_MIN = 112           ; an attention is at least 560 us low ...
+        .equ    ATT_MAX = 96            ; ... and at most 480 us more, 1040
+        .equ    L0 = 13                 ; a 0: 65 us low ...
+        .equ    H0 = 7                  ; ... 35 us high
+        .equ    L1 = 7                  ; a 1: 35 us low ...
+        .equ    H1 = 13                 ; ... 65 us high
+        .equ    CHK = 3                 ; the collision test, 50 us into a 1
+        .equ    SAMPLE = 10             ; 50 us after a fall: the bit
+        .equ    LOW_TO = 8              ; a low ends by about 90 us
+        .equ    HIGH_TO = 18            ; the next fall within 90 us of a rise
+        .equ    SRQ = 60                ; an SRQ ends 300 us after the stop's fall
+        .equ    BUS_TO = 80             ; the bus high within 400 us of it
+        .equ    TLT = 40                ; Tlt, 200 us
+        .equ    TLT_TO = 60             ; a Listen's start bit within 300 us
+        .equ    DIR = 1 << 1            ; BE_CFG: MSB first, no CRC
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, ADBIT
+        CSRW    OD_MASK, r7             ; AD open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, ADBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, TK            ; one tick = 5 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, DIR
+        CSRW    BE_CFG, r7
+        LDI     r7, ADPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples AD
+        LDI     r6, TK
+        SETP    AD, 1                   ; let go of the line
+        POP     r2                      ; register 3 after a reset
+        POP     r3                      ; the seed
+
+; A reset: register 3 to its default with SRQ enabled, no word, no collision.
+reset:  MOV16   r7, 0x0FFF
+        AND     r2, r2, r7
+        MOV16   r7, 0x2000
+        OR      r0, r2, r7
+
+; Idle: a low, told apart by its length.
+idle:   WAITP   AD, 1
+        WAITP   AD, 0                   ; a fall
+        SETD    ATT_MIN
+        WAITP   AD, 1, T
+        BNT     idle                    ; up before 560 us: not an attention
+        SETD    ATT_MAX
+        WAITP   AD, 1, T
+        BNT     att
+        WAITP   AD, 1                   ; still low at 1040 us: a reset, to its end
+        JMP     reset
+att:    LDI     r7, 8
+        CSRW    CNT, r7
+        CALL    rx                      ; the sync, then the command byte
+        BT      idle
+        STSR    r4
+        LDI     r7, 0xFF
+        AND     r4, r4, r7              ; the command byte
+        SETD    HIGH_TO
+        WAITP   AD, 0, T                ; the stop bit's fall
+        BT      idle
+        CSRW    TICK_INT, r6
+        SETD    0                       ; anchored at the stop bit's fall
+        MOV     r7, r4
+        ANDI    r7, 15
+        BZ      reset                   ; SendReset
+        CALL    take                    ; a word from INQ, if none is held
+        MOV     r7, r4
+        SHRI    r7, 4
+        MOV     r5, r0
+        SHRI    r5, 8
+        ANDI    r5, 15
+        CMP     r7, r5
+        BZ      mine
+
+; Another device's command: SRQ if a word is held and SRQ is enabled.
+        MOV     r7, r2
+        SHLI    r7, 1                   ; C = a word is held
+        BNC     idle
+        MOV     r7, r0
+        SHLI    r7, 3                   ; C = SRQ enable
+        BNC     idle
+        SETP    AD, 0                   ; hold the line: the host's stop is still low
+        SETP    AD, 1, D
+        WAITD   SRQ                     ; let go 300 us after the stop bit's fall
+        JMP     idle
+
+; For this address: by the command code, bits 3:2.
+mine:   MOV     r7, r4
+        SHRI    r7, 2
+        ANDI    r7, 3
+        CMPI    r7, 2
+        BZ      listen
+        BC      talk                    ; 3
+        TEST    r7, r7
+        BNZ     idle                    ; 1: reserved
+        MOV     r7, r4
+        ANDI    r7, 3
+        CMPI    r7, 1
+        BNZ     idle                    ; 0010, 0011: reserved
+        MOV16   r7, 0x7FFF
+        AND     r2, r2, r7              ; Flush: the word held is dropped
+        JMP     idle
+
+; Talk: Tlt after the bus goes high, then the start bit, 16 bits, the stop.
+talk:   SETD    BUS_TO
+        WAITP   AD, 1, T                ; the stop bit's release, or an SRQ's end
+        BT      idle
+        CSRW    TICK_INT, r6            ; the release restarts the tick grid
+        SETD    0                       ; anchored on the release as seen
+        MOV     r7, r4
+        ANDI    r7, 3
+        CMPI    r7, 3
+        BZ      t_r3
+        TEST    r7, r7
+        BNZ     idle                    ; registers 1 and 2: silent
+        MOV     r7, r2
+        SHLI    r7, 1
+        BNC     idle                    ; register 0 with no word held: silent
+        MOV     r5, r1
+        JMP     t_go
+t_r3:   CSRR    r7, NOW                 ; register 3 with a random address
+        ADD     r3, r3, r7
+        MOV     r7, r3
+        SHRI    r7, 4
+        XOR     r7, r7, r3
+        ANDI    r7, 15
+        SHLI    r7, 8
+        MOV16   r5, 0xF0FF
+        AND     r5, r0, r5
+        OR      r5, r5, r7
+t_go:   SETP    AD, 0, D
+        WAITD   TLT                     ; the start bit's fall, Tlt after the release
+        MOV16   r7, 0x8000
+        LDI     r6, 1
+        CALL    send                    ; the start bit, a 1
+        MOV     r7, r5
+        LDI     r6, 16
+        CALL    send
+        SETP    AD, 1, D
+        WAITD   L0                      ; the stop bit, a 0
+        LDI     r6, TK
+        MOV     r7, r4
+        ANDI    r7, 3
+        BZ      t_r0
+        MOV16   r7, 0xBFFF
+        AND     r2, r2, r7              ; a whole Talk register 3: no collision
+        JMP     idle
+t_r0:   MOV16   r7, 0x7FFF
+        AND     r2, r2, r7              ; the word was sent
+        JMP     idle
+
+; Listen: the start bit within TLT_TO, 16 bits, the stop bit.
+listen: SETD    BUS_TO
+        WAITP   AD, 1, T
+        BT      idle
+        SETD    TLT_TO
+        LDI     r7, 17
+        CSRW    CNT, r7
+        CALL    rx_w                    ; the start bit and two bytes
+        BT      idle
+        SETD    HIGH_TO
+        WAITP   AD, 0, T                ; the stop bit
+        BT      idle
+        STSR    r5
+        MOV     r7, r4
+        ANDI    r7, 3
+        CMPI    r7, 3
+        BZ      l_r3
+        SETD    0
+        WAITB   OUTQ_NF, T              ; TD is reached: a test
+        BT      idle                    ; OUTQ full: dropped
+        .bounded "guarded by the WAITB OUTQ_NF above; only this thread pushes OUTQ"
+        PUSH    r5
+        JMP     idle
+l_r3:   LDI     r7, 0xFF
+        AND     r7, r5, r7              ; the handler ID field
+        LDI     r4, 0xFE
+        CMP     r7, r4
+        BZ      l_fe
+        TEST    r7, r7
+        BNZ     l_idle                  ; 0xFD, 0xFF, a handler change: ignored
+        MOV16   r7, 0x2000
+        AND     r7, r5, r7              ; 0x00: the SRQ enable bit ...
+        MOV16   r4, 0xDFFF
+        AND     r0, r0, r4
+        OR      r0, r0, r7
+        JMP     l_addr                  ; ... and the address
+l_fe:   MOV     r7, r2
+        SHLI    r7, 2                   ; C = a collision was seen
+        BC      l_idle                  ; then the device does not move
+l_addr: MOV16   r7, 0xF0FF
+        AND     r0, r0, r7
+        MOV16   r7, 0x0F00
+        AND     r7, r5, r7
+        OR      r0, r0, r7
+l_idle: JMP     idle
+
+; take: a word from INQ into r1 if none is held. TD must be reached.
+take:   MOV     r7, r2
+        SHLI    r7, 1
+        BC      tk_ret                  ; one is held
+        WAITB   INQ_NE, T               ; a test, not a wait
+        BT      tk_ret
+        .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ"
+        POP     r1
+        MOV16   r7, 0x8000
+        OR      r2, r2, r7
+tk_ret: RET
+
+; rx: CNT cells into SR, MSB first; each fall within HIGH_TO of the last
+; rise (rx_w: within the TD already set). Returns T = 1 on a timeout.
+rx:     SETD    HIGH_TO
+rx_w:   WAITP   AD, 0, T
+        BT      rx_out
+        CSRW    TICK_INT, r6            ; the fall restarts the tick grid
+        SETD    0
+        WAITD   SAMPLE
+        SHI                             ; the line at 50 us is the bit; Z = done
+        SETD    LOW_TO
+        WAITP   AD, 1, T
+        BT      rx_out                  ; a low too long
+        BNZ     rx
+rx_out: RET
+
+; send: r6 bits of r7, MSB first, with collision detection. Entered with the
+; first cell's fall staged or landed at the last deadline; returns with the
+; fall after the last cell landed. A 1 whose line is low at 50 us is a
+; collision: the device lets go (it already has) and goes idle.
+send:   SHLI    r7, 1                   ; C = the bit
+        SETP    AD, 1, D
+        BC      s_one
+        WAITD   L0                      ; a 0: the rise 65 us after the fall
+        SETP    AD, 0, D
+        WAITD   H0                      ; the next fall 35 us later
+        JMP     s_next
+s_one:  WAITD   L1                      ; a 1: released 35 us after the fall
+        WAITD   CHK
+        JP      AD, 0, s_col            ; someone else holds it low
+        SETP    AD, 0, D
+        WAITD   H1 - CHK                ; the next fall, 100 us after the last
+s_next: DJNZ    r6, send
+        RET
+s_col:  LDI     r6, TK
+        MOV16   r7, 0x4000
+        OR      r2, r2, r7              ; a collision was seen
+        JMP     idle

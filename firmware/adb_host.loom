@@ -1,0 +1,359 @@
+; adb_host.loom
+; An Apple Desktop Bus (ADB) host: Talk, Listen, Flush and SendReset
+; commands and the global reset given by the host on the SPI side; a Talk
+; reply of 2 to 8 bytes captured, or no reply reported; a device's Service
+; Request (SRQ) seen and reported.
+;
+; Written on 2026-11-05, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). ADB is in no design document.
+; Its one wire is open drain; a bit is a 100 us cell whose low part says
+; the value (a 0 is 65 us low then 35 high, a 1 is 35 low then 65 high);
+; a command is an 800 us attention low, a 65 us sync high, the command
+; byte and a stop bit; the addressed device answers after the stop-to-start
+; time Tlt, and any other device may stretch the stop bit's low to 300 us
+; to ask for service. The program uses:
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the host only pulls
+;     the line low or lets it go, and the board's pull-up makes the high;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): every edge the host makes lands on the
+;     clock of its deadline, so each cell's 65/35 split is exact to the clock;
+;   - the timed waits (WAITP ... T, SEMANTICS 6.4), built for the receivers'
+;     frame timeouts: a device that is missing, early or stuck cannot hang
+;     the thread, and "no reply" is the timeout itself;
+;   - the tick restart (a write of TICK_INT, SEMANTICS 4), built for UART
+;     receivers to lock to a start bit: each received cell's fall restarts
+;     the 5 us tick grid, so the sample 50 us later is exact to the clock;
+;   - the bit engine's SHI (SEMANTICS 6.9), built for the serial protocols,
+;     as a one-bit sampler, MSB first, with CNT counting each 16-bit word.
+; What the firmware does that no hardware does: the attention, sync and
+; stop bit; the 65/35 coding of each cell; the SRQ test in the stop bit;
+; Tlt; the reply's length found from where it stops (8n + 2 cells with the
+; start and stop bits) and its framing checked. No hardware in Loom codes a
+; bit as the ratio of a cell.
+;
+; Readings taken on the open spec questions (2026-11-06):
+;   - Apple's Guide to the Macintosh Family Hardware was not read; the
+;     timings rest on Microchip AN591B, Apple HW01 and TMK adb.c (secondary)
+;     and are to be checked against the Guide's table when it is read.
+;   - Sync: 65 us sent (TMK); the checker accepts 63 to 72.1 us, which
+;     covers AN591's 70 us.
+;   - Tlt is the bus-high time from the stop bit's release (or an SRQ's end)
+;     to the reply's start bit; the device answers at 200 us.
+;   - After an SRQ the addressed device still answers Tlt after it (TMK);
+;     a device that stays silent reads as no reply with SRQ set.
+;   - A low over 1040 us is a reset at the device.
+;   - The bit is read at 50 us after each fall (AN591's receiver): cells of
+;     about 77 to 125 us, not the full +-30 %. A low/high ratio decoder
+;     would cost about six slots a cell; not done for the word budget.
+;   - No random source: the device's address field mixes a host seed with
+;     NOW; two Loom devices must be given different seeds.
+;
+; Pin: AD = BIDIR0, open drain (OD_MASK bit 0). Nothing drives it high.
+;
+; Host words (FIFO space, thread 0).
+;   INQ, one word per transaction:
+;     bit 15 = 1: the global reset, the line low for 3 ms (the other bits
+;       are ignored);
+;     bit 15 = 0: bits 7:0 the command byte, sent as given: AAAA 11 RR Talk
+;       register RR of address AAAA, AAAA 10 RR Listen, AAAA 0001 Flush,
+;       xxxx 0000 SendReset (AAAA 01 RR and AAAA 0010/0011 are reserved
+;       and sent like a Flush: no data phase). For a Listen, bits 9:8 are
+;       W - 1, W the number of data words (1..4), and W more words follow
+;       in INQ: 2 W bytes, MSB first, the first word's high byte first (an
+;       odd Listen length is not offered: the registers a host writes, 2 and
+;       3, are two bytes). The program takes them all before the attention,
+;       so a Listen never waits for the host on the wire. Bits 14:10 are
+;       ignored.
+;   OUTQ, per transaction: a status word, then for a Talk reply of N bytes
+;   (N + 1) / 2 data words in wire order (an odd N leaves the last byte in
+;   the high half and 0 in the low). Status:
+;     bits 15:8  the command byte (0 for the global reset);
+;     bits 7:4   N, the reply's bytes: 0 for no reply, for a Listen, Flush,
+;                SendReset or reset, and for an error;
+;     bit 2      the global reset was sent (status 0x0004);
+;     bit 1      error: a low that did not end in time (a cell's low past
+;                about 90 us, an SRQ past 330 us), a reply whose cell count
+;                is not 8 N + 2 with N in 2..8, or a stop bit that is not 0
+;                (the start bit is not checked: it is taken as a cell);
+;     bit 0      SRQ: the line was still low 10 us after the host let go of
+;                the command's stop bit.
+;   The PUSHes block while OUTQ is full: the host pops each report before
+;   the next transaction (the bus is idle meanwhile, as ADB allows).
+;
+; Rate: TICK_INT = TK = 5 x US clocks, 5 us at US = 50 (50 MHz). Every ADB
+; time is a multiple of 5 us, the coarse tick keeps every WAITD in 8 bits
+; (the attention is 160 ticks), and the checker proves the schedule for
+; US = 10 as well (the time-scaled build of tools/tests/test_fw_adb.py).
+;
+; Timing, every figure in us (sources in tools/protomodels/adb.py; Apple's
+; Guide to the Macintosh Family Hardware was not at hand and is unchecked):
+;     attention   800 low (exact, latched)       AN591 p.2, Fig. 2
+;     sync        65 high                        TMK adb.c (800 = 765 + 35)
+;     bit cell    100: 0 = 65 low / 35 high, 1 = 35 low / 65 high
+;                                                AN591 p.3, Fig. 3
+;     stop bit    a 0 bit                        AN591 p.3
+;     SRQ         a device holds the stop bit low 300 in all
+;                                                Apple HW01; AN591 Fig. 2
+;     Tlt         bus high 140..260, 200 nominal, from the stop bit's
+;                 release to the data's start bit   HW01; AN591 p.5
+;     reset       3000 low                       AN591 p.2; TMK 2.8..5.2 ms
+;     reply       start bit 1, 2..8 bytes MSB first, stop bit 0  AN591 p.3
+; Receiving. Each cell's fall restarts the tick and the line is sampled
+; SAMPLE = 50 us later: a 1's low (35, 24.5..45.5 at the devices' +-30 %,
+; AN591 p.2) has ended and a 0's (65, 45.5..84.5) has not; AN591's own
+; receiver takes 50 as its threshold (p.5). A low must end by about 90 us,
+; and the next fall must come within 90 us of the rise; when it does not,
+; the reply has ended and its last cell was the stop bit.
+; No reply: no fall within REPLY_TO = 300 us of the bus going high.
+;
+; OD_MASK (BUGS 14): set first and read back three slots later, as
+; dht22_host.loom does and for the same reason (its header): adb_device.loom
+; sets its bit with the same three instructions.
+;
+; Memory: 184 words, 114 in thread 0's quarter (0x000..0x07F) and 70 from
+; 0x180 in thread 3's (the end of a reply, the report, the reset and the
+; send subroutine), so thread 3 must not be started with this program, as
+; the listing says. With adb_device.loom on thread 1 (0x080) and a second
+; copy on thread 2 (0x100) the programs load together.
+;
+; Registers: r0..r3 the data words (a chain: each new word enters at r3 and
+; the older ones move down: r0 <= r1 <= r2 <= r3, written out
+; where it is used, as a subroutine shared by the timed and the untimed code
+; would join their paths for the deadline checker, loomasm README 7), r4 the bit count or a loop count, r5
+; the status, r6 TK (the tick restart; a loop count in a Listen), r7 the
+; bits being sent and scratch, also the `.csr` scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    ADPIN = 0               ; BIDIR0
+        .pins   AD = ADPIN
+        .equ    ADBIT = 1 << ADPIN      ; its bit in OD_MASK
+        .equ    US = 50                 ; clocks per microsecond at 50 MHz
+        .equ    TK = 5 * US             ; one tick = 5 us
+        .equ    ATT = 160               ; attention, 800 us
+        .equ    SYNC = 13               ; sync, 65 us
+        .equ    L0 = 13                 ; a 0: 65 us low ...
+        .equ    H0 = 7                  ; ... 35 us high
+        .equ    L1 = 7                  ; a 1: 35 us low ...
+        .equ    H1 = 13                 ; ... 65 us high
+        .equ    SRQ_AT = 2              ; the SRQ test, 10 us after the stop's release
+        .equ    SRQ_TO = 64             ; an SRQ ends within 320 us more
+        .equ    TLT = 40                ; Tlt, 200 us
+        .equ    REPLY_TO = 60           ; no fall within 300 us: no reply
+        .equ    SAMPLE = 10             ; 50 us after a fall: the bit
+        .equ    LOW_TO = 8              ; a low ends by about 90 us
+        .equ    HIGH_TO = 18            ; the next fall within 90 us of a rise
+        .equ    RST = 200               ; the reset: 3 x 200 ticks, 3 ms
+        .equ    DIR = 1 << 1            ; BE_CFG: MSB first, no CRC
+        .equ    S_SRQ = 1               ; status bits
+        .equ    S_ERR = 2
+        .equ    S_RST = 4
+        .equ    SPILL = 0x180           ; thread 3's quarter (header, Memory)
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, ADBIT
+        CSRW    OD_MASK, r7             ; AD open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, ADBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, TK            ; one tick = 5 us; also the checker's .tick
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, DIR
+        CSRW    BE_CFG, r7
+        LDI     r7, ADPIN << 5
+        CSRW    BE_PINS, r7             ; SHI samples AD
+        LDI     r6, TK
+        SETP    AD, 1                   ; released: the pull-up holds it high
+
+; One transaction per host word.
+cmd:    POP     r5                      ; blocks
+        MOV     r7, r5
+        SHLI    r7, 1                   ; C = bit 15
+        BC      to_rst
+        MOV     r4, r5
+        SHRI    r4, 8
+        ANDI    r4, 3
+        INC     r4                      ; W = bits 9:8 + 1, for a Listen
+        SHLI    r5, 8                   ; the status: the command byte in 15:8
+        MOV     r7, r5
+        SHRI    r7, 10
+        ANDI    r7, 3                   ; the command code, bits 3:2
+        CMPI    r7, 2
+        BNZ     go                      ; not a Listen
+        MOV     r6, r4                  ; W, kept for the data phase
+        POP     r0                     ; the data words, before the attention
+        DEC     r4
+        BZ      go
+        POP     r1
+        DEC     r4
+        BZ      go
+        POP     r2
+        DEC     r4
+        BZ      go
+        POP     r3
+
+; The command: attention, sync, the byte MSB first, the stop bit.
+go:     SETD    0                       ; re-anchor after the unbounded POPs
+        SETP    AD, 0, D
+        WAITD   2                       ; the attention's fall
+        SETP    AD, 1, D
+        WAITD   ATT                     ; 800 us later the sync's rise
+        SETP    AD, 0, D
+        WAITD   SYNC                    ; 65 us later the first cell's fall
+        MOV     r7, r5                  ; the command byte in bits 15:8
+        LDI     r4, 8
+        CALL    send                    ; returns at the stop bit's fall
+        SETP    AD, 1, D
+        WAITD   L0                      ; the stop bit's release
+        WAITD   SRQ_AT
+        JP      AD, 1, no_srq
+        ORI     r5, S_SRQ               ; a device holds the line: SRQ
+        SETD    SRQ_TO
+        WAITP   AD, 1, T
+        BT      to_bad                  ; stuck low
+        SETD    SRQ_AT                  ; the bus is high: as without an SRQ
+no_srq: MOV     r7, r5
+        SHRI    r7, 10
+        ANDI    r7, 3                   ; the command code, bits 3:2
+        LDI     r4, 0
+        CMPI    r7, 3
+        BZ      talk
+        CMPI    r7, 2
+        BNZ     to_rep                  ; Flush, SendReset, reserved: no data
+
+; Listen: Tlt, the start bit, W words from r0 on, the stop bit.
+        SETP    AD, 0, D
+        WAITD   TLT - SRQ_AT            ; 200 us after the bus went high
+        MOV16   r7, 0x8000
+        LDI     r4, 1
+        CALL    send                    ; the start bit, a 1
+lw:     MOV     r7, r0
+        LDI     r4, 16
+        CALL    send
+        MOV     r0, r1                  ; down
+        MOV     r1, r2
+        MOV     r2, r3
+        DJNZ    r6, lw
+        SETP    AD, 1, D
+        WAITD   L0                      ; the stop bit, a 0
+        LDI     r4, 0
+to_rep: JMP     report
+
+; Talk: the reply's start bit within REPLY_TO, then cells until one is
+; missing; the last cell received was the stop bit.
+talk:   SETD    REPLY_TO
+        WAITP   AD, 0, T
+        BT      to_rep                  ; no reply (r4 = 0)
+        LDI     r7, 17
+        CSRW    CNT, r7                 ; the start bit and the first word
+rxbit:  CSRW    TICK_INT, r6            ; the fall restarts the tick grid
+        SETD    0
+        WAITD   SAMPLE
+        SHI                             ; the line at 50 us is the bit; Z = word full
+        BNZ     rx_n
+        STSR    r7
+        MOV     r0, r1                  ; down
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r7                  ; a whole word into the chain
+        LDI     r7, 16
+        CSRW    CNT, r7
+rx_n:   INC     r4
+        SETD    LOW_TO
+        WAITP   AD, 1, T
+        BT      to_bad                  ; a low too long
+        SETD    HIGH_TO
+        WAITP   AD, 0, T
+        BNT     rxbit                   ; the next cell
+        JMP     rx_end
+to_bad: JMP     bad
+to_rst: JMP     reset
+
+; The rest lives in thread 3's quarter (header, Memory).
+        .org    SPILL
+
+; The reply has ended: r4 = 8 N + 2 cells, the last one in SR bit 0.
+rx_end: MOV     r6, r4
+        SUBI    r6, 2
+        MOV     r7, r6
+        ANDI    r7, 7
+        BNZ     bad                     ; not whole bytes
+        SHRI    r6, 3                   ; N
+        CMPI    r6, 2
+        BNC     bad                     ; under 2 bytes
+        CMPI    r6, 9
+        BC      bad                     ; over 8
+        STSR    r7
+        ANDI    r7, 1
+        BNZ     bad                     ; the stop bit is not 0
+        MOV     r4, r6
+        ANDI    r4, 1
+        BZ      even
+        STSR    r7                      ; an odd N: the last byte and the stop bit
+        SHLI    r7, 7                   ; the byte in bits 15:8, 0 below
+        MOV     r0, r1                  ; down
+        MOV     r1, r2
+        MOV     r2, r3
+        MOV     r3, r7
+even:   MOV     r7, r6
+        SHLI    r7, 4
+        OR      r5, r5, r7              ; N into status bits 7:4
+        MOV     r4, r6
+        INC     r4
+        SHRI    r4, 1                   ; (N + 1) / 2 words
+        JMP     report
+
+bad:    ORI     r5, S_ERR
+        LDI     r4, 0
+
+; The report: the status, then r4 words from the chain in wire order (the
+; first at r(4 - r4)).
+report: LDI     r6, TK
+        PUSH    r5
+        TEST    r4, r4
+        BZ      back
+        LDI     r7, 4
+        SUB     r7, r7, r4
+        BZ      pw
+nm:     MOV     r0, r1                  ; down
+        MOV     r1, r2
+        MOV     r2, r3
+        DJNZ    r7, nm
+pw:     PUSH    r0
+        MOV     r0, r1
+        MOV     r1, r2
+        MOV     r2, r3
+        DJNZ    r4, pw
+back:   JMP     cmd
+
+; The global reset: 3 ms low.
+reset:  SETD    0
+        SETP    AD, 0, D
+        WAITD   2
+        WAITD   RST
+        WAITD   RST
+        SETP    AD, 1, D
+        WAITD   RST
+        LDI     r5, S_RST
+        LDI     r4, 0
+        JMP     report
+
+; send: r4 bits of r7, MSB first. Entered with the first cell's fall staged
+; or landed at the last deadline; returns with the fall after the last
+; cell landed.
+send:   SHLI    r7, 1                   ; C = the bit
+        SETP    AD, 1, D
+        BC      s_one
+        WAITD   L0                      ; a 0: the rise 65 us after the fall
+        SETP    AD, 0, D
+        WAITD   H0                      ; the next fall 35 us later
+        JMP     s_next
+s_one:  WAITD   L1                      ; a 1: 35 us
+        SETP    AD, 0, D
+        WAITD   H1                      ; 65 us
+s_next: DJNZ    r4, send
+        RET
