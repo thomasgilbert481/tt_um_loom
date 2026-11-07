@@ -1,0 +1,242 @@
+; morse_rx.loom
+; International Morse code decoder (ITU-R M.1677-1) for a keyed line on
+; IN0, learning the sender's speed, delivering ASCII to the host through
+; OUTQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; Morse code. Nothing in Loom was built for it, and nothing in the wire
+; format is fixed: the dot length is whatever the sender's hand makes it.
+; The program reads the local time (`CSRR NOW`, SEMANTICS 4) at every edge
+; the pin waits see (`WAITP`, SEMANTICS 6.4), and ends a space with a timed
+; wait (`WAITP ... T`) against a deadline it writes itself (`CSRW TD`), the
+; timeouts built for PS/2 and I2C clock stretching. The code table is read
+; from the data memory (`LD`, SEMANTICS 6.11, D-027), built for device
+; emulation. What the firmware does that no hardware does: the speed
+; estimate and its tracking, the split of marks into dots and dashes and
+; of spaces into element, letter and word spaces, and the table lookup.
+; It needs the FIFOs and the data memory, nothing else.
+;
+; Pin: RX = IN0, low while the key is down: a straight key or a keyer's
+; output closing to ground against a pull-up, or a tone decoder's output
+; (an NE567's is low while it hears its tone). Idle high.
+;
+; Host words. INQ[0], once, before the first character: the starting
+; estimate of the dot, in ticks (1 .. 6000; for a sender of w WPM, 1.2 s /
+; w over the tick). The program waits for it before it listens.
+; OUTQ[0], one word per item:
+;   0x00cc  a character, ASCII cc (upper case), or 0x0020 for a word space;
+;   0x80pp  a pattern with no character: pp is the code, first element in
+;           bit 0 (1 = a dash) under a marker 1 (M.1677-1's signs with no
+;           character, such as understood ...-. = 0x30, arrive this way);
+;   0x8100  seven or more elements, not the error signal;
+;   0x8200  the error signal, eight or more dots (1.1.3: eight dots). The
+;           host, which has the text, decides what it erases.
+; The program blocks on a full OUTQ, which a host must keep from happening:
+; a report goes out at most once per letter space.
+;
+; Code (M.1677-1, Annex 1, Part I, read 2026-11-07): the letters, figures
+; and the punctuation with a written character, as morse_tx.loom lists
+; them; spacing (section 2): dash = 3 dots (2.1), and spaces of 1, 3 and 7
+; dots inside a letter, between letters and between words (2.2 .. 2.4).
+;
+; Tick (set by the host before RUN): any; the program counts in ticks.
+;   50 MHz: TICK_INT 12500 (250 us): 5 WPM is a dot of 960 ticks, 60 WPM
+;     of 80. The RTL tests: TICK_INT 16 and a dot of 16 ticks (256 clocks).
+; A word-space threshold (5 E) must stay under 32768 ticks (the deadline's
+; half range, SEMANTICS 4): E < 6553 ticks, 1.6 s at 250 us.
+;
+; Decisions, with E the current dot estimate in ticks:
+;   a mark under 2 E is a dot, else a dash (the midpoint of 1 and 3);
+;   a space under 2 E is an element space; from 2 E the character has
+;   ended and is reported then, while the space goes on; from 5 E (the
+;   midpoint of 3 and 7) it is a word space and 0x0020 follows.
+; Tracking: after every mark, E = (E + x) / 2, with x the mark for a dot
+; and the mark / 3 for a dash (0.332 of it, by shifts); after every element
+; space s, E = (E + s) / 2. Each element halves the error, so a sender
+; who changes speed is followed within one or two characters. The element
+; spaces carry the speed in one step: a sender who becomes up to 1.5 times
+; faster (a dash still over 2 E) or up to 2 times slower (a dot still under
+; 2 E) is read right from the first character at the new speed; a larger
+; step can misread a character or two while E moves. Letter and word
+; spaces are not used (operators stretch them).
+;
+; Measurement: each edge's time is read two slots after the WAITP that
+; saw it, the same delay for every edge, so a duration is exact to one
+; tick. There is no glitch filter: a key bounce longer than a slot reads
+; as an element (a weaker point than a dedicated decoder with debouncing;
+; a keyer's output does not bounce). A key held down waits forever.
+; There is no `WAITD` and no latched write, so the deadline checker has no
+; pair to prove; `.tick` records the RTL tests' tick.
+;
+; Size: 80 words of code (0x000 .. 0x04F, thread 0's quarter) and the
+; 64-word table at 384 .. 447 (thread 3's quarter, beside morse_tx's at
+; 448 .. 495), so both programs run together on threads 0 and 1.
+;
+; Registers: r0 E; r1 the time of the last edge; r2 the
+; time now and scratch; r3 the dashes of the character so far; r4 the
+; weight of its next element (1, 2, 4, ...), the marker at the end; r6 a
+; duration or deadline; r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   16                      ; the RTL tests' tick (no deadline pairs)
+        .equ    TABLE = 384             ; the decode table, 64 words (thread 3's quarter)
+
+start:  POP     r0                      ; the starting estimate of the dot
+hunt:   WAITP   RX, 1                   ; an idle (up) line first
+idle:   WAITP   RX, 0                   ; a mark: the first of a character
+newch:  CSRR    r1, NOW                 ; its start
+        LDI     r3, 0
+        LDI     r4, 1
+
+; A mark, from its start r1.
+mk:     WAITP   RX, 1
+        CSRR    r2, NOW
+        SUB     r6, r2, r1              ; m
+        MOV     r1, r2                  ; the mark's end
+        MOV     r7, r0
+        ADD     r7, r7, r0              ; 2 E
+        CMP     r6, r7                  ; C: m >= 2 E, a dash
+        BNC     dot
+        OR      r3, r3, r4              ; a dash: its bit
+        MOV     r7, r6                  ; x = m / 3, as m (1/4 + 1/16 + 1/64 + 1/256)
+        SHRI    r7, 2
+        MOV     r6, r7
+        SHRI    r7, 2
+        ADD     r6, r6, r7
+        SHRI    r7, 2
+        ADD     r6, r6, r7
+        SHRI    r7, 2
+        ADD     r6, r6, r7
+dot:    ADD     r0, r0, r6              ; E = (E + x) / 2
+        SHRI    r0, 1
+        MOV     r7, r4                  ; the next element's weight,
+        SHLI    r7, 1                   ; saturating at bit 15 (C)
+        BC      sp
+        MOV     r4, r7
+
+; The space after it, from r1: an element space ends before 2 E.
+sp:     MOV     r6, r0
+        ADD     r6, r6, r0
+        ADD     r6, r6, r1
+        CSRW    TD, r6
+        WAITP   RX, 0, T
+        BT      letter                  ; 2 E of space: the character has ended
+        CSRR    r2, NOW                 ; the next mark's start
+        SUB     r6, r2, r1              ; s
+        MOV     r1, r2
+        ADD     r0, r0, r6              ; E = (E + s) / 2
+        SHRI    r0, 1
+        JMP     mk
+
+; The character has ended: r3 its dashes, r4 the marker above them.
+letter: MOV     r2, r4
+        SHRI    r2, 7                   ; Z: six elements or fewer
+        BNZ     long
+        OR      r3, r3, r4              ; the code, marker form, 2 .. 127
+        MOV     r2, r3
+        SHRI    r2, 1                   ; two codes a word
+        MOV16   r7, TABLE
+        ADD     r2, r2, r7
+        LD      r7, r2, 0
+        MOV     r2, r3
+        ANDI    r2, 1                   ; Z: the even code, in bits 7:0
+        BZ      lo
+        SWAP    r7, r7
+lo:     LDI     r2, 0xFF
+        AND     r7, r7, r2              ; the character; Z: none
+        BNZ     put
+        MOV     r7, r3                  ; 0x80pp: a pattern with no character
+        LDIH    r7, 0x80
+        JMP     put
+long:   LDI     r7, 0
+        LDIH    r7, 0x81                ; seven or more elements
+        SHRI    r2, 1                   ; r4 >> 8; Z: seven
+        BZ      put
+        CMPI    r3, 0                   ; Z: all dots
+        BNZ     put
+        LDIH    r7, 0x82                ; the error signal
+put:    PUSH    r7                      ; blocks while OUTQ is full
+
+; The space goes on: a word space from 5 E.
+        MOV     r6, r0
+        SHLI    r6, 2
+        ADD     r6, r6, r0
+        ADD     r6, r6, r1
+        CSRW    TD, r6
+        WAITP   RX, 0, T
+        BNT     newch                   ; a mark: the next character
+        LDI     r7, 0x20
+        PUSH    r7                      ; a word space
+        JMP     idle
+
+; The decode table: the character of code 2i in bits 7:0 of word i, of
+; code 2i + 1 in 15:8 (marker form, as above), 0 = none. Generated from
+; the M.1677-1 table in tools/protomodels/morse.py (code_byte).
+        .org    TABLE
+        .word   0x0000                  ; 0x00 -, 0x01 -
+        .word   0x5445                  ; 0x02 E, 0x03 T
+        .word   0x4E49                  ; 0x04 I, 0x05 N
+        .word   0x4D41                  ; 0x06 A, 0x07 M
+        .word   0x4453                  ; 0x08 S, 0x09 D
+        .word   0x4752                  ; 0x0a R, 0x0b G
+        .word   0x4B55                  ; 0x0c U, 0x0d K
+        .word   0x4F57                  ; 0x0e W, 0x0f O
+        .word   0x4248                  ; 0x10 H, 0x11 B
+        .word   0x5A4C                  ; 0x12 L, 0x13 Z
+        .word   0x4346                  ; 0x14 F, 0x15 C
+        .word   0x0050                  ; 0x16 P, 0x17 -
+        .word   0x5856                  ; 0x18 V, 0x19 X
+        .word   0x5100                  ; 0x1a -, 0x1b Q
+        .word   0x5900                  ; 0x1c -, 0x1d Y
+        .word   0x004A                  ; 0x1e J, 0x1f -
+        .word   0x3635                  ; 0x20 5, 0x21 6
+        .word   0x3700                  ; 0x22 -, 0x23 7
+        .word   0x0000                  ; 0x24 -, 0x25 -
+        .word   0x3800                  ; 0x26 -, 0x27 8
+        .word   0x2F00                  ; 0x28 -, 0x29 0x2f
+        .word   0x002B                  ; 0x2a 0x2b, 0x2b -
+        .word   0x2800                  ; 0x2c -, 0x2d 0x28
+        .word   0x3900                  ; 0x2e -, 0x2f 9
+        .word   0x3D34                  ; 0x30 4, 0x31 0x3d
+        .word   0x0000                  ; 0x32 -, 0x33 -
+        .word   0x0000                  ; 0x34 -, 0x35 -
+        .word   0x0000                  ; 0x36 -, 0x37 -
+        .word   0x0033                  ; 0x38 3, 0x39 -
+        .word   0x0000                  ; 0x3a -, 0x3b -
+        .word   0x0032                  ; 0x3c 2, 0x3d -
+        .word   0x3031                  ; 0x3e 1, 0x3f 0
+        .word   0x0000                  ; 0x40 -, 0x41 -
+        .word   0x0000                  ; 0x42 -, 0x43 -
+        .word   0x0000                  ; 0x44 -, 0x45 -
+        .word   0x3A00                  ; 0x46 -, 0x47 0x3a
+        .word   0x0000                  ; 0x48 -, 0x49 -
+        .word   0x0000                  ; 0x4a -, 0x4b -
+        .word   0x003F                  ; 0x4c 0x3f, 0x4d -
+        .word   0x0000                  ; 0x4e -, 0x4f -
+        .word   0x0000                  ; 0x50 -, 0x51 -
+        .word   0x0022                  ; 0x52 0x22, 0x53 -
+        .word   0x0000                  ; 0x54 -, 0x55 -
+        .word   0x0040                  ; 0x56 0x40, 0x57 -
+        .word   0x0000                  ; 0x58 -, 0x59 -
+        .word   0x0000                  ; 0x5a -, 0x5b -
+        .word   0x0000                  ; 0x5c -, 0x5d -
+        .word   0x0027                  ; 0x5e 0x27, 0x5f -
+        .word   0x2D00                  ; 0x60 -, 0x61 0x2d
+        .word   0x0000                  ; 0x62 -, 0x63 -
+        .word   0x0000                  ; 0x64 -, 0x65 -
+        .word   0x0000                  ; 0x66 -, 0x67 -
+        .word   0x0000                  ; 0x68 -, 0x69 -
+        .word   0x002E                  ; 0x6a 0x2e, 0x6b -
+        .word   0x2900                  ; 0x6c -, 0x6d 0x29
+        .word   0x0000                  ; 0x6e -, 0x6f -
+        .word   0x0000                  ; 0x70 -, 0x71 -
+        .word   0x2C00                  ; 0x72 -, 0x73 0x2c
+        .word   0x0000                  ; 0x74 -, 0x75 -
+        .word   0x0000                  ; 0x76 -, 0x77 -
+        .word   0x0000                  ; 0x78 -, 0x79 -
+        .word   0x0000                  ; 0x7a -, 0x7b -
+        .word   0x0000                  ; 0x7c -, 0x7d -
+        .word   0x0000                  ; 0x7e -, 0x7f -

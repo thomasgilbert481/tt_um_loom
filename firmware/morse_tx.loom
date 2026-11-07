@@ -1,0 +1,299 @@
+; morse_tx.loom
+;
+; Director's decisions (2026-11-07): the signs with no written character
+; (M.1677-1 1.1.3) and the accented e are left out of the keyer and
+; reported by the decoder as patterns; each extra space adds 7 dots of
+; silence; words per minute use the PARIS convention, which M.1677-1 does
+; not contain (unchecked against a primary document).
+; International Morse code keyer (ITU-R M.1677-1): ASCII from the host
+; through INQ[0], keyed out on OUT0 with an optional sidetone on OUT1.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; Morse code. Nothing in Loom was built for it. The program uses the
+; deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10, D-016),
+; built so that WS2812 pulses land on the exact clock, for every key edge;
+; the tick divider (SEMANTICS 4), built for UART rates, as the sidetone's
+; half period; and the data memory (`LD`, SEMANTICS 6.11, D-027), built for
+; device emulation, for the code table. What the firmware does that no
+; hardware does: the variable-length code (1 to 6 elements a character),
+; the 1 : 3 dot and dash and the 1 : 3 : 7 spaces, the speed from words per
+; minute, the sidetone, and the skipping of characters with no code.
+;
+; Pins: KEY = OUT0, high while the key is down (a keying transistor or a
+; transmitter's key line). TONE = OUT1, a square wave at the tick rate / 2
+; while the key is down and the sidetone is on, else low (a piezo or an
+; audio input through a resistor). Both idle low.
+;
+; Host words (FIFO space, thread 0), one at a time; bits 15:14 the kind:
+;   00  a character: bits 7:0 ASCII, bits 13:8 ignored. A space makes the
+;       space after the previous character a word space (7 dots); each
+;       further space adds 7 more. A character with no code (any byte not
+;       in the table below, control characters and bytes over 0x7F
+;       included) is skipped and reported. Lower case is sent as upper.
+;   01  the speed in words per minute: bits 7:0 = w, 1 .. 255; the dot
+;       becomes round(840 / w) sidetone cycles, which is 1.2 s / w with a
+;       700 Hz sidetone (the tick below). w = 0 is rejected and reported.
+;   10  the dot length directly: bits 11:0 = D sidetone cycles, 2 .. 4095;
+;       for another sidetone, or a speed the WPM form cannot give. D < 2 is
+;       rejected and reported.
+;   11  the sidetone: bit 0, 1 = on, 0 = off (the reset state).
+; Before any speed word the dot is 42 cycles: 20 WPM at 700 Hz.
+; Speed and sidetone words take effect from the next character.
+;
+; Reports (FIFO space read, thread 0), only for a refused word:
+;   0xC0cc  character cc skipped (no code); nothing is keyed for it.
+;   0xC1nn  speed word refused (w = 0, or D < 2); nn its bits 7:0.
+; The program blocks on a full OUTQ, which lengthens the space it is in.
+;
+; Code (M.1677-1, Annex 1, Part I, read 2026-11-07): 1.1.1 letters a .. z
+; (accented e ..-.. has no ASCII code and is not sent); 1.1.2 figures 0 .. 9;
+; 1.1.3 the punctuation that has a written character: . , : ? ' - / ( ) "
+; = + @ (the double hyphen is written =, the cross +). The signs with no
+; character (understood, error, wait, end of work, starting signal) can be
+; sent as letters run together only by a host that changes the spacing, which
+; this program does not offer: see QUESTIONS. The multiplication sign is
+; the letter X (3.2.1): the host sends X.
+; Spacing (section 2): a dash is three dots (2.1); one dot between the
+; signals of a letter (2.2), three between letters (2.3), seven between
+; words (2.4). Speed: no speed is set by M.1677-1; words per minute are
+; counted on PARIS, 50 dots with its word space (the convention, not in
+; M.1677-1): a dot is 1.2 s / w.
+;
+; Tick (set by the host before RUN, the M2 convention): one tick is half a
+; sidetone period, TICK = f_clk / (2 f_tone); every length is a whole number
+; of sidetone cycles (2 ticks), the dot D cycles.
+;   50 MHz, 700 Hz: TICK_INT 35714, TICK_FRAC 73: 35714.285 clocks (ideal
+;     35714.2857, -0.02 ppm). 20 WPM: D = 42, a dot 60.0 ms.
+;   600 .. 800 Hz: TICK_INT 41666 .. 31250; the WPM form then scales by
+;     f / 700, so a host using another tone sends D = 1.2 f / w (raw form).
+;   The RTL tests: TICK_INT 32, D = 4: a dot of 256 clocks.
+; The deadline schedule is proved for ticks of 32 clocks or more (.tick).
+;
+; Timing. Every key edge is `SETP KEY, v, D` and the WAITD that lands it,
+; on the exact clock of its tick (SEMANTICS 6.10 rule 1): every mark and
+; space is a whole number of sidetone cycles, exact to the clock. The
+; sidetone's edges are ordinary pin writes, one slot (4 clocks) after
+; their ticks, since the one latch is the key's: OUT (OUTGRP = TONE alone)
+; writes r5 bit 0 for the rise, so one loop serves a mark with and without
+; sidetone, and SETP the fall.
+; The next character is taken from INQ in a window of LEAD ticks at the end
+; of the letter space; a character queued in time is keyed with an exact
+; 3-dot space. A control word, a skipped character or an empty INQ restarts
+; the schedule from now (SETD 0), so the space before the next mark is then
+; at least its nominal length and longer by the host's delay plus at most
+; LEAD ticks and the work of the word: never shorter.
+;
+; Size: 122 words of code (0x000 .. 0x079, thread 0's quarter) and the
+; 48-word table at 448 .. 495 (thread 3's quarter, beside morse_rx's table
+; at 384 .. 447), so both programs run together on threads 0 and 1.
+;
+; Registers: r0 the host word, r1 the code being keyed (the elements left,
+; first in bit 0, above a marker 1), r2 scratch, r3 sidetone cycles left
+; in a mark or space, r4 D, r5 bit 0 sidetone on, bit 1 the last word a
+; space, r6 and r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   KEY = OUT0, TONE = OUT1
+        .tick   32                      ; the shortest tick the schedule is proved for
+        .equ    LEAD  = 8               ; ticks: the window before a character's first mark
+        .equ    LEADC = LEAD / 2        ; the same in sidetone cycles
+        .equ    D0    = 42              ; the reset dot: 20 WPM at 700 Hz
+        .equ    K     = 840             ; sidetone cycles in 1.2 s at 700 Hz
+        .equ    TABLE = 448             ; the code table, 48 words (thread 3's quarter)
+
+start:  SETP    KEY, 0                  ; key up
+        SETP    TONE, 0
+        .csr    OUTGRP, (1 << 5) | pin(TONE)    ; OUT writes TONE alone
+        LDI     r4, D0
+        LDI     r5, 0                   ; sidetone off, no space yet
+
+; Idle: INQ was empty. The schedule restarts at the next word.
+idle:   POP     r0                      ; blocks while INQ is empty
+        SETD    0                       ; the window starts now
+
+; A word, in the window: TD is its start, reached. A character's first mark
+; lands LEAD ticks after it.
+disp:   MOV     r2, r0
+        SHRI    r2, 14                  ; the kind; Z: a character
+        BNZ     ctl
+        LDI     r7, 0xFF
+        AND     r1, r0, r7              ; the byte
+        SUBI    r1, 0x20                ; C: 0x20 or more; Z: a space
+        BNC     unk
+        BZ      space
+        LDI     r7, 0x60
+        CMP     r1, r7                  ; C: 0x80 or more
+        BC      unk
+        MOV     r2, r1
+        SHRI    r2, 1                   ; two codes a word
+        MOV16   r7, TABLE
+        ADD     r2, r2, r7
+        LD      r7, r2, 0
+        ANDI    r1, 1                   ; Z: the even byte, in bits 7:0
+        BZ      lo
+        SWAP    r7, r7
+lo:     LDI     r1, 0xFF
+        AND     r1, r7, r1              ; the code; Z: none
+        BZ      unk
+        ANDI    r5, 1                   ; a character: the last word is not a space
+        WAITD   LEAD - 2                ; the element code below lands the first mark
+
+; The next element's mark, two ticks before it: r3 its cycles, D or 3 D.
+elem:   SHRI    r1, 1                   ; C = the element
+        MOV     r3, r4                  ; a dot: D cycles
+        BNC     e1
+        ADD     r3, r3, r4              ; a dash: 3 D
+        ADD     r3, r3, r4
+e1:     SETP    KEY, 1, D
+        WAITD   2                       ; the key goes down
+
+; A mark of r3 cycles, entered at its first edge. TONE follows r5 bit 0 in
+; the first tick of each cycle and is low in the second.
+mark:   OUT     r5
+ml:     WAITD   1
+        SETP    TONE, 0
+        DEC     r3
+        BZ      mend
+        WAITD   1
+        OUT     r5                      ; one slot after the tick, as the fall
+        JMP     ml
+mend:   SETP    KEY, 0, D
+        WAITD   1                       ; the key comes up on the mark's last tick
+
+; After a mark, TD at its end. r1 = 1: that was the character's last element.
+        CMPI    r1, 1
+        BZ      lgap
+        MOV     r3, r4                  ; the element space, D cycles:
+        DEC     r3                      ; D - 1 here (D >= 2), the last in elem
+eg:     WAITD   2
+        DJNZ    r3, eg
+        JMP     elem
+
+; The letter space, 3 D cycles: 3 D - LEADC here, then the window.
+lgap:   MOV     r3, r4
+        ADD     r3, r3, r4
+        ADD     r3, r3, r4
+        SUBI    r3, LEADC               ; 2 or more (D >= 2)
+lg:     WAITD   2
+        DJNZ    r3, lg
+nx:     WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      idle                    ; nothing queued: restart at the next word
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0
+        JMP     disp
+
+; A space character, in the window: 4 D cycles after a character (making
+; its 3-dot space 7), 7 D after a space, the window's own LEAD ticks
+; included; the window then starts again.
+space:  MOV     r3, r4
+        SHLI    r3, 2                   ; 4 D
+        MOV     r7, r5
+        ANDI    r7, 2                   ; Z: the last word was not a space
+        BZ      sp1
+        ADD     r3, r3, r4              ; 7 D
+        ADD     r3, r3, r4
+        ADD     r3, r3, r4
+sp1:    ORI     r5, 2
+        SUBI    r3, LEADC               ; the window's LEADC cycles first
+        WAITD   LEAD
+spl:    WAITD   2
+        DJNZ    r3, spl
+        JMP     nx
+
+; Control words (kind in r2: 1 WPM, 2 the dot, 3 the sidetone). Each ends
+; at cdone, which restarts the schedule.
+cdone:  SETD    0                       ; the window starts now
+        JMP     nx
+ctl:    CMPI    r2, 2
+        BZ      raw
+        BC      side                    ; 3
+        LDI     r7, 0xFF                ; 1: the speed
+        AND     r2, r0, r7              ; w; Z: 0
+        BZ      bad
+        MOV     r6, r2                  ; D = (K + w / 2) / w, by subtraction:
+        SHRI    r6, 1                   ; at most 840 rounds (w = 1 .. 255 give
+        MOV16   r7, K                   ; D = 840 .. 3)
+        ADD     r7, r7, r6
+        LDI     r4, 0
+dv:     CMP     r7, r2                  ; C: r7 >= w
+        BNC     cdone
+        SUB     r7, r7, r2
+        INC     r4
+        JMP     dv
+raw:    MOV16   r7, 0x0FFF
+        AND     r2, r0, r7              ; D
+        CMPI    r2, 2                   ; C: 2 or more
+        BNC     bad
+        MOV     r4, r2
+        JMP     cdone
+side:   ANDI    r5, 2                   ; bit 0 from the word
+        MOV     r2, r0
+        ANDI    r2, 1
+        OR      r5, r5, r2
+        JMP     cdone
+
+; Refused words: 0xC0cc a character with no code, 0xC1nn a speed word.
+unk:    LDI     r1, 0xC0
+        JMP     rep
+bad:    LDI     r1, 0xC1
+rep:    SWAP    r1, r1                  ; the kind to bits 15:8
+        LDI     r7, 0xFF
+        AND     r2, r0, r7
+        OR      r2, r2, r1
+        PUSH    r2                      ; blocks while OUTQ is full
+        JMP     cdone
+
+; The code table: ASCII 0x20 + 2i in bits 7:0 of word i, 0x21 + 2i in 15:8;
+; each code first element in bit 0 (1 = a dash) under a marker 1, 0 = no code.
+; Generated from the M.1677-1 table in tools/protomodels/morse.py (code_byte).
+        .org    TABLE
+        .word   0x0000                  ; 0x20 0x21
+        .word   0x0052                  ; 0x22 0x23
+        .word   0x0000                  ; 0x24 0x25
+        .word   0x5E00                  ; 0x26 0x27
+        .word   0x6D2D                  ; 0x28 0x29
+        .word   0x2A00                  ; 0x2a 0x2b
+        .word   0x6173                  ; 0x2c 0x2d
+        .word   0x296A                  ; 0x2e 0x2f
+        .word   0x3E3F                  ; 0 1
+        .word   0x383C                  ; 2 3
+        .word   0x2030                  ; 4 5
+        .word   0x2321                  ; 6 7
+        .word   0x2F27                  ; 8 9
+        .word   0x0047                  ; 0x3a 0x3b
+        .word   0x3100                  ; 0x3c 0x3d
+        .word   0x4C00                  ; 0x3e 0x3f
+        .word   0x0656                  ; 0x40 A
+        .word   0x1511                  ; B C
+        .word   0x0209                  ; D E
+        .word   0x0B14                  ; F G
+        .word   0x0410                  ; H I
+        .word   0x0D1E                  ; J K
+        .word   0x0712                  ; L M
+        .word   0x0F05                  ; N O
+        .word   0x1B16                  ; P Q
+        .word   0x080A                  ; R S
+        .word   0x0C03                  ; T U
+        .word   0x0E18                  ; V W
+        .word   0x1D19                  ; X Y
+        .word   0x0013                  ; Z 0x5b
+        .word   0x0000                  ; 0x5c 0x5d
+        .word   0x0000                  ; 0x5e 0x5f
+        .word   0x0600                  ; 0x60 a
+        .word   0x1511                  ; b c
+        .word   0x0209                  ; d e
+        .word   0x0B14                  ; f g
+        .word   0x0410                  ; h i
+        .word   0x0D1E                  ; j k
+        .word   0x0712                  ; l m
+        .word   0x0F05                  ; n o
+        .word   0x1B16                  ; p q
+        .word   0x080A                  ; r s
+        .word   0x0C03                  ; t u
+        .word   0x0E18                  ; v w
+        .word   0x1D19                  ; x y
+        .word   0x0013                  ; z 0x7b
+        .word   0x0000                  ; 0x7c 0x7d
+        .word   0x0000                  ; 0x7e 0x7f
