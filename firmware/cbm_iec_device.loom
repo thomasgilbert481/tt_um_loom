@@ -1,0 +1,256 @@
+; cbm_iec_device.loom
+; Loom as a device on the Commodore serial bus (the "IEC" bus of the
+; VIC-20, C64 and C128, a disk drive's or a printer's side): it answers
+; every ATN, follows the commands for its device number, stores what it is
+; sent as a listener (to the host, byte by byte) and, when told to TALK,
+; turns the bus round and talks back the reply the host gave it.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the Commodore serial bus is
+; in no Loom design document. The program uses:
+;   - two open-drain BIDIR pins (OD_MASK, SEMANTICS 3 and 6.3), built for
+;     I2C, for CLK and DATA, and a third BIDIR pin only read, for ATN (only
+;     the controller pulls ATN, [B]);
+;   - the bit engine's shift register in manual mode (SHO, SHI, CNT,
+;     SEMANTICS 6.9), built for the synchronous serial programs, on DATA;
+;   - JP on single pins as a two-way poll (ATN or CLK), and WAITP with the
+;     deadline timeout (SEMANTICS 6.4) for the 200 us EOI threshold and the
+;     1 ms frame handshake;
+;   - the FIFOs (6.7): the listener's and the talker's flow control is the
+;     bus's own, the hold-off a device may take while it holds a line.
+; What the firmware does that no hardware does: ATN acknowledge, command
+; decoding against its device number, the CLK/DATA byte handshake both
+; ways, EOI by timing and its acknowledge pulse, the frame handshake and
+; the talk turnaround. Weaker than a 1541: ATN is polled, not an
+; interrupt. It is seen within a few slots while the device is idle,
+; between bytes as a listener and between command bytes, but not while it
+; is inside a byte, nor at all while it talks (a controller that pulls ATN
+; in the middle of a talk is not answered until the talk ends). A real
+; device answers ATN at any time within 1 ms ([S4], "ATN Response").
+; There is no SRQ, no fast serial and no empty stream.
+;
+; Sources: as cbm_iec_host.loom, [B] Butterfield, COMPUTE! issue 38
+; (July 1983), [S4] and [S2] Steil, pagetable.com (2019). Every timing is
+; secondary; the bit polarity (1 = DATA released) is from memory and
+; unchecked. Timings chosen, in ticks of one microsecond (TICK_INT from
+; the host): T_BIT 64, T_NE 20, T_BB 100 (also the device's hold of CLK
+; after the turnaround before ready to send, at least 80 us from memory,
+; unchecked), T_EOI 200, T_EI 80, T_FR 80, T_LIM 1000, all as in the host's
+; header.
+;
+; Pins: ATN = BIDIR3 (read only: its PIN_OE stays 0), CLK = BIDIR4, DATA =
+; BIDIR5, open drain. With cbm_iec_host.loom on BIDIR0..2 (thread 0) the
+; bench joins 0-3, 1-4, 2-5. OD_MASK (BUGS 14): set first, read back three
+; slots later, set again if lost.
+;
+; Host words (FIFO space, thread 1).
+;   INQ word 0: TICK_INT, clocks per microsecond. Word 1: the device
+;   number pa (bits 4:0; 4 to 30 on a real bus: 31 is UNLISTEN/UNTALK).
+;   INQ, then: the reply, popped one word per byte when it talks: the byte
+;   in bits 7:0, bit 8 set on the last (sent with EOI). The device waits
+;   for it holding CLK (not ready to send), which the bus allows ([B] step
+;   1), so the controller waits too.
+;   OUTQ:
+;     0x02xx a SECOND (0x60+sa), CLOSE (0xE0+sa) or OPEN (0xF0+sa) byte
+;            received under ATN while LISTEN or TALK addressed this device;
+;     0x00xx / 0x01xx a data byte received as listener, 0x100 if with EOI;
+;     0x82xx as talker, no frame handshake within 1 ms for byte xx: the
+;            device lets the bus go and waits for ATN.
+;   The PUSHes happen while the device holds DATA after a frame (busy), so
+;   a full OUTQ only holds the talker back; it loses nothing.
+;
+; Commands ([S2]): LISTEN pa makes it a listener and UNLISTEN undoes it;
+; TALK pa makes it the talker, and UNTALK or a TALK for another device
+; undoes it; a LISTEN for another device changes nothing. When ATN is
+; released it listens for data, talks, or lets DATA go and waits.
+;
+; Memory: the main loop in thread 1's quarter (0x080..0x0FF) and the
+; subroutines in thread 3's (0x180 up). Threads 2 and 3 run nothing.
+;
+; Registers: r0 the byte, r1 the command group, r2 pa, r3 the state (1
+; listener, 2 talker, 0 neither), r5 the EOI flag, r6 and r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   ATN = BIDIR3, CLK = BIDIR4, DATA = BIDIR5
+        .equ    ODBITS = (1 << pin(CLK)) | (1 << pin(DATA))
+        .equ    T_BIT = 64
+        .equ    T_NE = 20
+        .equ    T_BB = 100
+        .equ    T_EOI = 200
+        .equ    T_EI = 80
+        .equ    T_FR = 80
+        .equ    T_LIM = 1000
+        .equ    E_FRAME = 0x8200
+        .equ    SECOND = 0x200
+        .equ    SPILL = 0x180           ; thread 3's quarter
+        .tick   10                      ; the fastest bus tested: TICK_INT 10
+
+start:  CSRR    r7, OD_MASK
+        ORI     r7, ODBITS
+        CSRW    OD_MASK, r7             ; CLK, DATA open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK             ; three slots later: still ours?
+        ANDI    r7, ODBITS
+        CMPI    r7, ODBITS
+        BNZ     start                   ; lost to the other thread's write
+        .csr    BE_PINS, (pin(DATA) << 5) | pin(DATA)   ; SHO and SHI on DATA
+        POP     r7
+        CSRW    TICK_INT, r7            ; one tick = 1 us
+        POP     r2                      ; the device number
+
+idle:   SETP    CLK, 1
+        SETP    DATA, 1                 ; nothing held
+        LDI     r3, 0
+        WAITP   ATN, 0
+atn:    SETP    CLK, 1                  ; under ATN every device listens
+        SETP    DATA, 0                 ; ATN acknowledged ([B]: within 1 ms)
+c_wait: JP      ATN, 0, c_poll
+c_end:  JMP     a_end                   ; ATN released: the commands are over
+c_poll: JP      CLK, 0, c_wait          ; until the controller is ready to send
+        JP      ATN, 1, c_end           ; read a slot later: a controller that
+                                        ; lets ATN and then CLK go is done
+        CALL    recv
+        MOV     r1, r0
+        SHRI    r1, 5                   ; 1 LISTEN, 2 TALK, 3 SECOND, 7 OPEN/CLOSE
+        MOV     r6, r0
+        ANDI    r6, 0x1F                ; the device number or sa
+        CMPI    r1, 1
+        BZ      c_lis
+        CMPI    r1, 2
+        BZ      c_tlk
+        CMPI    r1, 3
+        BZ      c_sec
+        CMPI    r1, 7
+        BNZ     c_wait                  ; anything else: not for a device
+c_sec:  CMPI    r3, 0
+        BZ      c_wait                  ; not addressed: not ours
+        MOV16   r7, SECOND
+        OR      r7, r7, r0
+        PUSH    r7                      ; DATA held: the controller waits
+        JMP     c_wait
+c_lis:  CMPI    r6, 31
+        BZ      c_unl
+        CMP     r6, r2
+        BNZ     c_wait                  ; another device listens: no change
+        LDI     r3, 1
+        JMP     c_wait
+c_unl:  ANDI    r3, 2                   ; UNLISTEN
+        JMP     c_wait
+c_tlk:  CMPI    r6, 31
+        BZ      c_unt
+        CMP     r6, r2
+        BNZ     c_unt                   ; another device talks: not us
+        LDI     r3, 2
+        JMP     c_wait
+c_unt:  ANDI    r3, 1                   ; UNTALK
+        JMP     c_wait
+
+a_end:  CMPI    r3, 2
+        BZ      talk
+        CMPI    r3, 1
+        BNZ     idle                    ; not addressed: let DATA go
+
+; Listener: DATA held (busy) between bytes.
+l_wait: JP      ATN, 1, l_poll
+        JMP     atn                     ; a command: UNLISTEN, say
+l_poll: JP      CLK, 0, l_wait          ; until the talker is ready to send
+        CALL    recv
+        MOV     r7, r5
+        SHLI    r7, 8
+        OR      r7, r7, r0
+        PUSH    r7                      ; DATA held meanwhile
+        CMPI    r5, 0
+        BZ      l_wait
+        SETD    0
+        WAITD   T_FR
+        JMP     idle                    ; after EOI both let go ([B] step 5)
+
+; Talker: the turnaround ([B], [S4] C and D), then the reply.
+talk:   WAITP   CLK, 1                  ; the controller lets go of CLK
+        SETP    CLK, 0                  ; take it
+        SETP    DATA, 1                 ; and let DATA go
+t_next: POP     r0                      ; CLK held: not ready to send yet
+        MOV     r5, r0
+        SHRI    r5, 8
+        ANDI    r5, 1                   ; the last byte goes with EOI
+        CALL    send
+        CMPI    r5, 0
+        BZ      t_next
+        SETD    0
+        WAITD   T_FR
+        JMP     idle                    ; and CLK goes
+
+; ---------------------------------------------------------- subroutines
+        .org    SPILL
+
+; TD = NOW + 1 ms, for a timed wait.
+ms1:    CSRR    r7, NOW
+        MOV16   r6, T_LIM
+        ADD     r7, r7, r6
+        CSRW    TD, r7
+        RET
+
+; Send r0 bits 7:0 as talker, with EOI if r5 = 1. Called with CLK held.
+send:   SETD    0
+        WAITD   T_BB                    ; between bytes ([S4] 100 us)
+        JP      DATA, 0, s_rts
+        JMP     e_frame                 ; nobody holds DATA: no listener ([S4] Errors)
+s_rts:  SETP    CLK, 1                  ; ready to send
+        WAITP   DATA, 1                 ; the listener is ready for data
+        CMPI    r5, 0
+        BZ      s_go
+        WAITP   DATA, 0                 ; EOI: hold CLK back until the
+        WAITP   DATA, 1                 ; listener's acknowledge pulse ends
+s_go:   LDSR    r0
+        LDI     r7, 8
+        CSRW    CNT, r7
+        SETD    0
+        WAITD   T_NE
+        SETP    CLK, 0                  ; data not valid
+s_bit:  SHO                             ; the bit on DATA, 1 = released; Z: the last
+        WAITD   T_BIT
+        SETP    CLK, 1                  ; data valid
+        WAITD   T_BIT
+        SETP    CLK, 0
+        SETP    DATA, 1
+        BNZ     s_bit
+        CALL    ms1                     ; also five slots for the synchroniser
+        WAITP   DATA, 0, T              ; frame handshake within 1 ms
+        BT      e_frame
+        RET
+
+; Receive a byte as listener into r0, r5 = 1 if it came with EOI. Called
+; with DATA held; returns with DATA held (the frame handshake).
+recv:   WAITP   CLK, 1                  ; the talker is ready to send
+        SETP    DATA, 1                 ; ready for data
+        LDI     r7, 8
+        CSRW    CNT, r7
+        LDI     r5, 0
+        SETD    T_EOI
+        WAITP   CLK, 0, T               ; CLK within 200 us: not the last byte
+        BNT     r_bit
+        LDI     r5, 1                   ; EOI ([B]): acknowledge it
+        SETP    DATA, 0
+        SETD    0
+        WAITD   T_EI
+        SETP    DATA, 1
+        WAITP   CLK, 0                  ; the talker goes on
+r_bit:  WAITP   CLK, 1                  ; data valid
+        SHI                             ; Z: the last bit
+        WAITP   CLK, 0
+        BNZ     r_bit
+        SETP    DATA, 0                 ; frame handshake
+        STSR    r0
+        SHRI    r0, 8                   ; LSB first: the byte was in SR[15:8]
+        RET
+
+; As talker, no frame handshake: report it, let go, wait for ATN.
+e_frame: MOV    r7, r0
+        SHLI    r7, 8
+        SHRI    r7, 8
+        MOV16   r6, E_FRAME
+        OR      r7, r7, r6
+        PUSH    r7
+        JMP     idle

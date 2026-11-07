@@ -1,0 +1,323 @@
+; cbm_iec_host.loom
+; Loom as the controller of the Commodore serial bus, the "IEC" bus of the
+; VIC-20, C64 and C128 to their disk drives and printers: it sends a
+; device LISTEN, SECOND and data bytes ending in EOI, then UNLISTEN; or
+; TALK, SECOND, turns the bus round, receives bytes up to EOI, then UNTALK.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): the Commodore serial bus is
+; in no Loom design document. The program uses:
+;   - three open-drain BIDIR pins (OD_MASK, SEMANTICS 3 and 6.3), built for
+;     I2C, for ATN, CLK and DATA: the bus is three wired-AND lines with
+;     pull-ups and nobody ever drives one high;
+;   - the bit engine's shift register in manual mode (SHO and SHI with CNT,
+;     SEMANTICS 6.9), built for the synchronous serial programs: SHO puts
+;     each bit on DATA through the open-drain rule (a 1 releases it), SHI
+;     samples DATA when the talker lets CLK go, LSB first;
+;   - WAITP with the deadline timeout (SEMANTICS 6.4) for the 200 us EOI
+;     threshold and the three 1 ms limits, and the FIFOs (6.7) for host
+;     commands, data and results.
+; What the firmware does that no hardware does: the ATN command sequence,
+; the CLK/DATA byte handshake, EOI by timing and its acknowledge pulse, the
+; frame handshake, the talk turnaround and every timeout. Weaker than a
+; C64: there is no SRQ, no JiffyDOS or fast serial, no "empty stream"
+; (512 us, Steil part 4) on receive, and the waits a talker or listener may
+; prolong without limit (ready to send, ready for data) have no timeout, so
+; a device that dies holding a line holds the program too.
+;
+; Sources (no Commodore standard is published; every timing is secondary):
+;   [B] J. Butterfield, "How the VIC/64 Serial Bus Works", COMPUTE! issue 38,
+;       July 1983 (atarimagazines.com reprint): true = line pulled to 0 V; the byte handshake
+;       steps 0 to 5; EOI when CLK is not pulled within 200 us of ready for
+;       data, acknowledged by DATA pulled at least 60 us; the talker pulls
+;       CLK within 60 us after it; bit hold at least 20 us (60 us with a C64
+;       listening); frame handshake and ATN response within 1 ms; the TALK
+;       turnaround.
+;   [S4] M. Steil, "Commodore Peripheral Bus: Part 4: Standard Serial",
+;       pagetable.com, 2019-05-06: steps 0 to 30 of a byte; CLK low before a
+;       bit and CLK released (data valid) at least 60 us each for devices
+;       (20 us for controllers); between bytes 100 us; EOI delay at least
+;       200 us; the turnaround A to D.
+;   [S2] M. Steil, "Commodore Peripheral Bus: Part 2: Bus Arbitration,
+;       TALK/LISTEN", pagetable.com, 2019-04-02: LISTEN 0x20+pa, UNLISTEN
+;       0x3F, TALK 0x40+pa, UNTALK 0x5F, SECOND 0x60+sa.
+;   From memory, unchecked: a 1 bit is DATA released (5 V), as the C64
+;   KERNAL's serial output sends it; ATN released at least 20 us after the
+;   last command frame (Tr); the turnaround's 20 to 100 us (Ttk).
+;   These are in QUESTIONS.md for the director.
+;
+; Times are in ticks of one "microsecond": the host sets TICK_INT, 50 at
+; 50 MHz for the real bus. The tests also run the bus at TICK_INT 10, five
+; times faster, with every window scaled with it (the RTL scenarios).
+; Chosen within the sources' windows:
+;   T_BIT 64 us: CLK held low with the bit set up, then released with the
+;     bit valid ([S4] at least 60, [B] set-up at most 70): 128 us a bit;
+;   T_NE 20 us: ready for data to CLK pulled ([B] under 200, usually 60;
+;     after an EOI acknowledge [B] under 60);
+;   T_BB 100 us: frame handshake to the next ready to send ([S4] 100);
+;   T_EI 80 us: the EOI acknowledge pulse as listener ([B] at least 60);
+;   T_R 30 us: frame to ATN release, ATN release to CLK release;
+;   T_FR 80 us: DATA held after an EOI byte before the controller lets go.
+;
+; Pins: ATN = BIDIR0, CLK = BIDIR1, DATA = BIDIR2, all open drain. With
+; cbm_iec_device.loom (thread 1: ATN = BIDIR3, CLK = BIDIR4, DATA = BIDIR5)
+; the bench joins 0-3, 1-4 and 2-5 with the pull-ups: two Loom threads never
+; share a pin. OD_MASK (BUGS 14): set first, read back three slots later and
+; set again if lost, as tm1637_controller.loom does.
+;
+; Host words (FIFO space, thread 0).
+;   INQ word 0: TICK_INT, clocks per microsecond (50 at 50 MHz).
+;   INQ, then one operation each, op in bits 15:12, the secondary address
+;   sa in bits 9:5, the device number pa in bits 4:0:
+;     op 1, send: LISTEN pa, SECOND sa, the data words, UNLISTEN. Each data
+;       word is a byte in bits 7:0 with bit 8 set on the last, sent with
+;       EOI. The program pops them as it goes; a one-byte message is one
+;       word with bit 8 set.
+;     op 2, receive: TALK pa, SECOND sa, the turnaround, the bytes up to the
+;       one with EOI, UNTALK.
+;     Other ops are ignored.
+;   OUTQ: each received byte as byte | 0x100 if it came with EOI; then the
+;   result of each operation: 0x4000 | op when done, or an error with the
+;   byte it concerns in bits 7:0, after which all three lines are released:
+;     0x81xx no device: DATA not pulled within 1 ms of ATN ([B]), xx the
+;            command byte about to be sent; or nobody holding DATA when a
+;            byte is to start ([S4] "Errors"), xx that byte (a send to a
+;            number no device answers: ATN is acknowledged by every device);
+;     0x82xx no frame handshake: DATA not pulled within 1 ms of a byte's
+;            last bit ([B], [S4] step 29); xx is the byte;
+;     0x83xx no turnaround: the device did not pull CLK within 1 ms of the
+;            controller letting go of it; xx is the SECOND byte.
+;   After an error in a send, the rest of its data words are popped and
+;   dropped up to the last one, so the next word is again an operation.
+;
+; Memory: the main loop in thread 0's quarter (0x000..0x07F) and the
+; subroutines in thread 2's (0x100 up). Threads 2 and 3 run nothing.
+;
+; Registers: r0 the byte, r1 pa, r2 sa, r3 op (0 once the last data word is
+; taken), r4 the operation word, r5 the EOI flag, r6 and r7 scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): every timing is
+; secondary (no Commodore standard is published).
+;   Bit polarity 1 = DATA released, from memory of the C64 KERNAL; the
+;   sources' text did not state it. Unchecked.
+;   Tr, Ttk, Tda and Tfr are from memory and unchecked; the turnaround
+;   limit of 1 ms is assumed (no source gives one).
+;   Not implemented: the empty-stream signal, SRQ and fast serial.
+;   A limit: the device polls ATN, so it does not answer one while inside
+;   a byte or while talking; a real 1541 answers at any time within 1 ms.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   ATN = BIDIR0, CLK = BIDIR1, DATA = BIDIR2
+        .equ    ODBITS = (1 << pin(ATN)) | (1 << pin(CLK)) | (1 << pin(DATA))
+        .equ    T_BIT = 64
+        .equ    T_NE = 20
+        .equ    T_BB = 100
+        .equ    T_EOI = 200
+        .equ    T_EI = 80
+        .equ    T_R = 30
+        .equ    T_FR = 80
+        .equ    T_LIM = 1000
+        .equ    E_NODEV = 0x8100
+        .equ    E_FRAME = 0x8200
+        .equ    E_TURN = 0x8300
+        .equ    DONE = 0x4000
+        .equ    SPILL = 0x100           ; thread 2's quarter
+        .tick   10                      ; the fastest bus tested: TICK_INT 10
+
+start:  CSRR    r7, OD_MASK
+        ORI     r7, ODBITS
+        CSRW    OD_MASK, r7             ; ATN, CLK, DATA open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK             ; three slots later: still all ours?
+        ANDI    r7, ODBITS
+        CMPI    r7, ODBITS
+        BNZ     start                   ; lost to the other thread's write
+        SETP    ATN, 1
+        SETP    CLK, 1
+        SETP    DATA, 1                 ; all released: the idle bus
+        .csr    BE_PINS, (pin(DATA) << 5) | pin(DATA)   ; SHO and SHI on DATA
+        POP     r7
+        CSRW    TICK_INT, r7            ; one tick = 1 us
+
+; One operation: decode it.
+cmd:    POP     r4
+        MOV     r1, r4
+        ANDI    r1, 0x1F                ; pa
+        MOV     r2, r4
+        SHRI    r2, 5
+        ANDI    r2, 0x1F                ; sa
+        MOV     r3, r4
+        SHRI    r3, 12                  ; op
+        LDI     r5, 0                   ; commands go without EOI
+        CMPI    r3, 2
+        BZ      talk
+        CMPI    r3, 1
+        BNZ     cmd                     ; not an operation: ignored
+
+; Send: LISTEN pa, SECOND sa under ATN, the data, UNLISTEN.
+        LDI     r0, 0x20
+        OR      r0, r0, r1              ; LISTEN pa
+        CALL    atn_on
+        CALL    send
+        LDI     r0, 0x60
+        OR      r0, r0, r2              ; SECOND sa
+        CALL    send
+        CALL    atn_off
+l_data: POP     r0                      ; CLK held meanwhile: not ready to send
+        MOV     r5, r0
+        SHRI    r5, 8
+        ANDI    r5, 1                   ; the last byte goes with EOI
+        CALL    send                    ; SHO sends bits 7:0 only
+        CMPI    r5, 0
+        BZ      l_data
+        LDI     r3, 0                   ; every data word taken
+        LDI     r5, 0
+        LDI     r0, 0x3F                ; UNLISTEN
+        CALL    atn_on
+        CALL    send
+        CALL    atn_off
+        SETP    CLK, 1                  ; the bus is idle again
+        MOV16   r0, DONE | 1
+        PUSH    r0
+        JMP     cmd
+
+; Receive: TALK pa, SECOND sa under ATN, the turnaround, the bytes, UNTALK.
+talk:   LDI     r0, 0x40
+        OR      r0, r0, r1              ; TALK pa
+        CALL    atn_on
+        CALL    send
+        LDI     r0, 0x60
+        OR      r0, r0, r2              ; SECOND sa
+        CALL    send
+        CALL    atn_off
+        SETP    DATA, 0                 ; turnaround: the controller listens
+        SETD    0
+        WAITD   T_R
+        SETP    CLK, 1                  ; and lets go of CLK ([B], [S4] C)
+        CALL    ms1                     ; also five slots for the synchroniser
+        WAITP   CLK, 0, T               ; the device takes CLK ([S4] D)
+        BNT     t_byte
+        JMP     e_turn
+t_byte: CALL    recv                    ; r0 the byte, r5 its EOI flag
+        MOV     r7, r5
+        SHLI    r7, 8
+        OR      r7, r7, r0
+        PUSH    r7                      ; DATA held meanwhile: not ready for data
+        CMPI    r5, 0
+        BZ      t_byte
+        SETD    0
+        WAITD   T_FR
+        SETP    DATA, 1                 ; after EOI both let go ([B] step 5)
+        LDI     r5, 0
+        LDI     r0, 0x5F                ; UNTALK
+        CALL    atn_on
+        CALL    send
+        CALL    atn_off
+        SETP    CLK, 1
+        MOV16   r0, DONE | 2
+        PUSH    r0
+        JMP     cmd
+
+; ---------------------------------------------------------- subroutines
+        .org    SPILL
+
+; ATN on: pull ATN and CLK, let DATA go; a device must pull DATA in 1 ms.
+atn_on: SETP    ATN, 0
+        SETP    CLK, 0
+        SETP    DATA, 1
+        CALL    ms1                     ; five slots: our own DATA pull has left FF2
+        WAITP   DATA, 0, T
+        BT      e_nodev
+        RET
+
+; ATN off, T_R after the last command frame.
+atn_off: SETD   0
+        WAITD   T_R
+        SETP    ATN, 1
+        RET
+
+; TD = NOW + 1 ms, for a timed wait.
+ms1:    CSRR    r7, NOW
+        MOV16   r6, T_LIM
+        ADD     r7, r7, r6
+        CSRW    TD, r7
+        RET
+
+; Send r0 bits 7:0 as talker, with EOI if r5 = 1. Called with CLK held.
+send:   SETD    0
+        WAITD   T_BB                    ; between bytes ([S4] 100 us)
+        JP      DATA, 0, s_rts
+        JMP     e_nodev                 ; nobody holds DATA: no listener ([S4] Errors)
+s_rts:  SETP    CLK, 1                  ; ready to send
+        WAITP   DATA, 1                 ; every listener ready for data
+        CMPI    r5, 0
+        BZ      s_go
+        WAITP   DATA, 0                 ; EOI: hold CLK back until the
+        WAITP   DATA, 1                 ; listener's acknowledge pulse ends
+s_go:   LDSR    r0
+        LDI     r7, 8
+        CSRW    CNT, r7
+        SETD    0
+        WAITD   T_NE
+        SETP    CLK, 0                  ; data not valid
+s_bit:  SHO                             ; the bit on DATA, 1 = released; Z: the last
+        WAITD   T_BIT
+        SETP    CLK, 1                  ; data valid
+        WAITD   T_BIT
+        SETP    CLK, 0
+        SETP    DATA, 1
+        BNZ     s_bit
+        CALL    ms1
+        WAITP   DATA, 0, T              ; frame handshake within 1 ms
+        BT      e_frame
+        RET
+
+; Receive a byte as listener into r0, r5 = 1 if it came with EOI. Called
+; with DATA held; returns with DATA held (the frame handshake).
+recv:   WAITP   CLK, 1                  ; the talker is ready to send
+        SETP    DATA, 1                 ; ready for data
+        LDI     r7, 8
+        CSRW    CNT, r7
+        LDI     r5, 0
+        SETD    T_EOI
+        WAITP   CLK, 0, T               ; CLK within 200 us: not the last byte
+        BNT     r_bit
+        LDI     r5, 1                   ; EOI ([B]): acknowledge it
+        SETP    DATA, 0
+        SETD    0
+        WAITD   T_EI
+        SETP    DATA, 1
+        WAITP   CLK, 0                  ; the talker goes on
+r_bit:  WAITP   CLK, 1                  ; data valid
+        SHI                             ; Z: the last bit
+        WAITP   CLK, 0
+        BNZ     r_bit
+        SETP    DATA, 0                 ; frame handshake
+        STSR    r0
+        SHRI    r0, 8                   ; LSB first: the byte was in SR[15:8]
+        RET
+
+; Errors: release the bus, report, drop the rest of a send's data.
+e_nodev: MOV16  r6, E_NODEV
+        JMP     fail
+e_frame: MOV16  r6, E_FRAME
+        JMP     fail
+e_turn: MOV16   r6, E_TURN
+fail:   SETP    ATN, 1
+        SETP    CLK, 1
+        SETP    DATA, 1
+        MOV     r7, r0
+        SHLI    r7, 8
+        SHRI    r7, 8                   ; the byte, without the EOI bit
+        OR      r6, r6, r7
+        PUSH    r6
+        CMPI    r3, 1
+        BNZ     again                   ; not a send, or its data all taken
+        CMPI    r5, 0
+        BNZ     again                   ; the last data word was the one sent
+drain:  POP     r7
+        SHRI    r7, 9                   ; C = bit 8, the last word
+        BNC     drain
+again:  JMP     cmd
