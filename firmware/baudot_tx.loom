@@ -1,0 +1,94 @@
+; baudot_tx.loom
+; A start-stop teleprinter transmitter for International Telegraph
+; Alphabet No. 2 (ITA2, "Baudot", ITU-T S.1) on OUT0: five-unit codes from
+; the host, each sent as a start element, the five code elements and a
+; stop element of 1.5 units, the 7.5-unit character of telex and of
+; amateur radioteletype.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core only:
+; pins, deadlines, INQ (SEMANTICS 6.7) and the deadline-latched pin write
+; (SETP ... D, 6.10, built so that UART and timer edges land on the exact
+; clock of their tick). No hardware knows a five-bit code or a half-unit
+; stop element: the shipped UARTs (uart_tx.loom, the bit engine's frames)
+; have whole stop bits, and the 1.5-unit stop is here a deadline of 48
+; ticks of 1/32 unit. The shift state of ITA2 is the host's business in
+; this program, which sends codes as given; firmware/bridge_uart_baudot.loom
+; inserts the shifts itself.
+;
+; Host words (FIFO space, thread 0): bits 4:0 one ITA2 combination, code
+; element 1 in bit 0 (S.1 Table 1: element 1 is sent first; condition Z,
+; stop polarity, is 1 and the line's idle level, 3.2); bits 15:5 ignored.
+; So E is 0x01, T 0x10, CR 0x08, LF 0x02, space 0x04, FIGS 0x1B,
+; LTRS 0x1F. Nothing is written to OUTQ.
+;
+; Timing sources. 50 bauds and the 7.5-unit character with a 1.5-unit stop
+; element: CCITT R.103 (1988) section 1 and 2.2; the minimum stop element a
+; telex output may release is 1.25 units (R.103 3.3), which this program
+; never goes below. 45.45 bauds (a 22 ms unit, 165 ms a character) is the
+; amateur radioteletype rate (secondary sources, see the FW_README); 75
+; bauds is the other common rate. The rate is the host's: one tick is
+; 1/32 unit (TPB below), set through the debug space before RUN:
+;     45.45 bauds (22 ms):  TICK_INT 34375, TICK_FRAC 0   (exact)
+;     50 bauds (20 ms):     TICK_INT 31250, TICK_FRAC 0   (exact)
+;     75 bauds (13.33 ms):  TICK_INT 20833, TICK_FRAC 85  (-0.6 ppm)
+;     the RTL tests:        TICK_INT 16, 512 clocks a unit
+; TICK_INT is 16 bits (SEMANTICS 5), so a whole unit (1.1 M clocks at
+; 45.45 bauds) cannot be one tick; 32 ticks a unit is the smallest power of
+; two that fits all three rates. The schedule is proved, and every edge
+; exact, for ticks of 12 clocks or more (.tick).
+;
+; Every edge is `SETP TX, v, D` and the WAITD that lands it, on the exact
+; clock of its tick (6.10 rule 1): every element is exactly 32 ticks and
+; the stop element exactly 48 when characters follow back to back. The
+; next code is taken from INQ LEAD ticks before the end of the stop
+; element; one queued by then starts on the exact clock the stop ends.
+; Otherwise the line idles at stop polarity, and a code that arrives later
+; starts on the second tick after it is taken (SETD 2 re-anchors the
+; schedule after the unbounded POP; the start is staged and the WAITD 0
+; committed, 3 slots, before NOW can reach that tick, so the latch fires on
+; it by rule 1 for any tick of 12 clocks or more; with SETD 1 a start taken
+; late in a tick landed at the WAITD's commit instead, off the grid, found
+; by the bridge test on the model): the stop element is then longer than
+; 1.5 units, never shorter.
+;
+; Size: 24 words (0x000 .. 0x017). Registers: r0 the code being sent, r1
+; the elements left.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   12                      ; the shortest tick the pairs are proved for
+        .equ    TPB  = 32               ; ticks a unit
+        .equ    STOP = TPB + TPB / 2    ; the 1.5-unit stop element
+        .equ    LEAD = 2                ; the next code is taken this early
+
+start:  SETP    TX, 1                   ; idle: stop polarity (condition Z)
+
+idle:   POP     r0                      ; block until the host sends a code
+        SETD    2                       ; re-anchor: TD = two ticks on, so the
+        SETP    TX, 0, D                ; latch is staged before NOW reaches TD
+        WAITD   0                       ; and the start lands on that tick (rule 1)
+
+frame:  LDI     r1, 5                   ; five code elements, element 1 first
+bit:    SHRI    r0, 1                   ; C = the next element
+        BC      one
+        SETP    TX, 0, D                ; condition A
+        JMP     next
+one:    SETP    TX, 1, D                ; condition Z
+next:   WAITD   TPB                     ; the previous element ends, this one lands
+        DJNZ    r1, bit
+
+        SETP    TX, 1, D                ; the stop element
+        WAITD   TPB                     ; element 5 ends; the stop lands
+        WAITD   STOP - LEAD             ; LEAD ticks before the stop ends
+        WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      empty
+        .bounded "guarded by the WAITB INQ_NE above; only this thread pops INQ"
+        POP     r0
+        SETP    TX, 0, D                ; the next start element lands
+        WAITD   LEAD                    ; exactly where the stop ends
+        JMP     frame
+
+empty:  WAITD   LEAD                    ; finish the stop element, then idle
+        JMP     idle

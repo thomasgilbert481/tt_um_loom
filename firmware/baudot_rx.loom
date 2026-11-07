@@ -1,0 +1,106 @@
+; baudot_rx.loom
+; A start-stop teleprinter receiver for International Telegraph Alphabet
+; No. 2 (ITA2, "Baudot", ITU-T S.1) on IN0, delivering each received
+; five-unit combination to the host through OUTQ[0].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core only:
+; pins, deadlines and OUTQ (SEMANTICS 6.7). Its frame finder and mid-bit
+; sampler are firmware/uart_rx.loom's, cut to five code elements and set
+; to 32 ticks a unit. No hardware knows a five-unit code; the shift state
+; (letters or figures, S.1 4.4) is the host's to track, because the same
+; combination means E or 3 depending on the last shift received:
+; tools/protomodels/baudot.py has the decoder that does it.
+;
+; Result format (FIFO space read, thread 0): one word per character.
+;     bits 4:0   the combination, code element 1 in bit 0 (S.1 Table 1:
+;                element 1 is sent first; condition Z = 1, 3.2)
+;     bit 8      framing error: the stop element was at start polarity
+;                (condition A) at its middle; the code is still given
+;     bit 9      overrun: OUTQ was full and at least one earlier character
+;                was dropped before this one
+;     other bits zero. Nothing is read from INQ.
+;
+; Rate: 32 ticks a unit. The host sets TICK_INT/TICK_FRAC to 1/32 unit
+; before RUN, as for firmware/baudot_tx.loom:
+;     45.45 bauds (22 ms):  TICK_INT 34375      50 bauds:  31250
+;     75 bauds:             TICK_INT 20833, TICK_FRAC 85
+;     the RTL tests:        TICK_INT 16, 512 clocks a unit
+; The deadline schedule is proved for ticks of 4 clocks or more (.tick).
+;
+; How a character is found and sampled. WAITP waits for start polarity
+; (the start element) and SETD 0 re-anchors the schedule on that edge: TD
+; becomes the tick boundary just passed, 0 to 1 tick before the edge was
+; seen, which was about 12 clocks after the pad changed (synchroniser, slot
+; grid, the SETD's own slot). WAITD 16 is the start element's middle and
+; every 32 ticks after it the middle of the next element, so all seven
+; samples sit within -P+12 .. +12 clocks of mid-element (P the tick):
+; at 45.45 bauds within 1/32 unit, at the test rate -4 .. +12 of 512 clocks.
+; A start element that is back at stop polarity at its middle is a glitch
+; and is ignored (R.103 2.6 rejects a start element under 0.4 unit and
+; accepts one over 0.6). The stop element is sampled once, at the middle
+; of its first unit, the place a 1-unit stop and a 1.5-unit stop share,
+; so the receiver takes any stop length from 1 unit up (R.103 3.3: telex
+; outputs release at least 1.25). After a framing error it waits for stop
+; polarity before it looks for the next start, so a break (the line held
+; at start polarity) is one framing error, not a stream of them.
+;
+; Rate tolerance: the stop sample is 6.5 units after the start edge, so a
+; sender e% off rate moves it by 6.5 e % of a unit: +-2 % is 0.13 unit,
+; inside the half unit either way (tested); the limit is about +-7 %
+; (0.5 / 6.5, less the sampling offset: estimated, not tested).
+; The start-element wait is back a few slots after the stop sample, half a
+; unit before even a 1-unit stop ends.
+;
+; Size: 33 words (0x000 .. 0x020). Registers: r0 the code, r1 the elements
+; left, r3 0x0100, r4 the overrun flag for the next word.
+;
+; Reading taken on the open spec question (2026-11-07): a stop element
+; shorter than R.103 3.3's 1.25 units is not flagged. The receiver checks
+; the stop half a unit in, as a start-stop receiver samples, and a
+; framing error means the line was not at Z there.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   4                       ; the shortest tick the pairs are proved for
+        .equ    TPB = 32                ; ticks a unit
+
+start:  LDI     r3, 0
+        LDIH    r3, 1                   ; r3 = 0x0100: the framing-error bit
+        LDI     r4, 0                   ; pending overrun flag (bit 9)
+
+rearm:  WAITP   RX, 0                   ; the start element (or already low)
+        SETD    0                       ; re-anchor on its edge
+        WAITD   TPB / 2                 ; the middle of the start element
+        JP      RX, 1, rearm            ; stop polarity again: a glitch
+        LDI     r0, 0
+        LDI     r1, 5
+
+bit:    WAITD   TPB                     ; the middle of the next code element
+        JP      RX, 1, one              ; sample
+        SHRI    r0, 1                   ; an A (0) enters at bit 4
+        DJNZ    r1, bit
+        JMP     stop
+one:    SHRI    r0, 1
+        ORI     r0, 0x10                ; a Z (1) enters at bit 4
+        DJNZ    r1, bit
+
+stop:   OR      r0, r0, r4              ; carry the overrun flag (bit 9)
+        WAITB   OUTQ_NF, T              ; room in OUTQ? TD is reached, so this
+        BT      full                    ; never waits: T = 1 means full
+        LDI     r4, 0
+        WAITD   TPB                     ; the middle of the stop element's first unit
+        JP      RX, 0, ferr             ; start polarity: framing error
+        PUSH    r0                      ; cannot stall: OUTQ had room, and only
+        JMP     rearm                   ; the host takes words out
+
+full:   LDIH    r4, 2                   ; r4 = 0x0200: bit 9 on the next word;
+        WAITD   TPB                     ; this character is dropped, but a break
+        JP      RX, 0, brk              ; must still end before the next start
+        JMP     rearm
+
+ferr:   OR      r0, r0, r3              ; bit 8: framing error
+        PUSH    r0
+brk:    WAITP   RX, 1                   ; wait for stop polarity again
+        JMP     rearm

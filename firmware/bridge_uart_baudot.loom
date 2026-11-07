@@ -1,0 +1,437 @@
+; bridge_uart_baudot.loom
+; A UART-to-teleprinter bridge: thread 0 receives ASCII on a serial line
+; (8N1, for example 115200 baud from a PC), translates it into
+; International Telegraph Alphabet No. 2 (ITA2, ITU-T S.1) and inserts the
+; letter-shift and figure-shift combinations the text needs; thread 1
+; sends the codes as 7.5-unit start-stop characters (a 1.5-unit stop
+; element) at teleprinter speed. No host in the loop: the host loads the
+; image, sets the two ticks and starts both threads.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core (pins,
+; deadlines, the deadline-latched pin write of 6.10 for every teleprinter
+; edge), thread 0's bit engine in manual mode (SHI shifts the UART bits
+; in, 6.9, built for the synchronous serial programs) and LD/ST to data
+; memory (6.11, built so that device emulators can keep a register file)
+; for the translation table and the queue between the two threads. No
+; hardware knows ITA2, its shift state, a five-unit code or a half-unit
+; stop element: all of it is firmware. Thread 0's receiver is
+; firmware/bridge_uart_dmx.loom's; thread 1's transmitter is
+; firmware/baudot_tx.loom with its INQ replaced by the queue.
+;
+; Pins: RX = IN0 (thread 0, the UART input), TX = OUT0 (thread 1, the
+; teleprinter loop: 1 = condition Z, stop polarity, mark; S.1 3.2), and
+; CTS_N = OUT1, a flow-control output for the UART sender, low = clear to
+; send (the sense of an FTDI or CP210x CTS# input). The UART side is about
+; 2000 times faster than the teleprinter, so a sender that ignores CTS_N
+; overruns the queue after 63 codes and the bridge drops what does not fit.
+;
+; --------------------------------------------------------- the translation
+; One table word per ASCII code 0x00 .. 0x7F (TABLE below): bits 4:0 the
+; ITA2 combination (code element 1 in bit 0, S.1 Table 1), bits 6:5 its
+; case: 1 letters, 2 figures, 3 either (space, carriage return, line feed:
+; S.1 4.4 makes only combinations 1 .. 26 depend on the shift), 0 none.
+; Lower case is sent as upper case (S.1 2.3: ITA2 has one series of
+; letters). The figure case carries - ? : 3 8 ( ) . , 9 0 1 4 ' 5 7 = 2 /
+; 6 + (S.1 2.1, Table 1) and BEL is the audible signal, figure J (4.3).
+; Every other byte is DROPPED, not replaced: ! " # $ % & * ; < > @ [ \ ] ^
+; _ ` { | } ~, DEL, the other control codes and bytes 0x80 .. 0xFF, and
+; also ENQ (it would be "who are you?", figure D, which starts the far
+; end's answerback: S.1 4.1; see QUESTIONS) and NUL (all-space, combination
+; 32, must not be sent during a call: S.1 4.7.2). F, G and H in figure
+; case are not defined internationally (S.1 4.2) and are never sent.
+;
+; The shift rules. The case the far end is in is tracked in r3: unknown at
+; start, so the first letter, figure or either-case character is preceded
+; by a shift (S.1 4.4: the first combination transmitted shall be a
+; shift). A letter in figure case (or unknown) gets LTRS first, a figure in
+; letter case gets FIGS first. One more rule, for receivers with "unshift
+; on space" (a common amateur-radio setting that S.1 does not have): after
+; a space sent in figure case the case is taken as unknown, so the next
+; letter or figure gets its shift again. An S.1 receiver ignores the
+; repeated shift (it is already in that case) and an unshift-on-space
+; receiver needs it, so the output prints the same on both.
+;
+; UART rate: 8 ticks a bit. The host sets thread 0's TICK_INT/TICK_FRAC
+; to one eighth of a bit before RUN (115200 baud: 54 + 64/256; the RTL
+; tests: 32, 256 clocks a bit). The deadline pairs are proved for ticks of
+; 32 clocks or more (.tick below); samples sit within -P+12 .. +12 clocks
+; of mid-bit (P the tick). A character is translated during its own stop
+; bit; after the stop sample the queue write takes at most 22 slots (88
+; clocks), inside the half bit (4P) before a back-to-back start bit.
+;
+; Teleprinter rate: 32 ticks a unit, thread 1's TICK_INT as for
+; firmware/baudot_tx.loom (45.45 bauds: 34375; 50 bauds: 31250; 75 bauds:
+; 20833 + 85/256; the RTL tests: 16, 512 clocks a unit). Every edge is
+; latched (6.10), every element exactly 32 ticks and the stop element 48
+; when codes follow back to back, as in baudot_tx.loom (R.103 sections 1,
+; 2.2; at least the 1.25-unit stop of 3.3 always). Proved for ticks of 16
+; clocks or more.
+;
+; ------------------------------------------------------------- the queue
+; A ring of 64 codes at RING .. RING + 63, with two shared words, each
+; written by one thread only: HEAD (thread 0: the next entry it writes)
+; and TAIL (thread 1: the next entry it reads). Thread 0 writes an entry
+; and only then publishes HEAD; thread 1 reads an entry and only then
+; publishes TAIL; an LD or ST is one access at one edge (6.11), so neither
+; ever sees a half-written word, and with at most 63 entries in use the
+; writer never overtakes the reader. A character takes one or two entries
+; (its shift and itself) and goes in whole or not at all.
+;
+; Flow control on CTS_N. Thread 0 sets CTS_N = 1 (stop) after a write
+; that leaves fewer than LOW free entries; thread 1 sets CTS_N = 0 (go)
+; after a read that leaves HIGH or more. Two threads write this one output
+; pin, which is safe here: each thread writes only its own value and the
+; pin holds the last write (it is not a wired-AND, COMMON.md), and the free
+; count cannot move from under LOW to HIGH or back in the few slots
+; between a thread's read of the other's index and its pin write (a UART
+; character adds at most 2 entries in 10 bits, a teleprinter character
+; removes 1 in 7.5 units). A sender that stops within LOW / 2 = 8
+; characters of CTS_N rising loses nothing (FTDI parts stop within 3).
+;
+; Memory, all 512 words: thread 0's code 84 words (0 .. 83), thread 1's
+; 45 words (128 .. 172), 259 words loaded in all,
+; the table at 256 .. 383 (thread 2's quarter), HEAD and TAIL at 384, 385,
+; the ring at 386 .. 449 (thread 3's quarter). Threads 2 and 3 cannot run
+; beside it.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   Unshift on space: kept. The shift is re-sent after a space sent in
+;   figure case, so S.1 receivers and "unshift on space" receivers print
+;   the same; it costs one combination and S.1 4.4 allows it.
+;   A shift after a long idle: not sent. S.1 4.4 asks for one when
+;   transmission commences, which the first character after start gets;
+;   doing it after idle would need a third shared word.
+;   ENQ: dropped, not mapped to WRU, so a stray byte cannot make the far
+;   end send its answerback.
+;   Figure case: the international ITA2 table only; no US TTY variant.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0, TX = OUT0, CTS_N = OUT1
+        .equ    OVS = 8                 ; UART ticks a bit
+        .equ    TPB = 32                ; teleprinter ticks a unit
+        .equ    STOP = TPB + TPB / 2    ; the 1.5-unit stop element
+        .equ    LEAD = 4                ; thread 1 takes the next code this early
+        .equ    TABLE = 256             ; 128 words, one per ASCII code
+        .equ    SHARED = 384            ; HEAD, TAIL
+        .equ    RING = SHARED + 2       ; 64 entries
+        .equ    MASK = 63               ; ring index mask
+        .equ    LOW = 16                ; free entries under which CTS_N stops the sender
+        .equ    HIGH = 32               ; free entries from which CTS_N lets it go
+        .equ    LET = 1                 ; the cases (table bits 6:5, and r3)
+        .equ    FIG = 2
+        .equ    EITHER = 3
+        .equ    LTRS = 0x1F             ; S.1 Table 1, combination 29
+        .equ    FIGS = 0x1B             ; combination 30
+        .equ    SPACE = 0x04            ; combination 31
+
+; ============================================== thread 0: UART to the ring
+; r0 the byte, then its combination; r1 SHARED; r2 the free entries; r3 the
+; case the far end is in (0 unknown, LET, FIG); r4 HEAD; r5 the combination
+; to write, 0 for none; r6 the case after it; r7 the shift to write first,
+; 0 for none (combination 32 is never sent, so 0 is free to mean that).
+        .thread 0
+        .tick   32                      ; the shortest tick the pairs are proved for
+        .csr    BE_PINS, pin(RX) << 5   ; SHI reads RX; BE_CFG 0: LSB first
+        LDI     r3, 0                   ; the case: unknown (S.1 4.4)
+        LDI     r4, 0                   ; HEAD = TAIL = 0 at load
+
+rx:     WAITP   RX, 0                   ; the start bit (or already low)
+        SETD    0                       ; re-anchor on its edge
+        WAITD   OVS / 2                 ; the middle of the start bit
+        JP      RX, 1, rx               ; high again: a glitch
+        LDI     r0, 8
+        CSRW    CNT, r0                 ; eight SHIs
+bit:    WAITD   OVS                     ; the middle of the next data bit
+        SHI                             ; sample; Z on the eighth
+        BNZ     bit
+        STSR    r0
+        SHRI    r0, 8                   ; the byte, from SR 15:8
+
+; Translate during the stop bit: r5, r7, r6 and the room are decided here.
+        LDI     r5, 0                   ; nothing to write unless found below
+        MOV     r7, r0
+        SHRI    r7, 7                   ; Z: 0x00 .. 0x7F
+        BNZ     stop                    ; 0x80 .. 0xFF: no ITA2 code, dropped
+        MOV16   r7, TABLE
+        ADD     r7, r7, r0
+        LD      r0, r7, 0               ; the table word
+        MOV     r6, r0
+        SHRI    r6, 5                   ; r6 = its case; Z: no code, dropped
+        BZ      stop
+        ANDI    r0, 31                  ; r0 = the combination
+        LDI     r7, 0                   ; no shift, unless one is needed
+        CMPI    r6, EITHER
+        BZ      either
+        CMP     r6, r3                  ; a letter or a figure: in that case?
+        BZ      room
+        LDI     r7, LTRS                ; no: its shift first
+        CMPI    r6, LET
+        BZ      room
+        LDI     r7, FIGS
+        JMP     room
+either: MOV     r6, r3                  ; space, CR, LF: the case stays...
+        TEST    r3, r3
+        BNZ     usos
+        LDI     r7, LTRS                ; ...but nothing has been sent yet: a
+        LDI     r6, LET                 ; shift first (S.1 4.4)
+        JMP     room
+usos:   CMPI    r0, SPACE               ; a space in figure case: the case is
+        BNZ     room                    ; then unknown (unshift-on-space
+        CMPI    r3, FIG                 ; receivers are back in letters)
+        BNZ     room
+        LDI     r6, 0
+room:   MOV16   r1, SHARED
+        LD      r2, r1, 1               ; TAIL
+        SUB     r2, r2, r4
+        SUBI    r2, 1
+        ANDI    r2, MASK                ; r2 = free entries
+        TEST    r7, r7
+        BZ      one
+        SUBI    r2, 1                   ; one for the shift; C = 0: none free
+        BNC     stop
+one:    SUBI    r2, 1                   ; one for the character
+        BNC     stop                    ; no room: the character is dropped whole
+        MOV     r5, r0                  ; r2 = free entries after the write
+
+stop:   WAITD   OVS                     ; the middle of the stop bit
+        JP      RX, 0, ferr             ; low: framing error, the byte is dropped
+        TEST    r5, r5
+        BZ      rx                      ; dropped, or no room
+        TEST    r7, r7
+        BZ      put
+        ADD     r0, r1, r4
+        ST      r7, r0, RING - SHARED   ; the shift
+        ADDI    r4, 1
+        ANDI    r4, MASK
+put:    ADD     r0, r1, r4
+        ST      r5, r0, RING - SHARED   ; the character
+        ADDI    r4, 1
+        ANDI    r4, MASK
+        ST      r4, r1, 0               ; publish HEAD, after the entries
+        MOV     r3, r6                  ; the far end's case from now on
+        CMPI    r2, LOW                 ; C: LOW or more still free
+        BC      rx
+        SETP    CTS_N, 1                ; nearly full: stop the sender
+        JMP     rx
+
+ferr:   WAITP   RX, 1                   ; wait for the line to return to idle
+        JMP     rx
+
+; ======================================== thread 1: the ring to the teleprinter
+; r0 the code being sent, r1 the elements left, r2 HEAD as last read, r3
+; scratch, r4 TAIL, r5 SHARED.
+        .thread 1
+        .tick   16                      ; the shortest tick the pairs are proved for
+t1:     SETP    TX, 1                   ; idle: stop polarity (condition Z)
+        MOV16   r5, SHARED
+        LDI     r4, 0                   ; TAIL
+
+idle1:  LD      r2, r5, 0               ; HEAD: poll until the ring holds a code
+        CMP     r2, r4
+        BZ      idle1
+        ADD     r3, r5, r4
+        LD      r0, r3, RING - SHARED   ; the code
+        ADDI    r4, 1
+        ANDI    r4, MASK
+        ST      r4, r5, 1               ; publish TAIL, after the read
+        SETD    2                       ; re-anchor: TD = two ticks on, so the
+        SETP    TX, 0, D                ; latch is staged before NOW reaches TD
+        WAITD   0                       ; and the start lands on that tick (rule 1)
+
+frame1: SUB     r3, r4, r2              ; free entries, as of the HEAD read
+        SUBI    r3, 1
+        ANDI    r3, MASK
+        CMPI    r3, HIGH                ; C: HIGH or more free
+        BNC     nogo
+        SETP    CTS_N, 0                ; let the sender go again
+nogo:   LDI     r1, 5                   ; five code elements, element 1 first
+bit1:   SHRI    r0, 1                   ; C = the next element
+        BC      one1
+        SETP    TX, 0, D                ; condition A
+        JMP     next1
+one1:   SETP    TX, 1, D                ; condition Z
+next1:  WAITD   TPB                     ; the previous element ends, this one lands
+        DJNZ    r1, bit1
+
+        SETP    TX, 1, D                ; the stop element
+        WAITD   TPB                     ; element 5 ends; the stop lands
+        WAITD   STOP - LEAD             ; LEAD ticks before the stop ends
+        LD      r2, r5, 0               ; HEAD
+        CMP     r2, r4
+        BZ      empty1
+        ADD     r3, r5, r4
+        LD      r0, r3, RING - SHARED   ; the next code
+        ADDI    r4, 1
+        ANDI    r4, MASK
+        ST      r4, r5, 1               ; publish TAIL
+        SETP    TX, 0, D                ; the next start element lands
+        WAITD   LEAD                    ; exactly where the stop ends
+        JMP     frame1
+
+empty1: WAITD   LEAD                    ; finish the stop element, then poll
+        JMP     idle1
+
+; ====================================================== data, at load time
+        .thread 0
+        .org    SHARED
+        .word   0                       ; HEAD
+        .word   0                       ; TAIL
+
+; The translation table (header): ITA2 combinations from S.1 Table 1,
+; code element 1 in bit 0, condition Z = 1 (3.2).
+        .equ    C_A = 0x03
+        .equ    C_B = 0x19
+        .equ    C_C = 0x0E
+        .equ    C_D = 0x09
+        .equ    C_E = 0x01
+        .equ    C_F = 0x0D
+        .equ    C_G = 0x1A
+        .equ    C_H = 0x14
+        .equ    C_I = 0x06
+        .equ    C_J = 0x0B
+        .equ    C_K = 0x0F
+        .equ    C_L = 0x12
+        .equ    C_M = 0x1C
+        .equ    C_N = 0x0C
+        .equ    C_O = 0x18
+        .equ    C_P = 0x16
+        .equ    C_Q = 0x17
+        .equ    C_R = 0x0A
+        .equ    C_S = 0x05
+        .equ    C_T = 0x10
+        .equ    C_U = 0x07
+        .equ    C_V = 0x1E
+        .equ    C_W = 0x13
+        .equ    C_X = 0x1D
+        .equ    C_Y = 0x15
+        .equ    C_Z = 0x11
+        .org    TABLE
+        .word   0                       ; 0x00: none
+        .word   0                       ; 0x01: none
+        .word   0                       ; 0x02: none
+        .word   0                       ; 0x03: none
+        .word   0                       ; 0x04: none
+        .word   0                       ; 0x05: none
+        .word   0                       ; 0x06: none
+        .word   FIG << 5 | C_J          ; 0x07 BEL
+        .word   0                       ; 0x08: none
+        .word   0                       ; 0x09: none
+        .word   EITHER << 5 | 0x02      ; 0x0A LF
+        .word   0                       ; 0x0B: none
+        .word   0                       ; 0x0C: none
+        .word   EITHER << 5 | 0x08      ; 0x0D CR
+        .word   0                       ; 0x0E: none
+        .word   0                       ; 0x0F: none
+        .word   0                       ; 0x10: none
+        .word   0                       ; 0x11: none
+        .word   0                       ; 0x12: none
+        .word   0                       ; 0x13: none
+        .word   0                       ; 0x14: none
+        .word   0                       ; 0x15: none
+        .word   0                       ; 0x16: none
+        .word   0                       ; 0x17: none
+        .word   0                       ; 0x18: none
+        .word   0                       ; 0x19: none
+        .word   0                       ; 0x1A: none
+        .word   0                       ; 0x1B: none
+        .word   0                       ; 0x1C: none
+        .word   0                       ; 0x1D: none
+        .word   0                       ; 0x1E: none
+        .word   0                       ; 0x1F: none
+        .word   EITHER << 5 | SPACE     ; 0x20 space
+        .word   0                       ; 0x21 !: none
+        .word   0                       ; 0x22 ": none
+        .word   0                       ; 0x23 #: none
+        .word   0                       ; 0x24 $: none
+        .word   0                       ; 0x25 %: none
+        .word   0                       ; 0x26 &: none
+        .word   FIG << 5 | C_S          ; 0x27 '
+        .word   FIG << 5 | C_K          ; 0x28 (
+        .word   FIG << 5 | C_L          ; 0x29 )
+        .word   0                       ; 0x2A *: none
+        .word   FIG << 5 | C_Z          ; 0x2B +
+        .word   FIG << 5 | C_N          ; 0x2C ,
+        .word   FIG << 5 | C_A          ; 0x2D -
+        .word   FIG << 5 | C_M          ; 0x2E .
+        .word   FIG << 5 | C_X          ; 0x2F /
+        .word   FIG << 5 | C_P          ; 0x30 0
+        .word   FIG << 5 | C_Q          ; 0x31 1
+        .word   FIG << 5 | C_W          ; 0x32 2
+        .word   FIG << 5 | C_E          ; 0x33 3
+        .word   FIG << 5 | C_R          ; 0x34 4
+        .word   FIG << 5 | C_T          ; 0x35 5
+        .word   FIG << 5 | C_Y          ; 0x36 6
+        .word   FIG << 5 | C_U          ; 0x37 7
+        .word   FIG << 5 | C_I          ; 0x38 8
+        .word   FIG << 5 | C_O          ; 0x39 9
+        .word   FIG << 5 | C_C          ; 0x3A :
+        .word   0                       ; 0x3B ;: none
+        .word   0                       ; 0x3C <: none
+        .word   FIG << 5 | C_V          ; 0x3D =
+        .word   0                       ; 0x3E >: none
+        .word   FIG << 5 | C_B          ; 0x3F ?
+        .word   0                       ; 0x40 @: none
+        .word   LET << 5 | C_A          ; 0x41 A
+        .word   LET << 5 | C_B          ; 0x42 B
+        .word   LET << 5 | C_C          ; 0x43 C
+        .word   LET << 5 | C_D          ; 0x44 D
+        .word   LET << 5 | C_E          ; 0x45 E
+        .word   LET << 5 | C_F          ; 0x46 F
+        .word   LET << 5 | C_G          ; 0x47 G
+        .word   LET << 5 | C_H          ; 0x48 H
+        .word   LET << 5 | C_I          ; 0x49 I
+        .word   LET << 5 | C_J          ; 0x4A J
+        .word   LET << 5 | C_K          ; 0x4B K
+        .word   LET << 5 | C_L          ; 0x4C L
+        .word   LET << 5 | C_M          ; 0x4D M
+        .word   LET << 5 | C_N          ; 0x4E N
+        .word   LET << 5 | C_O          ; 0x4F O
+        .word   LET << 5 | C_P          ; 0x50 P
+        .word   LET << 5 | C_Q          ; 0x51 Q
+        .word   LET << 5 | C_R          ; 0x52 R
+        .word   LET << 5 | C_S          ; 0x53 S
+        .word   LET << 5 | C_T          ; 0x54 T
+        .word   LET << 5 | C_U          ; 0x55 U
+        .word   LET << 5 | C_V          ; 0x56 V
+        .word   LET << 5 | C_W          ; 0x57 W
+        .word   LET << 5 | C_X          ; 0x58 X
+        .word   LET << 5 | C_Y          ; 0x59 Y
+        .word   LET << 5 | C_Z          ; 0x5A Z
+        .word   0                       ; 0x5B [: none
+        .word   0                       ; 0x5C \: none
+        .word   0                       ; 0x5D ]: none
+        .word   0                       ; 0x5E ^: none
+        .word   0                       ; 0x5F _: none
+        .word   0                       ; 0x60 `: none
+        .word   LET << 5 | C_A          ; 0x61 a
+        .word   LET << 5 | C_B          ; 0x62 b
+        .word   LET << 5 | C_C          ; 0x63 c
+        .word   LET << 5 | C_D          ; 0x64 d
+        .word   LET << 5 | C_E          ; 0x65 e
+        .word   LET << 5 | C_F          ; 0x66 f
+        .word   LET << 5 | C_G          ; 0x67 g
+        .word   LET << 5 | C_H          ; 0x68 h
+        .word   LET << 5 | C_I          ; 0x69 i
+        .word   LET << 5 | C_J          ; 0x6A j
+        .word   LET << 5 | C_K          ; 0x6B k
+        .word   LET << 5 | C_L          ; 0x6C l
+        .word   LET << 5 | C_M          ; 0x6D m
+        .word   LET << 5 | C_N          ; 0x6E n
+        .word   LET << 5 | C_O          ; 0x6F o
+        .word   LET << 5 | C_P          ; 0x70 p
+        .word   LET << 5 | C_Q          ; 0x71 q
+        .word   LET << 5 | C_R          ; 0x72 r
+        .word   LET << 5 | C_S          ; 0x73 s
+        .word   LET << 5 | C_T          ; 0x74 t
+        .word   LET << 5 | C_U          ; 0x75 u
+        .word   LET << 5 | C_V          ; 0x76 v
+        .word   LET << 5 | C_W          ; 0x77 w
+        .word   LET << 5 | C_X          ; 0x78 x
+        .word   LET << 5 | C_Y          ; 0x79 y
+        .word   LET << 5 | C_Z          ; 0x7A z
+        .word   0                       ; 0x7B {: none
+        .word   0                       ; 0x7C |: none
+        .word   0                       ; 0x7D }: none
+        .word   0                       ; 0x7E ~: none
+        .word   0                       ; 0x7F: none
