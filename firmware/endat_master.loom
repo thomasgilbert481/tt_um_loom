@@ -1,0 +1,352 @@
+; endat_master.loom
+; A HEIDENHAIN EnDat 2.2 master: reads the position of an absolute encoder
+; with the mode command "Encoder send position values" (000111), measures
+; the cable's propagation delay on every frame and samples each bit in the
+; middle of its cell, so it works on a cable whose delay is most of a clock
+; period. CLOCK goes out on one pin; DATA is a half-duplex pair: DATA out
+; and the driver enable go to an RS-485 transceiver, DATA in comes back
+; from it. This program sees the logic side only.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; deadlines, the FIFOs), the deadline-latched pin write (SEMANTICS 6.10,
+; built for clock-exact UART and WS2812 edges), here placing every CLOCK
+; edge on its tick, LD/ST (slice B, SEMANTICS 6.11) for one saved word, and
+; the bit engine in manual mode (SHO, SHI, SEMANTICS 6.9) with its CRC
+; unit, built for USB's CRC5/CRC16 and CAN's CRC15: SHO sends the mode
+; command, SHI samples the answer LSB first while the CRC unit runs
+; EnDat's CRC-5 over it. No hardware knows EnDat: the mode command and the
+; bus turnaround, the start-bit search that measures the delay, the moving
+; sample point, the split of the frame into the 16-bit shift register, the
+; residue check and the wait for the encoder's recovery time are firmware.
+;
+; Sources (tools/protomodels/endat.py has the page-by-page list and what
+; is unchecked): HEIDENHAIN Technical Information EnDat 2.2, ID 383942-25,
+; 9/2011, pp. 4 to 6. The CRC-5 polynomial and start value are not in that
+; document and are unchecked.
+;
+; Pins: CLK = OUT0, DOUT = OUT1 (DATA to the transceiver), DE = OUT2 (1:
+; the master drives DATA), DIN = IN0. They move with the assembler's --pin.
+;
+; Host command (INQ[0]):
+;     bit 15 = 1   CONFIG: bits 5:0 the position bits n (1 .. 32). Nothing
+;                  is clocked. After reset 25 bits.
+;     bit 15 = 0   READ: clock one frame.
+; Result (OUTQ[0]), three words per READ:
+;     status       bit 0 ERR (F1 was 1), bit 2 CRC (the CRC-5 did not
+;                  check), bit 3 NOSTART (no start bit in 16 periods from
+;                  rise 11: frame abandoned), bit 4 BUSY (DATA did not go
+;                  low within 255 ticks of the READ: the encoder is in its
+;                  recovery time or absent), bits 10:8 the delay phase d
+;                  (1 .. 8: the start bit was first seen d ticks, eighths
+;                  of a period, after its rising edge), bits 15:12 the
+;                  whole periods the start bit came after rise 11 (tcal).
+;     pos low      position bits 15:0
+;     pos high     position bits 31:16 (0 for n <= 16)
+;
+; Rate: one tick is an eighth of a CLOCK period, CLOCK = clk / (8 * TICK).
+; HEIDENHAIN asks for sampling at eight times the clock or more (p. 4).
+; The host sets TICK_INT before RUN; the program is proved for .tick 60,
+; 104 kHz at 50 MHz, at the bottom of the 100 kHz to 2 MHz that EnDat
+; allows without delay compensation. That is this master's limit, and it
+; is the firmware's: a sampled bit with a full shift register costs 13
+; slots between two ticks, and a deadline-latched edge needs its WAITD
+; committed 5 clocks before the tick (biss_master.loom explains the 5).
+; A dedicated EnDat master clocks 16 MHz.
+;
+; Delay compensation (p. 4). The encoder answers on a rising edge; on a
+; long cable its DATA arrives up to most of a period later. From rise 11
+; on the master tests DATA on every tick; the first tick d that sees the
+; start bit bounds the delay to ((d - 1) .. d] ticks, and each later bit
+; is sampled at that tick plus 3 + 8k ticks: at least 3 ticks after the
+; bit arrives and 4 before the next one does. Delays from 0 to 7 ticks
+; (seven eighths of a period) work; a delay of a period or more would be
+; read as a late start bit (tcal), which HEIDENHAIN's master handles with a
+; test run at a slow clock and this one does not.
+;
+; Memory: 232 words in three blocks: the command, the setup and the mode
+; command at 0x000 to 0x047 (72 words, thread 0's quarter); the start-bit
+; search, the data loop and the sampler at 0x130 to 0x17F (80, the end of
+; thread 2's quarter); the post-processing and the setting word at 0x180 to
+; 0x1CF (80, thread 3's quarter). The encoder (endat_encoder.loom, 169
+; words) runs beside it on thread 1 from 0x080 to 0x128, into thread 2's
+; quarter, so with both loaded only threads 0 and 1 run.
+;
+; Readings taken on the open spec questions (2026-11-07): timing from
+; HEIDENHAIN Technical Information EnDat 2.2 (ID 383942-25, pp. 4 to 6).
+;   CRC-5: the document gives no polynomial. x^5 + x^3 + x + 1 with start
+;   value 11111 is from a forum thread, unchecked; so are its inversion
+;   and bit order.
+;   Which clock edge each side uses, where the mode command and the
+;   turnaround fall, an active-high error bit and the data line held high
+;   in the recovery time are readings of the timing diagrams.
+;   A limit: the clock runs at 104 kHz, the bottom of EnDat's 100 kHz to
+;   2 MHz range, set by the firmware's work per tick; cable delays up to
+;   seven eighths of a period.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   CLK = OUT0, DOUT = OUT1, DE = OUT2, DIN = IN0
+        .tick   60                      ; an eighth of a CLOCK period
+        .equ    DEFN = 25               ; after reset: 25 position bits
+        .equ    NSTART = 16             ; periods the start bit may be late
+        .equ    RDY = 255               ; ticks to wait for DATA low (tm)
+        .equ    MODECMD = 0x0070        ; DOUT after rises 1 .. 9, LSB first:
+                                        ; 0 0 (2T) 0 0 0 1 1 1 (000111) 0
+        .equ    RESIDUE = 0x4000        ; CRC[15:11] after a good frame: the
+                                        ; CRC of 11111 from 0 (01000), the CRC
+                                        ; being sent inverted
+
+; Registers: r0 the tick count of the start-bit search (kept for the
+; status), r1 16, r3 shift-register loads left, r4 rises left to the end
+; of the frame, r5 ticks to the next sample, r6 and r7 the full loads (the
+; last stays in SR), r2 scratch. The setting n is in memory (cfg).
+
+start:  SETP    CLK, 1                  ; CLOCK idles high
+        SETP    DE, 0                   ; the encoder drives DATA
+        SETP    DOUT, 0
+        .csr    BE_PINS, (pin(DIN) << 5) | pin(DOUT)    ; SHO: DOUT, SHI: DIN
+        .csr    BE_CFG, 0x0200          ; LSB first, CRC_EN; NRZ
+        .csr    CRC_POLY, 0x5800        ; x^5 + x^3 + x + 1 left-aligned
+        .csr    CRC_INIT, 0xF800        ; 11111 left-aligned
+
+cmd:    POP     r0                      ; next command (blocks while INQ is empty)
+        MOV     r2, r0
+        SHLI    r2, 1                   ; C = bit 15: CONFIG
+        BNC     read
+        ANDI    r0, 63
+        MOV16   r2, cfg
+        ST      r0, r2, 0               ; nothing is clocked
+        JMP     cmd
+
+read:   SETD    RDY                     ; the encoder's recovery time
+        WAITP   DIN, 0, T               ; ready: DATA low
+        BT      busy
+        MOV16   r2, cfg
+        LD      r0, r2, 0               ; n
+        MOV     r4, r0
+        ADDI    r4, 7                   ; phase-3 ticks to the end (data loop)
+        ADDI    r0, 6                   ; F1, n bits, CRC-5: split into loads
+        LDI     r3, 1                   ; of 16 from the end, the first one
+        CMPI    r0, 17                  ; shorter (r0, 1 .. 16)
+        BNC     rset
+        SUBI    r0, 16
+        INC     r3
+        CMPI    r0, 17
+        BNC     rset
+        SUBI    r0, 16
+        INC     r3
+rset:   LDI     r1, 16
+        LDI     r5, 11                  ; F1 is sampled 11 ticks after the
+        LDI     r2, MODECMD             ; start bit is first seen
+        LDSR    r2
+        LDI     r2, 9
+        SETD    1                       ; anchor; the first fall lands 4 ticks on
+        WAITD   0
+
+; Rises 1 .. 9: the master drives DATA from rise 1; after rises 2 .. 7 the
+; mode command 000111, read by the encoder at falls 3 .. 8; DATA released
+; after rise 9 (SHO puts each bit on DOUT, CRC unit or not: CRCI below).
+pre:    SETP    CLK, 0, D
+        WAITD   4                       ; fall
+        SETP    CLK, 1, D
+        WAITD   4                       ; rise
+        SETP    DE, 1
+        SHO
+        DJNZ    r2, pre
+        SETP    DE, 0                   ; turnaround: the encoder takes DATA
+        SETP    CLK, 0, D
+        WAITD   4                       ; fall 10
+        SETP    CLK, 1, D
+        WAITD   4                       ; rise 10
+        CSRW    CNT, r0                 ; the first load's length
+        CRCI
+        LDI     r0, 0
+        LDI     r6, NSTART
+        SETP    CLK, 0, D
+        WAITD   4                       ; fall 11
+        SETP    CLK, 1, D
+        WAITD   4                       ; rise 11: the search starts
+        JMP     srch
+
+busy:   LDI     r7, 0x10                ; BUSY
+        JMP     report0
+
+        .org    0x130                   ; thread 2's quarter, after the encoder
+
+; The start-bit search, rise 11 on: DATA tested on every tick, r0 counting
+; the ticks; JP leaves at the first tick that sees the start bit, through a
+; stub, into the data loop at the tick after it (CLOCK's phase carries on).
+srch:   WAITD   1
+        INC     r0
+        JP      DIN, 1, f1              ; phase 1
+        WAITD   1
+        INC     r0
+        JP      DIN, 1, f2
+        WAITD   1
+        INC     r0
+        JP      DIN, 1, f3
+        SETP    CLK, 0, D
+        WAITD   1                       ; phase 4: fall
+        INC     r0
+        JP      DIN, 1, f4
+        WAITD   1
+        INC     r0
+        JP      DIN, 1, f5
+        WAITD   1
+        INC     r0
+        JP      DIN, 1, f6
+        WAITD   1
+        INC     r0
+        JP      DIN, 1, f7
+        SETP    CLK, 1, D
+        WAITD   1                       ; phase 8: the next rise
+        INC     r0
+        JP      DIN, 1, f8
+        DJNZ    r6, srch
+        JMP     nostart                 ; CLOCK high: the encoder gives up
+f1:     INC     r4                      ; found before phase 3: one more
+        JMP     d2                      ; phase-3 tick in the frame
+f2:     INC     r4
+        JMP     d3
+f3:     JMP     d3e
+f4:     JMP     d5
+f5:     JMP     d6
+f6:     JMP     d7
+f7:     JMP     d7e
+f8:     JMP     d1
+
+; The data loop, one period: CLOCK rises at phase 0 and falls at phase 4;
+; every eighth tick from 11 after the start bit was seen is a sample. The
+; frame ends at phase 3 after the closing rise (r4 counts the phase-3
+; ticks), which comes after the last sample whatever the delay.
+d1:     WAITD   1
+        DJNZ    r5, d2
+        CALL    samp
+d2:     WAITD   1
+        DJNZ    r5, d3
+        CALL    samp
+d3:     WAITD   1
+        DJNZ    r5, d3c
+        CALL    samp
+d3c:    DJNZ    r4, d3e
+        JMP     post
+d3e:    SETP    CLK, 0, D
+d4:     WAITD   1                       ; fall
+        DJNZ    r5, d5
+        CALL    samp
+d5:     WAITD   1
+        DJNZ    r5, d6
+        CALL    samp
+d6:     WAITD   1
+        DJNZ    r5, d7
+        CALL    samp
+d7:     WAITD   1
+        DJNZ    r5, d7e
+        CALL    samp
+d7e:    SETP    CLK, 1, D
+d0:     WAITD   1                       ; rise
+        DJNZ    r5, d1
+        CALL    samp
+        JMP     d1
+
+; One sample: SHI (the CRC unit takes it), the next in 8 ticks; a full load
+; moves to r6 (r6 to r7) unless it is the last, which stays in SR.
+samp:   SHI
+        LDI     r5, 8
+        BNZ     sret
+        DJNZ    r3, more
+        RET
+more:   MOV     r7, r6
+        STSR    r6
+        CSRW    CNT, r1
+sret:   RET
+
+nostart: LDI    r7, 0x08                ; NOSTART
+report0: LDI    r4, 0
+        LDI     r5, 0
+        JMP     report
+
+; After the frame, no deadline. The loads are W0 (the first, k1 bits at the
+; top of its word), W1 and W2 (full); r6, r7 and SR hold the last ones.
+; The stream, first bit lowest, is F1, the position, the CRC.
+        .org    0x180                   ; thread 3's quarter (see the header)
+post:   MOV16   r2, cfg
+        LD      r1, r2, 0               ; n
+        MOV     r4, r1
+        ADDI    r4, 6                   ; m: loads of 16 from the end
+        STSR    r5                      ; c = 1: W0 = SR
+        LDI     r2, 0
+        CMPI    r4, 17
+        BNC     post1
+        SUBI    r4, 16
+        MOV     r2, r5                  ; c >= 2: the last is W1 or W2
+        MOV     r5, r6
+        CMPI    r4, 17
+        BNC     post2
+        SUBI    r4, 16
+        MOV     r5, r7                  ; c = 3: W0 = r7, W1 = r6, W2 = SR
+        MOV     r7, r2
+        JMP     post3
+post1:  LDI     r6, 0
+post2:  MOV     r6, r2                  ; (c = 1: 0; c = 2: SR)
+        LDI     r7, 0
+post3:  LDI     r2, 16                  ; r4 = k1, 1 .. 16
+        SUB     r2, r2, r4              ; R = 16 - k1
+        MOV     r3, r4
+        DEC     r3                      ; L = k1 - 1 (shift by k1 in two steps)
+        SHR     r5, r5, r2              ; W0 right-aligned
+        SHL     r4, r6, r3
+        SHLI    r4, 1
+        OR      r5, r5, r4              ; A0 = stream bits 15:0
+        SHR     r4, r6, r2
+        SHL     r6, r7, r3
+        SHLI    r6, 1
+        OR      r6, r6, r4              ; A1 = bits 31:16
+        SHR     r7, r7, r2              ; A2 = bits 47:32
+        SHRI    r5, 1                   ; C = F1
+        LDI     r3, 0
+        BNC     pf1
+        LDI     r3, 1                   ; ERR
+pf1:    MOV     r4, r6
+        SHLI    r4, 15
+        OR      r5, r5, r4              ; position 15:0
+        SHRI    r6, 1
+        SHLI    r7, 15
+        OR      r4, r6, r7              ; position 31:16
+        LDI     r2, 16
+        CMPI    r1, 17
+        BC      pbig
+        SUB     r2, r2, r1              ; n <= 16: mask the low word
+        LDI     r6, 0xFF
+        LDIH    r6, 0xFF
+        SHR     r6, r6, r2
+        AND     r5, r5, r6
+        LDI     r4, 0
+        JMP     pstat
+pbig:   LDI     r2, 32
+        SUB     r2, r2, r1
+        LDI     r6, 0xFF
+        LDIH    r6, 0xFF
+        SHR     r6, r6, r2
+        AND     r4, r4, r6
+pstat:  DEC     r0                      ; r0 - 1 = 8 * periods + (d - 1)
+        MOV     r7, r0
+        ANDI    r7, 7
+        INC     r7
+        SHLI    r7, 8                   ; bits 11:8 d
+        SHRI    r0, 3
+        SHLI    r0, 12                  ; bits 15:12 periods after rise 11
+        OR      r7, r7, r0
+        OR      r7, r7, r3              ; bit 0 ERR
+        STCRC   r0
+        MOV16   r2, RESIDUE
+        CMP     r0, r2
+        BZ      report
+        ORI     r7, 0x04                ; CRC
+report: PUSH    r7
+        PUSH    r5
+        PUSH    r4
+        JMP     cmd
+
+cfg:    .word   DEFN                    ; the setting: n

@@ -1,0 +1,258 @@
+; endat_encoder.loom
+; A HEIDENHAIN EnDat 2.2 absolute encoder answering the mode command
+; "Encoder send position values" (000111): the encoder end of
+; endat_master.loom, for a bench or a demo without a real encoder. CLOCK
+; comes in on one pin; DATA is a half-duplex pair: DATA in from the RS-485
+; receiver, DATA out and the driver enable to the driver. It also plays the
+; cable: the host sets how late its DATA answers a rising clock edge, so a
+; master's propagation-delay compensation can be tested on the bench.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It needs the M2 core (pins,
+; timed edge waits, the FIFOs), the deadline-latched pin write (SEMANTICS
+; 6.10, built for clock-exact UART and WS2812 edges), here placing each
+; DATA change a set number of ticks after the clock edge that causes it,
+; LD/ST (slice B, SEMANTICS 6.11) for its four setting words, and the bit
+; engine in manual mode (SHO, SEMANTICS 6.9) with its CRC unit, built for
+; USB's CRC5/CRC16 and CAN's CRC15, here running EnDat's CRC-5 as the
+; error bit and the position go out. No hardware knows EnDat: the mode
+; command check, the bus turnaround, the start bit after tcal, the LSB-first
+; position split into 16-bit loads, the inverted CRC sent MSB first, the
+; recovery time, the error injection and the cable delay are firmware.
+;
+; Sources: as endat_master.loom (tools/protomodels/endat.py lists the pages
+; and marks what is unchecked).
+;
+; Pins: CLK = IN0, DIN = IN1, DOUT = OUT0, DE = OUT1 (1: the encoder drives
+; DATA), SCR = OUT2. SCR is a scratch output: SHO puts each bit there the
+; moment it is computed, JP reads it back, and the bit goes to DOUT as a
+; deadline-latched write, the cable's delay later (the bit engine's own pin
+; write cannot be latched). On SCR the undelayed bit stream is visible.
+; All move with the assembler's --pin.
+;
+; Host command (INQ): four words, always together and while no frame is
+; running (between frames the encoder looks at INQ):
+;     word 1     setting: bits 5:0 the position bits n (1 .. 32), bit 8 ERR
+;                (send F1 = 1), bit 9 BADCRC (send the CRC not inverted: a
+;                CRC error), bits 15:12 TCAL (the start bit that many whole
+;                periods after rise 11: a longer calculation time)
+;     word 2     position bits 15:0
+;     word 3     position bits 31:16 (bits at and above n must be 0)
+;     word 4     the cable: DATA changes this many ticks (0 .. 255) after the
+;                encoder sees the rising edge, plus its own reaction
+; Before the first command: 25 bits, position 0, no delay, no errors.
+; Nothing is pushed to OUTQ.
+;
+; Frame: DATA low while idle (ready). The first falling edge starts the
+; frame and the encoder lets go of DATA; the mode bits are read at falls 3
+; .. 8 (a mode other than 000111 is answered with F1 = 1: p. 5 says the
+; encoder transmits an error message); from rise 10 the encoder drives
+; DATA low; the start bit on rise 11 + TCAL, then F1, the n position bits
+; LSB first and the CRC-5 inverted MSB first, one per rising edge; the
+; closing rise after the last CRC bit raises DATA for the recovery time tm
+; (TM ticks), then DATA goes low: ready. A master that stops clocking
+; inside a frame for TMO ticks ends it the same way.
+;
+; Rate: the master's CLOCK times every bit. The tick times the cable delay,
+; tm and the clock timeout: TICK 4 at 50 MHz makes TM = 250 ticks 20 us
+; (EnDat 2.1's 10 to 30 us, p. 6) and a delay step 80 ns. Each DATA change
+; lands about 4 * DELAY clocks after the rising edge: the edge is seen 2
+; to 5 clocks late (synchroniser, slot grid), NOW is read a slot later and
+; may have ticked up to 3 clocks before, and the write lands on a tick, so
+; 4 * DELAY + 3 to 4 * DELAY + 14 clocks, and never before the CSRW TD
+; that sets it commits: 14 to 24 clocks for DELAY 0 to 2. The next bit
+; must be staged before the next rising edge, which limits CLOCK to
+; periods of that delay plus about 30 slots (the tests run 256 and 480).
+;
+; Memory: 169 words, 0x000 to 0x0A8 on thread 0, 41 words into thread 1's
+; quarter; the tests run it on thread 1 beside the master, from 0x080 to
+; 0x128, into thread 2's quarter (endat_master.loom keeps 0x130 on free).
+; No deadline pairs (no WAITD k): every wait is an edge with a timeout, or
+; a WAITD 0 on a deadline the program wrote.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   CLK = IN0, DIN = IN1, DOUT = OUT0, DE = OUT1, SCR = OUT2
+        .tick   4                       ; 80 ns at 50 MHz (delay, tm, timeout)
+        .equ    TM = 250                ; ticks: the recovery time tm
+        .equ    TMO = 250               ; ticks: CLOCK quiet inside a frame
+        .equ    DEFCFG = 25             ; 25 bits
+
+; Registers: r0 the delay; r1 the CRC mask (0xF800 inverts, 0 is BADCRC);
+; r4, r5 the next loads; r6 the loads left; r7 the last load's length; r2,
+; r3 scratch.
+
+start:  SETP    DOUT, 0                 ; idle: ready (DATA low)
+        SETP    DE, 1
+        .csr    BE_PINS, pin(SCR) | (pin(DIN) << 5)    ; SHO drives SCR
+        .csr    BE_CFG, 0x0200          ; LSB first, CRC_EN; NRZ
+        .csr    CRC_POLY, 0x5800        ; x^5 + x^3 + x + 1 left-aligned
+        .csr    CRC_INIT, 0xF800        ; 11111 left-aligned
+        CALL    prep
+
+; Idle: a falling CLOCK starts a frame; otherwise take a new setting.
+idle:   SETD    0                       ; TD reached: the WAITB below is a test
+        JP      CLK, 0, frame
+        WAITB   INQ_NE, T
+        BT      idle
+        MOV16   r2, buf
+        POP     r3
+        ST      r3, r2, 0
+        POP     r3
+        ST      r3, r2, 1
+        POP     r3
+        ST      r3, r2, 2
+        POP     r3
+        ST      r3, r2, 3
+        CALL    prep
+        JMP     idle
+
+; The frame. Fall 1 has been seen: the master takes DATA (from rise 1).
+frame:  SETP    DE, 0
+        SETD    TMO
+        WAITE   CLK, FALL, T            ; fall 2
+        BT      abort
+        LDI     r2, 1                   ; the mode bits at falls 3 .. 8,
+mbit:   SETD    TMO
+        WAITE   CLK, FALL, T
+        BT      abort
+        CSRR    r3, PIN_IN
+        SHRI    r3, pin(DIN)
+        ANDI    r3, 1
+        SHLI    r2, 1
+        OR      r2, r2, r3              ; shifted in behind a marker 1
+        MOV     r3, r2
+        SHRI    r3, 6
+        BZ      mbit                    ; until the marker reaches bit 6
+        ANDI    r2, 63                  ; drop the marker
+        CMPI    r2, 7                   ; 000111: encoder send position values
+        BZ      mok
+        STSR    r3                      ; any other: answer with F1 = 1
+        ORI     r3, 1
+        LDSR    r3
+mok:    LDI     r3, 3                   ; rises 8, 9 (the master lets go), 10
+rwait:  SETD    TMO
+        WAITE   CLK, RISE, T
+        BT      abort
+        DJNZ    r3, rwait
+        SETP    DOUT, 0                 ; rise 10: the encoder takes DATA, low
+        SETP    DE, 1
+        MOV16   r2, buf
+        LD      r3, r2, 0
+        SHRI    r3, 12                  ; TCAL
+        BZ      sbit
+tcal:   SETD    TMO                     ; rises 11 .. 10 + TCAL: still working
+        WAITE   CLK, RISE, T
+        BT      abort
+        DJNZ    r3, tcal
+sbit:   SETP    SCR, 1                  ; the start bit
+        CALL    send
+
+; F1 and the position: SR holds the first load and CNT its length (prep);
+; SHO puts one bit on SCR per rising edge while the CRC unit takes it.
+bit:    SHO
+        CALL    send
+        CSRR    r3, CNT
+        CMPI    r3, 0
+        BNZ     bit
+        DJNZ    r6, more                ; another load?
+        STCRC   r3                      ; CRC[15:11] after the position
+        XOR     r3, r3, r1              ; inverted (or not: BADCRC)
+        REV     r3, r3                  ; MSB first through an LSB-first SR
+        LDSR    r3
+        LDI     r3, 5
+        CSRW    CNT, r3
+cbit:   SHO
+        CALL    send
+        CSRR    r3, CNT
+        CMPI    r3, 0
+        BNZ     cbit
+        SETP    SCR, 1                  ; the closing rise: DATA high, tm
+        CALL    send
+        JMP     recov
+more:   LDSR    r4
+        MOV     r4, r5
+        CMPI    r6, 1
+        BNZ     more16
+        CSRW    CNT, r7                 ; the last load
+        JMP     bit
+more16: LDI     r3, 16
+        CSRW    CNT, r3
+        JMP     bit
+
+; A master that left the frame: DATA high now, then tm as after a frame.
+abort:  SETP    DOUT, 1
+        SETP    DE, 1
+recov:  SETD    TM                      ; tm from the closing rise (or now)
+        CALL    prep                    ; the next frame's loads meanwhile
+        WAITD   0
+        SETP    DOUT, 0                 ; ready
+        JMP     idle
+
+; send: the bit on SCR goes to DOUT, DELAY ticks after the next rising
+; edge. The write is staged first, so it lands on the deadline written
+; after the edge (SEMANTICS 6.10 rule 2 for DELAY 0, else rule 1); if the
+; edge never comes it lands on the timeout, and abort raises DATA anyway.
+send:   SETD    TMO
+        JP      SCR, 1, send1
+        SETP    DOUT, 0, D
+        JMP     send2
+send1:  SETP    DOUT, 1, D
+send2:  WAITE   CLK, RISE, T
+        BT      abort
+        CSRR    r2, NOW
+        ADD     r2, r2, r0
+        CSRW    TD, r2
+        WAITD   0                       ; landed: TD may be rewritten again
+        RET
+
+; prep: the frame's loads from the setting in buf. The stream, first bit
+; lowest, is F1 then the position (n + 1 bits); LSB-first loads of 16 from
+; its start, the last one shorter (its bits right-aligned, as SHO wants).
+prep:   MOV16   r2, buf
+        LD      r3, r2, 0               ; setting
+        LD      r4, r2, 1               ; position 15:0
+        LD      r5, r2, 2               ; position 31:16
+        LD      r0, r2, 3               ; the delay
+        MOV     r7, r4                  ; stream bits 31:16
+        SHRI    r7, 15
+        MOV     r1, r5
+        SHLI    r1, 1
+        OR      r7, r7, r1
+        SHLI    r4, 1                   ; stream bits 15:0 ...
+        MOV     r2, r3
+        SHLI    r2, 8                   ; C = bit 8: ERR
+        BNC     pnoerr
+        ORI     r4, 1                   ; ... F1 = 1
+pnoerr: SHRI    r5, 15                  ; stream bit 32
+        LDSR    r4
+        MOV     r4, r7
+        MOV     r1, r3
+        ANDI    r1, 63
+        INC     r1                      ; n + 1 bits
+        LDI     r6, 1                   ; loads
+        CMPI    r1, 17
+        BNC     pk1
+        INC     r6
+        SUBI    r1, 16
+        CMPI    r1, 17
+        BNC     pk1
+        INC     r6
+        SUBI    r1, 16
+pk1:    MOV     r7, r1                  ; the last load's length
+        CMPI    r6, 1
+        BNZ     pk16
+        CSRW    CNT, r7                 ; one load: it is the last
+        JMP     pkc
+pk16:   LDI     r2, 16
+        CSRW    CNT, r2
+pkc:    CRCI
+        LDI     r1, 0
+        LDIH    r1, 0xF8                ; the CRC goes out inverted ...
+        MOV     r2, r3
+        SHLI    r2, 7                   ; C = bit 9: BADCRC
+        BNC     pret
+        LDI     r1, 0                   ; ... unless BADCRC
+pret:   RET
+
+buf:    .word   DEFCFG, 0, 0, 0         ; the setting: words 1 .. 4
