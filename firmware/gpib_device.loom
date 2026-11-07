@@ -1,0 +1,352 @@
+; gpib_device.loom
+;
+; An IEEE 488 (GPIB, HP-IB) instrument interface: listener and talker at a
+; primary address the host sets, serial poll with a status byte the host
+; sets, and SRQ. The controller is the other end (tools/protomodels/gpib.py
+; models one); Loom has 19 pins, so a controller and a device on one chip
+; do not fit.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): GPIB is in no design document.
+; It is the only parallel bus among the programs: eight data lines and an
+; interlocked three-wire handshake, where every other program shifts bits.
+; The program uses:
+;   - the open-drain mode of the BIDIR pads (OD_MASK, SEMANTICS 3), built for
+;     I2C: DIO1..DIO8 are BIDIR0..BIDIR7, wired-AND with the bus, and OUT
+;     writes all eight in one slot (OUTGRP base 0, 8 pins);
+;   - IN with an INGRP of 13 pins (base 0), built to read a group of pins at
+;     once: one IN takes DIO1..8, ATN, DAV, NRFD, NDAC and EOI in one slot,
+;     so the byte and the ATN and EOI that qualify it are read together;
+;   - JP on a pin, built for bit tests in protocol loops: every handshake
+;     wait is a two-slot loop "JP ATN, 0, out ; JP line, level, again", so
+;     the device leaves any wait within two slots of ATN;
+;   - WAITB INQ_NE, T as a non-blocking test of INQ, and PUSH, which stalls
+;     while OUTQ is full: then NRFD stays asserted and the bus waits for the
+;     host, which is GPIB's own flow control.
+; What the firmware does that no hardware does: the source handshake (SH)
+; and acceptor handshake (AH), the T1 settling delay, the command decoder
+; (MLA, MTA, UNL, UNT, other talk addresses, SPE, SPD, SDC, DCL, GET), the
+; talker and listener address states, the serial poll state, the status
+; byte and the service request. A GPIB chip (TMS9914, NAT7210) does all of
+; this in gates and answers ATN in about 200 ns; this program answers in
+; 12 to 15 clocks from idle (240 to 300 ns at 50 MHz) and at worst in 62
+; (1.24 us), see "Timing".
+;
+; Interface functions (IEEE 488.1 subsets; names from memory, unchecked):
+; SH1, AH1, T6 (basic talker, serial poll, unaddressed by MLA, no talk
+; only), L4 (basic listener, unaddressed by MTA), SR1, RL0, PP0, DC1, DT1
+; (GET is reported to the host), C0, E1 (open collector).
+;
+; Pins. The board needs an open-collector inverting driver per handshake
+; line (a 7406 gate or an N-MOSFET, as the bench models): OUT high pulls
+; the bus line low, which is "asserted" (GPIB is negative logic), and
+; reset (PIN_OUT = 0) releases every line. Inputs read the bus lines.
+;   DIO1..DIO8  BIDIR0..BIDIR7  open drain, in and out
+;   ATN = IN0, DAV = IN1, NRFD = IN2, NDAC = IN3, EOI = IN4 (ui[7])
+;   DAV_O = OUT0, NRFD_O = OUT1, NDAC_O = OUT2, EOI_O = OUT3, SRQ_O = OUT4
+; Left out, for want of pins and words: IFC and REN (no input pin is left;
+; the host resets the thread instead of IFC, and the device has no
+; remote/local state), parallel poll (EOI with ATN is ignored), secondary
+; addresses (0x60..0x7F are ignored), the controller function. OUT5 is free.
+;
+; Host words (INQ): first, after RUN, the configuration: bits 4:0 the
+; primary address (0..30), bits 15:8 T1 in units of 8 clocks (0 means 13:
+; 2.08 us at 50 MHz). Then any number of
+;   0x0000 | (eoi << 8) | byte   a byte to talk, EOI with it if eoi is 1;
+;   0x8000 | stb                 the status byte; bit 6 (rsv) set asserts
+;                                SRQ, clear releases it.
+; Words are taken in order; a talk byte waits in a register until a
+; controller reads it, and no host word is taken while one waits.
+; Results (OUTQ):
+;   0x0000 | (eoi << 8) | byte   a byte received as a listener;
+;   0x8000 | cmd                 SDC (0x04, when listening), GET (0x08, when
+;                                listening) or DCL (0x14) was received;
+;   0x8100 | stb                 a serial poll read this status byte. If
+;                                bit 6 was set, SRQ is released and bit 6
+;                                cleared (the next poll reads it clear).
+;
+; Command bytes (ATN asserted; DIO8 is ignored): MLA = 0x20 | address,
+; MTA = 0x40 | address, UNL = 0x3F, UNT = 0x5F, SPE = 0x18, SPD = 0x19 (NI,
+; "GPIB messages"); SDC = 0x04, GET = 0x08, DCL = 0x14 (from memory,
+; unchecked). MLA unaddresses the talker and MTA the listener; another
+; device's talk address unaddresses the talker.
+;
+; Handshake (Keithley 3321 manual, figure 4-2 text). As acceptor: NDAC
+; asserted and NRFD released (ready); on DAV asserted, assert NRFD, read the
+; lines, release NDAC; on DAV released, assert NDAC; then hand the byte on
+; and release NRFD. As source: put the byte (and EOI) on the lines, wait
+; T1, wait for NRFD released (every listener ready), assert DAV, wait for
+; NDAC released (every listener accepted), release DAV, EOI and DIO. On
+; ATN asserted the source releases DAV, EOI and DIO at once and becomes an
+; acceptor of commands; a byte cut short by ATN is offered again later.
+;
+; Timing (50 MHz; tick = 1 clock, the reset value). A pad change at edge e
+; is seen by pin_in from X cycle e+2 (SEMANTICS 3); a WAITP sees it by e+5,
+; a two-slot JP loop by e+9; a SETP n slots later changes its pad at its
+; X+2. The figures below count from the receiver's pad change:
+;   ATN to NDAC asserted, from idle (WAITP, BT, SETP): 12 to 15 clocks,
+;   240 to 300 ns. Worst case 62 clocks (1.24 us), when ATN comes just as a
+;   host word is taken (POP, its JP ATN, CALL hostw, nine slots, JMP idle,
+;   SETD, WAITP, BT, SETP). That is slower than the 200 ns a 488.1 device
+;   is held to (from memory, unchecked), and harmless to a controller that
+;   waits T1 (2 us) after ATN before it asserts DAV, as the model's does;
+;   from talking with nothing on the bus, at most 58 clocks;
+;   ATN to DAV released while sourcing a byte: 8 to 15 clocks (the loops'
+;   JP ATN, then t_atn's first SETP); DAV, NDAC, EOI and DIO all done 24
+;   to 31 clocks after it, at most 44 if ATN comes between the OUT and the
+;   first loop (send checks ATN once more before it puts a byte on DIO);
+;   T1: DIO to DAV at least 8 x T1 + 28 clocks, EOI to DAV 8 x T1 + 16
+;   (132 and 120 clocks at the default 13: 2.64 and 2.40 us, over the
+;   2 us open-collector figure, from memory, unchecked);
+;   after NDAC rises the device releases DAV at once, EOI and DIO within
+;   16 clocks; a controller that asserts ATN at once and puts a command
+;   on DIO sees the two bytes ORed for those clocks, well inside its T1;
+;   a byte takes, with a controller as fast as this program, about 40
+;   clocks as listener and T1 + 40 as talker; the slowest listener sets
+;   the pace, as on any GPIB.
+;
+; Registers: r0 the lines or a word, r1 the address, r2 the states (LADS 1,
+; TADS 2, SPMS 4, PEND 8: a talk byte waits in r5), r3 the status byte, r4
+; T1, r5 the waiting talk byte, r6 and r7 scratch (.csr uses r7).
+;
+; Memory: 204 words from 0x000, so it spills into thread 1's quarter
+; (0x080..0x0CB; thread 1 must not be started). That costs nothing: the
+; program takes every BIDIR and every IN pin, so no other protocol fits
+; beside it anyway; threads 2 and 3 (0x100..0x1FF) stay free.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   A limit, not a reading: the device answers ATN in 12 to 62 clocks
+;   (up to 1.24 us), where IEEE 488.1 asks 200 ns (from memory, unchecked).
+;   It works with a controller that waits T1 after asserting ATN before
+;   DAV, as the model controller does; with one that does not, it can
+;   miss a command byte. A dedicated GPIB chip does this in hardware.
+;   T1, the 200 ns figure and the SDC, GET and DCL codes are from memory;
+;   the MLA, MTA, UNL, UNT, SPE and SPD codes, the handshake order and
+;   bit 6 of the poll byte were checked on vendor pages.
+;   The host sets the whole status byte, bit 6 included (not built by the
+;   device as IEEE 488.2 does). IFC and REN are not implemented.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   ATN = IN0, DAV = IN1, NRFD = IN2, NDAC = IN3, EOI = IN4
+        .pins   DAV_O = OUT0, NRFD_O = OUT1, NDAC_O = OUT2, EOI_O = OUT3
+        .pins   SRQ_O = OUT4
+        .equ    POLL = 64               ; idle: look at INQ every 64 clocks
+        .equ    T1_DEFAULT = 13         ; 13 x 8 clocks: 2.08 us at 50 MHz
+
+start:  .csr    OD_MASK, 0xFF           ; DIO1..8 open drain, first (PORTING 4)
+        .csr    OUTGRP, (8 << 5) | 0    ; OUT writes DIO1..DIO8
+        .csr    INGRP, (13 << 5) | 0    ; IN reads DIO, ATN, DAV, NRFD, NDAC, EOI
+        POP     r0                      ; the configuration
+        .csr    OD_MASK, 0xFF           ; again, slots later (BUGS 14)
+        MOV     r1, r0
+        ANDI    r1, 31                  ; the primary address
+        MOV     r4, r0
+        SHRI    r4, 8                   ; T1 in 8-clock units
+        BNZ     t1ok
+        LDI     r4, T1_DEFAULT
+t1ok:   LDI     r2, 0                   ; idle, unaddressed
+        LDI     r3, 0                   ; status byte 0, SRQ released
+
+; Idle: no line driven. Wait for ATN; every POLL clocks look at INQ.
+idle:   SETD    POLL
+        WAITP   ATN, 0, T
+        BT      i_poll
+cmd:    SETP    NDAC_O, 1               ; ATN: acceptor ready (ACRS)
+ca_w:   JP      DAV, 0, ca_got
+        JP      ATN, 0, ca_w
+        MOV     r6, r2                  ; ATN released: listen, talk or idle
+        SHRI    r6, 1                   ; C = LADS
+        BC      lis                     ; a listener stays ready
+        SETP    NDAC_O, 0
+        SHRI    r6, 1                   ; C = TADS
+        BNC     idle
+        JMP     talk
+i_poll: MOV     r6, r2
+        SHRI    r6, 4                   ; C = PEND
+        BC      idle                    ; a talk byte waits: take nothing more
+        WAITB   INQ_NE, T               ; TD has passed: a test, not a wait
+        BT      idle
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only this thread pops INQ"
+        POP     r0
+        JP      ATN, 0, i_late          ; ATN meanwhile: NDAC first
+        CALL    hostw
+        JMP     idle
+i_late: SETP    NDAC_O, 1               ; T1 leaves time for the word after
+        CALL    hostw
+        JMP     ca_w
+
+; A byte under ATN (or one that came as ATN went away).
+ca_got: CALL    take                    ; r0 = the lines, NRFD asserted
+ca_chk: MOV     r6, r0
+        SHRI    r6, 9                   ; C = ATN line high (false) at the byte
+        BC      ca_dat
+        NOT     r0, r0
+        SHLI    r0, 9
+        SHRI    r0, 9                   ; the command, DIO8 dropped
+        XOR     r6, r0, r1
+        CMPI    r6, 0x20
+        BZ      c_mla                   ; my listen address
+        CMPI    r0, 0x3F
+        BZ      c_unl
+        LDI     r7, 0x40
+        CMP     r6, r7
+        BZ      c_mta                   ; my talk address
+        MOV     r6, r0
+        SHRI    r6, 5
+        CMPI    r6, 2
+        BZ      c_unt                   ; UNT or another device's talk address
+        CMPI    r0, 0x18
+        BZ      c_spe
+        CMPI    r0, 0x19
+        BZ      c_spd
+        CMPI    r0, 0x14
+        BZ      c_rep                   ; DCL, universal
+        MOV     r6, r2
+        SHRI    r6, 1                   ; C = LADS: SDC and GET are addressed
+        BNC     c_done
+        CMPI    r0, 0x04
+        BZ      c_rep                   ; SDC
+        CMPI    r0, 0x08
+        BNZ     c_done                  ; anything else is ignored
+c_rep:  LDI     r6, 0
+        LDIH    r6, 0x80
+        OR      r6, r6, r0
+        PUSH    r6                      ; stalls while OUTQ is full: NRFD waits
+        JMP     c_done
+c_mla:  ANDI    r2, 0x3D                ; not a talker (T6)
+        ORI     r2, 1                   ; listener
+        JMP     c_done
+c_mta:  ANDI    r2, 0x3E                ; not a listener (L4)
+        ORI     r2, 2                   ; talker
+        JMP     c_done
+c_unl:  ANDI    r2, 0x3E
+        JMP     c_done
+c_unt:  ANDI    r2, 0x3D
+        JMP     c_done
+c_spe:  ORI     r2, 4
+        JMP     c_done
+c_spd:  ANDI    r2, 0x3B
+c_done: SETP    NRFD_O, 0               ; ready for the next byte
+        JMP     ca_w
+ca_dat: MOV     r6, r2
+        SHRI    r6, 1                   ; C = LADS
+        BC      l_dat
+        SETP    NRFD_O, 0               ; not ours: dropped
+        JMP     ca_w
+
+l_atn:  JMP     ca_w
+
+; Listener, ATN released: NDAC asserted, NRFD released, wait for DAV.
+lis:    JP      DAV, 0, l_got
+        JP      ATN, 0, l_atn           ; ATN: the next bytes are commands
+        MOV     r6, r2
+        SHRI    r6, 4                   ; C = PEND
+        BC      lis
+        SETD    0
+        WAITB   INQ_NE, T               ; a test: TD is now
+        BT      lis
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only this thread pops INQ"
+        POP     r0
+        CALL    hostw
+        JMP     lis
+l_got:  CALL    take
+        MOV     r6, r0
+        SHRI    r6, 9                   ; C = ATN line high (false)
+        BNC     ca_chk                  ; ATN came with it: a command
+l_dat:  NOT     r0, r0                  ; asserted lines are now 1s
+        MOV     r6, r0
+        SHRI    r6, 12
+        ANDI    r6, 1                   ; EOI (pin 12)
+        SHLI    r6, 8
+        SHLI    r0, 8
+        SHRI    r0, 8                   ; the byte
+        OR      r0, r0, r6
+        PUSH    r0                      ; stalls while OUTQ is full: NRFD waits
+        SETP    NRFD_O, 0               ; ready again
+        JMP     lis
+
+; Accept one byte: DAV is asserted, NDAC asserted, NRFD released.
+take:   SETP    NRFD_O, 1               ; not ready
+        IN      r0                      ; the byte, ATN and EOI together
+        SETP    NDAC_O, 0               ; accepted
+        WAITP   DAV, 1                  ; the source takes DAV away
+        SETP    NDAC_O, 1               ; not accepted, for the next byte
+        RET
+
+; A host word in r0: a talk byte to hold, or the status byte.
+hostw:  MOV     r6, r0
+        SHLI    r6, 1                   ; C = bit 15
+        BC      h_stb
+        MOV     r5, r0
+        ORI     r2, 8                   ; PEND
+        RET
+h_stb:  MOV     r3, r0                  ; 0x80 | stb: send uses the low byte
+        MOV     r6, r0
+        SHRI    r6, 7                   ; C = bit 6, rsv
+        BC      h_srq
+        SETP    SRQ_O, 0
+        RET
+h_srq:  SETP    SRQ_O, 1                ; request service
+        RET
+
+; Source one byte, r0 = (eoi << 8) | byte. Leaves for t_atn on ATN.
+send:   JP      ATN, 0, t_atn           ; no byte on DIO under ATN
+        NOT     r6, r0
+        OUT     r6                      ; a 1 bit pulls its DIO line low
+        MOV     r6, r0
+        SHRI    r6, 9                   ; C = EOI with this byte
+        BNC     s_t1
+        SETP    EOI_O, 1
+s_t1:   MOV     r6, r4
+s_t1l:  JP      ATN, 0, t_atn
+        DJNZ    r6, s_t1l               ; T1: r4 x 8 clocks
+s_rfd:  JP      ATN, 0, t_atn
+        JP      NRFD, 0, s_rfd          ; until every listener is ready
+        SETP    DAV_O, 1                ; data valid
+s_dac:  JP      ATN, 0, t_atn
+        JP      NDAC, 0, s_dac          ; until every listener has it
+        SETP    DAV_O, 0
+        SETP    EOI_O, 0
+        LDI     r6, 0xFF
+        OUT     r6                      ; DIO released
+        RET
+t_atn:  SETP    DAV_O, 0                ; ATN: data no longer valid
+        SETP    NDAC_O, 1               ; acceptor of the commands
+        SETP    EOI_O, 0
+        LDI     r6, 0xFF
+        OUT     r6                      ; DIO released
+        JMP     ca_w
+
+; Talker, ATN released: the status byte in a serial poll, else host bytes.
+talk:   JP      ATN, 0, t_atn
+        MOV     r6, r2
+        SHRI    r6, 3                   ; C = SPMS
+        BC      t_stb
+        SHRI    r6, 1                   ; C = PEND
+        BC      t_dat
+        SETD    0
+        WAITB   INQ_NE, T               ; a test: TD is now
+        BT      talk
+        .bounded "guarded by the WAITB INQ_NE above, completed by condition; only this thread pops INQ"
+        POP     r0
+        JP      ATN, 0, t_late
+        CALL    hostw
+        JMP     talk
+t_late: SETP    NDAC_O, 1
+        CALL    hostw
+        JMP     ca_w
+t_dat:  MOV     r0, r5
+        CALL    send
+        ANDI    r2, 0x37                ; the byte went: not PEND
+        JMP     talk
+t_stb:  MOV     r0, r3                  ; the status byte, no EOI
+        CALL    send
+        LDI     r6, 0
+        LDIH    r6, 0x81
+        OR      r6, r6, r3
+        PUSH    r6                      ; report the poll
+        LDI     r6, 0xBF
+        AND     r3, r3, r6              ; rsv cleared
+        SETP    SRQ_O, 0                ; SRQ released
+        JMP     talk
