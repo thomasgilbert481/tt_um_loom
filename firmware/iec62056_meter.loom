@@ -1,0 +1,358 @@
+; iec62056_meter.loom
+; The tariff device side of IEC 62056-21 (formerly IEC 61107, "IEC 1107")
+; protocol mode C, data readout: an electricity meter's optical port. It
+; answers a request with an identification whose manufacturer letters and
+; baud rate character the host gives, waits for the acknowledgement,
+; switches its bit clock to the rate it offered when the client takes it,
+; and sends the host's data block as a data message with its BCC.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): IEC 62056-21 is in no Loom
+; design document. It needs the M2 core (pins, deadlines, the FIFOs), the
+; bit engine's shift register in manual mode (SHO and SHI, SEMANTICS 6.9),
+; built for the synchronous serial programs and USB's and CAN's encoders,
+; PAR for the even parity, LD/ST of slice B (SEMANTICS 6.11, built for the
+; I2C EEPROM's array) for the messages and the variables, and the tick
+; divider (SEMANTICS 4), built for the host to set once, which the program
+; rewrites in mid-session. No hardware knows IEC 62056-21: the 7E1 frame,
+; the request parser, the reaction times, the tt fallback, the check of
+; the acknowledgement, the rate switch and the BCC are all firmware.
+;
+; Standard: IEC 62056-21:2002, clauses named where used (the model,
+; tools/protomodels/iec62056.py, lists them). Character format 5.4, 5.6:
+; 1 start bit, 7 data bits LSB first, even parity, 1 stop bit.
+;
+; Pins: TX = OUT1, to the optical transmitter (1 = MARK, LED off, the idle
+; state: 4.3.5); RX = IN1, from the optical receiver, the same polarity.
+; Thread 1, so that it runs beside iec62056_client.loom on thread 0 with
+; no change; alone, thread 1 is the only one started.
+;
+; Host set-up. Before RUN: TICK_INT and TICK_FRAC for eight ticks a bit
+; at 300 baud (at 50 MHz 20833 and 85; 96 and 0 on the tests' 230.4 kHz
+; clock), read once; the program writes the divider from then on. After
+; RUN (INQ[1]), once: what follows the '/' of the identification (6.3.2),
+; three manufacturer letters, the baud character Z ('0' .. '6', 300 << Z
+; baud, 6.3.14 item 13 c)) and at most 16 identification characters (item
+; 14), one per word in bits 6:0 and a 0 word; then the data block (item
+; 15: printable characters, CR and LF, no '/' or '!'), one per word and a
+; 0 word. At most IDMAX and BLKMAX characters; more are dropped. The
+; program does not check the characters: they are the host's.
+;
+; Result (OUTQ[1]), one word per session, after its data message, if
+; OUTQ has room (else it is dropped):
+;     bit 15     1
+;     bits 10:8  the Z of the data message's rate (0 = 300 baud)
+;     bit 1      no acknowledgement: the fallback after tt (6.4.3.6)
+;     bit 0      an acknowledgement that was not ACK '0' Z '0' CR LF for
+;                its own Z (6.4.3.2: 300 baud then), or had a bad character
+;
+; Behaviour (6.4.3.2, 6.4.3.6):
+;     request    "/?!" <CR> <LF> at 300 baud (6.3.1, the general address);
+;                a character with a parity or framing error, any other
+;                character, or a gap of 15 x 255 ticks (1 594 ms; ta <
+;                1 500 ms) starts the search again
+;     ident      '/', the host's characters, <CR> <LF>, its start bit TR
+;                after the end of the request's last stop bit: TR = 7 bits
+;                (23.3 ms) when the third letter is lower case (item 12:
+;                then tr >= 20 ms), else 66 bits (220 ms; tr >= 200 ms)
+;     ack        its first start bit within TT = 17 x 255 ticks (1 806 ms;
+;                1 500 < tt <= 2 200 ms) of the identification's end; up
+;                to its <LF> (8 characters at most), each within 1 594 ms
+;     data       ACK '0' Z '0' with its own Z: at 300 << Z baud, TR after
+;                the end of the ack's last stop bit; any other ack: at
+;                300 baud, TR after it; no ack: at 300 baud, at TT
+;     message    STX, the block, '!' <CR> <LF>, ETX, the BCC (the XOR of
+;                the 7-bit characters after STX, ETX included: 6.2 NOTE),
+;                built once at set-up, sent back to back
+;     end        the status word, the 300-baud divider back, the search
+; Every edge is the SHO right after its WAITD, 6 to 9 clocks after its
+; tick. A received character restarts the tick grid on its start edge and
+; is sampled four ticks into each bit.
+;
+; Limits. Data readout only: no programming mode (an ack with Y = '1' is
+; answered with the data readout at 300 baud, the 6.4.3.3 reading for an
+; ack the device cannot honour), no manufacturer-specific options, no
+; addressed requests (6.3.14 item 22: a request with an address is not
+; answered), no repeat request handling (NAK). Protocol modes A, B, D, E
+; are not offered. A Z outside '0' .. '6' from the host is sent as given
+; and served at 300 baud.
+;
+; Memory: 123 words at 0x080 .. 0x0FA (thread 1's quarter), rate and the
+; set-up at 0x12F .. 0x187 (ICODE, after iec62056_client.loom's 0x100 ..
+; 0x12E), the variables and the messages at 0x188 .. 0x1FF (DATA; the
+; image loads 22 words, the rest is written before it is read): the data
+; block is at most BLKMAX = 72 characters, the memory being the limit.
+; Threads 2 and 3 must not be started.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   TX = OUT1, RX = IN1
+        .tick   24                      ; the fastest tick supported (header)
+        .equ    TRF = 56                ; TR - 4 ticks: 7.5 bits to the start bit
+        .equ    TRS = 528               ; 66.5 bits: 255 + 217 + 56
+        .equ    TO = 15                 ; 15 x 255 ticks: 1 594 ms
+        .equ    TT = 17                 ; 17 x 255 ticks: 1 806 ms
+        .equ    IDMAX = 20              ; XXX Z and 16 (6.3.14 items 12 to 14)
+        .equ    STX = 2
+        .equ    ETX = 3
+        .equ    DATA = 0x188            ; to 0x1FF (Memory)
+        .equ    V_INT = 0               ; offsets from DATA: the 300-baud divider
+        .equ    V_FRAC = 1
+        .equ    V_Z = 2                 ; the Z offered, 0 .. 6
+        .equ    V_FAST = 3              ; 1: the third letter is lower case
+        .equ    S_REQ = 4               ; "/?!" CR LF, end
+        .equ    S_ACKX = 10             ; ACK '0' Z '0' CR LF, end: the one taken
+        .equ    S_ID = 17               ; '/' XXX Z ident CR LF, end
+        .equ    S_MSG = S_ID + IDMAX + 4        ; STX block ! CR LF ETX BCC, end
+        .equ    BLKMAX = 0x200 - DATA - S_MSG - 7      ; 72
+        .equ    ICODE = 0x12F           ; after iec62056_client.loom's 0x100 .. 0x12E
+
+; Registers: r0 a character, r1 scratch, r2 Z, r3 a character's errors,
+; r4 timeout periods (in reply: the phase), r5 a count or the status,
+; r6 a string pointer or scratch, r7 DATA.
+
+start:  JMP     minit                   ; the set-up, at ICODE
+
+; -------------------------------------------------------------- request
+; "/?!" CR LF matched character by character against S_REQ; a '/' always
+; starts a new match.
+idle:   LDI     r2, 0
+        CALL    rate                    ; back to 300 baud
+        LDI     r4, TO
+hunt:   LDI     r5, 0                   ; characters matched
+hchr:   LDI     r3, 0
+        CALL    rxchar
+        BT      hunt                    ; a gap of 1 594 ms
+        TEST    r3, r3
+        BNZ     hunt                    ; parity or framing error
+        ADD     r1, r7, r5
+        LD      r1, r1, S_REQ           ; the character due
+        CMP     r0, r1
+        BZ      hok
+        LDI     r5, 0
+        CMPI    r0, '/'
+        BNZ     hchr
+hok:    INC     r5
+        CMPI    r5, 5
+        BNZ     hchr
+        LDI     r2, 0                   ; the identification at 300 baud
+        LDI     r4, 0                   ; reply phase 0
+        MOV16   r6, DATA + S_ID
+        JMP     reply
+
+; ------------------------------------------------------------------ ack
+; Up to the <LF> or 8 characters, each compared with S_ACKX: r2 collects
+; the differences and the character errors, r5 counts.
+ack:    LDI     r4, TT
+        LDI     r5, 0
+        LDI     r2, 0
+aloop:  LDI     r3, 0
+        CALL    rxchar
+        BT      atmo
+        LDI     r4, TO
+        OR      r2, r2, r3              ; a parity or framing error
+        ADD     r1, r7, r5
+        LD      r1, r1, S_ACKX
+        XOR     r1, r1, r0
+        OR      r2, r2, r1              ; a character not the one due
+        INC     r5
+        CMPI    r0, 10
+        BZ      aend
+        CMPI    r5, 8
+        BNZ     aloop
+; A length other than six needs no test: an <LF> anywhere but at index 5
+; differs from S_ACKX, and index 6 meets its end word, 0x8000.
+aend:   LDI     r5, 1                   ; status: a bad ack, 300 baud
+        TEST    r2, r2
+        LDI     r2, 0
+        BNZ     adata
+        LDI     r5, 0                   ; status: taken
+        LD      r2, r7, V_Z
+adata:  LDI     r4, 1                   ; reply phase 1
+        MOV16   r6, DATA + S_MSG
+        JMP     reply
+atmo:   LDI     r2, 0                   ; 300 baud, now
+        LDI     r4, 1
+        MOV16   r6, DATA + S_MSG
+        TEST    r5, r5
+        LDI     r5, 2                   ; status: no ack (tt)
+        BZ      rnow
+        LDI     r5, 1                   ; a gap inside the ack: a bad one
+        JMP     rnow
+
+; ---------------------------------------------------------------- reply
+; TR after the end of the last stop bit received (TD is its middle, 4
+; ticks before), the divider for Z = r2, the string at r6 from 8 new ticks
+; on; then phase 0 (r4) waits for the ack, phase 1 reports and starts over.
+reply:  LD      r0, r7, V_FAST
+        TEST    r0, r0
+        BNZ     rfast                   ; tr >= 20 ms
+        WAITD   255                     ; tr >= 200 ms
+        WAITD   TRS - TRF - 255
+rfast:  WAITD   TRF
+rnow:   CALL    rate
+        SETD    0                       ; (rate's own SETD, again: an anchor
+        CALL    txstr                   ;  between the two CALLs, for the checker)
+        WAITD   8                       ; the end of the last stop bit
+        TEST    r4, r4
+        BZ      ack
+        LDIH    r5, 0x80                ; the status word
+        OR      r5, r5, r2              ; Z << 8, from rate
+        WAITB   OUTQ_NF, T              ; TD is reached: a test
+        BT      idle                    ; full: dropped
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition; only the host pops OUTQ"
+        PUSH    r5
+        JMP     idle
+
+; ------------------------------------------------------------ subroutines
+; rxchar: as in iec62056_client.loom. The next character in r0 (7 bits),
+; T = 0; or T = 1 after r4 periods of 255 ticks with no start bit. Parity
+; and framing errors set bits 0 and 1 of r3. The tick grid restarts on
+; the start edge; each bit is sampled 4 ticks after its edge; it returns
+; from the middle of the stop bit (TD). Uses r1, r6.
+rxchar: MOV     r1, r4
+rxper:  SETD    255
+        WAITP   RX, 0, T                ; a start bit, or 255 ticks
+        BNT     rxgo
+        DJNZ    r1, rxper
+        RET                             ; T = 1
+rxgo:   CSRR    r6, TICK_INT
+        CSRW    TICK_INT, r6            ; the grid restarts here
+        SETD    0
+        WAITD   4                       ; the middle of the start bit
+        JP      RX, 1, rxchar           ; 1 again: a glitch
+        LDI     r0, 8
+        CSRW    CNT, r0
+rxb:    WAITD   8                       ; the middle of the next bit
+        SHI                             ; SR <= {RX, SR[15:1]}
+        BNZ     rxb
+        STSR    r0
+        SHRI    r0, 8                   ; {parity, data 6:0}
+        PAR     r0, r0                  ; C = odd: a parity error
+        BNC     rxpok
+        ORI     r3, 1
+rxpok:  SHLI    r0, 9
+        SHRI    r0, 9                   ; the character
+        WAITD   8                       ; the middle of the stop bit
+        JP      RX, 1, rxok
+        ORI     r3, 2
+rxok:   RET                             ; T = 0 (the WAITP's condition)
+
+; txstr: as in iec62056_client.loom: the string at r6 up to a word with
+; bit 15 set (a BCC may be 0), back to back, 7E1, LSB first, the first
+; start bit 8 ticks after TD; returns after the last stop bit's SHO.
+txstr:  LD      r0, r6, 0
+        MOV     r1, r0
+        SHLI    r1, 1                   ; the start bit, 0, in bit 0
+        BC      txend                   ; bit 15 shifted out: the end
+        PAR     r1, r1                  ; C = odd: the parity bit is 1
+        LDIH    r1, 2                   ; the stop bit (bit 9), parity 0
+        BNC     txev
+        LDIH    r1, 3                   ; parity 1
+txev:   LDSR    r1
+        LDI     r1, 10
+        CSRW    CNT, r1
+txb:    WAITD   8
+        SHO
+        BNZ     txb
+        INC     r6
+        JMP     txstr
+txend:  RET
+
+; ------------------------------------------- ICODE: rate and the set-up
+        .org    ICODE
+; rate: the divider for Z = r2 (0 .. 6), as in iec62056_client.loom: the
+; 24-bit period TICK_INT:TICK_FRAC of 300 baud shifted right by Z; r2 =
+; Z << 8 for the status. Uses r0, r1, r3. It ends with SETD 0 on the new grid (an anchor,
+; so the checker does not follow its RET into loops with no anchor).
+rate:   LD      r0, r7, V_INT
+        LD      r1, r7, V_FRAC
+        SHR     r1, r1, r2              ; FRAC >> Z
+        LDI     r3, 8
+        SUB     r3, r3, r2
+        SHL     r3, r0, r3              ; the bits of INT that move into FRAC
+        OR      r1, r1, r3              ; (CSRW keeps bits 7:0: SEMANTICS 6.6)
+        SHR     r0, r0, r2
+        CSRW    TICK_INT, r0
+        CSRW    TICK_FRAC, r1
+        SHLI    r2, 8
+        SETD    0
+        RET
+
+; The set-up: the identification into S_ID after its '/', its third letter's case into
+; V_FAST and its Z into V_Z and S_ACKX; then the data message into S_MSG
+; with its BCC. Characters past IDMAX or BLKMAX are dropped.
+minit:  SETP    TX, 1                   ; MARK, the idle state
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0               ; LSB first, no inversion
+        MOV16   r7, DATA
+        CSRR    r0, TICK_INT            ; the host's 300-baud divider
+        ST      r0, r7, V_INT
+        CSRR    r0, TICK_FRAC
+        ST      r0, r7, V_FRAC
+        MOV16   r6, DATA + S_ID + 1
+        LDI     r5, IDMAX
+mid:    POP     r0
+        TEST    r0, r0
+        BZ      midz
+        TEST    r5, r5
+        BZ      mid                     ; full: dropped
+        DEC     r5
+        ST      r0, r6, 0
+        INC     r6
+        JMP     mid
+midz:   LD      r0, r7, S_ID + 3        ; the third letter
+        LDI     r1, 'a'
+        CMP     r0, r1                  ; C: r0 >= 'a', lower case
+        LDI     r1, 0
+        BNC     mup
+        LDI     r1, 1
+mup:    ST      r1, r7, V_FAST
+        LD      r0, r7, S_ID + 4        ; Z
+        ST      r0, r7, S_ACKX + 2      ; the ack it takes has this Z
+        SUBI    r0, 48
+        CMPI    r0, 7
+        BC      mzok                    ; Z - '0' >= 7: not '0' .. '6'
+        ST      r0, r7, V_Z
+mzok:   LDI     r0, 13
+        ST      r0, r6, 0
+        LDI     r0, 10
+        ST      r0, r6, 1
+        MOV16   r0, 0x8000
+        ST      r0, r6, 2
+; The data message: STX (in the image), the block, '!' CR LF ETX, the BCC.
+        MOV16   r6, DATA + S_MSG + 1
+        LDI     r5, BLKMAX
+        LDI     r3, 0x25                ; the BCC of '!' CR LF ETX
+mblk:   POP     r0
+        TEST    r0, r0
+        BZ      mend
+        TEST    r5, r5
+        BZ      mblk                    ; full: dropped
+        DEC     r5
+        ST      r0, r6, 0
+        INC     r6
+        XOR     r3, r3, r0
+        JMP     mblk
+mend:   LDI     r0, '!'
+        ST      r0, r6, 0
+        LDI     r0, 13
+        ST      r0, r6, 1
+        LDI     r0, 10
+        ST      r0, r6, 2
+        LDI     r0, ETX
+        ST      r0, r6, 3
+        ST      r3, r6, 4               ; the BCC
+        MOV16   r0, 0x8000
+        ST      r0, r6, 5
+        JMP     idle
+
+; The data the image loads; S_ID and S_MSG beyond their first word are
+; written before they are read.
+        .org    DATA
+        .word   0, 0, 0, 0                              ; V_INT .. V_FAST
+        .word   '/', '?', '!', '\r', '\n', 0x8000       ; S_REQ, 6.3.1
+        .word   6, '0', '0', '0', '\r', '\n', 0x8000    ; S_ACKX, 6.3.3
+        .word   '/'                                     ; S_ID
+        .org    DATA + S_MSG
+        .word   STX

@@ -1,0 +1,338 @@
+; iec62056_client.loom
+; An IEC 62056-21 (formerly IEC 61107, "IEC 1107") protocol mode C client:
+; the hand-held unit (HHU) or reading head that reads an electricity
+; meter through its optical port. For each host command it sends the
+; request at 300 baud, reads the meter's identification, takes the baud
+; rate it offers, acknowledges with option 0 (data readout), switches its
+; own bit clock, receives the data message, checks its BCC and passes the
+; identification and the data block to the host.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): IEC 62056-21 is in no Loom
+; design document. It needs the M2 core (pins, deadlines, the FIFOs), the
+; bit engine's shift register in manual mode (SHO and SHI, SEMANTICS 6.9),
+; built for the synchronous serial programs and USB's and CAN's encoders,
+; PAR for the even parity, LD/ST of slice B (SEMANTICS 6.11, built for the
+; I2C EEPROM's array) for the two messages it sends and its variables, and
+; the per-thread tick divider (TICK_INT, TICK_FRAC: SEMANTICS 4), built so
+; that the host could pick one rate before RUN, which this program
+; rewrites itself in the middle of a session. No hardware knows IEC
+; 62056-21: the 7E1 frame, the message parser, the reaction time, the
+; choice of rate, the divider arithmetic for it, the timeouts and the BCC
+; are all firmware.
+;
+; Standard: IEC 62056-21:2002 (the clauses are named where they are used;
+; tools/protomodels/iec62056.py lists them). Character format 5.4 and 5.6:
+; 1 start bit, 7 data bits LSB first, even parity, 1 stop bit. Rates 5.2
+; and 6.3.14 item 13 c): Z = '0' .. '6' is 300 << Z baud.
+;
+; Pins: TX = OUT0, to the reading head's transmitter (1 = MARK, LED off,
+; the idle state; 4.3.5: ON = SPACE = 0); RX = IN0, from its receiver, the
+; same polarity. BE_CFG.INV = 0.
+;
+; Host set-up, before RUN: TICK_INT and TICK_FRAC for eight ticks a bit at
+; 300 baud (at 50 MHz TICK_INT 20833, TICK_FRAC 85: 20833.33 clocks, exact
+; to 0.0001 %; TICK_INT 96 on the tests' slow clock of 230.4 kHz). The
+; program reads them once and from then on writes the divider itself; the
+; host must not write it again.
+;
+; Host command (INQ[0]): one word per readout, bits 2:0 the highest Z the
+; client accepts (the reading head's limit, 5.2 NOTE), 0 .. 6.
+;
+; Result (OUTQ[0]), per readout: every character of the identification
+; as it arrives, one word each in bits 6:0, '/' to <LF> included; then
+; every character of the data message between STX and ETX (the data
+; block, '!', <CR>, <LF>), one word each; then a status word:
+;     bit 15     1: the status word (no character word has it)
+;     bits 10:8  the Z of the data message's rate (0 = 300 baud)
+;     bit 5      overrun: OUTQ was full, a character was not pushed
+;     bit 4      format: the identification did not start with '/', had
+;                no <LF> by its 23rd character (6.3.14 item 14: 16 at
+;                most), or its fifth character is not a digit (protocol
+;                mode A or B, not supported: nothing more is done)
+;     bit 3      BCC error: the data message's BCC is wrong
+;     bit 2      timeout: no character for 15 x 255 ticks (1 594 ms; ta < 1 500 ms,
+;                tr <= 1 500 ms, 6.4.3.6)
+;     bit 1      framing error: a stop bit was 0
+;     bit 0      parity error: a character's parity was odd
+; Bits 5:0 all clear: a good readout. One character arrives every 0.52 ms
+; at 19 200 baud: the host keeps OUTQ from filling.
+;
+; Behaviour (6.4.3.2, 6.4.3.6):
+;     request    "/?!" <CR> <LF> (6.3.1, the general address) at 300 baud,
+;                back to back, from the POP
+;     ident      read at 300 baud, each character by TO after the previous
+;     choice     Z = '0' .. '6' and at most the host's limit: that rate;
+;                any other digit ('7' .. '9' reserved, or over the limit):
+;                '0', and the session stays at 300 baud (Figure 15)
+;     ack        <ACK> '0' Z '0' <CR> <LF> (6.3.3), its start bit TR = 66
+;                bits (220 ms) after the end of the identification's last
+;                stop bit (tr >= 200 ms; a meter whose third letter is in
+;                lower case may answer after 20 ms, 6.3.14 item 12, but the
+;                client always leaves the 200 ms every device accepts)
+;     switch     at the end of the acknowledgement's last stop bit it
+;                writes the divider for Z: the 300-baud period shifted
+;                right by Z (24 bits, TICK_INT:TICK_FRAC); the meter starts
+;                its data message no sooner than 20 ms later (6.4.3.6)
+;     data       STX, then characters up to ETX and the BCC, each by TO;
+;                characters before the STX are not part of the message and
+;                are ignored; the BCC is the XOR of the 7-bit characters
+;                after STX up to and including ETX (6.2 NOTE)
+;     end        the status word, the 300-baud divider back, the next POP
+; Every edge is the SHO right after its WAITD, 6 to 9 clocks after its
+; tick. Each received character restarts the tick grid on its start edge
+; (a TICK_INT write clears the accumulator, SEMANTICS 4) and is sampled
+; four ticks into each bit.
+;
+; Limits. Data readout only: no programming mode (6.4.3.3), no
+; manufacturer-specific options (6.4.3.4), no addressed requests (6.3.14
+; item 22), no repeat request (NAK) after a bad readout: the host sends the
+; command again. Protocol modes A, B, D and E are not read. The Z
+; arithmetic truncates the 24-bit period: at 50 MHz 19 200 baud is
+; 83 333/256 = 325.520 clocks a tick for 325.521 exact (0.0004 % fast).
+;
+; Memory: 127 words at 0x000 .. 0x07E (thread 0's quarter) and 47 at
+; 0x100 .. 0x12E: the variables and the two messages (DATA, 17 words the
+; image loads), the set-up (ICODE) and txstr. Beside iec62056_meter.loom
+; (thread 1) in one 512-word image; threads 2 and 3 must not be started.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   The client always waits 220 ms before its acknowledgement, even when
+;   the meter's identification allows 20 ms; that is well inside the
+;   1500 ms the meter waits for it.
+;   Both sides switch rate after the acknowledgement's last stop bit; the
+;   text does not give the exact moment, and the meter allows for it.
+;   The meter has no programming mode: an acknowledgement asking for one
+;   gets a data readout at 300 baud.
+;   Not read: the BCC example (figure 7), the mode C timing drawings
+;   (figures 13 to 15), ISO/IEC 7480 (the edge window used is the bench's)
+;   and ISO/IEC 1177 (LSB first is assumed, as for every UART here).
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0, RX = IN0
+        .tick   24                      ; the fastest tick supported (header)
+        .equ    TR = 66 * 8 + 4 - 8     ; ack start bit 66 bits after the end
+        .equ    TO = 15                 ; 15 x 255 ticks: 1 594 ms at any rate
+        .equ    IDMAX = 23              ; '/' XXX Z, 16, <CR> <LF>
+        .equ    PARE = 1                ; status bits (header)
+        .equ    FRAME = 2
+        .equ    TMO = 4
+        .equ    BCCE = 8
+        .equ    FMT = 16
+        .equ    OVR = 32
+        .equ    STX = 2
+        .equ    ETX = 3
+        .equ    DATA = 0x100            ; the spill quarter (header: Memory)
+        .equ    V_INT = 0               ; offsets from DATA: the 300-baud divider
+        .equ    V_FRAC = 1
+        .equ    S_REQ = 2               ; "/?!" CR LF, end
+        .equ    S_ACK = 8               ; ACK '0' Z '0' CR LF, end
+        .equ    V_Z = 15                ; the identification's Z
+        .equ    V_MAX = 16              ; the host's highest Z
+        .equ    ICODE = DATA + 17
+
+; Registers: r0 a character, r1 scratch, r2 a count or Z, r3 the status,
+; r4 timeout periods (15 << Z), r5 a count or the BCC, r6 a deadline or a
+; string pointer, r7 DATA.
+
+start:  JMP     cinit                   ; the set-up, at ICODE
+
+; -------------------------------------------------------------- request
+idle:   LDI     r2, 0
+        CALL    rate                    ; 300 baud; r4 = TO; r2 = 0
+        POP     r1                      ; the command: the highest Z
+        ST      r1, r7, V_MAX
+        LDI     r3, 0
+        SETD    0
+        MOV16   r6, DATA + S_REQ
+        CALL    txstr                   ; "/?!" CR LF from 8 ticks on
+
+; ---------------------------------------------------------------- ident
+; Each character pushed as it comes (if OUTQ has room: TD, the stop
+; bit's middle, is reached, so the WAITB is a test); the fifth (Z) kept in V_Z, the count
+; in r5. The <LF> ends the message.
+        LDI     r5, 0
+idc:    CALL    rxchar
+        BT      tmo
+        WAITB   OUTQ_NF, T              ; TD is reached: a test, T = 1 full
+        BT      idov
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition; only the host pops OUTQ"
+        PUSH    r0
+idnx:   INC     r5
+        CMPI    r5, 1
+        BNZ     idz
+        CMPI    r0, '/'
+        BZ      idc
+        JMP     fmt                     ; not an identification
+idz:    CMPI    r5, 5
+        BNZ     idl
+        ST      r0, r7, V_Z             ; Z
+idl:    CMPI    r0, 10
+        BZ      idend
+        CMPI    r5, IDMAX
+        BNZ     idc
+        JMP     fmt                     ; too long
+idov:   ORI     r3, OVR
+        JMP     idnx
+
+; --------------------------------------------------------------- choice
+; r5 - '0' must be a digit; 0 .. 6 and at most the host's limit is taken.
+idend:  CMPI    r5, 7
+        BNC     fmt                     ; shorter than "/XXXZ" CR LF
+        LD      r5, r7, V_Z
+        SUBI    r5, 48                  ; '0'
+        CMPI    r5, 10
+        BC      fmt                     ; not a digit: mode A or B
+        CMPI    r5, 7
+        BC      idrej                   ; '7' .. '9': reserved
+        LD      r1, r7, V_MAX
+        CMP     r1, r5
+        BC      idok                    ; limit >= Z
+idrej:  LDI     r5, 0
+idok:   MOV     r2, r5                  ; Z
+        ADDI    r5, 48
+        ST      r5, r7, S_ACK + 2
+; The ack's start bit 66 bits after the <LF>'s stop bit ends: TD is that
+; stop bit's middle, 4 ticks before its end; txstr's first WAITD adds 8.
+        WAITD   255
+        WAITD   255
+        WAITD   TR - 510
+        MOV16   r6, DATA + S_ACK
+        CALL    txstr
+        WAITD   8                       ; the end of the <LF>'s stop bit
+        CALL    rate                    ; the divider for Z (r2)
+
+; ----------------------------------------------------------------- data
+; STX first (anything before it ignored), then up to ETX, each character
+; pushed but the ETX, the BCC over all of them, then the BCC itself.
+dstx:   CALL    rxchar
+        BT      tmo
+        CMPI    r0, STX
+        BNZ     dstx
+        LDI     r5, 0
+dchr:   CALL    rxchar
+        BT      tmo
+        XOR     r5, r5, r0
+        CMPI    r0, ETX
+        BZ      dbcc
+        WAITB   OUTQ_NF, T
+        BT      dov
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition; only the host pops OUTQ"
+        PUSH    r0
+        JMP     dchr
+dov:    ORI     r3, OVR
+        JMP     dchr
+dbcc:   CALL    rxchar
+        BT      tmo
+        CMP     r0, r5
+        BZ      done
+        ORI     r3, BCCE
+        JMP     done
+tmo:    ORI     r3, TMO
+        JMP     done
+fmt:    ORI     r3, FMT
+done:   LDIH    r3, 0x80                ; the status word: bit 15
+        OR      r3, r3, r2              ; Z << 8, from rate (0 before it)
+        WAITB   OUTQ_NF                 ; the host keeps up; nothing is timed now
+        PUSH    r3
+        JMP     idle
+
+; ------------------------------------------------------------ subroutines
+; rxchar: the next character in r0 (7 bits), T = 0; or T = 1 after r4
+; periods of 255 ticks with no start bit. Parity and framing errors go to
+; r3. On the start edge the tick grid restarts (TICK_INT written with its
+; own value), so each bit is sampled 4 ticks after its edge. The
+; character is assembled during the parity bit; it returns from the
+; middle of the stop bit (TD), 4 ticks before its end, so a caller has
+; half a bit to be back at the WAITP. Uses r1, r6.
+rxchar: MOV     r1, r4
+rxper:  SETD    255
+        WAITP   RX, 0, T                ; a start bit, or 255 ticks
+        BNT     rxgo
+        DJNZ    r1, rxper
+        RET                             ; T = 1
+rxgo:   CSRR    r6, TICK_INT
+        CSRW    TICK_INT, r6            ; the grid restarts here
+        SETD    0
+        WAITD   4                       ; the middle of the start bit
+        JP      RX, 1, rxchar           ; 1 again: a glitch
+        LDI     r0, 8
+        CSRW    CNT, r0
+rxb:    WAITD   8                       ; the middle of the next bit
+        SHI                             ; SR <= {RX, SR[15:1]}
+        BNZ     rxb
+        STSR    r0
+        SHRI    r0, 8                   ; {parity, data 6:0}
+        PAR     r0, r0                  ; C = odd: a parity error
+        BNC     rxpok
+        ORI     r3, PARE
+rxpok:  SHLI    r0, 9
+        SHRI    r0, 9                   ; the character
+        WAITD   8                       ; the middle of the stop bit
+        JP      RX, 1, rxok
+        ORI     r3, FRAME
+rxok:   RET                             ; T = 0 (the WAITP's condition)
+
+; rate: the divider for Z = r2 (0 .. 6): the 24-bit period TICK_INT:
+; TICK_FRAC of 300 baud shifted right by Z (5.2: 300 << Z baud); r4 =
+; 15 << Z, so the timeout is the same time at every rate; r2 = Z << 8.
+rate:   LD      r0, r7, V_INT
+        LD      r1, r7, V_FRAC
+        SHR     r1, r1, r2              ; FRAC >> Z
+        LDI     r6, 8
+        SUB     r6, r6, r2
+        SHL     r6, r0, r6              ; the bits of INT that move into FRAC
+        OR      r1, r1, r6              ; (CSRW keeps bits 7:0: SEMANTICS 6.6)
+        SHR     r0, r0, r2
+        CSRW    TICK_INT, r0
+        CSRW    TICK_FRAC, r1
+        LDI     r4, TO
+        SHL     r4, r4, r2
+        SHLI    r2, 8
+        SETD    0                       ; an anchor: see iec62056_meter.loom
+        RET
+
+; ------------------------------------------------- ICODE: the set-up
+        .org    ICODE
+cinit:  SETP    TX, 1                   ; MARK, the idle state
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        .csr    BE_CFG, 0               ; LSB first, no inversion
+        MOV16   r7, DATA
+        CSRR    r0, TICK_INT            ; the host's 300-baud divider
+        ST      r0, r7, V_INT
+        CSRR    r0, TICK_FRAC
+        ST      r0, r7, V_FRAC
+        JMP     idle
+
+; txstr: the string at r6, ended by a word with bit 15 set (a 0 could be
+; a BCC in iec62056_meter.loom, which has the same routine), back to back,
+; the first start bit 8 ticks after TD. Each character is one 7E1 frame: SR = {stop 1, parity,
+; data 6:0, start 0}, ten SHOs 8 ticks apart, LSB first, each the
+; instruction after its WAITD. Returns after the last stop bit's SHO; that
+; stop bit ends at TD + 8. Uses r0, r1, r6. (One routine, not two: the
+; checker follows a RET to every CALL site, and a nested CALL would give
+; it loops with no anchor.)
+txstr:  LD      r0, r6, 0
+        MOV     r1, r0
+        SHLI    r1, 1                   ; the start bit, 0, in bit 0
+        BC      txend                   ; bit 15 shifted out: the end
+        PAR     r1, r1                 ; C = odd: the parity bit is 1
+        LDIH    r1, 2                   ; the stop bit (bit 9), parity 0
+        BNC     txev
+        LDIH    r1, 3                   ; parity 1
+txev:   LDSR    r1
+        LDI     r1, 10
+        CSRW    CNT, r1
+txb:    WAITD   8
+        SHO
+        BNZ     txb
+        INC     r6
+        JMP     txstr
+txend:  RET
+
+; The data: the divider, the two messages, Z and the host's limit.
+        .org    DATA
+        .word   0, 0
+        .word   '/', '?', '!', '\r', '\n', 0x8000       ; 6.3.1
+        .word   6, '0', '0', '0', '\r', '\n', 0x8000    ; 6.3.3: ACK V Z Y
+        .word   0, 0
