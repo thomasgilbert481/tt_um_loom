@@ -1,0 +1,222 @@
+; vga_bars.loom
+; VGA 640x480 at 60 Hz from firmware: HSYNC, VSYNC and a 2-bit-per-channel
+; colour picture on a TinyVGA Pmod. Pattern 0 is eight full-intensity colour
+; bars; 1 an 8 x 8 checkerboard; 2 the four levels of grey, red, green and
+; blue (every DAC step of the Pmod); 3 a white field (the picture's edges).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core: the
+; deadline-latched pin write of SEMANTICS 6.10 (SETP pin, v, D), built for
+; clock-exact serial edges (ws2812, the DShot frame) and here putting every
+; HSYNC and VSYNC edge on the exact clock; OUT through an OUTGRP group
+; (SEMANTICS 6.3), built for parallel buses, here writing six colour pins in
+; one slot; LD from the instruction memory (slice B, SEMANTICS 6.11), built
+; for device tables, here holding the patterns; one FIFO word for the
+; pattern. No hardware knows video: the 800-pixel line, the 525-line frame,
+; the porches, the sync polarity and the picture are all firmware.
+;
+; Pins: the TinyVGA Pmod on the uio header (BIDIR0 .. 7, push-pull). Its
+; bit order is the TT "VGA Output" pinout (tools/protomodels/vga.py cites
+; it), which names uo_out; Loom's uo_out[6] and [7] are HOST_IRQ and
+; HOST_MISO, so on Loom the Pmod goes on the bidirectional header instead,
+; same order:
+;     BIDIR0 R1   BIDIR1 G1   BIDIR2 B1   BIDIR3 VSYNC
+;     BIDIR4 R0   BIDIR5 G0   BIDIR6 B0   BIDIR7 HSYNC
+; R1, G1, B1 are the most significant bits. The pins are fixed by the Pmod
+; and by the colour words below; do not move them with --pin.
+;
+; Rate: the program sets one tick = one clock (.csr below); the host must
+; not set TICK_INT. Timing at 50 MHz against VESA DMT ID 04h (vga.py cites
+; the page). One DMT pixel is 1.986 clocks; the line is 1588 clocks:
+;     line      1588 clocks = 31.760 us  (DMT 31.778 us: -0.056 %, the pixel
+;                                         clock tolerance is +-0.5 %)
+;     active    1270 clocks  (640 px)    the colour window, see below
+;     front     32 clocks    (8 border + 8 porch = 16 px; DMT 31.8)
+;     HSYNC     191 clocks low (96 px; DMT 190.7)
+;     back      95 clocks    (40 porch + 8 border = 48 px; DMT 95.3)
+;     frame     525 lines: 480 active, 10 front, 2 VSYNC low, 33 back
+;               (8 + 2, 2, 25 + 8 in DMT with its borders), 59.97 Hz
+; 1589 clocks would be closer (31.780 us, +0.007 %), but 1588 is a multiple
+; of the 4-clock slot: every line then lands on the same slot phase and is
+; identical to the clock, so the bar edges do not shimmer from line to line.
+; HSYNC and VSYNC are deadline-latched, so they are exact to the clock.
+; The frame starts with the 45 blanking lines (VSYNC falls 10 lines in).
+;
+; Horizontal resolution. A colour change is an OUT, one slot, and slots
+; come every 4 clocks: an edge can sit only on a 4-clock grid (2.01 DMT
+; pixels), which gives 317 columns in the 640-pixel window at the very
+; best (a straight run of OUTs from registers). Fetching each colour from
+; memory (LD, two slots, then OUT) takes 12 clocks, about 106 columns.
+; This program needs eight bars, 156 or 160 clocks each (78.6 or 80.6 px).
+;
+; Where the colour edges fall, exactly. After the last TICK write a tick is
+; every clock, so a deadline set by SETD m in X cycle y, plus later WAITDs,
+; is reached in cycle y + m + their sum (SEMANTICS 4), and the thread's X
+; cycles are y + 4j (SEMANTICS 2). With SETD 7 and the 95-clock back porch
+; the line start S is y + 102 + 1588 n: an X cycle + 2. An OUT right after
+; a WAITD whose deadline is on an X cycle is executed 4 clocks later and
+; changes the pad 2 after that (SEMANTICS 2), 6 clocks after the deadline,
+; so every colour deadline is S - 6 + a multiple of 4, and every colour
+; edge lands exactly where it is meant to: S + 0, 160, 316, 476, 636, 792,
+; 952, 1112 (px 0, 80.6, 159.2, 239.8, 320.4, 399.0, 479.6, 560.2, all
+; within 0.8 px of 80 i) and black at S + 1268 (px 638.8), 2 clocks before
+; the active area ends. Those are the nearest points of the 4-clock grid.
+;
+; Host: one INQ[0] word picks the pattern (bits 1:0; 15:2 ignored). The
+; program takes at most one word a frame, at the end of the blanking, and
+; keeps the last pattern; before any word it shows pattern 0. Nothing goes
+; to OUTQ.
+;
+; Memory: 83 words of thread 0's quarter (0x000 .. 0x052) and 64 words of
+; pattern tables at 0x0C0 .. 0x0FF, the top of thread 1's quarter: a
+; program run beside it on thread 1 has 64 words (0x080 .. 0x0BF);
+; threads 2 and 3 are free. Worst deadline slack 17 clocks (the back porch
+; after the last blanking line, where the pattern word is taken).
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   A TinyVGA Pmod goes in the uio (bidirectional) socket, not the output
+;   one: Loom's uo_out[7:6] are the host port's IRQ and MISO.
+;   Line of 1588 clocks (31.760 us, -0.056 %, inside DMT's 0.5 %), not
+;   1589: every line is then identical and the bar edges do not shimmer.
+;   VSYNC switches at the start of a line's active area (DMT does not say
+;   where). The timing assumes the 50 MHz board clock; at 48 MHz the line
+;   is 4.1 % long, outside the tolerance.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   R1 = BIDIR0, G1 = BIDIR1, B1 = BIDIR2, VSYNC = BIDIR3
+        .pins   R0 = BIDIR4, G0 = BIDIR5, B0 = BIDIR6, HSYNC = BIDIR7
+        .equ    VBLANK = 45             ; blanking lines: 10 front, 2 sync, 33 back
+        .equ    VS_FALL = VBLANK - 10   ; r6 at the start of line 490
+        .equ    VS_RISE = VS_FALL - 2   ; r6 at the start of line 492
+        .equ    VACTIVE = 480
+        .equ    ROWS = 60               ; lines per checkerboard row
+        .equ    HFP_END = 40            ; colour off (1262) to HSYNC fall (1302)
+        .equ    HSW = 191               ; HSYNC low
+        .equ    HBP = 95                ; HSYNC rise (1493) to line start (1588)
+        .equ    ADV = 6                 ; an OUT changes the pad 6 clocks after its deadline
+        .equ    BLANK = 0x08            ; the OUT group's word for black: VSYNC 1
+        .equ    TABLES = 0x0C0          ; four patterns of 16 words
+
+; Registers: r0 the next bar's colour word, r1 BLANK, r2 the phase (0 the
+; blanking, 1 the active lines), r3 scratch, r4 the current table row,
+; r5 lines left in this checkerboard row, r6 lines left in this phase,
+; r7 the current pattern's table (and the .csr scratch before the loop).
+
+start:  .csr    TICK_INT, 1             ; one tick = one clock (the program's rate)
+        .csr    TICK_FRAC, 0
+        .csr    OUTGRP, (7 << 5) | pin(R1)  ; OUT writes BIDIR0 .. 6
+        .csr    PIN_OUT, 0x88           ; HSYNC and VSYNC high (idle), colours 0
+        .csr    PIN_OE, 0xFF            ; then drive all eight Pmod pins
+        LDI     r1, BLANK
+        LDI     r2, 0                   ; the blanking comes first
+        LDI     r6, VBLANK
+        MOV16   r7, TABLES              ; pattern 0
+        SETD    7                       ; a virtual HSYNC rise; 7 puts S on the grid (header)
+
+; ------------------------------------------------------- a blanking line
+; Entered just after the HSYNC rise (S + 1493 of the line before). VSYNC is
+; staged here and lands on this line's start S, the next deadline.
+bline:  CMPI    r6, VS_FALL
+        BNZ     bl1
+        SETP    VSYNC, 0, D             ; line 490: VSYNC falls at S
+bl1:    CMPI    r6, VS_RISE
+        BNZ     bl2
+        SETP    VSYNC, 1, D             ; line 492: VSYNC rises at S
+bl2:    WAITD   HBP                     ; S
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255                     ; S + 1020
+        WAITD   1262 - 1020             ; S + 1262, where the colour deadline would be
+        JMP     tail
+
+; r0 holds bar 0's word; S - ADV is the next deadline. Bars of 160, 156,
+; 160, 160, 156, 160, 160, 156 clocks, 1268 in all, each word fetched before.
+; 160, ... clocks, 1264 in all, each word fetched in the bar before.
+vis:    WAITD   HBP - ADV               ; S - 6: bar 0
+        OUT     r0
+        LD      r0, r4, 1
+        WAITD   160                     ; S + 154: bar 1
+        OUT     r0
+        LD      r0, r4, 2
+        WAITD   156                     ; S + 310: bar 2
+        OUT     r0
+        LD      r0, r4, 3
+        WAITD   160                     ; S + 470: bar 3
+        OUT     r0
+        LD      r0, r4, 4
+        WAITD   160                     ; S + 630: bar 4
+        OUT     r0
+        LD      r0, r4, 5
+        WAITD   156                     ; S + 786: bar 5
+        OUT     r0
+        LD      r0, r4, 6
+        WAITD   160                     ; S + 946: bar 6
+        OUT     r0
+        LD      r0, r4, 7
+        WAITD   160                     ; S + 1106: bar 7
+        OUT     r0
+        WAITD   156                     ; S + 1262: black at S + 1268
+        OUT     r1
+
+; ------------------------------------------------------- every line's end
+; From S + 1262: the front porch, HSYNC low for HSW clocks, then the
+; decision about the next line inside the back porch (HBP - ADV = 89
+; clocks to the next deadline at the most, the checker's budget).
+tail:   SETP    HSYNC, 0, D
+        WAITD   HFP_END                 ; S + 1302: HSYNC falls on this clock
+        SETP    HSYNC, 1, D
+        WAITD   HSW                     ; S + 1493: HSYNC rises on this clock
+        DJNZ    r6, more
+        XORI    r2, 1                   ; the phase is over: switch
+        BNZ     to_vis
+        LDI     r6, VBLANK              ; the active lines are over
+        JMP     bline
+
+; The blanking is over: take a new pattern if the host sent one (the test
+; is non-blocking: TD, the HSYNC rise, has been reached), then line 0.
+to_vis: MOV16   r6, VACTIVE
+        LDI     r5, ROWS
+        WAITB   INQ_NE, T               ; T = 0 only if a word is queued
+        BT      keep
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, and only this thread pops INQ[0]"
+        POP     r3
+        ANDI    r3, 3
+        SHLI    r3, 4                   ; 16 words a pattern
+        MOV16   r7, TABLES
+        ADD     r7, r7, r3
+keep:   MOV     r4, r7                  ; row A of the pattern
+        LD      r0, r4, 0
+        JMP     vis
+
+more:   TEST    r2, r2
+        BZ      bline                   ; another blanking line
+        DJNZ    r5, vrow
+        LDI     r5, ROWS                ; a new checkerboard row: A <-> B
+        XORI    r4, 8
+vrow:   LD      r0, r4, 0
+        JMP     vis
+
+; ------------------------------------------------------- the patterns
+; Each pattern is two rows of eight bar words, A at +0 and B at +8; the
+; rows swap every ROWS lines (only the checkerboard and the levels differ).
+; A word is the OUT group BIDIR6 .. 0 = B0 G0 R0 VSYNC B1 G1 R1, VSYNC 1.
+; Level L (0 .. 3) of a channel puts L >> 1 in its 1 pin and L & 1 in its 0.
+        .equ    K = 0x08                ; black
+        .equ    W = 0x7F                ; white (3, 3, 3)
+        .equ    YL = 0x3B               ; yellow (3, 3, 0)
+        .equ    CY = 0x6E               ; cyan (0, 3, 3)
+        .equ    GR = 0x2A               ; green (0, 3, 0)
+        .equ    MG = 0x5D               ; magenta (3, 0, 3)
+        .equ    RD = 0x19               ; red (3, 0, 0)
+        .equ    BL = 0x4C               ; blue (0, 0, 3)
+        .org    TABLES
+bars:   .word   W, YL, CY, GR, MG, RD, BL, K        ; pattern 0, row A
+        .word   W, YL, CY, GR, MG, RD, BL, K        ; row B, the same
+check:  .word   W, K, W, K, W, K, W, K              ; pattern 1: 80 px x 60 lines
+        .word   K, W, K, W, K, W, K, W
+levels: .word   0x7F, 0x0F, 0x78, K, 0x19, 0x09, 0x18, K  ; 2: grey 3..0, red 3..1
+        .word   0x2A, 0x0A, 0x28, K, 0x4C, 0x0C, 0x48, K  ; green 3..1, blue 3..1
+white:  .word   W, W, W, W, W, W, W, W              ; pattern 3: the whole window
+        .word   W, W, W, W, W, W, W, W

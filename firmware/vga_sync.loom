@@ -1,0 +1,114 @@
+; vga_sync.loom
+; VGA 640x480 at 60 Hz sync generator: HSYNC and VSYNC on a TinyVGA Pmod
+; with the VESA DMT porches, the colour pins held black, and a display-
+; enable output (DE, high in the active area) for a scope, a logic analyser
+; or a second board that draws the picture. vga_bars.loom adds the picture.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M1 core and the
+; deadline-latched pin write of SEMANTICS 6.10 (SETP pin, v, D), built for
+; clock-exact serial edges (ws2812, the DShot frame), here putting every
+; HSYNC and VSYNC edge on the exact clock. No hardware knows video: the
+; line, the frame, the porches and the sync polarity are all firmware.
+;
+; Pins: the TinyVGA Pmod on the uio header (BIDIR0 .. 7, push-pull; Loom's
+; uo_out[6] and [7] are HOST_IRQ and HOST_MISO, so the TT "VGA Output"
+; pinout on uo_out cannot be used; vga_bars.loom's header has the table):
+;     HSYNC = BIDIR7, VSYNC = BIDIR3, colours BIDIR0 .. 2 and 4 .. 6 at 0,
+;     DE = OUT0 (uo_out[0]; not on the Pmod; movable with --pin DE=<pin>).
+;
+; Rate: the program sets one tick = one clock; the host must not set
+; TICK_INT. At 50 MHz, against VESA DMT ID 04h (tools/protomodels/vga.py
+; cites the page; one DMT pixel is 1.986 clocks):
+;     line    1588 clocks = 31.760 us (DMT 31.778 us, -0.056 %; the pixel
+;             clock tolerance is +-0.5 %), from the start of the active area:
+;     active  1270 clocks (640 px), front 32 (16 px), HSYNC low 191 (96 px),
+;             back 95 (48 px)
+;     frame   525 lines: 480 active, 10 front, VSYNC low 2, 33 back, 59.97 Hz
+; 1588 is a multiple of the 4-clock slot, so every line has the same slot
+; phase; vga_bars.loom's header says why that matters for the picture.
+; HSYNC and VSYNC are latched writes: exact to the clock. DE is an ordinary
+; SETP after its WAITD, so it sits on the 4-clock slot grid; SETD 7 puts the
+; line start S on that grid (vga_bars.loom's header has the arithmetic), so
+; DE rises exactly at S and falls at S + 1268, 2 clocks before the end.
+; The frame starts with the 45 blanking lines (VSYNC falls 10 lines in).
+;
+; Host: nothing. Load, RUN thread 0.
+;
+; Memory: 49 words of thread 0's quarter (0x000 .. 0x030). Worst deadline
+; slack 28 clocks.
+;
+; Readings taken on the open spec questions (2026-11-07):
+;   A TinyVGA Pmod goes in the uio (bidirectional) socket, not the output
+;   one: Loom's uo_out[7:6] are the host port's IRQ and MISO.
+;   Line of 1588 clocks (31.760 us, -0.056 %, inside DMT's 0.5 %), not
+;   1589: every line is then identical and the bar edges do not shimmer.
+;   VSYNC switches at the start of a line's active area (DMT does not say
+;   where). The timing assumes the 50 MHz board clock; at 48 MHz the line
+;   is 4.1 % long, outside the tolerance.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   VSYNC = BIDIR3, HSYNC = BIDIR7, DE = OUT0
+        .equ    VBLANK = 45             ; blanking lines: 10 front, 2 sync, 33 back
+        .equ    VS_FALL = VBLANK - 10   ; r6 at the start of line 490
+        .equ    VS_RISE = VS_FALL - 2   ; r6 at the start of line 492
+        .equ    VACTIVE = 480
+        .equ    HFP_END = 40            ; DE deadline (1262) to HSYNC fall (1302)
+        .equ    HSW = 191               ; HSYNC low
+        .equ    HBP = 95                ; HSYNC rise (1493) to line start (1588)
+        .equ    ADV = 6                 ; a SETP changes the pad 6 clocks after its deadline
+
+; Registers: r2 the phase (0 the blanking, 1 the active lines), r6 lines
+; left in this phase, r7 the .csr scratch.
+
+start:  .csr    TICK_INT, 1             ; one tick = one clock (the program's rate)
+        .csr    TICK_FRAC, 0
+        .csr    PIN_OUT, 0x88           ; HSYNC and VSYNC high (idle), colours 0
+        .csr    PIN_OE, 0xFF            ; then drive all eight Pmod pins
+        SETP    DE, 0
+        OEP     DE, 1                   ; a no-op unless DE is moved to a BIDIR pin
+        LDI     r2, 0                   ; the blanking comes first
+        LDI     r6, VBLANK
+        SETD    7                       ; a virtual HSYNC rise; 7 puts S on the slot grid
+
+; A blanking line, entered just after the HSYNC rise of the line before.
+bline:  CMPI    r6, VS_FALL
+        BNZ     bl1
+        SETP    VSYNC, 0, D             ; line 490: VSYNC falls at S
+bl1:    CMPI    r6, VS_RISE
+        BNZ     bl2
+        SETP    VSYNC, 1, D             ; line 492: VSYNC rises at S
+bl2:    WAITD   HBP                     ; S
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255                     ; S + 1020
+        WAITD   1262 - 1020             ; S + 1262, where DE would fall
+        JMP     tail
+
+; An active line: DE high from S to S + 1268 (deadlines 6 clocks before).
+vis:    WAITD   HBP - ADV               ; S - 6
+        SETP    DE, 1
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255                     ; S + 1014
+        WAITD   1262 - 1014             ; S + 1262: DE falls at S + 1268
+        SETP    DE, 0
+
+; Every line's end: the front porch, HSYNC, the next line's kind.
+tail:   SETP    HSYNC, 0, D
+        WAITD   HFP_END                 ; S + 1302: HSYNC falls on this clock
+        SETP    HSYNC, 1, D
+        WAITD   HSW                     ; S + 1493: HSYNC rises on this clock
+        DJNZ    r6, more
+        XORI    r2, 1                   ; the phase is over: switch
+        BNZ     to_vis
+        LDI     r6, VBLANK
+        JMP     bline
+to_vis: MOV16   r6, VACTIVE
+        JMP     vis
+more:   TEST    r2, r2
+        BZ      bline
+        JMP     vis
