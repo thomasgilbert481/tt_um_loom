@@ -1,0 +1,256 @@
+; cppm_tx.loom
+; A CPPM (combined PPM, "PPM sum") encoder: the signal of an RC
+; transmitter's trainer port or a receiver's PPM output, one wire carrying
+; up to 8 channels. The host loads the channel values in microseconds and
+; the thread sends the frame over and over on OUT0, taking a new set only
+; at a frame boundary, so no frame mixes old and new values.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; CPPM. It uses the deadline-latched pin write (SETP ... D, SEMANTICS
+; 6.10), built so a UART or SPI edge lands on the exact tick, for every
+; edge here; the deadline register written at run time (CSRW TD, 6.6,
+; built so a receiver can time a silence) for waits longer than the 255
+; ticks a WAITD holds; the FIFOs (6.7) and the data memory (LD/ST, 6.11,
+; built for device emulation) for a double-buffered channel table. No
+; hardware knows the frame: its layout, the sync time, the clamps and
+; the frame-boundary hand-over are firmware. A dedicated timer peripheral
+; (a microcontroller's output compare, as EdgeTX uses) does the same
+; job with no thread; Loom spends one of four threads and about 30 slots
+; per edge on it.
+;
+; Director's decisions (2026-11-07): channels clamp to Betaflight's 750 ..
+; 2250 us, the stricter decoder, so every cited decoder accepts what is
+; sent; at most 8 channels; separators 250 .. 500 us (this program's own
+; limits); the receiver reports every frame and leaves Betaflight's
+; 25-good-frames trust rule to the host.
+;
+; Wire format. There is no formal standard; every figure below is from
+; public secondary sources, read 2026-11-07, and none was checked against
+; a transmitter on the bench:
+;   [EdgeTX]  radio/src/pulses/ppm.cpp, pulses.h, myeeprom.h, edgetx.h
+;             (an open-source transmitter firmware): separator ("delay")
+;             300 us by default, settable in 50 us steps
+;             (GET_MODULE_PPM_DELAY = delay * 50 + 300); frame length
+;             22.5 ms by default (PPM_DEF_PERIOD), settable; the rest after
+;             the last pulse at least 3 ms (PPM_SAFE_MARGIN * 2 ticks of a
+;             2 MHz timer); centre 1500 us and +-512 us (PPM_CENTER);
+;             polarity selectable.
+;   [BF]      Betaflight src/main/drivers/rx/rx_pwm.c (a flight controller's
+;             decoder): rising-edge capture, channel = edge-to-edge time,
+;             valid 750 .. 2250 us, sync when 2700 us or more, 4 channels
+;             at least.
+;   [AP]      ArduPilot libraries/AP_RCProtocol/AP_RCProtocol_PPMSum.cpp:
+;             sync when 2700 us or more, valid over 700 and under 2300 us.
+; A frame is N + 1 separator pulses of width SEP at the active level, the
+; line at the idle level between them. Channel i (1 .. N) is the time from
+; the start of separator i to the start of separator i + 1; the time from
+; separator N + 1 to the next frame's first separator is the sync gap.
+; The frame period is FRAME: the sync gap is FRAME less the sum of the
+; channels, and never less than SYNCMIN = 3000 us (EdgeTX's 3 ms rest, above
+; both decoders' 2700 us). If the channels leave less, the frame is longer
+; than FRAME, as EdgeTX's is.
+;
+; Host interface (INQ[0]; nothing goes to OUTQ):
+;   at start, before or after RUN, three words:
+;     SEP    separator width in ticks, clamped to 250 .. 500 (sources: 300,
+;            and 300 .. 400 on trainer ports; the limits are this program's)
+;     FRAME  frame period in ticks, at most 30000 (TD's 2^15
+;            half-window, SEMANTICS 4, bounds the longest wait)
+;     POL    bit 0: the idle level. 0: idle low, separators high (EdgeTX's
+;            default for a module); 1: idle high, separators low.
+;   then any number of loads: 0x8000 | N (N = 0 .. 8, larger is 8), then N
+;   channel values in ticks, each clamped to Betaflight's 750 .. 2250, so
+;   both decoders take every channel this program sends. A load becomes the
+;   frame's channels at the next sync gap after its last value arrives; a
+;   new header before then replaces the load in progress. A word under
+;   0x8000 with no load open is ignored. N = 0 stops the pulses (the line
+;   stays idle). Until the first load completes the line is idle. With no
+;   channels the frame is one idle step of 250 ticks (IDLEW), so a load is
+;   taken within a few steps and starts at the step after it completes.
+;   The program reads INQ once after each edge, about 1,000 times a second
+;   at least, so a host with a 4-word INQ streams a load of 8 in 2 ms.
+;
+; Tick: one tick is 1 us, set by the host before RUN (the M2 convention):
+;   50 MHz: TICK_INT 50, TICK_FRAC 0 (exact).
+; The deadline pairs are proved for a tick of 4 clocks or more (.tick
+; below); the tests on the RTL use exactly 4, which scales every time by
+; 4/50 (a "microsecond" of 4 clocks) and keeps the protocol's ratios.
+;
+; Timing. Every edge is a latched write staged before the deadline it lands
+; on, so each is on the exact tick, whatever the slot grid (6.10). A wait
+; of W ticks to an edge is WAITD LEAD (200), then TD = target - K, the
+; SETP ... D, and WAITD K (8): the latch fires when NOW ticks to the
+; target. The latched write is staged only after WAITD LEAD has completed,
+; so it cannot fire on that intermediate deadline. Every interval is at
+; least 250 ticks, more than LEAD + K.
+;
+; Data memory (thread 3's quarter, which no thread runs): 0x1E0 SEP,
+; 0x1E1 FRAME, 0x1E2 POL, 0x1E3 ACTN (channels in the active set), 0x1E4
+; STGN (in the staged set), 0x1E5 PACT (the active buffer's address);
+; buffers at 0x1E8 and 0x1F0, eight words each. The staged buffer is the
+; one PACT does not name; the hand-over at the sync gap swaps the two.
+;
+; Pin: PPM = OUT0, push-pull. Code: thread 0, words as test_fw_cppm.py
+; pins them.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   PPM = OUT0
+        .equ    LEAD = 200              ; the first WAITD of a long wait
+        .equ    K = 8                   ; the last one, after TD is rewritten
+        .equ    SEPMIN = 250
+        .equ    SEPMAX = 500
+        .equ    FRMAX = 30000
+        .equ    CHMIN = 750             ; [BF]
+        .equ    CHMAX = 2250            ; [BF]
+        .equ    SYNCMIN = 3000          ; [EdgeTX]
+        .equ    MAXCH = 8
+        .equ    IDLEW = SEPMIN          ; the step while no channels are loaded
+        .equ    CFG = 0x1E0             ; data memory (header)
+        .equ    OSEP = 0
+        .equ    OFRAME = 1
+        .equ    OPOL = 2
+        .equ    OACTN = 3
+        .equ    OSTGN = 4
+        .equ    OPACT = 5
+        .equ    BUFA = CFG + 8
+        .equ    BUFB = CFG + 16
+        .equ    FLIP = (BUFA | BUFB) - (BUFA & BUFB)    ; xor: PACT xor FLIP is the other buffer
+
+; Registers: r1 S, the TD value of the current separator's start; r2 the
+; next channel's index; r3 the sum of this frame's channels so far; r4 the
+; level of the next edge (and scratch before it is set); r5 values still
+; to come in the open load; r6 where the next one goes (0: no load staged
+; or open); r0 and r7 scratch (r7 = the next edge's time less K when
+; `edge` is called).
+        .thread 0
+        .tick   4                       ; the shortest tick the pairs are proved for
+start:  MOV16   r7, CFG
+        POP     r0                      ; SEP (waits for the host)
+        MOV16   r4, SEPMIN
+        CMP     r0, r4
+        BC      s1
+        MOV     r0, r4
+s1:     MOV16   r4, SEPMAX
+        CMP     r4, r0
+        BC      s2
+        MOV     r0, r4
+s2:     ST      r0, r7, OSEP
+        POP     r0                      ; FRAME (a short one is lengthened by SYNCMIN)
+        MOV16   r4, FRMAX
+        CMP     r4, r0
+        BC      f2
+        MOV     r0, r4
+f2:     ST      r0, r7, OFRAME
+        POP     r0                      ; POL
+        ANDI    r0, 1
+        ST      r0, r7, OPOL
+        MOV     r4, r0                  ; the line's level: idle
+        BZ      ilow
+        SETP    PPM, 1                  ; idle high
+        JMP     iset
+ilow:   SETP    PPM, 0                  ; idle low
+iset:   MOV16   r0, BUFA
+        ST      r0, r7, OPACT
+        LDI     r0, 0
+        ST      r0, r7, OACTN           ; no channels: the line stays idle
+        LDI     r5, 0                   ; (r2, r3: the first step is a sync, which clears them)
+        LDI     r6, 0
+        SETD    1
+        WAITD   1                       ; anchor
+        CSRR    r1, TD                  ; a "separator" of no channels ends here
+        JMP     top
+
+
+; Every edge comes back here, with TD = the edge's tick, reached. One INQ
+; word is taken, if there is one: TD is reached, so the WAITB is a test
+; (T = 1: INQ empty).
+top:    WAITB   INQ_NE, T
+        BT      pdone
+        .bounded "guarded by the WAITB above, which completed by its condition; only this thread pops INQ[0]"
+        POP     r0
+        ADD     r7, r0, r0              ; C = bit 15: a header
+        BC      phead
+        TEST    r5, r5
+        BZ      pdone                   ; no load open: ignored
+        ST      r0, r6, 0
+        INC     r6
+        DEC     r5                      ; 0: complete (r6 stays set: staged)
+        JMP     pdone
+phead:  ANDI    r0, 15
+        CMPI    r0, MAXCH + 1
+        BNC     pn
+        LDI     r0, MAXCH
+pn:     MOV16   r7, CFG
+        ST      r0, r7, OSTGN
+        MOV     r5, r0
+        LD      r6, r7, OPACT
+        XORI    r6, FLIP                ; into the buffer not being sent
+; The edge just made was a separator's start if it went to the active
+; level: then the next is its end, at S + SEP. Otherwise (a separator's
+; end, the anchor, or an idle frame of no channels) the next is a start.
+pdone:  MOV16   r7, CFG
+        LD      r0, r7, OPOL            ; the idle level
+        CMP     r4, r0
+        BZ      gap
+        MOV     r4, r0                  ; the end: back to idle
+        LD      r0, r7, OSEP
+        ADD     r7, r1, r0
+        JMP     edge
+gap:    LD      r0, r7, OACTN
+        CMP     r2, r0
+        BC      sync                    ; every channel sent: the sync gap
+        LD      r0, r7, OPACT
+        ADD     r0, r0, r2
+        LD      r0, r0, 0               ; the channel's value
+        MOV16   r4, CHMIN
+        CMP     r0, r4
+        BC      c1
+        MOV     r0, r4
+c1:     MOV16   r4, CHMAX
+        CMP     r4, r0
+        BC      c2
+        MOV     r0, r4
+c2:     ADD     r3, r3, r0
+        INC     r2
+        JMP     next
+sync:   TEST    r0, r0                  ; r0 = ACTN
+        LDI     r0, IDLEW
+        BZ      sok                     ; no channels: look again in IDLEW
+        LD      r0, r7, OFRAME
+        MOV16   r4, SYNCMIN
+        SUB     r0, r0, r3              ; FRAME less the channels (C: no borrow)
+        BNC     smin
+        CMP     r0, r4
+        BC      sok
+smin:   MOV     r0, r4                  ; never less than SYNCMIN
+sok:    LDI     r2, 0
+        LDI     r3, 0
+        TEST    r5, r5
+        BNZ     next                    ; a load is still arriving
+        TEST    r6, r6
+        BZ      next                    ; nothing staged
+        LD      r4, r7, OSTGN           ; the frame boundary: the staged set
+        ST      r4, r7, OACTN           ; becomes the active one
+        LD      r4, r7, OPACT
+        XORI    r4, FLIP
+        ST      r4, r7, OPACT
+        LDI     r6, 0
+next:   ADD     r1, r1, r0              ; S: the next separator's start
+        LD      r4, r7, OPOL
+        LD      r0, r7, OACTN
+        TEST    r0, r0
+        BZ      quiet                   ; no channels: stay idle
+        XORI    r4, 1                   ; the active level
+quiet:  MOV     r7, r1
+; Make the edge at r7 at level r4, on the exact tick.
+edge:   SUBI    r7, K
+        TEST    r4, r4
+        WAITD   LEAD
+        BZ      e0
+        SETP    PPM, 1, D               ; staged now, after LEAD's deadline
+        JMP     e1
+e0:     SETP    PPM, 0, D
+e1:     CSRW    TD, r7
+        WAITD   K                       ; the latch fires as NOW reaches TD
+        JMP     top

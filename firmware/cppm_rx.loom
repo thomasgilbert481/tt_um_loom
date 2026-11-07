@@ -1,0 +1,186 @@
+; cppm_rx.loom
+; A CPPM (combined PPM, "PPM sum") decoder on IN0: measures the time
+; between rising edges, finds the sync gap that ends a frame, and reports
+; every channel and a status word per frame to the host through OUTQ[1].
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; CPPM. It uses the edge wait with a timeout (WAITE ... T against a TD
+; written at run time, SEMANTICS 6.4 and 6.6, built for PS/2 and the I2C
+; clock-stretch timeouts) and NOW read as a timestamp (CSRR NOW), as
+; quad_decoder.loom and ir_sirc_rx.loom do, and the FIFOs. No hardware
+; knows the frame: the interval arithmetic, the sync threshold, the range
+; check, the channel count and the loss of signal are firmware. A
+; timer's input capture (what Betaflight uses) timestamps an edge to its
+; timer clock; here an edge is timestamped to the tick, late by a constant
+; plus 0 .. 3 clocks of the slot grid (SEMANTICS 2), so a channel reads
+; within one tick (1 us) of the wire, as a 1 MHz capture timer does.
+;
+; Wire format and limits (secondary sources, read 2026-11-07; there is no
+; formal standard; see cppm_tx.loom for the full list):
+;   [BF]  Betaflight src/main/drivers/rx/rx_pwm.c: rising-edge capture,
+;         channel = time between rising edges, valid 750 .. 2250 us
+;         (PPM_IN_MIN/MAX_CHANNEL_PULSE_US), sync 2700 us or more
+;         (PPM_IN_MIN_SYNC_PULSE_US).
+;   [AP]  ArduPilot AP_RCProtocol_PPMSum.cpp: sync 2700 us or more, valid
+;         over 700 and under 2300 us.
+; This program takes Betaflight's window, inclusive at both ends (whether
+; Betaflight's own comparison is inclusive was not checked; at one tick of
+; resolution it does not matter), and the 2700 us both give.
+; Polarity: both are decoded with no setting. The separators all have one
+; width, so the intervals between their rising edges equal those between
+; their falling edges: on a line idle low (separators high) a rising edge
+; starts each separator, on a line idle high it ends each one.
+;
+; Host interface (thread 1):
+;   INQ[1], two words before or after RUN: N, the channel count expected
+;   (1 .. 8; 0: any count from 1 to 8 is accepted), and LOSS, the ticks
+;   with no rising edge after which the signal is lost (at most 32000,
+;   TD's 2^15 half-window; it must exceed the longest sync gap).
+;   OUTQ[1], one word per channel and one status word per frame:
+;     channel  bit 15 = 0; bits 14:12 the channel's index (0 = channel 1);
+;              bits 11:0 its width in ticks (under 2700: longer is a sync).
+;     status   bit 15 = 1; bit 14: words were dropped since the last
+;              status (OUTQ was full); bits 13:12 the kind: 0 a frame (the
+;              sync gap after it was seen), 1 a frame with the wrong
+;              channel count, 2 no sync (a ninth channel: the words since
+;              the last status are void), 3 the signal was lost; bits 11:8
+;              the channels in it; bits 7:0 a mask, bit i set when channel
+;              i + 1 was outside 750 .. 2250.
+;   A frame is good when its status is 0x8N00 (kind 0, mask 0). Nothing is
+;   reported until the first sync gap (the frame in progress at start is
+;   partial), nor after kinds 2 and 3 until the next sync gap.
+;   A push never waits: a word that finds OUTQ full is dropped and the
+;   next status says so (bit 14). Each channel is at least 750 us, so a
+;   host that reads OUTQ once a millisecond loses nothing.
+;
+; Tick: one tick is 1 us, set by the host before RUN:
+;   50 MHz: TICK_INT 50, TICK_FRAC 0 (exact).
+; The RTL tests use TICK_INT 4, which scales every time by 4/50, as for
+; cppm_tx.loom. The longest path from an edge to the next WAITE is 42
+; slots (a frame's end: status and push, counted by hand from the code),
+; 168 clocks, so a rising edge less than that after another is not seen
+; (a glitch that close is lost; a later one is counted and spoils the
+; frame). At 50 MHz that is 3.4 us; at the RTL's 4-clock tick, 42 ticks.
+; No deadline pair: the only deadlines are timeouts (no WAITD).
+;
+; Pin: RX = IN0. Code: thread 1 (0x080 ..), so it runs beside
+; cppm_tx.loom on thread 0; words as test_fw_cppm.py pins them.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0
+        .equ    SYNC = 2700             ; [BF], [AP]
+        .equ    CHMIN = 750             ; [BF]
+        .equ    CHMAX = 2250            ; [BF]
+        .equ    MAXCH = 8
+        .equ    LOSSMAX = 32000
+        .equ    DROP = 0x4000           ; status bit 14
+        .equ    LOSSW = 0x0FF           ; data memory: LOSS (the last word of thread 1's quarter)
+
+; Registers: r0 scratch and the word to push; r1 the last rising edge's
+; NOW; r2 channels in this frame; r3 the out-of-range mask; r4 N; r5 1
+; while hunting for a sync gap, else 0; r6 DROP once a word was dropped;
+; r7 the interval, and scratch. LOSS is kept at LOSSW (0x0FF).
+        .thread 1
+start:  POP     r4                      ; N
+        ANDI    r4, 15
+        POP     r7                      ; LOSS
+        MOV16   r0, LOSSMAX
+        CMP     r0, r7
+        BC      lok
+        MOV     r7, r0
+lok:    MOV16   r0, LOSSW
+        ST      r7, r0, 0               ; kept in data memory
+        LDI     r2, 0
+        LDI     r3, 0
+        LDI     r5, 1                   ; hunting
+        LDI     r6, 0
+        CSRR    r1, NOW
+
+; Wait for a rising edge, at most LOSS ticks after the last one.
+wait:   MOV16   r7, LOSSW
+        LD      r7, r7, 0
+        ADD     r7, r1, r7
+        CSRW    TD, r7
+        WAITE   RX, RISE, T
+        BT      lost
+        CSRR    r0, NOW                 ; the edge's timestamp
+        SUB     r7, r0, r1              ; the interval
+        MOV     r1, r0
+        MOV16   r0, SYNC
+        CMP     r7, r0
+        BC      sync                    ; 2700 or more: the sync gap
+        TEST    r5, r5
+        BNZ     wait                    ; hunting: not a channel yet
+        CMPI    r2, MAXCH
+        BC      nosync                  ; a ninth channel: no sync gap
+        MOV16   r0, CHMIN
+        CMP     r7, r0
+        BNC     range                   ; under 750
+        MOV16   r0, CHMAX
+        CMP     r0, r7
+        BC      inr                     ; 2250 or under
+range:  LDI     r0, 1
+        SHL     r0, r0, r2
+        OR      r3, r3, r0              ; flag channel r2
+inr:    MOV     r0, r2
+        SHLI    r0, 12
+        OR      r0, r0, r7              ; index and width
+        INC     r2
+        CALL    push
+        JMP     wait
+
+; A sync gap: the end of a frame, or, while hunting, the start of one.
+sync:   TEST    r5, r5
+        BNZ     found
+        LDI     r0, 0                   ; kind 0
+        TEST    r4, r4
+        BZ      k0                      ; N = 0: any count
+        CMP     r2, r4
+        BZ      k0
+        LDI     r0, 1                   ; the wrong channel count
+k0:     CALL    status
+        JMP     wait
+found:  LDI     r5, 0
+        LDI     r2, 0
+        LDI     r3, 0
+        JMP     wait
+
+nosync: LDI     r0, 2
+        CALL    status
+        LDI     r5, 1                   ; hunt for the next sync gap
+        JMP     wait
+
+; No edge for LOSS ticks: report once, then wait for any edge, untimed.
+lost:   LDI     r0, 3
+        CALL    status
+        LDI     r5, 1
+        WAITE   RX, RISE
+        CSRR    r1, NOW
+        JMP     wait
+
+; Push the status of kind r0 (0 .. 3) and start a new frame.
+status: ORI     r0, 8                   ; bit 15, after the shifts
+        SHLI    r0, 4
+        OR      r0, r0, r2              ; the count
+        SHLI    r0, 8
+        OR      r0, r0, r3              ; the mask
+        OR      r0, r0, r6              ; DROP
+        LDI     r6, 0
+        LDI     r2, 0
+        LDI     r3, 0
+        CALL    push
+        RET
+
+; Push r0 if OUTQ has room, else drop it and set DROP. SETD 0 makes TD
+; reached, so the WAITB is a test (TD is rewritten before the next wait).
+push:   SETD    0
+        WAITB   OUTQ_NF, T
+        BT      pfull
+        PUSH    r0                      ; cannot stall: OUTQ had room, only this thread pushes
+        RET
+pfull:  MOV16   r6, DROP
+        RET
+
+        .org    LOSSW
+        .word   LOSSMAX                 ; LOSS, written at start
