@@ -712,8 +712,12 @@ else:
     else:                  advance                        (6.12.5)
     w is ETX_CFG:          REF <= 1, nothing stored
     w is a data write:     accept or refuse               (below)
-w is ETX_STAT:  clear the sticky bits written as 1; a sticky bit set at
-                the same edge stays set (set wins over clear)
+w is ETX_STAT:  clear the sticky bits written as 1; a sticky bit whose
+                set condition occurs at the same edge (FDONE at a
+                release, UNDER at an underrun) is 1 after that edge,
+                whatever it held before (set wins over clear). REF is set
+                only by an ETX write and one ETX write lands per edge, so
+                it never meets a clear
 ```
 
 A **data write** is a write of `ETX_DATA`, `ETX_LAST` or `ETX_LAST1`; its
@@ -825,7 +829,8 @@ With the start at edge `s` (so `s = x + 2` for the `CSRW` whose X cycle is
   re-registered: the value on the pad in cycle `k` is the function above
   of the state in cycle `k`. The frame's first half bit is therefore on the
   pad in cycle `s` (`TD+ = 0`, `TD- = 1`), and `PIN_OUT[9:8]` is back on
-  the pad in the cycle after the release edge. The pad still changes only
+  the pad in the cycle that the release edge begins (`BUSY` is 0 in it).
+  "The cycle after the release" below means that cycle. The pad still changes only
   at an edge. The mux is the last thing in `loom_pins` before the port.
 - **`PIN_OUT` is untouched.** The block never writes it, and pin writes to
   indices 16 and 17 (by `SETP`, staged `SETP ... D`, `OUT`, `SHO` with or
