@@ -1,0 +1,566 @@
+; mstp_master.loom
+;
+; A BACnet MS/TP master node (ANSI/ASHRAE 135 clause 9: master-slave/
+; token-passing on an RS-485 half-duplex bus, the building-automation
+; field bus), as one program that two threads run at once, each with its
+; own pins and its own data: two masters on one chip. A master takes part
+; in the token ring of the addresses 0 .. Nmax_master: it finds its
+; successor by Poll For Master, answers other masters' polls, sends one
+; host frame (BACnet Data Not Expecting Reply) each time it holds the
+; token, passes the token on, polls one more address every Npoll tokens
+; (to find a master that has come up), retries a pass once and looks for
+; a new successor when the old one stays silent, and makes a new token
+; when the bus has been silent for Tno_token + TS * Tslot (lost-token
+; recovery). It gives the host the data frames addressed to it or
+; broadcast. RX comes from the RO output of an RS-485 transceiver, TX goes
+; to its DI input and DE to its driver enable.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the M2 core (pins,
+; deadlines, the FIFOs), LD/ST of slice B (SEMANTICS 6.11), built for the
+; I2C EEPROM's array and USB's descriptors, here holding each master's
+; settings, ring state, received header and frame to send, and the bit
+; engine in manual mode (SEMANTICS 6.9) with its CRC unit, built for USB's
+; CRC5/CRC16 and CAN's CRC15: both MS/TP CRCs (the header CRC-8,
+; x^8 + x^7 + 1, and the data CRC-16, x^16 + x^12 + x^5 + 1, both
+; reflected) run on it, one after the other in each frame, by feeding the
+; bits LSB first into its MSB-first register and bit-reversing the result
+; (REV), which is the same arithmetic. The code names no pin: TX and DE
+; are written by OUT through the thread's OUTGRP, data bits leave by SHO
+; and enter by SHI through its BE_PINS, and the start bit is found by IN
+; through its INGRP, so the one copy of the code serves both threads (the
+; 512-word memory has room for one copy and two masters' data, not for
+; two copies). No hardware knows MS/TP or a UART: the characters, the
+; start-bit search, the preamble hunt, the frame format, both CRCs' byte
+; order and complement, the silence timers, the turnaround and the master
+; node state machine are all firmware.
+;
+; Sources: clause 9 is not free. The frame format, both CRCs and the
+; master state machine follow the open-source BACnet stack (S. Karg,
+; bacnet-stack, src/bacnet/datalink/mstp.c, mstp.h, mstpdef.h, crc.c),
+; a secondary source; tools/protomodels/mstp.py is the model and cites them.
+;
+; Pins: master 0 (thread 0) RX = IN0, TX = OUT0, DE = OUT1; master 1
+; (thread 2) RX = IN2, TX = OUT2, DE = OUT3. TX idles high; DE = 1 drives
+; the bus. All six move with the assembler's --pin, TX to an OUT pin and
+; DE to the pin after it (OUT writes the two together). The bench or the
+; board wires the two transceivers to one bus.
+;
+; Settings, words of data memory the host loads with the image, before RUN
+; (master 0 at CFG0, master 1 at CFG2; ticks are eighths of a bit):
+;     +0   TS, this station's address, 0 .. Nmax_master
+;     +1   Nmax_master, 1 .. 127
+;     +2   Tusage_timeout in ticks, 1 .. 65535 (20 .. 35 ms; at 9600 baud
+;          20 ms is 1536 ticks): how long a pass or a poll waits for the
+;          other station to start a frame
+;     +3   TL, +4 NL: the silence after which this station makes a new
+;          token, Tno_token + TS * Tslot (500 ms + TS * 10 ms), as NL
+;          periods of TL ticks (1 .. 65535 each)
+;     +5   Tframe_abort in ticks (60 bit times = 480 ticks): the longest
+;          silence between two octets of a frame
+;     +6   Npoll (50): tokens between two maintenance polls
+; A frame's first octet is waited for from when the master starts to
+; listen (just after the frame before, sent or received; IDLE starts again
+; after every frame it sees); later octets from the middle of the stop bit
+; of the octet before. Rate: eight ticks a bit, TICK_INT and
+; TICK_FRAC set by the host before RUN; the pairs are proved for ticks of
+; 24 clocks or more (192 clocks a bit, 260 kbaud at 50 MHz; MS/TP runs at
+; 9600 .. 115200 baud, 54 .. 651 clocks a tick).
+;
+; Host frame (INQ), sent the next time the token is held:
+;     word 1     bits 7:0 the destination (255 broadcast), bits 15:8 n,
+;                1 .. 29 bytes of data
+;     n words    the data, one byte per word in bits 7:0
+; It goes out as a BACnet Data Not Expecting Reply frame (type 6). The
+; whole frame must reach INQ promptly once the token is held: the node
+; waits for it while the bus stays silent.
+; Report (OUTQ):
+;     0x40dd     the host frame went out, to station dd
+;     0x00bb     a data byte of a frame received with DA = TS or 255
+;     status     after those bytes: bit 15 set, bit 14 the data CRC is
+;                bad, bits 13:8 the frame type, bits 7:0 the source
+; A byte or status that finds OUTQ full is dropped: the host keeps OUTQ
+; drained.
+;
+; Not done (weaker than a full clause 9 node): no Data Expecting Reply is
+; sent and none is answered (no ANSWER_DATA_REQUEST, no Reply Postponed; a
+; requester times out), Test_Request is not answered, Nmax_info_frames is
+; 1, frames over 29 data bytes are not sent (any length is received), the
+; stop bits received are not checked (the CRCs are), and the start bit is
+; found on the tick grid, so a received bit is sampled 0 to 1 tick (an
+; eighth of a bit) before its middle. A frame that follows the one before
+; with little idle is received only if the master is back at rxframe, and
+; sees the line at mark, before its first start bit; the tests send one
+; bit of idle at 192 clocks a bit (a model master's data frame, then its
+; Token); no idle at all is not tested. A frame after a turnaround is
+; always seen.
+;
+; Memory: the code is in thread 0's section, 0x000 .. 0x0FF and from
+; 0x110 on; thread 2's entry, 0x100 .. 0x10F, sets its pins and jumps into
+; it. Threads 1 and 3 must not be started. Data: master 0 at 0x1A0, master
+; 1 at 0x1D0, 48 words each (the settings, the ring state, the received
+; header, the frame to send); the image need not load more than the
+; settings.
+;
+; Readings taken on the open spec questions (2026-11-07): ASHRAE 135
+; clause 9 was not read; timing and CRCs from an open-source BACnet
+; stack (secondary). The CRC polynomial names are from memory; a test
+; shows the stack's code equals the reflected CRCs of those polynomials.
+;   Any octet that starts within Tusage_timeout counts as the successor
+;   using the token (the stack asks for more than 4 octets).
+;   A sole master polls the ring again after every token use.
+;   A partial master: no Data Expecting Reply, no Test_Request answer,
+;   one frame per token, host frames of 1 to 29 bytes, stop bits not
+;   checked (the CRCs are).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0, TX = OUT0, DE = OUT1
+        .pins   RX2 = IN2, TX2 = OUT2, DE2 = OUT3
+        .tick   24                      ; the shortest tick the pairs are proved for
+        .equ    OVS = 8                 ; ticks per bit
+        .equ    CFG0 = 0x1A0            ; master 0's data; r1 holds it
+        .equ    CFG2 = 0x1D0            ; master 1's data
+        .equ    TS = 0                  ; the settings
+        .equ    NMAX = 1
+        .equ    TUSE = 2
+        .equ    TL = 3
+        .equ    NL = 4
+        .equ    TABRT = 5
+        .equ    NPOLL = 6
+        .equ    NS = 7                  ; the ring state
+        .equ    PS = 8
+        .equ    TC = 9
+        .equ    RETRY = 10
+        .equ    CNTL = 11               ; NL periods left
+        .equ    STATE = 12              ; where rxframe returns
+        .equ    HDR = 13                ; type, DA, SA, length (2), CRC
+        .equ    BUF = 19                ; the frame to send, 29 bytes
+        .equ    T_TOKEN = 0             ; frame types
+        .equ    T_PFM = 1
+        .equ    T_RPFM = 2
+        .equ    T_DNER = 6
+
+; Registers: r0 an octet or scratch, r1 the master's data (CFG0 or CFG2),
+; r2 a frame type or a pointer, r3 a station address or a count, r4 a data
+; length, r5 a timeout in ticks (rxbyte's argument), r6 scratch, r7 the
+; .csr scratch.
+
+; Each thread's entry: its pins, then the one copy of the code. OUTGRP is
+; TX and DE (bit 0 TX, bit 1 DE), INGRP is RX alone.
+        .thread 2
+        .csr    OUTGRP, (2 << 5) | pin(TX2)
+        .csr    INGRP, (1 << 5) | pin(RX2)
+        .csr    BE_PINS, (pin(RX2) << 5) | pin(TX2)
+        MOV16   r1, CFG2
+        JMP     start
+
+        .thread 0
+        .csr    OUTGRP, (2 << 5) | pin(TX)
+        .csr    INGRP, (1 << 5) | pin(RX)
+        .csr    BE_PINS, (pin(RX) << 5) | pin(TX)
+        MOV16   r1, CFG0
+start:  LDI     r0, 1
+        OUT     r0                      ; TX mark, DE off: listen
+        .csr    BE_CFG, 0x200           ; NRZ, LSB first, CRC_EN
+        LD      r0, r1, TS              ; INITIALIZE: NS = PS = TS,
+        ST      r0, r1, NS              ; TokenCount = Npoll
+        ST      r0, r1, PS
+        LD      r0, r1, NPOLL
+        ST      r0, r1, TC
+        SETD    0                       ; the silence starts now
+
+; ------------------------------------------------------------------- IDLE
+; Wait for a frame. A silence of Tno_token + TS * Tslot is NO_TOKEN run
+; out: every station waits Tno_token, then Tslot more for each address
+; below its own, so the lowest address that is alive makes the token.
+idle:   LD      r0, r1, NL
+        ST      r0, r1, CNTL
+idlew:  LD      r5, r1, TL
+        LDI     r0, 1                   ; rxframe returns to idlec
+        ST      r0, r1, STATE
+        JMP     rxframe
+idlec:  BNT     seen
+        LD      r0, r1, CNTL
+        DEC     r0
+        ST      r0, r1, CNTL
+        BNZ     idlew
+        JMP     lost
+seen:   BNZ     idle                    ; an invalid frame
+seenv:  LD      r2, r1, HDR + 1         ; a valid one: DA
+        LD      r3, r1, TS
+        CMP     r2, r3
+        BNZ     idle                    ; not for us (data for 255 is reported)
+        LD      r0, r1, HDR             ; the type
+        TEST    r0, r0
+        BZ      usetok                  ; Token: USE_TOKEN
+        CMPI    r0, T_PFM
+        BNZ     idle                    ; data frames went to the host already
+        LDI     r2, T_RPFM              ; Poll For Master: Reply To Poll For Master
+        LD      r3, r1, HDR + 2
+        LDI     r4, 0
+        CALL    txframe
+        JMP     idle
+
+; PASS_TOKEN's successor silent twice: the same from NS + 1 (ptfail).
+lost:   LD      r0, r1, TS
+        ST      r0, r1, PS
+lostps: LD      r0, r1, TS
+        ST      r0, r1, NS
+        LDI     r0, 0
+        ST      r0, r1, TC
+        JMP     pollps
+pollts: LD      r0, r1, TS              ; PS = TS, poll from TS + 1
+        ST      r0, r1, PS
+pollps:
+        LD      r3, r1, PS              ; r3 = (PS + 1) mod (Nmax_master + 1)
+        INC     r3
+        LD      r0, r1, NMAX
+        CMP     r0, r3
+        BC      np1
+        LDI     r3, 0
+np1:
+poll:   ST      r3, r1, PS              ; Poll For Master to r3 = PS
+        LDI     r2, T_PFM
+        LDI     r4, 0
+        CALL    txframe
+
+; -------------------------------------------------------- POLL_FOR_MASTER
+pfm:    LD      r5, r1, TUSE
+        LDI     r0, 2                   ; rxframe returns to pfmc
+        ST      r0, r1, STATE
+        JMP     rxframe
+pfmc:   BT      pfmto
+        BNZ     pfmto                   ; an invalid frame counts as no reply
+        LD      r0, r1, HDR
+        CMPI    r0, T_RPFM
+        BNZ     seenv                   ; another valid frame: as IDLE would
+        LD      r2, r1, HDR + 1
+        LD      r3, r1, TS
+        CMP     r2, r3
+        BNZ     idle
+        LD      r0, r1, HDR + 2         ; a reply for us: NS = its source,
+        ST      r0, r1, NS              ; PS = TS, TokenCount = 0, pass
+        LDI     r0, 0
+        ST      r0, r1, TC
+        ST      r3, r1, PS
+        JMP     passtk
+pfmto:  LD      r2, r1, NS              ; no reply
+        LD      r3, r1, TS
+        CMP     r2, r3
+        BNZ     passtk                  ; a successor is known: pass to it
+        LD      r3, r1, PS              ; r3 = (PS + 1) mod (Nmax_master + 1)
+        INC     r3
+        LD      r0, r1, NMAX
+        CMP     r0, r3
+        BC      np2
+        LDI     r3, 0
+np2:
+        CMP     r3, r2
+        BNZ     poll                    ; poll the next address
+        ; Every address polled and none answered: the sole master. It
+        ; uses the token, then polls the ring again.
+
+; -------------------------------------------------------------- USE_TOKEN
+usetok: SETD    0                       ; TD = NOW: the WAITB is a test
+        WAITB   INQ_NE, T
+        BT      donetk
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, and only this thread pops its INQ"
+        POP     r4                      ; DA | n << 8
+        MOV     r3, r4
+        SHLI    r3, 8
+        SHRI    r3, 8
+        SHRI    r4, 8
+        MOV     r2, r1
+        ADDI    r2, BUF
+        MOV     r5, r4
+ucopy:  POP     r0                      ; the host sends the rest promptly
+        ST      r0, r2, 0
+        INC     r2
+        DJNZ    r5, ucopy
+        SETD    0
+        LDI     r2, T_DNER
+        CALL    txframe
+        LDIH    r3, 0x40
+        WAITB   OUTQ_NF, T              ; TD has passed: a test
+        BT      donetk
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r3                      ; 0x40dd: sent
+
+; --------------------------------------------------------- DONE_WITH_TOKEN
+; Nmax_info_frames is 1, so the token is done with after one frame. With
+; no successor known, poll from TS + 1. Otherwise pass the token, but
+; every Npoll tokens poll one address between TS and NS first (the
+; maintenance poll that finds a master that has come up since).
+donetk: LD      r2, r1, NS
+        LD      r3, r1, TS
+        CMP     r2, r3
+        BZ      pollts
+        LD      r3, r1, TC
+        INC     r3
+        ST      r3, r1, TC
+        LD      r0, r1, NPOLL
+        CMP     r3, r0                  ; C: TokenCount + 1 >= Npoll
+        BNC     passtk
+        LD      r3, r1, PS              ; r3 = (PS + 1) mod (Nmax_master + 1)
+        INC     r3
+        LD      r0, r1, NMAX
+        CMP     r0, r3
+        BC      np3
+        LDI     r3, 0
+np3:
+        CMP     r3, r2
+        BNZ     poll                    ; PS + 1 is not NS: poll it
+        LD      r0, r1, TS              ; the poll cycle is complete
+        ST      r0, r1, PS
+        LDI     r0, 1
+        ST      r0, r1, TC
+
+; ------------------------------------------------------------- PASS_TOKEN
+; Any frame that starts within Tusage_timeout shows the token was taken;
+; it is received and handled as in IDLE. Silence: send it once more, then
+; give the successor up and poll from NS + 1.
+passtk: LDI     r0, 0
+        ST      r0, r1, RETRY
+ptx:    LDI     r2, T_TOKEN
+        LD      r3, r1, NS
+        LDI     r4, 0
+        CALL    txframe
+        LD      r5, r1, TUSE
+        LDI     r0, 3                   ; rxframe returns to ptxc
+        ST      r0, r1, STATE
+        JMP     rxframe
+ptxc:   BNT     seen
+        LD      r0, r1, RETRY
+        TEST    r0, r0
+        BNZ     ptfail
+        INC     r0
+        ST      r0, r1, RETRY
+        JMP     ptx
+ptfail: LD      r0, r1, NS
+        ST      r0, r1, PS
+        JMP     lostps
+
+
+; ---------------------------------------------------------------- rxframe
+; Receive one frame (the Receive Frame state machine), entered by JMP with
+; STATE set (see rfret). The first octet must
+; start within r5 ticks of TD; later octets within Tframe_abort of the one
+; before; the first one, within r5 ticks of the entry (the line is first
+; seen at mark, so the master may come here late, inside the stop bit
+; before). Returns T = 1: silence, nothing came. Else T = 0 and Z = 1 for a
+; valid frame (its header at HDR; the data of a frame for TS or 255 went to
+; OUTQ, then its status), Z = 0 for an invalid one (a broken preamble, a
+; bad header CRC, a bad data CRC or an octet missing).
+rxframe: MOV    r6, r5
+        SETD    1                       ; re-anchor: the silence counts from here
+rfm:    WAITD   1                       ; the line at mark first (the stop bit of
+        IN      r0                      ; the frame before, or idle), sampled
+        TEST    r0, r0                  ; once a tick
+        BNZ     rfst
+        DJNZ    r6, rfm
+        LDI     r0, 4
+        CSRW    FLAGS, r0               ; T = 1: silence
+        JMP     rfret
+rfst:   CALL    rbs                     ; the first octet's start bit, in time r6
+        JMP     rfgot
+rfhunt: CALL    rxbyte
+rfgot:  BT      rfret                   ; silence
+        LDI     r6, 0x55
+        CMP     r0, r6
+        BNZ     rfhunt                  ; octets before a preamble are eaten
+        LD      r5, r1, TABRT
+        CALL    rxbyte
+        BT      rfbad
+        LDI     r6, 0xFF
+        CMP     r0, r6
+        BNZ     rfbad
+        LDI     r7, 0                   ; the CRC unit for the header CRC-8:
+        LDIH    r7, 0x81                ; x^8 + x^7 + 1 left-aligned, preset
+        CSRW    CRC_POLY, r7            ; 0xFF (a write of CRC presets it)
+        LDIH    r7, 0xFF
+        CSRW    CRC, r7
+        MOV     r2, r1
+        ADDI    r2, HDR
+        LDI     r3, 6
+rfh:    CALL    rxbyte                  ; type, DA, SA, length (MSB first), CRC
+        BT      rfbad
+        ST      r0, r2, 0
+        INC     r2
+        DJNZ    r3, rfh
+        STCRC   r0
+        MOV16   r6, 0xAA00              ; rev8(0x55): the CRC-8 residue
+        CMP     r0, r6
+        BNZ     rfbad                   ; a bad header CRC: ignored
+        LD      r4, r1, HDR + 3
+        SWAP    r4, r4
+        LD      r0, r1, HDR + 4
+        OR      r4, r4, r0
+        BZ      rfret                   ; no data: valid
+        MOV16   r7, 0x1021              ; the CRC unit for the data CRC-16:
+        CSRW    CRC_POLY, r7            ; x^16 + x^12 + x^5 + 1, preset 0xFFFF
+        LDI     r7, 0
+        NOT     r7, r7
+        CSRW    CRC, r7
+        LD      r0, r1, HDR + 1         ; r3 = 0 (from DJNZ): report it
+        LD      r6, r1, TS
+        CMP     r0, r6
+        BZ      rfd
+        LDI     r6, 0xFF
+        CMP     r0, r6
+        BZ      rfd
+        LDI     r3, 1                   ; not for us: only checked
+rfd:    ADDI    r4, 2                   ; the data, then its CRC (LSB first)
+rfdb:   CALL    rxbyte
+        BT      rfbad
+        TEST    r3, r3
+        BNZ     rfnext
+        CMPI    r4, 3
+        BNC     rfnext                  ; a CRC octet: not reported
+        WAITB   OUTQ_NF, T              ; TD has passed: a test
+        BT      rfnext
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r0
+rfnext: DJNZ    r4, rfdb
+        STCRC   r6
+        MOV16   r2, 0x1D0F              ; rev16(0xF0B8): the CRC-16 residue
+        LDI     r0, 2
+        CMP     r6, r2
+        BZ      rfrep
+        LDI     r0, 3                   ; 3: bit 14, the data CRC is bad
+rfrep:  TEST    r3, r3
+        BNZ     rfchk
+        SHLI    r0, 6
+        LD      r6, r1, HDR
+        ANDI    r6, 0x3F
+        OR      r0, r0, r6
+        SWAP    r0, r0
+        LD      r6, r1, HDR + 2
+        OR      r0, r0, r6
+        WAITB   OUTQ_NF, T
+        BT      rfchk
+        .bounded "the WAITB OUTQ_NF, T just before completed by its condition, so OUTQ has room"
+        PUSH    r0                      ; the status
+rfchk:  STCRC   r6
+        CMP     r6, r2                  ; Z: the data CRC is good
+        JMP     rfret
+
+; Past thread 2's entry (0x100 .. 0x10F).
+        .org    0x110
+rfbad:  LDI     r0, 0
+        CSRW    FLAGS, r0               ; T = 0, Z = 0: invalid
+; Back to the state that asked, by STATE (1 IDLE, 2 POLL_FOR_MASTER, 3
+; PASS_TOKEN). Not a CALL: the deadline checker returns every RET to every
+; CALL, and a RET here would close a loop with no deadline on it. LD and
+; DJNZ leave T and Z alone.
+rfret:  LD      r0, r1, STATE
+        DJNZ    r0, rfr2
+        JMP     idlec
+rfr2:   DJNZ    r0, rfr3
+        JMP     pfmc
+rfr3:   JMP     ptxc
+
+; ----------------------------------------------------------------- rxbyte
+; One 8N1 octet, LSB first, through SHI (so into the CRC). TD is the
+; middle of the last data bit of the octet before (or the end of the last
+; stop bit sent); the start bit must come within r5 ticks of the middle of
+; that octet's stop bit. The search samples RX through IN once a tick
+; (eight times a bit, as a UART does). Returns T = 1 if it did not come;
+; else T = 0, the octet in r0 and TD at the middle of its last data bit.
+rxbyte: WAITD   OVS                     ; the middle of the stop bit
+        MOV     r6, r5
+rbs:    WAITD   1
+        IN      r0
+        TEST    r0, r0
+        BZ      rbgo                    ; low: a start bit
+        DJNZ    r6, rbs
+        LDI     r0, 4
+        CSRW    FLAGS, r0               ; T = 1: silence
+        RET
+rbgo:   WAITD   3                       ; 3 to 4 ticks after its edge
+        LDI     r0, 8
+        CSRW    CNT, r0
+rbit:   WAITD   OVS
+        SHI
+        BNZ     rbit
+        LDI     r0, 0
+        CSRW    FLAGS, r0               ; T = 0
+        STSR    r0
+        SHRI    r0, 8
+        RET
+
+; ---------------------------------------------------------------- txframe
+; Send a frame of type r2 to station r3 with r4 data octets from CFG + BUF
+; (r4 = 0: none, and no data CRC). The driver goes on Tturnaround (40 bit
+; times, and one more to spare) after the end of the last stop bit
+; received (TD, the middle of its last data bit, + 1.5 bits), then one bit
+; ahead of the preamble, and off at the end of the last stop bit.
+txframe: WAITD  180                     ; TD is the middle of a last data
+        WAITD   160                     ; bit, as sampled (up to a tick early):
+                                        ; 1.5 + 40 bit times and a bit to spare
+        LDI     r0, 3
+        OUT     r0                      ; DE on, TX mark
+        LDI     r0, 0x55
+        CALL    txbyte
+        LDI     r0, 0xFF
+        CALL    txbyte
+        LDI     r7, 0                   ; the CRC unit for the header CRC-8:
+        LDIH    r7, 0x81                ; x^8 + x^7 + 1 left-aligned, preset
+        CSRW    CRC_POLY, r7            ; 0xFF (a write of CRC presets it)
+        LDIH    r7, 0xFF
+        CSRW    CRC, r7
+        MOV     r0, r2
+        CALL    txbyte                  ; type
+        MOV     r0, r3
+        CALL    txbyte                  ; DA
+        LD      r0, r1, TS
+        CALL    txbyte                  ; SA
+        LDI     r0, 0
+        CALL    txbyte                  ; length, MSB first
+        MOV     r0, r4
+        CALL    txbyte
+        STCRC   r0
+        REV     r0, r0
+        NOT     r0, r0                  ; the header CRC, complemented
+        CALL    txbyte
+        TEST    r4, r4
+        BZ      txend
+        MOV16   r7, 0x1021              ; the CRC unit for the data CRC-16:
+        CSRW    CRC_POLY, r7            ; x^16 + x^12 + x^5 + 1, preset 0xFFFF
+        LDI     r7, 0
+        NOT     r7, r7
+        CSRW    CRC, r7
+        MOV     r2, r1
+        ADDI    r2, BUF
+txd:    LD      r0, r2, 0
+        INC     r2
+        CALL    txbyte
+        DJNZ    r4, txd
+        STCRC   r0
+        REV     r0, r0
+        NOT     r0, r0                  ; the data CRC, complemented,
+        MOV     r2, r0                  ; least significant octet first
+        CALL    txbyte
+        MOV     r0, r2
+        SWAP    r0, r0
+        CALL    txbyte
+txend:  LDI     r0, 1
+        WAITD   OVS                     ; the end of the last stop bit
+        OUT     r0                      ; DE off
+        RET
+
+; txbyte: one 8N1 character of the octet in r0 bits 7:0 (bits 15:8 are
+; never shifted out), its start bit OVS ticks after TD. OUT writes TX and
+; DE (DE stays on), SHO writes TX alone.
+txbyte: LDSR    r0
+        LDI     r0, 8
+        CSRW    CNT, r0
+        LDI     r0, 2
+        WAITD   OVS                     ; the stop bit before it ends
+        OUT     r0                      ; start bit
+tbit:   WAITD   OVS
+        SHO                             ; a data bit, LSB first, into the CRC
+        BNZ     tbit
+        LDI     r0, 3
+        WAITD   OVS
+        OUT     r0                      ; the stop bit
+        RET

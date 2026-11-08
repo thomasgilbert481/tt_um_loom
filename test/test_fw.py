@@ -141,6 +141,7 @@ from tools.tests import test_fw_tlc5940                           # noqa: E402
 from tools.tests import test_fw_feldhell                          # noqa: E402
 from tools.tests import test_fw_sstv                              # noqa: E402
 from tools.tests import test_fw_xy2                               # noqa: E402
+from tools.tests import test_fw_mstp                              # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
@@ -170,7 +171,7 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_endat, test_fw_mdb, test_fw_kline, test_fw_nmea,
            test_fw_mbp, test_fw_magstripe, test_fw_wspr, test_fw_psk31,
            test_fw_unio, test_fw_tlc5940, test_fw_feldhell, test_fw_sstv,
-           test_fw_xy2)
+           test_fw_xy2, test_fw_mstp)
 
 
 def _make(scenario):
