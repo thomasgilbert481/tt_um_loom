@@ -112,6 +112,7 @@ from tools.tests import test_fw_hub75                             # noqa: E402
 from tools.tests import test_fw_vga                               # noqa: E402
 from tools.tests import test_fw_composite                         # noqa: E402
 from tools.tests import test_fw_spdif                             # noqa: E402
+from tools.tests import test_fw_i3c                               # noqa: E402
 from tools.tests import test_fw_iec62056                          # noqa: E402
 from tools.tests import test_fw_lego_pf                           # noqa: E402
 from tools.tests import test_fw_dtmf                              # noqa: E402
@@ -174,7 +175,7 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_endat, test_fw_mdb, test_fw_kline, test_fw_nmea,
            test_fw_mbp, test_fw_magstripe, test_fw_wspr, test_fw_psk31,
            test_fw_unio, test_fw_tlc5940, test_fw_feldhell, test_fw_sstv,
-           test_fw_xy2, test_fw_mstp, test_fw_spdif)
+           test_fw_xy2, test_fw_mstp, test_fw_spdif, test_fw_i3c)
 
 
 def _make(scenario):

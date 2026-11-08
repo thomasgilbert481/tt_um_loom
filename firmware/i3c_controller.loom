@@ -1,0 +1,404 @@
+; i3c_controller.loom
+; MIPI I3C Basic SDR controller: RSTDAA, ENTDAA (dynamic address assignment
+; for every target on the bus), private write and private read. Written on
+; 2026-11-08 after the hardware was complete (D-032), as a protocol Loom was
+; not designed for (D-035). It uses the FIFOs and the per-pin output enable
+; (OEP), which were built for host traffic and for I2C/1-Wire style buses;
+; no hardware knows what a T-bit, an arbitrable header or a provisioned ID
+; is. The firmware does everything I3C adds over I2C: it switches SDA
+; between open drain and push-pull inside a frame, sends and checks the
+; T-bit parity, reads the 64 arbitration bits of ENTDAA and assigns the
+; addresses.
+;
+; Director's decisions (2026-11-08), until the specification is read: the
+; MIPI I3C Basic v1.1.1 PDF is sent only on request, so it was not read. The
+; open-drain timing minimums, the 0x7E broadcast address and the RSTDAA and
+; ENTDAA codes are as the Linux kernel's I3C headers quote them; the
+; push-pull timings, the T-bit rules, the ENTDAA parity and the PID layout
+; are from memory and marked unchecked in tools/protomodels/i3c.py. HDR
+; modes, IBI, Hot-Join, direct CCCs and mixed I2C buses are not done.
+;
+; Pins: SCL = BIDIR0, push-pull (OE 1) all the time: I3C has no clock
+; stretching, only the controller moves SCL. SDA = BIDIR1. OD_MASK is not
+; used: it is one register for all threads (BUGS 14), so flipping a bit of
+; it mid-frame would race the target thread on the same chip. Instead
+;     open drain   PIN_OUT[SDA] = 0, `OEP SDA, 1` pulls low, `OEP SDA, 0`
+;                  releases (the pull-up makes the high);
+;     push-pull    PIN_OE[SDA] = 1, `SETP SDA, b` drives b both ways.
+; OEP and SETP are bit-masked commits (SEMANTICS 6.3), so the mode is per
+; pin and per thread. Push-pull is left by `OEP SDA, 0` first (released,
+; the line stays where the pull-up or the target puts it) and then
+; `SETP SDA, 0`, so the line never glitches. The board needs a pull-up on
+; SDA (I3C's open-drain phases); SCL needs none.
+;
+; Host command format (FIFO space, thread 0): one word per operation.
+;     bits 15:12  opcode: 1 RSTDAA, 2 ENTDAA, 3 private write, 4 private read
+;     bits 6:0    ENTDAA: the first dynamic address to assign (then +1 per
+;                 target); write and read: the target's dynamic address
+;     bits 11:8   write: the number of data bytes (1..15) that follow, one
+;                 per word in bits 7:0; read: the most bytes to read (1..15)
+;     bit 7       write only: send the first byte's T-bit inverted (a test
+;                 of the target's parity check)
+; Results (FIFO space read):
+;     RSTDAA      0x1000, or 0x9000 if no target ACKed the 0x7E header
+;     ENTDAA      per target that won an arbitration: four words, PID[47:32],
+;                 PID[31:16], PID[15:0], BCR << 8 | DCR, then 0x2000 | the
+;                 address assigned (bit 15 set if the target did not ACK
+;                 it, and then the address is offered again); at the end
+;                 0x2E00 | the number of addresses assigned, or 0xAE00 if
+;                 the 0x7E header itself was not ACKed
+;     write       0x3000 | the bytes sent, or 0xB000 if the address was NACKed
+;     read        one word per byte: 0x4000 | byte, with bit 8 = the T-bit the
+;                 target sent (1: it had more); 0xC000 if the address was NACKed
+;
+; Frames on the wire (I3C Basic v1.1.1 section 5.1, from memory, unchecked;
+; the specification is sent only after a request form, see the model
+; tools/protomodels/i3c.py):
+;     RSTDAA      S 7E/W ACK | 0x06 T | P
+;     ENTDAA      S 7E/W ACK | 0x07 T | Sr 7E/R ACK | 64 bits PID BCR DCR |
+;                 DA[6:0] PAR ACK | Sr 7E/R ... until 7E/R is NACKed | P
+;     write       S DA/W ACK | d0 T | d1 T ... | P
+;     read        S DA/R ACK | d0 T | ... the target ends with T = 0, or the
+;                 controller ends a T = 1 by pulling SDA low while SCL is
+;                 high in the T-bit (an Sr), then P
+; Open drain: the address byte and its ACK, the 64 arbitration bits, the
+; assigned address with its parity and its ACK. Push-pull: CCC and data
+; bytes with their T-bits (the controller's on a write; the target's on a
+; read). The controller sends the assigned address open drain although
+; push-pull may be allowed there: open drain is always safe on the wire
+; (QUESTIONS.md item 2). The T-bit of a write is odd parity: the nine bits
+; hold an odd number of ones. PAR gives the XOR of the byte in C.
+; A private transfer starts S DA directly (no 7E header first), which
+; I3C Basic allows; no target here raises an In-Band Interrupt, so the
+; address arbitration that form opens is never contested.
+;
+; Timing of one bit, in ticks (16 a bit): SCL falls at a deadline; SDA is
+; set LOA ticks later (mid-low, so a target letting go of its ACK or of its
+; read data has time to see the fall); SCL rises LOB ticks after that;
+; SDA is sampled HA ticks after the rise and SCL falls HB ticks later.
+; Low 10 ticks, high 6. At 50 MHz with TICK_INT 4 (the shortest tick the
+; schedule is proved for, .tick below) a bit is 64 clocks: SCL 781 kHz,
+; tLOW 800 ns, tHIGH 480 ns. The limit is the bit's own slot count: 16
+; slots, every one of them used on the longest path. Slower rates take a
+; larger TICK_INT; a Loom target (i3c_target.loom) needs TICK_INT 8 or
+; more (390 kHz), its poll loops being the limit.
+; Against the SDR table (section 6.2; the open-drain figures read through
+; the Linux kernel's copy, include/linux/i3c/master.h; the rest from memory,
+; unchecked): tLOW_OD >= 200 ns and tHIGH_INIT_OD >= 200 ns hold with 800
+; and 480 ns; push-pull tLOW, tHIGH >= 24 ns, tCAS >= 38.4 ns, tCBP >=
+; tCAS/2 hold by an order of magnitude; tCAS <= 1 us (activity state 0)
+; holds with HB = 4 ticks, 320 ns. The 41 ns tHIGH ceiling is for a mixed
+; bus (I2C devices with spike filters); this controller is for a pure I3C
+; bus and cannot meet it (one slot is 80 ns).
+; Between operations, and wherever a POP or PUSH waits, SCL simply stays
+; low (a stretched low phase; SDR has no maximum tLOW).
+;
+; Registers: r0 transmit shifter, r1 bit count, r2 scratch, r3 bits sampled
+; from SDA, r4 byte count or the next dynamic address, r5 the forced-bad
+; T-bit flag (ENTDAA: the count of addresses assigned), r6 the byte to
+; send, r7 the command word.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   SCL = BIDIR0, SDA = BIDIR1
+        .tick   4                       ; the shortest tick the schedule is proved for
+        .equ    LOA = 6                 ; SCL fall to the SDA change
+        .equ    LOB = 4                 ; SDA change to the SCL rise
+        .equ    HA = 2                  ; SCL rise to the SDA sample
+        .equ    HB = 4                  ; sample to the SCL fall (and START hold)
+        .equ    BCAST_W = 0xFC          ; 0x7E << 1 | W
+        .equ    BCAST_R = 0xFD          ; 0x7E << 1 | R
+        .equ    RSTDAA = 0x06           ; CCC, broadcast
+        .equ    ENTDAA = 0x07           ; CCC, broadcast
+        .equ    BUF = 16                ; bus free after a STOP (tBUF; from memory, unchecked)
+
+start:  SETP    SDA, 0                  ; open drain, released: the bus idles high
+        OEP     SDA, 0
+        SETP    SCL, 1                  ; SCL push-pull high
+        OEP     SCL, 1
+
+cmd:    POP     r7                      ; next command (blocks while INQ is empty)
+        SETD    1                       ; re-anchor after the unbounded POP
+        MOV     r2, r7
+        SHRI    r2, 12                  ; the opcode
+        CMPI    r2, 1
+        BZ      op_rst
+        CMPI    r2, 2
+        BZ      op_daa
+        CMPI    r2, 3
+        BZ      op_wr
+        CMPI    r2, 4
+        BNZ     cmd                     ; anything else is ignored
+        JMP     op_rd                   ; in thread 2's quarter, out of BZ's reach
+
+; RSTDAA: S 7E/W ACK, 0x06 T, P. Every target forgets its dynamic address.
+op_rst: LDI     r0, BCAST_W
+        SWAP    r0, r0
+        CALL    s_hdr
+        BC      rs_nak
+        LDI     r6, RSTDAA
+        LDI     r5, 0
+        CALL    txb
+        CALL    stop
+        LDI     r3, 0
+        LDIH    r3, 0x10
+        PUSH    r3
+        JMP     cmd
+rs_nak: CALL    stop
+        LDI     r3, 0
+        LDIH    r3, 0x90
+        PUSH    r3
+        JMP     cmd
+
+; ENTDAA: S 7E/W ACK, 0x07 T, then one Sr 7E/R round per target until the
+; header is NACKed. In a round every target still without an address sends
+; PID, BCR, DCR open drain, MSB first; a target that sends a 1 (released)
+; and sees a 0 has lost and stops, so the lowest 64-bit value wins. The
+; controller only listens (it releases SDA for all 64 bits), then assigns.
+op_daa: LDI     r0, BCAST_W
+        SWAP    r0, r0
+        CALL    s_hdr
+        BC      da_nak
+        MOV     r4, r7
+        SHLI    r4, 9
+        SHRI    r4, 9                   ; r4 = the first address to assign
+        LDI     r6, ENTDAA
+        LDI     r5, 0                   ; T-bit good; then the count assigned
+        CALL    txb
+        SETD    0                       ; keeps every RET return path short
+da_lp:  LDI     r0, BCAST_R
+        SWAP    r0, r0
+        LDI     r2, 4                   ; four 16-bit words of arbitration data
+        CALL    sr_hdr
+        BC      da_end                  ; NACK: every target has an address
+da_w:   LDI     r1, 16
+da_b:   CALL    clk_rx                  ; SDA released: the targets drive
+        DJNZ    r1, da_b
+        PUSH    r3                      ; PID[47:32], PID[31:16], PID[15:0], BCR:DCR
+        SETD    0                       ; SCL just stays low while the host reads
+        DJNZ    r2, da_w
+        MOV     r0, r4                  ; the address, then odd parity over it
+        SHLI    r0, 1
+        PAR     r6, r4                  ; C = XOR of the seven address bits
+        BC      da_odd
+        ORI     r0, 1                   ; an even number of ones: PAR = 1
+da_odd: SHLI    r0, 8
+        SETD    0
+        LDI     r1, 8
+da_a:   SHLI    r0, 1                   ; DA[6:0], PAR, open drain
+        CALL    clk_od
+        DJNZ    r1, da_a
+        CALL    clk_rx                  ; the target's ACK
+        SHRI    r3, 1                   ; C = the ACK slot
+        MOV     r3, r4
+        BNC     da_ok
+        LDIH    r3, 0xA0                ; NACKed: offer the address again
+        JMP     da_put
+da_ok:  LDIH    r3, 0x20
+        ADDI    r4, 1
+        ADDI    r5, 1
+da_put: PUSH    r3
+        SETD    0
+        JMP     da_lp
+da_end: CALL    stop
+        MOV     r3, r5
+        LDIH    r3, 0x2E
+        PUSH    r3
+        JMP     cmd
+da_nak: CALL    stop
+        LDI     r3, 0
+        LDIH    r3, 0xAE
+        PUSH    r3
+        JMP     cmd
+
+; Private write: S DA/W ACK, then each byte push-pull with its T-bit, P.
+op_wr:  MOV     r0, r7
+        SHLI    r0, 9                   ; r0[15:8] = DA << 1 | W
+        CALL    s_hdr
+        BC      wr_nak
+        MOV     r4, r7
+        SHRI    r4, 8
+        ANDI    r4, 15                  ; the byte count
+        MOV     r5, r7
+        SHRI    r5, 7
+        ANDI    r5, 1                   ; 1: send the first T-bit inverted
+wr_lp:  POP     r6                      ; SCL stays low while the host catches up
+        CALL    txb
+        LDI     r5, 0
+        DJNZ    r4, wr_lp
+        CALL    stop
+        MOV     r3, r7
+        SHRI    r3, 8
+        ANDI    r3, 15
+        LDIH    r3, 0x30
+        PUSH    r3
+        JMP     cmd
+wr_nak: CALL    stop
+        LDI     r3, 0
+        LDIH    r3, 0xB0
+        PUSH    r3
+        JMP     cmd
+
+; ---------------------------------------------------------------------------
+; The private read and the bit and frame subroutines live in thread 2's quarter (the other commands fill
+; thread 0's): thread 2 must not be started with this image. CALL takes an
+; absolute address, so nothing else changes.
+;
+; Return paths. The deadline checker lets every RET return after every CALL
+; of the thread (tools/loomasm/README.md), so the code after each CALL
+; reaches its next deadline or anchor within three slots, or re-anchors
+; with SETD 0 first; that is why some SETD 0s below sit where SCL is
+; simply low.
+; ---------------------------------------------------------------------------
+        .org    0x100
+
+; clk_od: one open-drain bit. C = the bit (1 releases SDA, 0 pulls it low).
+; clk_rx: one bit driven by someone else (or an ACK slot): SDA released.
+; clk_pp: one push-pull bit (PIN_OE[SDA] is already 1). C = the bit.
+; Both enter with SCL low since the last deadline, shift the SDA level seen
+; HA ticks after the rise into r3 bit 0, and return with SCL low again, at
+; a deadline.
+clk_od: WAITD   LOA
+        BC      od1
+        OEP     SDA, 1                  ; pull low
+        JMP     clk_hi
+od1:    OEP     SDA, 0                  ; release
+        JMP     clk_hi
+clk_rx: WAITD   LOA                     ; a bit someone else drives: SDA released
+        OEP     SDA, 0
+        JMP     clk_hi
+clk_pp: WAITD   LOA
+        BC      pp1
+        SETP    SDA, 0
+        JMP     clk_hi
+pp1:    SETP    SDA, 1
+clk_hi: WAITD   LOB
+        SETP    SCL, 1
+        WAITD   HA
+        SHLI    r3, 1
+        JP      SDA, 0, ck0
+        ORI     r3, 1                   ; sample SDA
+ck0:    WAITD   HB
+        SETP    SCL, 0
+        RET
+
+; clk_te: the T-bit of the last byte a read allows. SDA released; sampled as
+; in clk_od; then pulled low while SCL is still high, two ticks before the
+; fall: an Sr if the target sent T = 1 (it let go at the rise), no edge if
+; it sent T = 0. SCL is high two ticks longer than in other bits.
+clk_te: WAITD   LOA
+        OEP     SDA, 0
+        WAITD   LOB
+        SETP    SCL, 1
+        WAITD   HA
+        SHLI    r3, 1
+        JP      SDA, 0, te0
+        ORI     r3, 1
+te0:    WAITD   HB
+        OEP     SDA, 1                  ; SDA low, SCL high
+        WAITD   2
+        SETP    SCL, 0
+        RET
+
+; s_hdr: START from a free bus (both lines high), then hdr.
+s_hdr:  SETD    0
+        OEP     SDA, 1                  ; START: SDA falls while SCL is high
+        WAITD   HB                      ; tHD_STA (tCAS)
+        SETP    SCL, 0
+        JMP     hdr
+
+; sr_hdr: repeated START from SCL low, then hdr. SDA is released first
+; (this also leaves push-pull after a T-bit), SCL rises, SDA falls.
+sr_hdr: WAITD   LOA
+        OEP     SDA, 0
+        SETP    SDA, 0                  ; open drain from here
+        WAITD   LOB
+        SETP    SCL, 1
+        WAITD   HA                      ; tSU_STA of the Sr
+        OEP     SDA, 1                  ; Sr: SDA falls while SCL is high
+        WAITD   HB                      ; tHD_STA
+        SETP    SCL, 0
+; hdr: the address byte in r0[15:8] (7-bit address, RnW), open drain, then
+; the ACK slot with SDA released. Returns C = the ACK slot (0: ACK; SETD
+; and RET leave the flags alone).
+hdr:    LDI     r1, 8
+hd1:    SHLI    r0, 1
+        CALL    clk_od
+        DJNZ    r1, hd1
+        CALL    clk_rx
+        SETD    0
+        SHRI    r3, 1                   ; C = the ACK slot
+        RET
+
+; txb: send r6[7:0] push-pull with its T-bit (odd parity: nine bits with an
+; odd number of ones), inverted if r5 = 1. Enters push-pull (SCL is low).
+txb:    MOV     r0, r6
+        SHLI    r0, 1
+        PAR     r2, r6                  ; C = XOR of the data bits
+        BC      tx_odd
+        ORI     r0, 1                   ; even: T = 1
+tx_odd: XOR     r0, r0, r5              ; the forced-bad T-bit, if asked
+        SHLI    r0, 7                   ; the byte and T in r0[15:7]
+        OEP     SDA, 1                  ; push-pull from here
+        SETD    0
+        LDI     r1, 9
+wb1:    SHLI    r0, 1
+        CALL    clk_pp
+        DJNZ    r1, wb1
+        SETD    0
+        RET
+
+; stop: STOP from SCL low, then BUF ticks of free bus. Leaves SDA released
+; (open drain) and SCL driven high.
+stop:   WAITD   LOA
+        SETP    SDA, 0
+        OEP     SDA, 1                  ; SDA low (open drain)
+        WAITD   LOB
+        SETP    SCL, 1
+        WAITD   HA                      ; tSU_STO
+        OEP     SDA, 0                  ; STOP: SDA rises while SCL is high
+        WAITD   BUF
+        RET
+
+; Private read: S DA/R ACK, then bytes the target drives push-pull. Its T-bit
+; is 1 while it has more and 0 on its last byte. On the last byte the host
+; allowed the controller clocks the T-bit with clk_te, which pulls SDA low
+; while SCL is high: an Sr that ends a T = 1, and no edge at all after a
+; T = 0 (the target is holding SDA low then). P follows either way.
+op_rd:  MOV     r0, r7
+        SHLI    r0, 1
+        ORI     r0, 1                   ; R
+        SHLI    r0, 8                   ; r0[15:8] = DA << 1 | R
+        CALL    s_hdr
+        BC      rd_nak
+        MOV     r4, r7
+        SHRI    r4, 8
+        ANDI    r4, 15                  ; the most bytes to read
+rd_by:  SETD    0
+        LDI     r1, 8
+rd_b:   CALL    clk_rx                  ; SDA released: the target drives
+        DJNZ    r1, rd_b
+        SETD    0
+        CMPI    r4, 1
+        BZ      rd_last
+        CALL    clk_rx                  ; the T-bit
+        JMP     rd_got
+rd_last: CALL   clk_te                  ; the T-bit, ended by the controller
+rd_got: SHRI    r3, 1                   ; r3[7:0] = the byte, C = T
+        BC      rd_more
+        LDIH    r3, 0x40
+        PUSH    r3
+        SETD    0
+        CALL    stop
+        JMP     cmd
+rd_more: LDIH   r3, 0x41
+        PUSH    r3
+        SETD    0
+        DJNZ    r4, rd_by
+        CALL    stop                    ; clk_te ended it
+        JMP     cmd
+rd_nak: CALL    stop
+        LDI     r3, 0
+        LDIH    r3, 0xC0
+        PUSH    r3
+        JMP     cmd

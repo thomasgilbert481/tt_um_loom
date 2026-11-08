@@ -1,0 +1,299 @@
+; i3c_target.loom
+; MIPI I3C Basic SDR target: a 48-bit provisioned ID, BCR and DCR held in data
+; memory, dynamic address assignment by ENTDAA (with the open-drain
+; arbitration on the 64 bits), RSTDAA, private writes into a 15-byte buffer
+; and private reads of that buffer. Written on 2026-11-08 after the hardware
+; was complete (D-032), as a protocol Loom was not designed for (D-035). It
+; uses the data memory (LD, ST; built for device emulation such as the I2C
+; EEPROM) and the per-pin output enable (OEP); everything I3C-specific (the
+; arbitration, the T-bit parity, the push-pull read with its T-bit hand-off,
+; the address the controller hands out) is firmware.
+;
+; Director's decisions (2026-11-08), until the specification is read: the
+; MIPI I3C Basic v1.1.1 PDF is sent only on request, so it was not read. The
+; open-drain timing minimums, the 0x7E broadcast address and the RSTDAA and
+; ENTDAA codes are as the Linux kernel's I3C headers quote them; the
+; push-pull timings, the T-bit rules, the ENTDAA parity and the PID layout
+; are from memory and marked unchecked in tools/protomodels/i3c.py. HDR
+; modes, IBI, Hot-Join, direct CCCs and mixed I2C buses are not done.
+;
+; Pins: SCL = BIDIR2, input only; SDA = BIDIR3. As in i3c_controller.loom,
+; OD_MASK is not used: in open-drain phases PIN_OUT[SDA] = 0 and `OEP SDA, 1`
+; pulls low, `OEP SDA, 0` releases; in push-pull (the data and T-bits of a
+; read) PIN_OE[SDA] = 1 and `SETP SDA, b`. On a board both pins join the
+; controller's SCL and SDA; the bench joins BIDIR0/2 and BIDIR1/3.
+;
+; Data window (thread 3's quarter, which no thread runs when this image is
+; loaded; the host rewrites it while the thread is halted to give the device
+; another identity):
+;     0x180 PID[47:32]  0x181 PID[31:16]  0x182 PID[15:0]  0x183 BCR << 8 | DCR
+;     0x184.. the private-write buffer, one byte per word
+; The PID fields (I3C Basic section 5.1.4.1.1, from memory, unchecked):
+; PID[47:33] the MIPI manufacturer ID, PID[32] 0 for a fixed part ID,
+; PID[31:16] part ID, PID[15:12] instance ID, PID[11:0] vendor defined. The
+; image below holds an example, 0x0123_4567_89AB. BCR = 0x01: bit 0 "maximum
+; data speed limitation", which this device needs (see Rate), role target
+; (bits 7:6 = 0), no IBI, no HDR (from memory, unchecked). DCR = 0x00 (a
+; generic device).
+;
+; Behaviour.
+;     7E/W, then a CCC with a good T-bit: ACKed. RSTDAA (0x06) clears the
+;         dynamic address; ENTDAA (0x07) arms the arbitration if the device
+;         has no address. Other CCCs are ignored (the device waits for Sr/P).
+;     7E/R while armed: ACKed; the 64 bits are sent open drain, MSB first;
+;         a 1 sent (released) that reads back 0 has lost: the device lets go
+;         and waits for the next Sr. The winner checks the odd parity of the
+;         address byte (DA[6:0], PAR) and ACKs it, or NACKs a bad one and
+;         stays armed. STOP disarms.
+;     DA/W: ACKed; each byte with a good T-bit (odd parity over the nine
+;         bits) goes into the buffer. A bad T-bit refuses the rest of the
+;         transfer: the device stops taking bytes and waits for Sr/P; the
+;         bytes before it stay.
+;     DA/R: NACKed while the buffer is empty; else ACKed, and the buffered
+;         bytes are sent push-pull, T = 1 after each but the last, T = 0 on
+;         the last. A T = 1 is driven high in the low phase and let go at
+;         the rise; if the controller then pulls SDA low while SCL is high
+;         (an Sr, ending the read) the device follows the Sr. A T = 0 is
+;         held low until SCL falls.
+;     Any other address: not ACKed; the device waits for Sr/P.
+; Reports to the host (FIFO space read, thread 1), pushed at the Sr or P
+; that ends the transfer: 0x1000 RSTDAA; 0x2000 | DA when an address is
+; ACKed; 0x3000 | the bytes stored for a private write, | 0x8000 if a
+; T-bit was bad. The host must read them: a full OUTQ stalls the PUSH and
+; the device would miss the next frame (four reports fit).
+;
+; Rate: the controller owns SCL, so the program has no tick and no deadline
+; (no WAITD; nothing for the deadline checker to prove). Every SCL edge is
+; seen by a WAITP or a three-slot JP poll, within about 14 clocks of the pad.
+; What the device must meet: drive SDA after a fall before the controller
+; samples, and sample SDA after a rise before an Sr or P can move it. Under
+; i3c_controller.loom at TICK_INT 8 (390 kHz at 50 MHz) the controller
+; samples 96 clocks after each fall; measured on the model, this program
+; has the ACK of a read header (the longest decode: 9 slots after the
+; return from rx8) on SDA at most 71 clocks after the 8th fall, and read
+; data at most 53 clocks after a fall (the first bit of a byte: LD, SWAP,
+; drive). After a rise it samples SDA within 8 clocks; an Sr or P moves
+; SDA HA = 16 clocks after the rise. So TICK_INT 8 or more. That is far
+; below the 12.5 MHz an I3C target is expected to follow, hence BCR bit 0;
+; and the clock-to-data turnaround (tSCO, at most 12 ns in the SDR table,
+; from memory, unchecked) is 180 ns to 1.4 us here.
+;
+; Registers: r0 shifter, r1 bit count, r2 scratch and read count, r3 the
+; dynamic address (0: none), r4 the report pending (0: none), r5 bytes in
+; the buffer, r6 memory pointer, r7 1 while ENTDAA is armed.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   SCL = BIDIR2, SDA = BIDIR3
+        .equ    BROADCAST = 0x7E        ; the broadcast address
+        .equ    RSTDAA = 0x06
+        .equ    ENTDAA = 0x07
+        .equ    DATA = 0x180            ; PID, BCR:DCR, then the buffer
+        .equ    BUFFER = DATA + 4
+
+start:  SETP    SDA, 0                  ; open drain, released
+        OEP     SDA, 0
+idle:   WAITE   SDA, fall               ; a START is SDA falling ...
+        JP      SCL, 0, idle            ; ... while SCL is high
+frame:  WAITP   SCL, 0                  ; the START's hold ends
+        CALL    rx8                     ; the address byte (an Sr or P inside
+        SHRI    r0, 1                   ; it jumps to ev_sr or ev_p); C = RnW
+        BC      f_rd
+        CMP     r0, r3                  ; (r3 = 0 without an address, and
+        BZ      h_w                     ; address 0 never appears): DA/W
+        LDI     r2, BROADCAST
+        CMP     r0, r2
+        BZ      h_bw                    ; 7E/W: a broadcast CCC follows
+        JMP     skip
+f_rd:   CMP     r0, r3
+        BZ      g_r                     ; DA/R
+        LDI     r2, BROADCAST
+        CMP     r0, r2
+        BNZ     skip
+        JMP     h_br                    ; 7E/R: ENTDAA's arbitration
+g_r:    JMP     h_r
+; The ACK has to be on SDA before the controller samples it, HA ticks after
+; the 9th rise: so the address is decoded in at most 9 slots from the 8th
+; fall to the ACK's OEP (the read path, the longest, through h_r).
+
+; ev_sr, ev_p: a repeated START or a STOP seen while SCL was high. The
+; report of the transfer it ends goes to the host first.
+ev_sr:  CALL    report
+        WAITP   SCL, 0
+        JMP     frame
+ev_p:   CALL    report
+        LDI     r7, 0                   ; P ends ENTDAA
+        JMP     idle
+report: OEP     SDA, 0                  ; let go of SDA, whatever we were doing
+        SETP    SDA, 0
+        TEST    r4, r4
+        BZ      rp0
+        PUSH    r4
+        LDI     r4, 0
+rp0:    RET
+
+; rxbit: one bit, entered with SCL low. Samples SDA as soon as SCL is seen
+; high, then watches both lines until SCL falls: SDA moving while SCL is
+; high is an Sr (it fell) or a P (it rose), and leaves through ev_sr or
+; ev_p. The two JPs of the poll read the pads 4 clocks apart; SDA moves
+; only LOA ticks after a fall, so a fall is always seen first.
+rxbit:  WAITP   SCL, 1
+        JP      SDA, 0, rb0
+        SHLI    r0, 1
+        ORI     r0, 1
+rb1:    JP      SCL, 0, rbx
+        JP      SDA, 0, ev_sr
+        JMP     rb1
+rb0:    SHLI    r0, 1
+rb0p:   JP      SCL, 0, rbx
+        JP      SDA, 1, ev_p
+        JMP     rb0p
+rbx:    RET
+
+; skip: not ours. Clock bits through until an Sr or a P.
+skip:   OEP     SDA, 0
+        SETP    SDA, 0
+sk:     CALL    rxbit
+        JMP     sk
+
+; ack: pull SDA low for the ACK slot (we are in its low phase); returns
+; after its fall with SDA still low.
+ack:    OEP     SDA, 1
+        WAITP   SCL, 1
+        WAITP   SCL, 0
+        RET
+
+; rx8, rx9: receive eight or nine bits into r0 (cleared first), MSB first.
+rx9:    LDI     r1, 9
+        JMP     rx
+rx8:    LDI     r1, 8
+rx:     LDI     r0, 0
+rx_l:   CALL    rxbit
+        DJNZ    r1, rx_l
+        RET
+
+
+; 7E/W: ACK, then the CCC and its T-bit.
+h_bw:   CALL    ack
+        OEP     SDA, 0
+        CALL    rx9                     ; r0 = CCC << 1 | T
+        PAR     r2, r0                  ; C = 1: an odd number of ones, good
+        BNC     skip
+        SHRI    r0, 1
+        CMPI    r0, RSTDAA
+        BNZ     c_daa
+        LDI     r3, 0                   ; forget the dynamic address
+        LDI     r4, 0
+        LDIH    r4, 0x10                ; report 0x1000 at the Sr or P
+        JMP     skip
+c_daa:  CMPI    r0, ENTDAA
+        BNZ     skip
+        TEST    r3, r3
+        BNZ     skip                    ; already has an address: stays out
+        LDI     r7, 1                   ; armed
+        JMP     skip
+
+; DA/W: ACK, then bytes into the buffer until an Sr or P (or a bad T-bit).
+h_w:    CALL    ack
+        OEP     SDA, 0
+        LDI     r5, 0
+        LDI     r6, BUFFER & 0xFF
+        LDIH    r6, BUFFER >> 8
+        LDI     r4, 0
+        LDIH    r4, 0x30                ; report 0x3000 | count
+w_b:    CALL    rx9                     ; r0 = byte << 1 | T
+        PAR     r2, r0
+        BNC     w_bad
+        SHRI    r0, 1
+        ST      r0, r6, 0
+        ADDI    r6, 1
+        ADDI    r5, 1
+        ADDI    r4, 1
+        JMP     w_b
+w_bad:  LDIH    r4, 0xB0                ; refused: bit 15 in the report
+        JMP     skip
+
+; The identity and the buffer (thread 3's quarter, data only).
+        .org    DATA
+        .word   0x0123, 0x4567, 0x89AB  ; PID (an example)
+        .word   0x0100                  ; BCR 0x01, DCR 0x00
+
+; ---------------------------------------------------------------------------
+; ENTDAA arbitration and the private read live after the data in thread 3's
+; quarter (thread 3 is not started with this image); they return to the code
+; above through xskip and rd_sr (a branch reaches 128 words, a JP 32).
+; ---------------------------------------------------------------------------
+        .org    0x1A0
+xskip:  JMP     skip
+
+; 7E/R: ENTDAA's arbitration round, if armed.
+h_br:   TEST    r7, r7
+        BZ      xskip                   ; not armed: no ACK
+        CALL    ack                     ; SDA stays low: the first bit follows
+        LDI     r6, DATA & 0xFF
+        LDIH    r6, DATA >> 8
+        LDI     r2, 4                   ; four words: PID (3), BCR:DCR
+ar_w:   LD      r0, r6, 0
+        LDI     r1, 16
+ar_b:   SHLI    r0, 1                   ; C = the next bit, MSB first
+        BC      ar_1
+        OEP     SDA, 1                  ; a 0: pull low
+        WAITP   SCL, 1
+        JMP     ar_n
+ar_1:   OEP     SDA, 0                  ; a 1: let go ...
+        WAITP   SCL, 1
+        JP      SDA, 0, xskip           ; ... and someone pulled it low: lost
+ar_n:   WAITP   SCL, 0
+        DJNZ    r1, ar_b
+        ADDI    r6, 1
+        DJNZ    r2, ar_w
+        OEP     SDA, 0                  ; won: the controller sends the address
+        CALL    rx8                     ; r0 = DA << 1 | PAR
+        PAR     r2, r0
+        BNC     xskip                   ; bad parity: NACK, stay armed
+        CALL    ack
+        OEP     SDA, 0
+        SHRI    r0, 1
+        MOV     r3, r0                  ; the dynamic address
+        LDI     r7, 0                   ; done with ENTDAA
+        MOV     r4, r0
+        LDIH    r4, 0x20                ; report 0x2000 | DA
+        JMP     skip
+
+; DA/R: NACK with nothing buffered; else ACK and send the buffer push-pull.
+h_r:    TEST    r5, r5
+        BZ      xskip
+        CALL    ack                     ; SDA low, OE 1: push-pull from here
+        LDI     r6, BUFFER & 0xFF
+        LDIH    r6, BUFFER >> 8
+        MOV     r2, r5                  ; bytes left
+rd_by:  LD      r0, r6, 0
+        ADDI    r6, 1
+        SWAP    r0, r0                  ; the byte to r0[15:8]
+        LDI     r1, 8
+rd_b:   SHLI    r0, 1
+        BC      rd1
+        SETP    SDA, 0
+        JMP     rd_d
+rd1:    SETP    SDA, 1
+rd_d:   WAITP   SCL, 1
+        WAITP   SCL, 0
+        DJNZ    r1, rd_b
+        CMPI    r2, 1
+        BZ      rd_end
+        SETP    SDA, 1                  ; T = 1: more
+        WAITP   SCL, 1
+        OEP     SDA, 0                  ; let go at the rise (the hand-off)
+        SETP    SDA, 0
+rd_w:   JP      SCL, 0, rd_nx           ; the controller goes on ...
+        JP      SDA, 0, rd_sr           ; ... or ends the read with an Sr
+        JMP     rd_w
+rd_sr:  JMP     ev_sr                   ; (a JP reaches 32 words)
+rd_nx:  OEP     SDA, 1                  ; push-pull again (drives 0 until the bit)
+        SUBI    r2, 1
+        JMP     rd_by
+rd_end: SETP    SDA, 0                  ; T = 0: the last byte
+        WAITP   SCL, 1
+        WAITP   SCL, 0
+        JMP     skip                    ; lets go; a P or an Sr follows
+
