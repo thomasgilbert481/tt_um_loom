@@ -50,7 +50,9 @@ Consequences that both implementations must reproduce:
   from W to X and are visible from cycle `x+1`, which makes `WAITS` an atomic
   test-and-clear across threads. The model implements this rule with a list
   of pending commits tagged with their visibility cycle.
-- Pad outputs (`uo_out`, `uio_out`, `uio_oe`) are registers; a pin write in a
+- Pad outputs (`uo_out`, `uio_out`, `uio_oe`) are registers (for
+  `uo_out[1:0]`, a two-way mux of registers selected by the serializer's
+  `BUSY`, 6.12.7; the pad still changes only at an edge); a pin write in a
   slot with X cycle `x` changes the pad at edge `x+2`.
 - **Slot grid.** A wait completes in the first X cycle at or after its
   condition becomes true, and a thread has an X cycle only every 4 clocks. So
@@ -71,8 +73,9 @@ Consequences that both implementations must reproduce:
 | Own registers, flags, `PC`, `TD`, `DT`, return stack, `WAIT_ACTIVE`, `PREV_PINS`, `TICK_SEEN`, per-thread CSRs | as committed by the thread's previous valid slot (or by the host while halted) |
 | `NOW[t]` | the value of the `NOW` register during cycle `x` (section 4) |
 | `pin_in(i)` for index 0..12 | the pad value sampled at **edge x-1** (two-flop synchroniser: FF1 samples the pad at every edge, FF2 samples FF1; logic uses FF2) |
+| `pin_in(13)`, `pin_in(14)` | `RDY`, `BUSY` of 6.12 as visible in cycle `x` |
 | `pin_in(i)` for index 16..21 | the `PIN_OUT` bit for that pin as visible in cycle `x` |
-| `pin_in(i)` for any other index | 0 |
+| `pin_in(i)` for index 15 and 22..31 | 0 |
 | `SFLAGS` | committed value, plus the effect of the slot currently in W (forwarding) |
 | Global CSRs | committed value visible in cycle `x` |
 | FIFO status **[M2]** | occupancy visible in cycle `x` |
@@ -148,7 +151,7 @@ at every edge:
 | `MEM_PEND, MEM_LD, MEM_RD` **[M3 slice B]** | 1, 1, 3 | 0 | 6.11; the held access address and store word (9, 16) are per-thread too but not host-visible |
 
 Global: `RUN[3:0] = 0`, `HALTED[3:0] = 0`, `STEP_REQ[3:0] = 0`, `SFLAGS = 0`,
-`OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`. `BADOP` is a 16-bit register, reset
+`OD_MASK = 0`, `PIN_OUT = 0`, `PIN_OE = 0`, the serializer's state (6.12.1). `BADOP` is a 16-bit register, reset
 0: bits 3:0 are per thread, bit 14 is the host FIFO error (6.7, M2), bit 15 is
 the host access error, the rest read 0; the host writes 1 to clear a bit. `RESET_PC[t] = t * (IMEM_WORDS / 4)`, so the
 four threads never alias whatever the memory size (0, 64, 128, 192 for 256
@@ -158,10 +161,12 @@ words; `t * 0x100` for 1024). Instruction memory is **not** reset.
 `[4]` bit engine built (manual mode), `[5]` data memory built, `[6]` boot ROM
 built, `[7]` deadline-latched `SETP` built (M2), `[8]` bit engine auto mode
 built (M3 slice C; never set, because slice C is not built: D-032), `[9]`
-bit-engine encoders, stuffing and DIFF built (M3 slice A, 6.9.1), `[11:10]`
-zero, `[15:12]` log2 of `IMEM_WORDS`. The M1
+bit-engine encoders, stuffing and DIFF built (M3 slice A, 6.9.1), `[10]`
+Ethernet serializer built (6.12, D-036), `[11]` zero, `[15:12]` log2 of
+`IMEM_WORDS`. The M1
 build with 256 words reads 0x8000; the M2 build with the 512-word macro reads
-0x909A, and 0x929A with slice A.
+0x909A, and 0x929A with slice A, 0x92BA with slice B, 0x96BA with the
+serializer.
 
 ISA note: ISA 0.4.0 (2026-09-18) carries the encoding side of the M2 text:
 bit 0 of `SETP` is the `D` field (assembler token `D`), `SHO` and `SHI` list
@@ -288,7 +293,7 @@ bits it touches.
 `CSRR rd, n`: `rd <=` the CSR value visible in X, zero-extended; no flags.
 `CSRW n, ra`: the CSR takes `ra` truncated to its width. Read-only CSRs ignore
 writes; write-only and unimplemented CSRs read 0. CSRs that belong to a feature
-that is not built (`SR`, `CNT`, `CRC`, `BE_*`, `CRC_*`) read 0 and ignore
+that is not built (`SR`, `CNT`, `CRC`, `BE_*`, `CRC_*`, `ETX_*`) read 0 and ignore
 writes **without** setting `BADOP`: only instructions set `BADOP`. `NOW` reads `NOW` in X.
 `TID` reads `t`. `CSRW SFLAGS` ORs `ra[7:0]` into `SFLAGS`. `CSRW HOST_IRQ`
 sets `SWIRQ[t]` (host-visible, host-cleared). `CSRW FLAGS` writes `{T, C, Z}`.
@@ -555,6 +560,418 @@ image with the IMEM space it already has, so a device-emulation program (a
 with no new host feature.
 
 Until slice B is built, `LD` and `ST` are `NOP` + `BADOP` (section 9).
+
+### 6.12 Ethernet serializer **[ETX]** (D-036)
+
+One shared transmit block. It takes 16-bit words from CSR writes, sends
+them as a Manchester-coded frame with the preamble, the SFD and the FCS
+added, ends the frame with TP_IDL, and drives TD+ and TD- on `uo_out[0]`
+and `uo_out[1]` while it does. `CAPS[10]` reads 1 and `VERSION` reads 5
+when it is built; a build without it reads the CSRs below as unimplemented
+(0, writes ignored, no `BADOP`, as 6.6 says) and `pin_in(13)`, `pin_in(14)`
+as 0. The golden model builds it as the feature `ETX`.
+
+**6.12.4 and 6.12.5 are normative.** 6.12.6 is derived from them. If an
+implementer finds 6.12.6 (or any example) disagreeing with 6.12.4 or
+6.12.5, that is a spec bug to log in `docs/spec-questions/`, not a thing to
+resolve locally.
+
+Names. Every name in this section belongs to the serializer and is chosen
+not to collide with a name this file already uses (`HALF`, `LVL` of 6.9.1,
+the `C` flag, the `ph` counter, the stages `X`, `D`, `W`, the X cycle
+`x`). Phases are written `P_IDLE` .. `P_TAIL` so that they are not the
+configuration bits `PRE` and `FCS`. A bit value is `v`.
+
+#### 6.12.1 State
+
+All global (one copy, not per thread), all reset by `rst_n` to the values
+given (section 5's global reset list includes them), and touched by nothing
+else: not by `CTRL.RESET`, not by the host.
+
+| State | Bits | Reset | Meaning |
+|---|---|---|---|
+| `HALFN` | 4 | 1 | `N = HALFN + 1` clocks a half bit |
+| `PRE` | 1 | 1 | send the preamble and SFD before the data |
+| `FCS` | 1 | 1 | send the FCS after the data |
+| `IDL` | 4 | 6 | TP_IDL length in half bits |
+| `EPH` | 5 values | `P_IDLE` | phase: `P_IDLE`, `P_PRE`, `P_DATA`, `P_FCS`, `P_TAIL` |
+| `DIV` | 4 | 0 | clocks left in the current half bit, minus 1 |
+| `HB` | 1 | 0 | 0 in the first half of a bit, 1 in the second |
+| `POS` | 6 | 0 | the current bit's position in its field; in `P_TAIL`, half bits completed |
+| `TXB` | 1 | 0 | the value of the bit being sent |
+| `TXL` | 1 | 0 | the line level in `P_PRE`, `P_DATA` and `P_FCS` |
+| `SH`, `SL`, `S1` | 16, 1, 1 | 0 | the word being sent; it is the last word; it has one byte |
+| `HOLD`, `HV`, `HL`, `H1` | 16, 1, 1, 1 | 0 | the next word; valid; last; one byte |
+| `LSEEN` | 1 | 0 | a last word has been accepted in this frame |
+| `CRC32` | 32 | 0 | the CRC-32 register |
+| `FDONE`, `UNDER`, `REF` | 1 each | 0 | sticky: a frame ended; it ended by underrun; a write was refused |
+
+`BUSY = (EPH != P_IDLE)`. `RDY = !UNDER && (EPH == P_IDLE || ((EPH ==
+P_PRE || EPH == P_DATA) && !LSEEN && !HV))`. `RDY` is the level firmware
+polls; it is a conservative hint, not the acceptance rule. Acceptance is
+decided only by 6.12.4 at the commit edge (a write at a load edge can be
+accepted while `RDY` read 0 in the cycle before, and refused while it read
+1; firmware never meets either case, because a `WAITP` in X cycle `x` is
+followed by a `CSRW` committing at `x + 6` at the earliest).
+
+Only the values of `ETX_CFG`, `ETX_STAT`, `pin_in(13)`, `pin_in(14)` and
+the two pads are observable (6.12.7, 6.12.9); the RTL may encode the
+state any way that reproduces them. In every reachable state, `POS < IDL`
+holds in `P_TAIL` (the start and the tail rules make it so), and formal
+may use it as an invariant.
+
+#### 6.12.2 CSRs
+
+| # | Name | R/W | Bits | Read value | Write |
+|---|---|---|---|---|---|
+| 0x16 | `ETX_CFG` | RW | 10 | `{IDL[3:0], FCS, PRE, HALFN[3:0]}` in bits 9:0 | stores bits 9:0 if `EPH == P_IDLE`; else ignored and `REF <= 1` |
+| 0x17 | `ETX_DATA` | W | 16 | 0 | a data word, both bytes (6.12.4) |
+| 0x18 | `ETX_LAST` | W | 16 | 0 | the last data word, both bytes |
+| 0x19 | `ETX_LAST1` | W | 16 | 0 | the last data word, low byte only (bits 15:8 are not sent) |
+| 0x1A | `ETX_STAT` | RW | 5 | `{REF, UNDER, FDONE, RDY, BUSY}` in bits 4:0 | bits 4:2 written as 1 clear `REF`, `UNDER`, `FDONE` (write 1 to clear); bits 1:0 ignored |
+
+`ETX_CFG` reads 0x01B1 after reset (N = 2, `PRE`, `FCS`, `IDL` = 6) and
+`ETX_STAT` reads 0x0002 (`RDY`). Bits not listed read 0. The ETX CSRs join
+6.6's list of CSRs that belong to a feature that may not be built.
+
+`IDL` at 10 Mbit/s: the block holds TD+ high for `N * IDL` clocks after a
+last 0 and `N * (IDL + 1)` after a last 1 (the second half of a 1 is
+already high), so at N = 2 and 40 MHz the reset `IDL = 6` gives 300 ns and
+350 ns. Use 5 to 8 (250 to 400 ns after a last 0, 50 ns more after a last
+1); larger values put the start-of-idle pulse outside the TP_IDL template
+of clause 14.3.1.2.1, Figure 14-10 [S: subclause and figure confirmed by
+the UNH-IOL 10BASE-Te test suite, test 14.1.7; the 250 ns minimum from
+secondary sources only, unchecked]; 0 is for loopback tests. The block
+does not enforce the range.
+
+**Unchecked against IEEE 802.3 clause 14.** Two figures here come from
+secondary sources only (the UNH-IOL 10BASE-T MAU material and Wikipedia)
+and have not been read in IEEE 802.3 itself: the 250 ns minimum of the
+TP_IDL start-of-idle pulse (14.3.1.2.1, Figure 14-10), on which `IDL`'s
+reset value and range above rest, and the 10BASE-T transmit clock
+tolerance of 10 MHz +-0.01 %, which a board clock of 40 MHz at N = 2 must
+meet for the block to be 10BASE-T. If clause 14 gives other values, `IDL`'s
+reset value and range change with it (D-036).
+
+Byte order: bit `k` of a data word is sent `k`-th, `k` = 0..15 (0..7 for
+`ETX_LAST1`), so the low byte goes first and each byte goes LSB first, the
+octet and bit order of IEEE 802.3 clause 3.3 [S: secondary, Wikipedia
+"Ethernet frame"]. A frame of bytes `B0, B1, B2, ...` is the words
+`{B1, B0}, {B3, B2}, ...`: two bytes a word, packed little-endian.
+
+Timing: a `CSRW` to one of these CSRs with X cycle `x` commits at edge
+`x + 2` like every write to shared state (section 2), and a `CSRR` in X cycle
+`x` reads the value in cycle `x`. Only one slot is in W at any edge, so at
+most one ETX write commits at any edge.
+
+#### 6.12.3 The bit sequence
+
+A frame of `M` words, the last of which has `b` bytes (1 or 2), carries
+`NB = 16 (M - 1) + 8 b` data bits `d_0 .. d_{NB-1}` in the order of 6.12.2.
+It sends, in this order:
+
+1. If `PRE`: 64 bits `p_0 .. p_63` with `p_k = 1` for even `k`, `p_k = 0`
+   for odd `k`, except `p_63 = 1`: seven octets 0x55 and the SFD 0xD5,
+   each LSB first (clause 3.2.2, 3.2.3 [S: secondary]).
+2. The data bits.
+3. If `FCS`: 32 bits `f_0 .. f_31` with `f_j = ~CRC32[31 - j]`, where
+   `CRC32` is the register after the last data bit (clause 3.2.9 [S:
+   secondary]: the complement, the `x^31` term first).
+
+`CRC32` is set to 0xFFFF_FFFF when a frame starts (with the first data
+bit's update folded in when the frame has no preamble, 6.12.4) and, for
+every data bit `v` when it begins (6.12.4), `fb = CRC32[31] ^ v; CRC32 <=
+{CRC32[30:0], 1'b0} ^ (fb ? 32'h04C1_1DB7 : 32'h0)`. It does not change
+during the preamble or the FCS. Check values [C]: for the nine ASCII bytes
+`123456789` the 32 FCS bits as sent, read LSB first as a 32-bit number, are
+0xCBF4_3926 (`zlib.crc32`), the octets 0x26 0x39 0xF4 0xCB on the wire; a
+receiver that runs the same update over the data and the FCS bits ends with
+0xC704_DD7B.
+
+Each bit `v` is two half bits: the line level is `~v` in the first and `v`
+in the second (a 0 is high then low, a 1 low then high, as 6.9.1 already
+has it; clause 7.3.1.1 for 10BASE5, about 14.1.3 for 10BASE-T [S: number
+unchecked; polarity secondary, Wikipedia "Manchester code"]). "High" is TD+
+above TD- [S: not confirmed by a source; every 10BASE-T transmitter known
+to the reviewer and to me]. Each half bit lasts exactly N clocks. The first
+thing on the wire is therefore `TD+ = 0, TD- = 1`, the first half of
+`p_0 = 1`.
+
+#### 6.12.4 Every edge (normative)
+
+At every edge `e`, with every right-hand side the value before `e` (in
+cycle `e - 1`) and `w` the ETX write committing at `e`, if any:
+
+```
+bnd = (EPH != P_IDLE) && (DIV == 0)       # e ends a half bit
+if EPH == P_IDLE:
+    w is ETX_CFG:          store it                       (6.12.2)
+    w is a data write:     if UNDER: REF <= 1  else: start (below)
+else:
+    if not bnd:            DIV <= DIV - 1
+    else:                  advance                        (6.12.5)
+    w is ETX_CFG:          REF <= 1, nothing stored
+    w is a data write:     accept or refuse               (below)
+w is ETX_STAT:  clear the sticky bits written as 1; a sticky bit set at
+                the same edge stays set (set wins over clear)
+```
+
+A **data write** is a write of `ETX_DATA`, `ETX_LAST` or `ETX_LAST1`; its
+kind gives `last = (kind != ETX_DATA)` and `one = (kind == ETX_LAST1)`.
+
+**Start** (edge `s`): `LSEEN <= last`, `DIV <= N - 1`, `POS <= 0`, and
+
+- if `PRE`: `EPH <= P_PRE`; `HOLD <= w`, `HV <= 1`, `HL <= last`,
+  `H1 <= one`; `CRC32 <= 0xFFFF_FFFF`; begin bit `p_0` (not a data bit);
+- else: `EPH <= P_DATA`; `SH <= w`, `SL <= last`, `S1 <= one`, `HV <= 0`;
+  begin data bit `w[0]`, and `CRC32` takes the update of 6.12.3 applied to
+  0xFFFF_FFFF with `v = w[0]` (one assignment, not an initialisation
+  followed by an update), so that after edge `s` the register already
+  includes the first data bit, as it does after every later data bit
+  begins.
+
+**Begin bit `v`** at an edge: `TXB <= v`, `HB <= 0`, `DIV <= N - 1`,
+`TXL <= ~v`; and if it is a data bit (other than at the start, above), the
+CRC update of 6.12.3 with `v`.
+
+**Accept or refuse** a data write at an edge `e` where `EPH != P_IDLE`: it
+is **accepted** iff `EPH` is `P_PRE` or `P_DATA` before `e` and also after
+`e`, `LSEEN == 0` and `UNDER == 0` (both before `e`), and either `HV == 0`
+before `e` or the advance at `e` is a load (6.12.5) that takes `HOLD`.
+Accepted: `HOLD <= w`, `HV <= 1`, `HL <= last`, `H1 <= one`, `LSEEN <=
+last`; when the load takes `HOLD` at the same edge, `SH` gets the old
+`HOLD` and `HOLD` the new word, and `HV` stays 1. Otherwise it is
+**refused**: nothing changes but `REF <= 1`.
+
+There is no bypass from the write bus into `SH`: `SH` is only ever loaded
+from `HOLD`, or from the write at the start edge when `PRE == 0`.
+
+#### 6.12.5 The advance at a half-bit boundary (normative)
+
+At an edge `e` where `bnd` holds:
+
+1. `EPH` is `P_PRE`, `P_DATA` or `P_FCS` and `HB == 0`: the second half.
+   `HB <= 1`, `DIV <= N - 1`, `TXL <= TXB`.
+2. `EPH == P_PRE`, `HB == 1`, `POS < 63`: `POS <= POS + 1`; begin bit
+   `p_{POS+1}`.
+3. A **load**: `HB == 1` and either `EPH == P_PRE` with `POS == 63`, or
+   `EPH == P_DATA` at the word's last bit (`POS == 15`, or `POS == 7` if
+   `S1`) with `SL == 0`. If `HV == 1` (before `e`): `SH <= HOLD`,
+   `SL <= HL`, `S1 <= H1`, `HV <= 0` (unless a write is accepted at `e`,
+   6.12.4), `POS <= 0`, `EPH <= P_DATA`; begin data bit `HOLD[0]`. If
+   `HV == 0`: **underrun**: `UNDER <= 1` and enter the tail.
+4. `EPH == P_DATA`, `HB == 1`, not at the word's last bit: `POS <= POS +
+   1`; begin data bit `SH[POS + 1]`.
+5. `EPH == P_DATA`, `HB == 1`, at the last bit of a word with `SL == 1`: if
+   `FCS`, `EPH <= P_FCS`, `POS <= 0`, begin bit `~CRC32[31]` (not a data
+   bit), where `CRC32` already includes the last data bit; else enter the
+   tail.
+6. `EPH == P_FCS`, `HB == 1`: if `POS < 31`, `POS <= POS + 1` and begin bit
+   `~CRC32[30 - POS]` (not a data bit); else enter the tail.
+7. `EPH == P_TAIL`: if `POS + 1 == IDL`, release; else `POS <= POS + 1`,
+   `DIV <= N - 1`.
+
+**Enter the tail** at `e`: `HV <= 0`; if `IDL == 0`, release at `e`; else
+`EPH <= P_TAIL`, `POS <= 0`, `DIV <= N - 1`.
+
+**Release** at `e`: `EPH <= P_IDLE`, `HV <= 0`, `LSEEN <= 0`, `FDONE <= 1`.
+The release writes neither `UNDER` nor `REF`; an `UNDER <= 1` from rule 3
+at the same edge (an underrun with `IDL == 0`) stands, so that frame ends
+with `UNDER` and `FDONE` both set at `e`.
+
+#### 6.12.6 Consequences (derived from 6.12.4 and 6.12.5)
+
+With the start at edge `s` (so `s = x + 2` for the `CSRW` whose X cycle is
+`x`), half bit `i` of the frame, `i` = 0, 1, 2, ..., starts at edge
+`s + i N` and lasts N clocks; with `NBITS` bits sent, the tail starts at
+`s + 2 N NBITS` and the release is at `s + N (2 NBITS + IDL)`.
+
+- Call `K_m` the edge at which word `m` (`m` = 0 for the start word) is
+  loaded into `SH`. With `PRE`, `K_m = s + 2 N (64 + 16 m)` while every
+  word before it was full; without `PRE`, `K_0 = s` and `K_m = s + 32 N m`.
+- Word `m + 1` is accepted by a write that commits at any edge from `K_m`
+  (included: the load takes `HOLD` at that edge, so the write is accepted
+  through the second case of the accept rule) to `K_{m+1} - 1` (included):
+  a window of `32 N` edges (64 at N = 2). With `PRE`, `HOLD` holds word 0
+  from `s` until `K_0 = s + 128 N`, so a write of word 1 before `K_0` is
+  refused (`REF`); its window is `K_0 .. K_0 + 32 N - 1` (the 6.4 us of
+  preamble in which the thread has nothing to do but fetch word 1).
+  Without `PRE`, word 0 goes straight to `SH` at `s` and the window for
+  word 1 is `s + 1 .. s + 32 N - 1`.
+- A write that commits at `K_{m+1}` itself, or later, with nothing in
+  `HOLD` is the underrun: the load at `K_{m+1}` finds `HV == 0`, the tail
+  begins at that edge, and the write is refused because `EPH` after its
+  edge is `P_TAIL` (or `P_IDLE` if `IDL == 0`).
+- A frame whose feeder stops (a halted or reset thread, a slow loop) ends
+  by itself: within `32 N + N IDL` clocks of its last accepted word's load
+  if that word was not a last word (the underrun), and `96 N + N IDL` if it
+  was and `FCS` is set (a normal end; `32 N + N IDL` without `FCS`). The
+  block never needs an abort.
+- Firmware leaves `PIN_OUT[8]` and `PIN_OUT[9]` at 0 across a frame, so the
+  pads fall to the idle line at the release; the block does not check it.
+- The interframe gap (96 bit times, 9.6 us, clause 4.4.2 [S: secondary])
+  is firmware's: wait for `BUSY == 0`, then `DLY`. The NLP timer restarts
+  at the start of TP_IDL: 16 ms +- 8 ms from there to the first link pulse
+  [S: UNH-IOL test 14.1.1, citing 802.3-2008 14.2.1.1].
+
+#### 6.12.7 Pads and pins
+
+- **Pads.** In every cycle `k`: if `BUSY`, `uo_out[0] = TDP` and
+  `uo_out[1] = TDN` with `(TDP, TDN) = (TXL, ~TXL)` in `P_PRE`, `P_DATA`
+  and `P_FCS` and `(1, 0)` in `P_TAIL`; if not, `uo_out[0] = PIN_OUT[8]`
+  and `uo_out[1] = PIN_OUT[9]` as today (section 3). `uo_out[0]` and
+  `uo_out[1]` are a mux of registers (`EPH`, `TXL`, `PIN_OUT[9:8]`),
+  evaluated in the cycle in which they are seen, and are **not**
+  re-registered: the value on the pad in cycle `k` is the function above
+  of the state in cycle `k`. The frame's first half bit is therefore on the
+  pad in cycle `s` (`TD+ = 0`, `TD- = 1`), and `PIN_OUT[9:8]` is back on
+  the pad in the cycle after the release edge. The pad still changes only
+  at an edge. The mux is the last thing in `loom_pins` before the port.
+- **`PIN_OUT` is untouched.** The block never writes it, and pin writes to
+  indices 16 and 17 (by `SETP`, staged `SETP ... D`, `OUT`, `SHO` with or
+  without `DIFF`, `CSRW PIN_OUT` or the host) still commit to `PIN_OUT` as
+  6.3 says; while `BUSY` they do not reach the pad, and they show there
+  from the cycle after the release. The other 22 pads are unchanged.
+- **Reading back.** `pin_in(16)` and `pin_in(17)` stay the `PIN_OUT` bits
+  (section 3), not the line.
+- **Status pins.** `pin_in(13) = RDY` and `pin_in(14) = BUSY`, as visible
+  in cycle `x` (no synchroniser, like 16..21). `WAITP`, `JP`, `IN` (through
+  `INGRP`) and `SHI` read them. `WAITE` on them is never true, as for any
+  index above 12 (6.4), because `PREV_PINS` holds indices 0..12 only.
+  Index 15 and 22..31 still read 0. `PIN_IN` (CSR 0x13, host 0x0018) keeps
+  reading 0 in bits 15:13, because `PIN_IN` is the view of the pads and
+  these two are not pads.
+- **Why OUT0 and OUT1.** They are the pads W-113's NLP program drives
+  (`tenbaset_link.loom`: `.pins TDP = OUT0, TDN = OUT1`, with TD- held at 0;
+  checked 2026-11-08 in the W-113 worktree), so NLPs and frames share them
+  with no reconfiguration; they are outputs with no OE and no open-drain
+  gating (section 3), so the change touches two bits of the pad mux and
+  nothing in the `uio` path; and idle needs TD+ = TD- = 0 between frames,
+  NLPs need TD+ high with TD- low, and frames need complementary levels:
+  three states, which one pin cannot give. (Approved by Thomas, 2026-11-08.)
+- **Sharing with NLP firmware.** NLPs are written only while `BUSY == 0`
+  (the program tests `pin_in(14)` before each pulse, or the same thread
+  sends both, which is simplest).
+- **`BE_PINS`.** Nothing changes: a bit engine pointed at index 16 or 17
+  writes `PIN_OUT`, which shows on the pad only while the block is idle.
+- **Ownership and ISO-1.** The block is shared state, like `PIN_OUT`.
+  Ownership is by convention (ARCHITECTURE 7): one thread writes the ETX
+  CSRs. ISO-1's precondition gains "no other thread writes `ETX_*`", and
+  the owner's view (`pin_in(13/14)`, `ETX_STAT`, `ETX_CFG`) then depends
+  only on its own writes and the clock. A second writer is not undefined:
+  its writes follow the rules above in commit order, and the assembler's
+  whole-program check (ARCHITECTURE 7) can flag it.
+
+#### 6.12.8 Declarations and the edits elsewhere
+
+`isa/isa.yaml`, as the RTL change would add them:
+
+```yaml
+  0x16: {name: ETX_CFG,   rw: RW, bits: 10, doc: "ETX (Ethernet serializer, SEMANTICS 6.12) config {IDL[9:6], FCS[5], PRE[4], HALFN[3:0]}; reset 0x01B1; written only while idle"}
+  0x17: {name: ETX_DATA,  rw: W,  bits: 16, doc: "ETX: next frame word, low byte first; starts a frame when idle"}
+  0x18: {name: ETX_LAST,  rw: W,  bits: 16, doc: "ETX: last frame word, both bytes"}
+  0x19: {name: ETX_LAST1, rw: W,  bits: 16, doc: "ETX: last frame word, low byte only"}
+  0x1A: {name: ETX_STAT,  rw: RW, bits: 5,  doc: "ETX: {REF, UNDER, FDONE, RDY, BUSY}; write 1 to clear bits 4:2; reset 0x0002"}
+```
+
+and in `pins:`
+
+```yaml
+  13: {name: ETX_RDY,  dir: in, pad: "none (Ethernet serializer status)"}
+  14: {name: ETX_BUSY, dir: in, pad: "none (Ethernet serializer status)"}
+```
+
+The `csrs` schema has no `reset` or `optional` key: `tools/loomisa` loads
+each entry as a plain dict and uses only `name`, `rw`, `bits` and `doc`, so
+the reset value and the feature name live in `doc`. CSR numbers 0x1B to
+0x1F stay free. `meta.version` goes to "0.5.0" (new CSRs and pins, no new
+instruction), and the header comment's "Frozen as 1.0 at milestone M1" is
+corrected with it. Section 9 is unchanged: the block adds no instruction.
+
+Decode: after the YAML edit and `python -m tools.loomisa gen`,
+`loom_decode` provides `csr_etx_cfg`, `csr_etx_data`, `csr_etx_last`,
+`csr_etx_last1` and `csr_etx_stat`. The write is `is_csrw & csr_etx_*` in
+W with the W-stage write value; the read joins the `csr_rdata` mux in
+`loom_core` with the value visible in X. Hand-written RTL never compares
+the CSR field to 0x16..0x1A itself (CLAUDE.md).
+
+`CAPS` reads **0x96BA** with the block: today's 0x92BA (`[15:12]` = 9,
+bits 9, 7, 5, 4, 3, `[2:0]` = 2, `src/loom_top.v`) with bit 10 set.
+`VERSION` reads 5.
+
+The other edits the docs commit makes (D-036 step 1):
+
+1. Section 2, the bullet "Pad outputs ... are registers": add "(for
+   `uo_out[1:0]`, a two-way mux of registers selected by the serializer's
+   `BUSY`, 6.12.7; the pad still changes only at an edge)".
+2. Section 3, the table: a row "`pin_in(13)`, `pin_in(14)`: `RDY`, `BUSY`
+   of 6.12 as visible in cycle `x`", and "any other index: 0" narrowed to
+   15 and 22..31.
+3. Section 5: `CAPS[10]` Ethernet serializer built, `[11]` zero; the
+   example values gain "0x92BA with slice B, 0x96BA with the serializer";
+   the global reset list gains "the serializer's state, 6.12.1".
+4. Section 6.6: the list of CSRs of a feature that may not be built
+   (`SR`, `CNT`, `CRC`, `BE_*`, `CRC_*`) gains `ETX_*`.
+5. ARCHITECTURE 3.1: the index list (13 `ETX_RDY`, 14 `ETX_BUSY`, 15
+   reserved) and the pad table's notes for `uo_out[1:0]`; ARCHITECTURE 5.1:
+   the five CSRs; ARCHITECTURE 7: the ownership paragraph names the ETX
+   CSRs; ARCHITECTURE 8.2's "the host computes" the FCS is replaced.
+6. The `loom_pins.v` header comment ("13..15 reserved, read 0") changes in
+   the RTL commit, not the docs commit.
+
+#### 6.12.9 What the golden model must model, clock by clock
+
+- All of 6.12.1 as state, updated at every edge exactly as 6.12.4 and
+  6.12.5 say, from pre-edge values. The rules are written so that a literal
+  transcription is correct; where two rules touch the same register at one
+  edge, the text says which wins (`HV` at a load with an accepted write,
+  `UNDER` at a release, sticky set against clear).
+- The write stream: which ETX CSR the slot in W writes, with what value,
+  committing at `x + 2`; the read values of `ETX_CFG`, `ETX_STAT`,
+  `pin_in(13)` and `pin_in(14)` in every X cycle, since a `CSRR`, `JP`,
+  `WAITP` or `IN` that reads them lands in the retire record (`tr_val`,
+  `tr_done`, `tr_next_pc`, section 8).
+- `uo_out[0]` and `uo_out[1]` in every cycle (6.12.7). The co-simulation
+  harness already compares `uo_out`, `uio_out` and `uio_oe` every cycle
+  (`docs/VERIFICATION.md`, the L2 row: retire record, pads, `HOST_IRQ`, guard
+  registers, periodic full state); the model's `uo_out[1:0]` must
+  therefore follow 6.12.7 from the first frame, or every Ethernet program
+  diverges at edge `s`.
+- Not required: the internal encoding of `EPH`, `DIV`, `POS` or `CRC32`,
+  which no read exposes. The model must not read RTL state (section 10).
+- The co-simulation generator: one thread writes the ETX CSRs, from random
+  `ETX_CFG` values (every N, `PRE`, `FCS`, `IDL` including 0) with random
+  gaps, and with bins that hit: each window end and one edge either side
+  (the load-edge accept with `HV == 1`; the underrun edge `K_{m+1}` with
+  `HV == 0`; one edge before it); refused writes (before `K_0`, after a
+  last word, in `P_TAIL`, at the release edge, while `UNDER == 1`);
+  `ETX_STAT` clears, including one at the edge of a set; `CFG` writes while
+  busy; the feeder halted or reset mid-frame; `CSRR ETX_STAT`, `IN` over
+  13..14 and `JP 14` in the cycles of a start and a release; and pin writes
+  to 16 and 17 during a frame. Two writers are allowed by the text but not
+  generated: that case is **untested**.
+
+#### 6.12.10 Properties for `formal/` (proposed IDs)
+
+All are stated over reachable states (from reset); the induction may use
+the invariant "in `P_TAIL`, `POS < IDL`" of 6.12.1.
+
+- ETX-1 (pad shape): while `BUSY`, `uo_out[0] != uo_out[1]`, and in
+  `P_TAIL` they are `(1, 0)`; while not `BUSY` they equal `PIN_OUT[9:8]`.
+- ETX-2 (half-bit length): while `BUSY`, the pad pair changes only at the
+  start edge, at edges `s + i N`, and at the release edge; every Manchester
+  bit has a transition at its middle.
+- ETX-3 (termination): from any reachable state, with no data write
+  accepted, `BUSY` falls within `2 N (64 + 16 + 32) + N IDL` clocks
+  (bounded proof).
+- ETX-4 (no silent loss): every data write is accepted or sets `REF` at its
+  commit edge.
+- ETX-5 (isolation of the rest): `PIN_OUT`, `PIN_OE`, every thread's state
+  and the other 22 pads are unchanged by the block (an extension of
+  SCHED-2 and PIN-1).
+- Re-proved: SCHED-1..4, TIMER-1B/C, TIMER-2, PIN-1, PIN-2, ISO-1 with the
+  new precondition (6.12.7). ISO-1's miter compares the ETX state when the
+  thread under test is its owner.
 
 ## 7. Run control and the host **[M1 subset]**
 

@@ -532,7 +532,9 @@ class _ThreadBuilder:
         self.bidir = tuple(sorted(p for p, d in pins.items() if d["dir"] == "bidir"))
         self.inputs = tuple(sorted(p for p, d in pins.items() if d["dir"] == "in"))
         self.outputs = tuple(sorted(p for p, d in pins.items() if d["dir"] == "out"))
-        self.reserved_pins = tuple(p for p in range(32) if p not in pins)
+        # status indices (dir: status, D-036) have no pad: reserved, as before
+        self.reserved_pins = tuple(p for p in range(32)
+                                   if p not in pins or pins[p]["dir"] == "status")
         self.reserved_words = _reserved_words(isa, rng)
         self.unbuilt_cycle = list(unbuilt_mnemonics(self.features))
         rng.shuffle(self.unbuilt_cycle)

@@ -863,3 +863,135 @@ rather than for a different physical layer or coding.
 Consequences: four firmware agents in worktrees and the director on the
 gaps and the integration; L3 grows, with slow scenarios marked `model_only`
 as before; the firmware freeze date is unchanged.
+
+
+## D-036 2026-11-08 Thomas: a 10BASE-T transmit serializer is built; fdd16ef stays the fallback
+
+Decision: Loom gains one hardware block, the Ethernet serializer of
+SEMANTICS 6.12: a shared transmit block fed by CSR writes from one thread
+(`ETX_CFG`, `ETX_DATA`, `ETX_LAST`, `ETX_LAST1`, `ETX_STAT` at 0x16 to
+0x1A), with Manchester coding at N clocks a half bit (N = 2 at a 40 MHz
+board clock is exact 10 Mbit/s), the preamble and SFD, the CRC-32 FCS,
+TP_IDL, and two status pins (`pin_in(13)` ready, `pin_in(14)` busy). It
+drives TD+ and TD- on `uo_out[0]` and `uo_out[1]` while a frame is on the
+line and gives them back to `PIN_OUT` between frames, where W-113's
+firmware sends the link pulses. No receive, no auto-negotiation in
+hardware, no host register, no memory change (W-115 `MEMORY.md`). The
+datasheet clock stays 50 MHz; Ethernet runs at 40 MHz. `CAPS[10]`
+(`CAPS` 0x96BA, today's 0x92BA with bit 10 set), `VERSION` 5, ISA 0.5.0.
+Thomas approved every recommendation of W-115 `QUESTIONS.md` on
+2026-11-08 (hold the freeze; TD+/TD- on OUT0/OUT1; status pins 13 and 14;
+the underrun rule; no memory change now; 50 MHz main clock, 40 MHz for
+Ethernet). The spec is W-115 `SPEC.md` v2, after an independent review
+(`REVIEW.md`, Fable 5.1: 4 must-fix and 12 should-fix, all applied).
+This supersedes D-029's "10 Mbit Ethernet is not attempted" and D-035's
+rejection of 10BASE-T, for transmit only, and D-032's "the hardware is
+complete".
+
+Why: the organisers name 10 Mbit Ethernet as a stretch protocol and say
+that for USB and Ethernet "the more of the protocol work the chip does
+itself (line coding, CRC, clock recovery), the better" (FAQ, 2026-10-09).
+Firmware cannot do it: a half bit is 2.5 clocks at 50 MHz and a thread acts
+every 4 (W-114, D-029). The block is small, about 100 flops and 600 to 900
+placed cells, +2 to 3 per cent on 31,268 (W-114 section 4), and 8x4 has the
+room: overflow 48, detailed routing 2 h 52 min, the `gds` job 4 h 04 min
+(run 37547764383). At 40 MHz the slow corner closes with about +1.95 ns
+(W-114 section 1, an estimate from that run's paths), which 50 MHz does
+not. The feed is by CSR because the one SRAM port carries a fetch every
+clock (SEMANTICS 2, 6.11): a block that read memory would take F cycles
+and break SCHED-1 and SCHED-2. One thread feeds a word every 16 of its
+slots with about 6 slots of work (SPEC section B).
+Rejected: no hardware change (W-114's recommendation (a); Thomas chose
+otherwise on 2026-11-08); a receiver (2 samples a half bit at 40 MHz and no
+analog squelch, W-114 section 3); a DMA feed from the shared macro (above);
+a second SRAM macro or a bigger one in the same change (D-025, one change
+per hardening; MEMORY.md); a fractional divider at 50 MHz (10 ns of
+deterministic jitter); a selectable pad pair (a new source in every pad
+output mux, the slow-corner family of `docs/AREA.md`).
+
+Fallback: **fdd16ef** (the BUGS 11 fix on 8x4, run 37547764383, every job
+passed, `src/` unchanged since 2026-10-06) is the submission unless the
+Ethernet RTL meets every gate below by 2026-12-20. Two things keep it
+usable: the tag `fallback-fdd16ef` (pushed 2026-11-08), and its artefacts
+kept past GitHub's 90 days,
+which for a run of 2026-10-07 end about 2027-01-05, before the deadline
+(as release assets, D-033's `v1.0-rc1`, or by re-running the deterministic
+flow on the tag, which D-033 showed reproduces every number).
+
+Plan, in order, each step done before the next starts:
+
+1. **Spec review** (done 2026-11-08: Thomas's answers and the independent
+   review, applied in SPEC v2). IEEE 802.3 14.3.1.2.1, Figure 14-10 and the
+   transmit clock tolerance could not be read before the docs commit; the
+   TP_IDL figure and the tolerance are marked unchecked in SEMANTICS 6.12.2,
+   and Thomas reads them before the new freeze, fixing `IDL`'s reset value
+   and range if they differ (`IDL` is a register, so only the reset value
+   would change). Pins 13 and 14 are `dir: status` in `isa.yaml`: named, no
+   pad, refused as a `--pin` target. Then SEMANTICS 6.12
+   and the edits SPEC 6.12.8 lists (SEMANTICS 2, 3, 5, 6.6; ARCHITECTURE
+   3.1, 5.1, 7, 8.2), and the `isa.yaml` CSRs, pins and version, in one
+   docs commit (no hardening, D-018).
+2. **Golden model and RTL by two agents in separate worktrees**, neither
+   opening the other's code (METH-1), each logging spec questions in
+   `docs/spec-questions/loomsim-etx.md` and `rtl-etx.md`, ruled by the
+   director and appended. Both briefs say that 6.12.4 and 6.12.5 are
+   normative and 6.12.6 is derived, so a disagreement is a spec question,
+   not a local fix. Model: the feature `ETX` from 6.12. RTL: a new module
+   `loom_etx`, the generated `csr_etx_*` selects at the W-stage write bus,
+   `pin_in` 13 and 14, two bits of the pad mux in `loom_pins` (a mux of
+   registers, not re-registered); L1 tests with a Python transcription of
+   6.12 as the reference.
+3. **Co-simulation**: the generator drives the ETX CSRs from one thread
+   with the bins SPEC 6.12.9 lists (every N, `PRE`, `FCS`, `IDL`, each
+   window end and one edge either side, underruns, refused writes, clears
+   at the edge of a set). The harness already compares the pads every
+   cycle, so the model's `uo_out[1:0]` is checked from the first frame.
+4. **Formal**: ETX-1 to ETX-5 (SPEC 6.12.10), and SCHED-1..4, TIMER-1B/C,
+   TIMER-2, PIN-1, PIN-2 and ISO-1 re-proved, ISO-1 with the precondition
+   that one thread owns the ETX CSRs.
+5. **Mutation**: `loom_etx`, `loom_pins` and a re-sampled `loom_core` (the
+   last full run took 17.5 h wall clock, W-114).
+6. **Firmware**: `eth_tx` (an ARP request and a UDP frame from data memory,
+   with the NLP timer of W-113 in the same thread) and a **reference
+   receiver** in `tools/protomodels/` written from IEEE 802.3 clauses 3 and
+   14, not from SEMANTICS (SFD, Manchester decode, FCS residue 0xC704DD7B);
+   L3 tests on the model and the RTL; a PHY-GL-SDF scenario.
+7. **Hardening at 8x4**: one hardening for the block alone (D-025). Gate:
+   every job passes, the `gds` job inside six hours with at least an hour
+   spare, detailed routing under 3 h 45 min, typical slack positive at
+   20 ns, slow-corner slack positive at 25 ns (40 MHz). A fix round means a
+   second hardening; that one is the new freeze commit.
+8. **Gate level**: `gl_test` in CI and the SDF subset (120 of 120
+   scenarios today, W-114) re-run on the new netlist.
+9. **The whole firmware suite on the new RTL**: all 708 CI tests and every
+   program's L3 tests on the model and the RTL, unchanged except `CAPS`,
+   `VERSION` and any program that read pin index 13 or 14 (an assembler
+   audit first: those indices read 0 today).
+10. **Docs**: AREA, the datasheet (two clocks: 50 MHz, and 40 MHz for
+    Ethernet), ARCHITECTURE 8, CAPABILITY, README, FLEXIBILITY,
+    VERIFICATION_REPORT, the board note for a TD+/TD- Pmod.
+
+Schedule [E]: spec review by 2026-11-10; model, RTL and L1 green by 11-13;
+co-simulation, firmware and the first hardening by 11-15; formal, mutation
+and fixes by 11-19; the new freeze hardening and the SDF re-run by 11-22;
+the whole suite re-verified by 11-29; the firmware freeze stays 2026-12-01
+(D-030). About 9 to 12 working days (W-114 section 5). Last date to switch
+to the fallback with no rush: 2026-12-20; the deadline is 2027-01-18.
+
+How the flexibility claim is restated: "N programs were written and
+verified on the unchanged RTL of fdd16ef, after the hardware was declared
+complete (D-032). One peripheral was then added for one protocol the
+organisers named, 10BASE-T transmit, and every one of those programs was
+re-verified, unchanged, on the new RTL." The count N comes from
+FLEXIBILITY.md on the day (154 in W-114's count). The claim that `src/` has
+not changed since fdd16ef is withdrawn, not reworded. The Ethernet program
+is listed as the one program that needed hardware, with the reason
+(20 M half bits a second against one action per slot) and the line that
+the block also works as a generic Manchester framer with CRC-32 at
+f_clk / 2N.
+
+Consequences: PLAN M4 gains these steps and the freeze moves from
+2026-11-08 to about 2026-11-22; the final `gds` run of D-033 is made on the
+new freeze commit; D-033's fallback order (re-run, local hardening, then
+D-031 out) applies to it, and if all of that fails the submission is
+fdd16ef. Open questions are in W-115 `QUESTIONS.md`.
