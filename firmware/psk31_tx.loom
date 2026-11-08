@@ -1,0 +1,335 @@
+; psk31_tx.loom
+; A PSK31 transmitter (amateur-radio keyboard mode, G3PLX): text from the
+; host, varicode coded, sent as binary phase-shift keying of an audio
+; carrier at 31.25 baud on one pin, with a preamble of reversals before the
+; text and a postamble of steady carrier after it. Two modes: a square-wave
+; carrier with abrupt reversals, or a sine carrier whose reversals are
+; cosine-shaped, as a one-bit sigma-delta stream for an RC low-pass.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). PSK31 is not a line code but
+; a narrow-band phase modulation of an audio tone, and nothing in Loom was
+; built for it: no oscillator, no DAC, no modulator, no multiplier. The
+; program uses:
+;   - the per-thread fractional tick (TICK_INT/TICK_FRAC, built for UART
+;     baud rates) as the sample clock: one output bit per tick;
+;   - the deadline schedule (WAITD 1 every sample, proved by the checker);
+;   - the data memory (LD/ST, built for device-emulation tables) for the
+;     varicode table, a 64-entry sine table and the transmitter's state;
+;   - OUT through a one-pin OUTGRP group (as dtmf_gen.loom), so every
+;     sample's bit lands the same number of clocks after its tick.
+; What the firmware does that no hardware does: the varicode, the carrier
+; NCO, the BPSK, the cosine shaping of each reversal, the sigma-delta
+; modulation, the preamble, the idle between characters, the postamble and
+; the key-up and key-down ramps.
+;
+; Sources (tools/protomodels/psk31.py gives them in full): the ARRL "PSK31
+; Spec" page (N5SK after G3PLX): 31.25 baud; 0 = phase reversal, 1 = steady
+; carrier; the output cosine-filtered; preamble = continuous zeros (idle),
+; postamble = unmodulated carrier (ones); at least two zeros between
+; characters. The varicode table is fldigi's (pskvaricode.cxx), checked row
+; by row against the ARRL table (which has rows 90..96 shifted by one). G3PLX's
+; own RadCom article (1998/99) could not be read: unchecked.
+;
+; The shaping, and why no multiplier is needed. A reversal shaped by a
+; cosine is cos(pi t / T) sin(wc t) over one symbol T, centred on the
+; boundary; by the product formula that is half the sum of two tones,
+; sin(wc t + pi t / T) + sin(wc t - pi t / T) (G3PLX's two-tone picture).
+; So the program keeps a carrier phase th_c and a modulation phase th_m and
+; outputs  sin(th_c + th_m) + sin(th_c - th_m) = 2 sin(th_c) cos(th_m):
+; th_m resting at 0 or 1/2 cycle is the carrier with sign + or -, th_m
+; moving by 1/2 cycle over one symbol is a cosine-shaped reversal, and th_m
+; at 1/4 cycle is no carrier at all. Two table look-ups and an add.
+;
+; Square mode: the pin is the sign of sin(th_c + th_m), and th_m jumps by
+; 1/2 cycle exactly at a symbol boundary. This is plain square-wave BPSK:
+; its spectrum is a sinc around the carrier (sidebands at fc +- 1.5, 2.5 ..
+; times the baud rate only about 10, 14 .. dB down) plus the square wave's
+; odd harmonics: much wider than PSK31's two tones, as test_fw_psk31.py
+; measures. Use it only into a narrow filter, or where width does not
+; matter.
+;
+; Shaped mode: x = 32768 + 32000 sin(th_c) cos(th_m) (two words of
+; dtmf_gen.loom's table, 16384 + round(16000 sin)), first-order
+; sigma-delta: the carry of a 16-bit accumulator is the pin. An RC low-pass
+; (for example 1 kohm, 47 nF) gives the audio for a transceiver's input.
+; The reversal's envelope is exactly a cosine sampled N times; its zero
+; is the symbol boundary, N/2 samples after the program's decision instant
+; (the symbol centre). Phase truncation to 6 bits and the modulator's
+; noise are the only impurities; test_fw_psk31.py measures the result.
+;
+; Sample grid. fs = clock / tick. A symbol is N samples, N a power of two
+; (the host gives it), so the ramp step 32768 / N is exact and th_m lands
+; on its rest values exactly. The carrier is STEP / 65536 cycles a sample.
+; At 50 MHz, for 1000 Hz and 31.25 baud exactly:
+;     fs 32 000 Hz: TICK_INT 1562, TICK_FRAC 128, N 1024, STEP 2048
+;     fs 128 000 Hz: TICK_INT 390, TICK_FRAC 160, N 4096, STEP 512
+; Shaped mode wants the second: a first-order sigma-delta driven by a
+; signal that repeats every two symbols (idle) has idle tones on the very
+; lines that measure PSK31's purity (fc +- 3/2 baud, "IMD"): measured about
+; -23 to -30 dB at 32 samples a carrier cycle, -50 dB or lower at 128
+; (test_fw_psk31.py). Square mode does not care. The rate and
+; the carrier are both exact to the board clock. The schedule is proved
+; for any tick of at least the .tick below.
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, first five words (configuration): STEP; N (a power of two, 4 or
+;     more); MODE (bit 0: 1 shaped, 0 square); PRE, the preamble in symbols
+;     (zeros); POST, the postamble in symbols (ones).
+;   INQ, then: one word a character: bits 6:0 the character (bit 7 and
+;     bits 15:9 ignored); bit 8 set: end of message (postamble, key down).
+;   A word queued while the carrier is off keys up: a reference symbol
+;   (square) or a half-symbol cosine ramp-up (shaped), then the preamble,
+;   then the text. While the queue is empty the transmitter sends idle
+;   (zeros, which is also how PSK31 idles between characters). An end word
+;   queued while off sends a preamble and a postamble and nothing between.
+;   After the postamble: square mode stops at once (pin low); shaped mode
+;   ramps the carrier down over half a symbol (cosine), then silence (the
+;   pin alternates 1, 0: the filter's mid level). Nothing goes to OUTQ.
+;
+; Pins: TX = OUT0 (any output with --pin TX=<pin>).
+;
+; Memory: 354 words in 0x000 .. 0x16F (.imem 512): variables 0x001 ..
+; 0x00B, configuration code to 0x030, the sine table 0x040 .. 0x07F (an
+; absolute address, as dtmf_gen.loom: ADDI 63 then LD +1), the rest of the
+; code 0x080 .. 0x0EF, the varicode table 0x0F0 .. 0x16F. That is threads 0
+; to 2's quarters: threads 1 and 2 cannot run beside it, thread 3 (0x180)
+; can, with up to 128 words of its own. The varicode table is most of it;
+; a printable-only table (32 .. 127 and CR, LF) would bring the program
+; inside two quarters (QUESTIONS).
+;
+; Deadlines: ten pairs, all proved, one POP bounded by declaration (it
+; follows a WAITB INQ_NE, T that completed by its condition). The worst is
+; a shaped sample whose decision ends the preamble and pops and looks up
+; the first character: 75 slots = 300 clocks, the .tick below; at 50 MHz
+; fs 32 kHz gives a tick of 1562.5 clocks and fs 128 kHz 390.6.
+;
+; Readings taken on the open spec questions (2026-11-07): varicode from the
+; ARRL "PSK31 Spec" table checked row by row against fldigi's table (the
+; ARRL table shifts rows 90 to 96 by one); G3PLX's RadCom article was not
+; read. Secondary.
+;   Use shaped mode at 128 k samples a second (TICK_INT 390, TICK_FRAC
+;   160 at 50 MHz) on the air: square mode is as wide as textbook square
+;   BPSK (first sidebands -8.8 dB). Shaped mode's limit is the
+;   first-order sigma-delta's idle tones (-50 dB and below at that rate).
+;   Preamble and postamble lengths are host words (the source gives
+;   none). Only codes 0 to 127 are sent.
+
+        .imem   512
+        .thread 0
+        .pins   TX = OUT0
+        .tick   300
+        .equ    SINE  = 0x40                    ; 64 words, 16384 + round(16000 sin(2 pi i / 64))
+        .equ    EMPTY = 0x8000                  ; SR holding only its stop marker
+        .equ    ZERO1 = 0x4000                  ; SR for one 0 (idle, preamble)
+        .equ    ONE1  = 0xC000                  ; SR for one 1 (postamble)
+        .equ    QUART = 16384                   ; th_m of the envelope zero
+
+; r0 th_c, the carrier phase (2^16 = one cycle)   r1 th_m, the modulation phase
+; r2 STEP   r3 th_m's step this symbol (0, or 32768 / N while a shaped
+; reversal runs)   r4 the sigma-delta accumulator   r5 the next sample's bit
+; r6 r7 scratch; r7 the samples left in the symbol inside the loops.
+        JMP     start
+NWORD:  .word   0                               ; N, samples a symbol
+KEYLEN: .word   0                               ; key-up and key-down segment: N/2 shaped, N square
+MODE:   .word   0                               ; 1 shaped, 0 square
+THETA0: .word   0                               ; th_m at key-up: QUART shaped, 0 square
+IMM0:   .word   0                               ; th_m's jump on a 0: 32768 square, 0 shaped
+RAMP0:  .word   0                               ; th_m's step on a 0: 32768 / N shaped, 0 square
+PRE:    .word   0                               ; preamble symbols
+POST:   .word   0                               ; postamble symbols
+CNT:    .word   0                               ; preamble or postamble symbols left
+STATE:  .word   0                               ; 1 preamble, 2 text, 3 postamble, 4 ramp-down
+SR:     .word   EMPTY                           ; bits still to send, MSB next, then a stop 1
+
+start:  .csr    OUTGRP, (1 << 5) | pin(TX)      ; OUT r writes r[0] to TX
+        LDI     r6, 0                           ; the base of every variable
+        POP     r2                              ; STEP (blocks)
+        POP     r7                              ; N (blocks)
+        ST      r7, r6, NWORD
+        MOV16   r3, 0x8000                      ; 32768 / N, N a power of two
+        MOV     r5, r7
+rdiv:   SHRI    r5, 1
+        BZ      rdone
+        SHRI    r3, 1
+        JMP     rdiv
+rdone:  POP     r5                              ; MODE (blocks)
+        ANDI    r5, 1
+        ST      r5, r6, MODE
+        BZ      sqcfg
+        ST      r3, r6, RAMP0                   ; shaped: a 0 ramps th_m by 32768 over N
+        ST      r6, r6, IMM0
+        MOV16   r3, QUART
+        ST      r3, r6, THETA0                  ; key up from the envelope zero
+        SHRI    r7, 1                           ; and ramp up over N/2 samples
+        JMP     cfg2
+sqcfg:  ST      r6, r6, RAMP0                   ; square: a 0 jumps th_m by 32768
+        ST      r6, r6, THETA0
+        MOV16   r3, 0x8000
+        ST      r3, r6, IMM0
+cfg2:   ST      r7, r6, KEYLEN
+        POP     r7                              ; PRE (blocks)
+        ST      r7, r6, PRE
+        POP     r7                              ; POST (blocks)
+        ST      r7, r6, POST
+        LDI     r5, 0
+        SETD    1
+        JMP     off
+
+        .org    SINE                            ; 16384 + round(16000 sin(2 pi i / 64))
+        .word   16384, 17952, 19505, 21029, 22507, 23926, 25273, 26534
+        .word   27698, 28752, 29688, 30495, 31166, 31695, 32077, 32307
+        .word   32384, 32307, 32077, 31695, 31166, 30495, 29688, 28752
+        .word   27698, 26534, 25273, 23926, 22507, 21029, 19505, 17952
+        .word   16384, 14816, 13263, 11739, 10261,  8842,  7495,  6234
+        .word    5070,  4016,  3080,  2273,  1602,  1073,   691,   461
+        .word     384,   461,   691,  1073,  1602,  2273,  3080,  4016
+        .word    5070,  6234,  7495,  8842, 10261, 11739, 13263, 14816
+
+
+; Carrier off. Square: the pin low. Shaped: 1, 0, 1, 0 (x = 32768, the
+; filter's mid level). The pending bit goes out first. Any queued word
+; keys up; it is popped later, in the text state.
+off:    LDI     r6, 0
+        LD      r6, r6, MODE
+offl:   WAITD   1
+        OUT     r5
+        XOR     r5, r5, r6
+        AND     r5, r5, r6
+        WAITB   INQ_NE, T                       ; TD has passed: a test, not a wait
+        BT      offl
+        LDI     r6, 0                           ; key up
+        LD      r7, r6, PRE
+        ST      r7, r6, CNT
+        LDI     r7, 1
+        ST      r7, r6, STATE
+        LDI     r0, 0                           ; th_c from 0: boundaries at th_c = 0
+        LD      r1, r6, THETA0
+        LD      r3, r6, RAMP0
+        LD      r7, r6, KEYLEN
+        JMP     loop
+
+; Pick the sample loop of the mode; r6 must be 0 here.
+loop:   LD      r6, r6, MODE
+        TEST    r6, r6
+        BZ      sqloop
+        JMP     shloop
+
+; One square-mode sample: the bit for this sample (computed last tick) goes
+; out right after the tick; then the sign of sin(th_c + th_m) for the next.
+sqloop: WAITD   1
+        OUT     r5
+        MOV     r5, r0
+        ADD     r5, r5, r1
+        SHRI    r5, 15                          ; 1 in the negative half-cycle
+        ADD     r0, r0, r2
+        DJNZ    r7, sqloop
+        JMP     sym
+
+; One shaped sample: out with the bit computed last tick, then
+; x = t[th_c + th_m] + t[th_c - th_m] = 32768 + 32000 sin(th_c) cos(th_m)
+; into the modulator; its carry is the next bit. 21 slots and the WAITD.
+shloop: WAITD   1
+        OUT     r5
+        MOV     r5, r0
+        ADD     r5, r5, r1
+        SHRI    r5, 10                          ; the top 6 bits
+        ADDI    r5, 63
+        LD      r5, r5, SINE - 63
+        MOV     r6, r0
+        SUB     r6, r6, r1
+        SHRI    r6, 10
+        ADDI    r6, 63
+        LD      r6, r6, SINE - 63
+        ADD     r5, r5, r6                      ; x, 768 .. 64768
+        ADD     r4, r4, r5                      ; C = the bit
+        CSRR    r5, FLAGS                       ; {T, C, Z}
+        SHRI    r5, 1                           ; r5[0] = C
+        ADD     r0, r0, r2
+        ADD     r1, r1, r3
+        DJNZ    r7, shloop
+
+; A decision instant (square: a symbol boundary; shaped: a symbol centre,
+; N/2 samples before the boundary its reversal straddles). The last sample
+; is computed and in r5; everything below fits in the same tick.
+sym:    LDI     r6, 0
+        LD      r7, r6, SR
+        SHLI    r7, 1                           ; C = the next bit
+        BZ      refill                          ; only the stop 1 was left
+have:   ST      r7, r6, SR
+        LDI     r3, 0                           ; a 1: no reversal (LDI keeps C)
+        BC      next
+        LD      r3, r6, IMM0                    ; a 0: square, the reversal now;
+        ADD     r1, r1, r3
+        LD      r3, r6, RAMP0                   ; shaped, over the next N samples
+next:   LD      r7, r6, NWORD
+        JMP     loop
+
+refill: LD      r7, r6, STATE
+        CMPI    r7, 2
+        BZ      text
+        BC      late                            ; 3 postamble or 4 ramp-down
+        LD      r7, r6, CNT                     ; 1: preamble
+        SUBI    r7, 1                           ; C = a symbol left
+        BNC     pdone
+        ST      r7, r6, CNT
+        MOV16   r7, ZERO1
+        JMP     shift
+pdone:  LDI     r7, 2
+        ST      r7, r6, STATE
+text:   WAITB   INQ_NE, T                       ; TD has passed: a test, not a wait
+        BT      idle
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, so INQ holds a word; only this thread pops INQ"
+        POP     r7
+        MOV     r3, r7
+        SHRI    r3, 9                           ; C = bit 8: end of message
+        BC      endw
+        SHLI    r7, 9
+        SHRI    r7, 9                           ; the character, 7 bits
+        MOV16   r3, VTAB
+        ADD     r7, r7, r3
+        LD      r7, r7, 0                       ; code, 0, 0, stop 1
+        JMP     shift
+idle:   MOV16   r7, ZERO1                       ; nothing queued: idle
+        JMP     shift
+endw:   LDI     r7, 3
+        ST      r7, r6, STATE
+        LD      r7, r6, POST
+        JMP     post
+late:   CMPI    r7, 3
+        BNZ     off                             ; 4: the ramp-down is over
+        LD      r7, r6, CNT
+post:   SUBI    r7, 1                           ; C = a symbol left
+        BNC     down
+        ST      r7, r6, CNT
+        MOV16   r7, ONE1
+shift:  SHLI    r7, 1                           ; C = the bit
+        JMP     have
+down:   LD      r7, r6, MODE                    ; postamble over: key down
+        TEST    r7, r7
+        BZ      off                             ; square: at once
+        LDI     r7, 4                           ; shaped: th_m from rest to the
+        ST      r7, r6, STATE                   ; envelope zero over N/2
+        LD      r3, r6, RAMP0
+        LD      r7, r6, KEYLEN
+        JMP     shloop
+
+; The varicode, one word a character 0..127: code, 0, 0, a stop 1, then
+; zeros, left-aligned (tools.protomodels.psk31.left_aligned).
+VTAB:
+        .word   0xAAC8, 0xB6C8, 0xBB48, 0xDDC8, 0xBAC8, 0xD7C8, 0xBBC8, 0xBF48   ; 0
+        .word   0xBFC8, 0xEF20, 0xE900, 0xDBC8, 0xB748, 0xF900, 0xDD48, 0xEAC8   ; 8
+        .word   0xBDC8, 0xBD48, 0xEB48, 0xEBC8, 0xD6C8, 0xDAC8, 0xDB48, 0xD5C8   ; 16
+        .word   0xDEC8, 0xDF48, 0xEDC8, 0xD548, 0xD748, 0xEEC8, 0xBEC8, 0xDFC8   ; 24
+        .word   0x9000, 0xFF90, 0xAF90, 0xFA90, 0xED90, 0xB548, 0xAEC8, 0xBF90   ; 32
+        .word   0xFB20, 0xF720, 0xB790, 0xEF90, 0xEA40, 0xD480, 0xAE40, 0xD790   ; 40
+        .word   0xB720, 0xBD20, 0xED20, 0xFF20, 0xBB90, 0xAD90, 0xB590, 0xD690   ; 48
+        .word   0xD590, 0xDB90, 0xF520, 0xDE90, 0xF690, 0xAA40, 0xEB90, 0xABC8   ; 56
+        .word   0xAF48, 0xFA40, 0xEB20, 0xAD20, 0xB520, 0xEE40, 0xDB20, 0xFD20   ; 64
+        .word   0xAA90, 0xFE40, 0xFE90, 0xBE90, 0xD720, 0xBB20, 0xDD20, 0xAB20   ; 72
+        .word   0xD520, 0xEE90, 0xAF20, 0xDE40, 0xDA40, 0xAB90, 0xDA90, 0xAE90   ; 80
+        .word   0xBA90, 0xBD90, 0xAB48, 0xFB90, 0xF790, 0xFD90, 0xAFC8, 0xB690   ; 88
+        .word   0xB7C8, 0xB200, 0xBE40, 0xBC80, 0xB480, 0xC800, 0xF480, 0xB640   ; 96
+        .word   0xAC80, 0xD200, 0xF590, 0xBF20, 0xD900, 0xEC80, 0xF200, 0xE400   ; 104
+        .word   0xFC80, 0xDF90, 0xA900, 0xB900, 0xA400, 0xDC80, 0xF640, 0xD640   ; 112
+        .word   0xDF20, 0xBA40, 0xEA90, 0xADC8, 0xDD90, 0xAD48, 0xB5C8, 0xED48   ; 120
