@@ -1,0 +1,216 @@
+; sstv_m1.loom
+; A slow-scan television transmitter in Martin M1: the VIS header, then N
+; picture lines of a test pattern (EBU 100/75 colour bars), as a square
+; wave on one pin whose frequency carries the picture.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). SSTV is not a line code but
+; frequency modulation of an audio tone, and nothing in Loom was built for
+; it: there is no oscillator, no DAC and no frame buffer. The program uses:
+;   - the per-thread tick (TICK_INT, built for UART baud rates) as the
+;     sample clock of a numerically controlled oscillator;
+;   - the deadline schedule (WAITD 1 every sample, proved by the checker),
+;     so every sample lands on an absolute tick and no duration drifts;
+;   - OUT through a one-pin OUTGRP group, so the oscillator's top bit goes
+;     to the pin in the same slot of every sample, with no branch;
+;   - PAR (built for UART and 1-Wire parity) for the VIS parity bit;
+;   - the data memory (LD) for the colour-bar table.
+; What the firmware does that no hardware does: the oscillator itself (a
+; 16-bit phase accumulator; its carry-free top bit is the square wave),
+; phase-continuous frequency changes at every segment boundary, the VIS
+; code with its parity, the Martin M1 line schedule, the picture.
+;
+; What is weaker than a dedicated SSTV source: the pin carries a square
+; wave, not a sine. Its third harmonic (3300 .. 6900 Hz) is above the
+; voice band of a transceiver's audio input but must be filtered (an RC
+; or the radio's own filter); the fundamental's zero crossings are the
+; square wave's edges, which is what a zero-crossing decoder measures.
+; The edges sit on the sample grid, so each edge is late by up to one
+; sample (14.3 us at S = 2); the frequency is exact on average.
+;
+; Sources (tools/protomodels/sstv.py cites them in full). VIS: Wikipedia,
+; "Slow-scan television", section Header (secondary): 1900 Hz leader
+; 300 ms, 1200 Hz break 10 ms, leader 300 ms, 1200 Hz start bit, seven
+; data bits LSB first (1100 Hz = 1, 1300 Hz = 0), even parity, 1200 Hz
+; stop bit, 30 ms a bit; Martin M1 is code 44. Martin M1 line (FROM
+; MEMORY, UNCHECKED: J. L. Barber, "Proposal for SSTV mode
+; specifications", Dayton 2000, could not be fetched): 1200 Hz sync
+; 4.862 ms, 1500 Hz porch 0.572 ms, then green, blue and red scans of
+; 146.432 ms each (320 pixels, 0.4576 ms a pixel), each followed by a
+; 1500 Hz separator of 0.572 ms: 446.446 ms a line, 256 lines; 1500 Hz
+; black, 2300 Hz white.
+;
+; Sample rate. At 50 MHz the pixel (22 880 clocks), the sync (243 100) and
+; the porch (28 600) have the common divisor 2860 clocks, so with the host
+; rate S (0, 1, 2) and TICK_INT = 2860 >> S (2860, 1430, 715) every line
+; element is a whole number of samples: fs = 17 482.5 * 2^S Hz, a line
+; 7805 * 2^S samples, exactly 446.446 ms. Durations are stored for S = 2
+; (sync 340, porch 40, a 40-pixel bar 1280, VIS 300 ms 20979, 10 ms 699,
+; 30 ms 2098) and shifted right by 2 - S + T. T is a time compression for
+; tests (0 on the air): every duration divided by 2^T, the frequencies
+; not. VIS lengths are truncated: at S = 0 a 30 ms bit is 524 samples,
+; 29.97 ms; the 300 ms leader 5244, 299.95 ms. At another board clock the
+; host sets TICK_INT and TICK_FRAC to clock / fs (1/256 of a clock).
+;
+; Frequencies. Phase steps are stored for S = 2, round(f * 65536 / 69 930)
+; and shifted left by 2 - S, so the same frequencies come out at every S:
+; resolution 1.067 Hz (a third of a grey level, 800 Hz / 255 = 3.14 Hz).
+;     1100 -> 1031 = 1100.13 Hz    1500 -> 1406 = 1500.27 Hz
+;     1200 -> 1125 = 1200.43 Hz    1900 -> 1781 = 1900.41 Hz
+;     1300 -> 1218 = 1299.67 Hz    2300 -> 2155 = 2299.49 Hz
+;     level 191 (75 %), 2099.22 Hz -> 1967 = 2098.88 Hz
+; A frequency change keeps the phase (only the step changes) and takes
+; effect on the sample after a segment's last.
+;
+; Picture: eight bars of 40 pixels, white (100 %), yellow, cyan, green,
+; magenta, red, blue (75 %), black; the same on every line.
+;
+; Pins: TX = OUT0 (any output with --pin TX=<pin>). Low when idle.
+;
+; Host interface (FIFO space, thread 0), three words a transmission:
+;   INQ: S, the rate, 0..2 (TICK_INT = 2860 >> S at 50 MHz; above 2 reads as 2);
+;   INQ: T, the time compression, 0 on the air; 2 - S + T above 4 is
+;        taken as 4 (no duration may shrink to zero);
+;   INQ: N, the number of lines, 1..256 (0 sends the VIS only).
+; After the last line the pin goes low and the next three words start a
+; new transmission. Nothing goes to OUTQ.
+;
+; Deadlines: a sample inside a segment is 6 slots; the longest path from
+; one WAITD 1 to the next crosses a segment boundary (the last sample's
+; RET, the caller's next step and count, CALL, the two shifts): 19 slots,
+; 76 clocks, which the checker proves for the .tick below (any tick of 76
+; clocks or more). At 50 MHz the tick is 715 clocks or more.
+;
+; Memory: 0x000 .. 0x07F, all 128 words of thread 0's quarter (.imem 512):
+; the bar table and the VIS bit steps at 0x001 .. 0x01A (reached as LD
+; offsets from a register holding an index, so they must sit below 32),
+; N at 0x01B, the code after. It runs as thread 0 only.
+;
+; Readings taken on the open spec questions (2026-11-07): Barber's mode
+; specifications could not be fetched. The VIS format is from a secondary
+; source; the Martin M1 line timings (sync, porch, the 146.432 ms scans)
+; are from memory and unchecked. Check before use on the air.
+;   VIS code 44 (the source says "44 or 32"); a one-bit 30 ms stop bit;
+;   1500 Hz is black and 2300 Hz white; no greyscale band in the first
+;   16 lines.
+;   A square wave: its third harmonic must be filtered before a radio.
+
+        .imem   512
+        .thread 0
+        .pins   TX = OUT0
+        .tick   76
+        .equ    VIS_CODE = 44                   ; Martin M1
+        .equ    F1100 = 1031                    ; phase steps at S = 2
+        .equ    F1200 = 1125
+        .equ    F1300 = 1218
+        .equ    F1500 = 1406
+        .equ    F1900 = 1781
+        .equ    D300 = 20979                    ; durations at S = 2
+        .equ    D10 = 699
+        .equ    D30 = 2098
+        .equ    DSYNC = 340
+        .equ    DPORCH = 40
+        .equ    DBAR = 1280
+
+; r0 the phase (2^16 = one cycle)   r1 the VIS word, then the lines left
+; r2 the step   r3 the duration shift 2 - S + T   r4 the step shift 2 - S
+; r5 the next sample's bit   r6 the bar index   r7 samples left
+        JMP     start
+BARS:   .word   2155, 1967, 1967, 1967, 1406, 1406, 1406, 1406  ; green
+        .word   2155, 1406, 1967, 1406, 1967, 1406, 1967, 1406  ; blue
+        .word   2155, 1967, 1406, 1406, 1967, 1967, 1406, 1406  ; red
+BITF:   .word   F1300, F1100                    ; VIS bit 0, bit 1
+NL:     .word   0                               ; the host's N
+
+start:  .csr    OUTGRP, (1 << 5) | pin(TX)      ; OUT r writes r[0] to TX
+        LDI     r5, 0
+        OUT     r5                              ; idle low
+        POP     r4                              ; S (blocks)
+        CMPI    r4, 3
+        BNC     s_ok
+        LDI     r4, 2                           ; 3 and above read as 2
+s_ok:   NEG     r4, r4
+        ADDI    r4, 2                           ; 2 - S
+        POP     r3                              ; T (blocks)
+        ADD     r3, r3, r4
+        CMPI    r3, 5
+        BNC     t_ok
+        LDI     r3, 4                           ; no duration shrinks to 0
+t_ok:   POP     r1                              ; N (blocks)
+        ST      r1, r5, NL                      ; r5 = 0 here
+        LDI     r1, VIS_CODE
+        PAR     r1, r1                          ; C = odd number of ones
+        CSRR    r6, FLAGS                       ; {T, C, Z}
+        ANDI    r6, 2
+        SHLI    r6, 6                           ; C to bit 7: even parity
+        OR      r1, r1, r6
+        LDIH    r1, 1                           ; bit 8: the end marker
+        LDI     r0, 0
+        SETD    1
+
+; VIS: leader, break, leader, start bit, 7 data bits and parity LSB first,
+; stop bit.
+        MOV16   r2, F1900
+        MOV16   r7, D300
+        CALL    tone
+        MOV16   r2, F1200
+        MOV16   r7, D10
+        CALL    tone
+        MOV16   r2, F1900
+        MOV16   r7, D300
+        CALL    tone
+        MOV16   r2, F1200                       ; start bit
+        MOV16   r7, D30
+        CALL    tone
+bits:   MOV     r7, r1
+        ANDI    r7, 1
+        LD      r2, r7, BITF
+        MOV16   r7, D30
+        CALL    tone
+        SHRI    r1, 1
+        CMPI    r1, 1                           ; only the marker left?
+        BNZ     bits
+        MOV16   r2, F1200                       ; stop bit
+        MOV16   r7, D30
+        CALL    tone
+        LDI     r6, 0
+        LD      r1, r6, NL
+        TEST    r1, r1
+        BZ      done
+
+; One Martin M1 line: sync, porch, then green, blue and red, eight bars
+; each, each scan followed by a separator.
+line:   MOV16   r2, F1200
+        MOV16   r7, DSYNC
+        CALL    tone
+        MOV16   r2, F1500
+        LDI     r7, DPORCH
+        CALL    tone
+        LDI     r6, 0
+bar:    LD      r2, r6, BARS
+        MOV16   r7, DBAR
+        CALL    tone
+        ADDI    r6, 1
+        MOV     r7, r6
+        ANDI    r7, 7
+        BNZ     bar                             ; the scan goes on
+        MOV16   r2, F1500                       ; separator
+        LDI     r7, DPORCH
+        CALL    tone
+        CMPI    r6, 24
+        BNZ     bar                             ; the next colour
+        DJNZ    r1, line
+done:   JMP     start                           ; the pin goes low there
+
+; tone: r2 phase steps (S = 2 units) for r7 samples (S = 2 units). One
+; sample: the bit decided last sample goes out right after the tick, then
+; the phase advances and its top bit is the next sample's bit.
+tone:   SHL     r2, r2, r4
+        SHR     r7, r7, r3
+tl:     WAITD   1
+        OUT     r5
+        ADD     r0, r0, r2
+        MOV     r5, r0
+        SHRI    r5, 15
+        DJNZ    r7, tl
+        RET
