@@ -1,0 +1,349 @@
+; unio_device.loom
+; A UNI/O slave in the manner of Microchip's 11AA02E48 serial EEPROM: it
+; measures the master's bit rate on every start header, answers device
+; address 0xA0 with SAK, and serves READ (sequential, with MAK), WRITE (a
+; page buffer committed at the NoMAK, only after WREN), WREN and RDSR (WIP
+; and WEL, polled with MAK) from a 16-byte array, with a write-busy time.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The program uses:
+;   - the bit engine's Manchester decoder and encoder (BE_CFG.ENC = 2,
+;     SEMANTICS 6.9.1), built for the Manchester loopback: SHI samples each
+;     half bit and sets T on a bit with no middle edge (3.7: a missed edge
+;     sends the device to Idle), SHO sends the data bits of a READ or RDSR;
+;   - the tick restart on a TICK_INT write (SEMANTICS 4), built for the UART
+;     receivers' start bit: on every MAK's middle edge the program rewrites
+;     TICK_INT, so its quarter-bit grid starts again on the master's edge,
+;     the re-synchronisation the data sheet describes in 3.8;
+;   - the fractional tick (TICK_FRAC), built for 115200 baud from 50 MHz: the
+;     measured quarter bit keeps its half clock;
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C, and the deadline-
+;     latched pin write (SETP ... D, SEMANTICS 6.10), built for ws2812, for
+;     the SAK edges on their tick;
+;   - the data memory (LD/ST, SEMANTICS 6.11): the array, with the page
+;     buffer in the upper byte of each word.
+; What the firmware does that no hardware does: the rate measurement (a
+; counting loop over four bit periods of the header), the standby pulse,
+; the acknowledge sequence, the instruction set, the write-enable latch,
+; the page buffer and the write cycle.
+;
+; Source: Microchip DS20002122B (the 11AA02E48 data sheet), as cited in
+; unio_master.loom: Table 1-2 (TE 10..100 us, FDRIFT 0.5 % a byte, TIJIT,
+; TOJIT, TSTBY >= 600 us, TWC <= 5 ms), 3.1 standby, 3.2 header, 3.3
+; acknowledge, 3.4 address, 3.6 standby mode, 3.7 idle mode, 3.8 the
+; re-synchronisation on MAK, 4.1 READ, 4.3 WRITE, 4.4 WREN, 4.5 RDSR, 5.0
+; and Table 6-1 (no write without WEL), Table 4-1 opcodes.
+;
+; Rate measurement: the header after THDR is 01010101, a square wave of
+; period TE. From the first fall (0.5 TE) to the third (4.5 TE) the program
+; counts a two-slot loop (8 clocks a count): 4 TE / 8 counts, so a quarter
+; bit is count / 2 clocks (TICK_INT = count >> 1, TICK_FRAC = 128 for the
+; odd half). The count is good to one loop pass, 8 clocks in 4 TE (0.4 %
+; at 100 kbit/s, 0.04 % at 10 kbit/s), and every MAK restarts the grid, so
+; the error does not grow past a byte (FDRIFT allows 0.5 % a byte).
+; Timing, in quarter-bit ticks from the restart on a MAK's middle edge
+; (Q2 of the MAK bit, seen 2 to 9 clocks late, SEMANTICS 2 and 3):
+;     SAK      low from Q0 of the SAK bit, released at its Q2 (SETP ... D)
+;     receive  each bit sampled at Q1 and Q3
+;     send     each half bit from its Q0 and Q2 (the SHO after the WAITD),
+;              the line released at the MAK bit's start
+;     MAK      read at Q1; its middle edge awaited until Q3 (else Idle)
+;
+; Readings taken on the open questions (QUESTIONS.md): a standby pulse is a
+; high of 16 ticks of the idle rate (400 us, under TSTBY's 600 and over the
+; 1.5 TE that is the longest high inside a command at 10 kbit/s); the array
+; is 16 bytes, one page, and the word address is taken modulo 16 (the
+; 11AA02E48 has 256); the write cycle lasts TBUSY = 196 ticks of the rate
+; last measured (0.49 ms at 100 kbit/s, 4.9 ms at 10 kbit/s: inside TWC's
+; 5 ms, and long enough that a poll's first status byte, 39 TE after the
+; write's end at the soonest, still reads WIP = 1);
+; BP0 and BP1 read 0 (WRSR, ERAL, SETAL, CRRD and WRDI are not answered: a
+; NoSAK and Idle, as for any instruction the device does not have).
+;
+; Host words: none. Each WRITE that starts a write cycle pushes 0x5700 |
+; the number of bytes taken to OUTQ (thread 1), so a test can see it.
+;
+; OD_MASK (BUGS 14): set first, read back three slots later and set again
+; if the bit is missing, as unio_master.loom does.
+;
+; Memory: 0x080..0x0FF (thread 1's quarter) and 0x100..0x17F (thread 2's),
+; the array the last 16 words (0x170, loaded with the image): thread 2
+; must not be started. With unio_master.loom (thread 0) the two load
+; together.
+;
+; Registers: r0 the byte, r1 the acknowledge bit just read (1 MAK), r2 the
+; address (0..15), r3 the STATUS register (bit 0 WIP, bit 1 WEL), r4 the
+; end of the write cycle (NOW), r5 scratch, r6 the instruction, then the
+; bytes of the page buffer still to commit (bit i for address i), r7
+; scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .tick   125                     ; the fastest rate: 100 kbit/s at 50 MHz
+        .equ    SCIOPIN = 1             ; BIDIR1
+        .pins   SCIO = SCIOPIN
+        .equ    SCIOBIT = 1 << SCIOPIN
+        .equ    CFG = (1 << 1) | (2 << 3)   ; BE_CFG: MSB first, Manchester
+        .equ    IDLE_Q = 1250           ; the tick while idle: 25 us
+        .equ    STBYQ = 16              ; a standby: 16 idle ticks, 400 us
+        .equ    TBUSY = 196             ; the write cycle, ticks (header)
+        .equ    DATA = 0x170            ; the array, 16 words
+        .equ    I_READ = 0x03           ; Table 4-1
+        .equ    I_WRITE = 0x6C
+        .equ    I_WREN = 0x96
+        .equ    I_RDSR = 0x05
+        .equ    DEVADDR = 0xA0          ; 3.4
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, SCIOBIT
+        CSRW    OD_MASK, r7             ; SCIO open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, SCIOBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    BE_CFG, CFG
+        .csr    BE_PINS, SCIOPIN | SCIOPIN << 5
+        SETP    SCIO, 1                 ; released
+        LDI     r3, 0                   ; WEL = 0 at power-up (6.0)
+        LDI     r6, 0
+
+; Idle (3.7): everything ignored until a standby pulse, a high of STBYQ
+; ticks at the idle rate. Power-up starts here too (6.0).
+idle:   MOV16   r7, IDLE_Q
+        CSRW    TICK_INT, r7
+i_hi:   WAITP   SCIO, 1
+        SETD    STBYQ
+        WAITP   SCIO, 0, T
+        BNT     i_hi                    ; it fell too soon: not a standby
+
+; Standby (3.6): wait for the header's fall. During a write cycle the wait
+; times out at its end, so WIP is cleared before NOW can wrap past it.
+stby:   MOV     r7, r3
+        ANDI    r7, 1
+        BZ      s_wait                  ; no write cycle
+        CSRW    TD, r4
+        WAITP   SCIO, 0, T
+        BNT     hdr
+        ANDI    r3, 2                   ; timed out: the cycle is over, WIP = 0
+s_wait: WAITP   SCIO, 0                 ; the header's low (THDR)
+hdr:    WAITP   SCIO, 1                 ; THDR over: the header's first bit
+        WAITP   SCIO, 0                 ; 0.5 TE: its middle edge
+        LDI     r1, 0
+m1:     INC     r1                      ; 8 clocks a count (header)
+        JP      SCIO, 0, m1             ; low to 1.5 TE
+m2:     INC     r1
+        JP      SCIO, 1, m2             ; high to 2.5 TE
+m3:     INC     r1
+        JP      SCIO, 0, m3             ; low to 3.5 TE
+m4:     INC     r1
+        JP      SCIO, 1, m4             ; high to 4.5 TE: r1 = 4 TE / 8
+        MOV     r5, r1
+        SHRI    r5, 1                   ; a quarter bit, whole clocks
+        ANDI    r1, 1
+        SHLI    r1, 7                   ; and the half clock, in 1/256
+        CSRW    TICK_FRAC, r1
+        WAITP   SCIO, 1                 ; 5.5 TE
+        WAITP   SCIO, 0                 ; 6.5 TE
+        WAITP   SCIO, 1                 ; 7.5 TE: the header's last bit
+        WAITP   SCIO, 0                 ; 8 TE: the MAK bit starts low
+        WAITP   SCIO, 1                 ; 8.5 TE: its middle edge
+        CSRW    TICK_INT, r5            ; the grid starts on the edge (3.8)
+        SETD    0                       ; Q2 of the MAK bit
+        WAITD   4                       ; NoSAK after the header (3.3)
+        CALL    getb                    ; the device address
+        LDI     r7, DEVADDR
+        CMP     r0, r7
+        BNZ     idle                    ; not ours: NoSAK, Idle (3.7)
+        CALL    sak
+        CMPI    r1, 0
+        BZ      stby                    ; NoMAK after the address: a good end
+        CALL    getb                    ; the instruction
+        MOV     r6, r0
+        MOV     r7, r3                  ; WIP up to date: is the cycle over?
+        ANDI    r7, 1
+        BZ      d_op
+        CSRR    r7, NOW
+        SUB     r7, r7, r4
+        SHLI    r7, 1                   ; C: NOW is still before the end
+        BC      d_op
+        ANDI    r3, 2                   ; over: WIP = 0
+d_op:   CMPI    r6, I_RDSR
+        BZ      d_rdsr
+        CMPI    r6, I_READ
+        BZ      d_rw
+        LDI     r7, I_WRITE
+        CMP     r6, r7
+        BZ      d_rw
+        LDI     r7, I_WREN
+        CMP     r6, r7
+        BNZ     idle                    ; an instruction we do not have
+        CMPI    r1, 0
+        BNZ     idle                    ; 4.4: a MAK after WREN is invalid
+        ORI     r3, 2                   ; WEL = 1
+        CALL    sak
+        JMP     stby
+
+; RDSR (4.5): the STATUS register, again after every MAK, until a NoMAK.
+d_rdsr: CMPI    r1, 0
+        BZ      idle                    ; a NoMAK before the data: NoSAK
+        CALL    sak
+rs_lp:
+        MOV     r7, r3                  ; WIP up to date: is the cycle over?
+        ANDI    r7, 1
+        BZ      rs_st
+        CSRR    r7, NOW
+        SUB     r7, r7, r4
+        SHLI    r7, 1                   ; C: NOW is still before the end
+        BC      rs_st
+        ANDI    r3, 2                   ; over: WIP = 0
+rs_st:  MOV     r0, r3                  ; bits 1:0 WEL WIP, BP1 BP0 = 0
+        CALL    putb
+        CALL    sak
+        CMPI    r1, 0
+        BNZ     rs_lp
+        JMP     stby
+
+; ---------------------------------------------------------------------------
+; READ, WRITE and the subroutines run on into thread 2's quarter (header).
+; ---------------------------------------------------------------------------
+; READ (4.1) and WRITE (4.3): refused during a write cycle (3.3), then the
+; two word-address bytes, each with MAK and SAK.
+d_rw:   MOV     r7, r3
+        ANDI    r7, 1
+        BNZ     toidle                  ; WIP: NoSAK, Idle (3.7)
+        CMPI    r1, 0
+        BZ      toidle
+        CALL    sak
+        CALL    getb                    ; word address MSB (one page: unused)
+        CMPI    r1, 0
+        BZ      toidle
+        CALL    sak
+        CALL    getb                    ; word address LSB
+        MOV     r2, r0
+        ANDI    r2, 15                  ; the array is 16 bytes (header)
+        CMPI    r1, 0
+        BZ      toidle                  ; NoMAK before the data: NoSAK (4.3)
+        CALL    sak
+        CMPI    r6, I_READ
+        BNZ     d_wr
+rd_lp:  MOV16   r7, DATA
+        ADD     r7, r7, r2
+        LD      r0, r7, 0               ; the byte in 7:0 (putb sends those)
+        INC     r2
+        ANDI    r2, 15                  ; sequential, rolling over
+        CALL    putb
+        CALL    sak
+        CMPI    r1, 0
+        BNZ     rd_lp                   ; MAK: the next byte
+        JMP     stby                    ; NoMAK: a good end
+
+; WRITE data: each byte into the upper half of its word, its bit in r6.
+d_wr:   LDI     r6, 0
+wr_lp:  CALL    getb
+        MOV16   r7, DATA
+        ADD     r7, r7, r2
+        LD      r5, r7, 0
+        SHLI    r5, 8
+        SHRI    r5, 8                   ; the stored byte
+        SWAP    r0, r0
+        OR      r5, r5, r0              ; the new byte above it
+        ST      r5, r7, 0
+        LDI     r5, 1
+        SHL     r5, r5, r2
+        OR      r6, r6, r5              ; byte r2 is in the page buffer
+        INC     r2
+        ANDI    r2, 15                  ; 4.3: the address rolls in the page
+        CALL    sak
+        CMPI    r1, 0
+        BNZ     wr_lp                   ; MAK: another byte
+        MOV     r7, r3                  ; NoMAK: the write cycle, if WEL
+        ANDI    r7, 2
+        BZ      w_done                  ; 5.0: no WEL, nothing is written
+        MOV16   r7, DATA
+        LDI     r0, 0
+cl:     SHRI    r6, 1                   ; C: this byte is in the buffer
+        BNC     cn
+        LD      r5, r7, 0
+        SHRI    r5, 8                   ; the buffer byte becomes the byte
+        ST      r5, r7, 0
+        INC     r0
+cn:     INC     r7
+        CMPI    r6, 0
+        BNZ     cl
+        LDI     r3, 1                   ; WIP = 1, WEL = 0 (4.4)
+        CSRR    r4, NOW
+        LDI     r7, TBUSY
+        ADD     r4, r4, r7              ; the end of the write cycle
+        LDIH    r0, 0x57                ; 0x57nn: nn bytes written
+        WAITB   OUTQ_NF, T              ; a test: TD is long past
+        BT      w_done                  ; OUTQ full: the report is dropped
+        .bounded "guarded by the WAITB above: OUTQ has room"
+        PUSH    r0
+w_done: JMP     stby
+toidle: JMP     idle
+
+; getb: one byte from the master into r0, then its acknowledge bit (mak).
+; Enters with TD at Q2 of the SAK bit before; returns from mak.
+getb:   LDI     r7, 0
+        LDSR    r7                      ; SR = 0: r0 is the byte alone
+        LDI     r7, 8
+        CSRW    CNT, r7
+        CSRW    FLAGS, r7               ; 8: T = C = Z = 0
+        WAITD   3                       ; Q1 of the first bit
+gbl:    SHI                             ; first half
+        WAITD   2                       ; Q3
+        SHI                             ; second half: the bit; T if no edge
+        WAITD   2                       ; Q1 of the next bit
+        BNZ     gbl
+        BT      gbad                    ; a missed edge: Idle (3.7)
+        STSR    r0
+; mak: the acknowledge bit from the master, entered at its Q1. r1 = 1 for
+; MAK (low first half, rising middle), 0 for NoMAK; the grid restarts on
+; the middle edge (3.8); returns with TD at Q2 of the bit.
+mak:    CSRR    r7, TD
+        ADDI    r7, 2
+        CSRW    TD, r7                  ; the middle edge is due by Q3
+        CSRR    r5, TICK_INT
+        LDI     r1, 1
+        JP      SCIO, 0, mk_r           ; low: a MAK
+        LDI     r1, 0
+        WAITP   SCIO, 0, T              ; NoMAK: the falling middle edge
+        JMP     mk_t
+mk_r:   WAITP   SCIO, 1, T              ; MAK: the rising middle edge
+mk_t:   BT      gbad                    ; no edge: out of step, Idle
+        CSRW    TICK_INT, r5            ; the grid starts on the edge
+        SETD    0
+        RET
+gbad:   JMP     idle
+
+; putb: send r0[7:0], then read the master's acknowledge bit (mak). Enters
+; with TD at Q2 of the SAK bit before.
+putb:   SWAP    r7, r0
+        LDSR    r7                      ; the byte in SR[15:8]
+        LDI     r7, 8
+        CSRW    CNT, r7
+pbl:    WAITD   2                       ; Q0
+        SHO                             ; first half
+        WAITD   2                       ; Q2
+        SHO                             ; second half: the edge is the bit
+        BNZ     pbl
+        SETP    SCIO, 1, D              ; released at the MAK bit's start
+        WAITD   2
+        WAITD   1                       ; Q1 of the MAK bit
+        JMP     mak
+
+; sak: a SAK, a 1: low for the first half, released at the middle. Enters
+; and returns with TD at Q2 (of the MAK bit, then of the SAK bit).
+sak:    SETP    SCIO, 0, D
+        WAITD   2                       ; Q0: the SAK bit starts low
+        SETP    SCIO, 1, D
+        WAITD   2                       ; Q2: the rising middle edge
+        RET
+
+; The array: 16 bytes, loaded with the image (one page; the 11AA02E48's
+; 256 bytes would not fit).
+        .org    DATA
+        .word   0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77
+        .word   0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF

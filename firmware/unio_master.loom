@@ -1,0 +1,353 @@
+; unio_master.loom
+; A bus master for Microchip's UNI/O, the one-wire bus of the 11AA02E48
+; serial EEPROM (and its 11AAxxx family): the standby pulse, the start
+; header, READ of 1 to 16 bytes, WRITE of 1 to 16 bytes of a page after a
+; WREN, the write-in-progress poll (RDSR with MAK repeats), RDSR alone, and
+; the MAK/SAK acknowledge after every byte, a missing SAK reported.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). UNI/O is Manchester coded at a
+; bit rate the master picks between 10 and 100 kbit/s; the slave measures
+; it from the start header; every byte is followed by MAK (from the master)
+; and SAK (from the slave), and a slave that is absent or out of step shows
+; as a SAK bit with no middle edge. The program uses:
+;   - the bit engine's Manchester encoder and decoder (BE_CFG.ENC = 2,
+;     SEMANTICS 6.9.1), built for the Manchester loopback and IEEE 802.3
+;     framing: SHO sends each half bit, SHI samples each half and sets T when
+;     a bit has no middle edge, which is exactly UNI/O's NoSAK;
+;   - an open-drain BIDIR pin (OD_MASK), built for I2C: the master pulls the
+;     line low or lets it go, the board's pull-up makes the high level, so
+;     the slave can take the line for its SAK and its data bits;
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10), built for
+;     clock-exact edges (ws2812): the header's fall and the release before
+;     each SAK land on their tick;
+;   - the data memory (LD/ST, SEMANTICS 6.11), built for tables, here a
+;     16-word buffer so that no PUSH or POP sits inside a command.
+; What the firmware does that no hardware does: the header, the standby
+; and TSS timing, the acknowledge sequence and its check, the instruction
+; set, the page write with its poll, and the rate, all on one tick.
+;
+; Source: Microchip DS20002122B, "11AA02E48/11AA02E64 2K UNI/O Serial
+; EEPROM with EUI-48 or EUI-64 Node Identity" (2013):
+;     Table 1-2 AC characteristics: TE bit period 10..100 us (param 2);
+;       TIJIT master edge jitter tolerated +-0.06 UI (3); TOJIT slave output
+;       edge jitter +-0.25 UI (6); TSTBY standby >= 600 us (9); TSS header
+;       setup >= 10 us (10); THDR header low >= 5 us (11); TWC 5 ms (13).
+;     3.1 standby pulse; 3.2 start header (THDR low, then 01010101); 3.3
+;       acknowledge (MAK 1, NoMAK 0, SAK 1, NoSAK no middle edge; NoSAK after
+;       the header); 3.4 device address 1010 0000; 4.0 Table 4-1 opcodes;
+;       4.1 READ, 4.3 WRITE (16-byte page), 4.4 WREN, 4.5 RDSR (WIP bit 0,
+;       WEL bit 1, polled with MAK). Figure 1-2 and the header's 01010101:
+;       a 0 is a high-to-low middle edge, a 1 low-to-high (the data sheet's
+;       text does not say it in words: see QUESTIONS.md item 1).
+; Bytes go MSB first (Figures 4-1 to 4-6).
+;
+; Timing, in ticks of a quarter bit (TICK_INT = TE / 4):
+;     a bit       first half at its start Q0, second half at Q2 (the SHO
+;                 that follows the WAITD of each, so every master edge is
+;                 the same 4 to 7 clocks after its tick: no jitter beyond
+;                 the 0..3-clock slot grid, far inside TIJIT)
+;     a sample    the slave's halves at Q1 and Q3: TOJIT's +-0.25 UI around
+;                 the ideal edges leaves them in place (QUESTIONS.md item 2)
+;     header      fall, THDR = 4 quarters low (10 us at 100 kbit/s, >= 5),
+;                 then 0x55 and MAK; the SAK slot after it is not checked
+;     TSS         8 quarters from the slot after the last SAK sample (Q3),
+;                 so >= 7 quarters of high (17.5 us at 100 kbit/s, >= 10)
+;     standby     STBY = 250 quarters high (625 us at 100 kbit/s, >= 600),
+;                 sent before the first command, after a RATE word and
+;                 after every error (3.1: a NoSAK needs a standby)
+; At start the program pulls the line low for THDR quarters once: the low-
+; to-high transition the data sheet asks for after power-up (3.2 note).
+;
+; Host words (FIFO space, thread 0):
+;     1qqq qqqq qqqq qqqq  RATE: TICK_INT = q, a quarter bit in clocks
+;                          (125 = 100 kbit/s, 1250 = 10 kbit/s at 50 MHz);
+;                          the next command starts with a standby. No result.
+;     0001 nnnn aaaa aaaa  READ n+1 bytes from address a. n+1 results 0x00dd.
+;     0010 nnnn aaaa aaaa  WRITE n+1 bytes at a: WREN, WRITE, then the poll.
+;                          Followed by n+1 words, the data in bits 7:0.
+;                          One result 0xppss: ss the status read with WIP
+;                          = 0, pp the number of status bytes read with WIP
+;                          = 1 before it (63 and WIP still 1: gave up).
+;     0011 nnnn aaaa aaaa  the same WRITE without the WREN (a write the
+;                          device must refuse: 5.0, Table 6-1).
+;     0100 xxxx xxxx xxxx  RDSR: one result 0x00ss.
+;     anything else        ignored.
+; Errors, one result instead of the command's: 0x80kk, the SAK after byte
+; kk was missing (kk = 1 the device address, 2 the instruction, 3 and 4 the
+; word address, 5.. the data; counted within the command that failed: WREN,
+; WRITE or RDSR); 0xC0kk, data byte kk from the device had a bit with no
+; middle edge. After an error the next command starts with a standby.
+;
+; OD_MASK (BUGS 14): CSRR, ORI, CSRW is not atomic across threads, and
+; unio_device.loom sets its bit the same way: both read it back three
+; slots later and set it again if their bit is missing (dht22_host.loom).
+;
+; Memory: 0x000..0x07F (thread 0's quarter), the byte subroutines at
+; 0x180..0x1EF and the buffer at 0x1F0..0x1FF (thread 3's quarter, written
+; before it is read, not loaded): thread 3 must not be started. With
+; unio_device.loom (thread 1, 0x080..0x17F) the two load together.
+;
+; Registers: r0 the byte, r1 bit count, r2 buffer pointer, r3 byte count
+; and poll count, r4 the byte number kk, r5 1 = a standby is due, r6 the
+; host word, r7 scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): timing from
+; Microchip DS20002122B Table 1-2.
+;   Bit polarity (a 0 is high to low) from the data sheet's figures and a
+;   secondary citation of the UNI/O bus specification DS22076, which was
+;   not read. Unchecked.
+;   The master samples a slave bit at 0.25 and 0.75 of the bit: no margin
+;   at the slave's +-0.25 UI limit.
+;   Open drain with a pull-up, where the real part drives both ways.
+;   The device model in firmware is reduced: 16 bytes, READ, WRITE, WREN
+;   and RDSR only; its 400 us standby threshold is this program's choice.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .equ    SCIOPIN = 0             ; BIDIR0
+        .pins   SCIO = SCIOPIN
+        .equ    SCIOBIT = 1 << SCIOPIN  ; its bit in OD_MASK
+        .equ    Q = 125                 ; default quarter bit: 100 kbit/s at 50 MHz
+        .equ    CFG = (1 << 1) | (2 << 3)   ; BE_CFG: MSB first, Manchester
+        .equ    STBY = 250              ; standby, quarters (header)
+        .equ    TSS = 8                 ; quarters before a header
+        .equ    THDR = 4                ; quarters of header low
+        .equ    BUF = 0x1F0             ; 16 words, written before read
+        .equ    MAXPOLL = 63            ; status bytes with WIP = 1 before giving up
+        .equ    I_READ = 0x03           ; Table 4-1
+        .equ    I_WRITE = 0x6C
+        .equ    I_WREN = 0x96
+        .equ    I_RDSR = 0x05
+        .equ    DEVADDR = 0xA0          ; 3.4: family 1010, device 0000
+
+; OD_MASK first, read back three slots later (header, BUGS 14).
+start:  CSRR    r7, OD_MASK
+        ORI     r7, SCIOBIT
+        CSRW    OD_MASK, r7             ; SCIO open drain
+        NOP
+        NOP
+        CSRR    r7, OD_MASK
+        ANDI    r7, SCIOBIT
+        BZ      start                   ; lost to the other thread's write
+        .csr    TICK_INT, Q             ; also the checker's .tick: the fastest rate
+        .csr    BE_CFG, CFG
+        .csr    BE_PINS, SCIOPIN | SCIOPIN << 5   ; SHO drives SCIO, SHI reads it
+        SETD    0
+        SETP    SCIO, 0, D              ; the low-to-high after power-up (header)
+        WAITD   1
+        SETP    SCIO, 1, D
+        WAITD   THDR
+        LDI     r5, 1                   ; a standby before the first command
+
+cmd:    POP     r6                      ; the next host word (blocks)
+        SETD    0                       ; re-anchor after the unbounded POP
+        MOV     r7, r6
+        SHLI    r7, 1                   ; C = bit 15
+        BC      c_rate
+        MOV     r3, r6
+        SHRI    r3, 8
+        ANDI    r3, 15
+        INC     r3                      ; n + 1 bytes
+        SHRI    r7, 13                  ; the operation, bits 14:12
+        CMPI    r7, 1
+        BZ      c_read
+        CMPI    r7, 4
+        BNZ     c_nr
+        JMP     c_rdsr                  ; in thread 3's quarter (header)
+c_nr:   SUBI    r7, 2
+        SHRI    r7, 1                   ; Z: 2 or 3, a WRITE
+        BZ      c_write
+        JMP     cmd                     ; not a command: ignored
+c_rate: SHLI    r6, 1
+        SHRI    r6, 1
+        CSRW    TICK_INT, r6            ; a quarter bit = q clocks
+        LDI     r5, 1
+        JMP     cmd
+
+; READ: header, address, READ, the word address, then n+1 bytes, each with
+; MAK but the last (NoMAK). The bytes wait in BUF until the command is over.
+c_read: CALL    begin
+        LDI     r0, I_READ
+        CALL    xbm
+        LDI     r0, 0                   ; word address MSB
+        CALL    xbm
+        MOV     r0, r6                  ; word address LSB (xbs drops bits 15:8)
+        CALL    xbm
+        MOV16   r2, BUF
+r_lp:   CALL    rb
+        ST      r0, r2, 0
+        INC     r2
+        LDI     r0, 0                   ; NoMAK after the last byte
+        DEC     r3
+        BZ      r_ack
+        LDIH    r0, 0x80                ; MAK: another byte
+r_ack:  LDI     r1, 1
+        CALL    xbc
+        CMPI    r3, 0
+        BNZ     r_lp
+        MOV     r3, r2                  ; the end of the bytes
+        MOV16   r2, BUF
+p_lp:   LD      r0, r2, 0
+        SHLI    r0, 8
+        SHRI    r0, 8                   ; 0x00dd
+        PUSH    r0
+        INC     r2
+        CMP     r2, r3
+        BNZ     p_lp
+        JMP     cmd
+
+; WRITE: the data words into BUF first (no POP inside a command), then WREN
+; (unless the word says not to), WRITE with the word address and the bytes,
+; NoMAK after the last (4.3: that starts the write cycle), then RDSR with a
+; MAK after every status byte while WIP is 1 (4.5), NoMAK once it is 0.
+c_write: MOV16  r2, BUF
+        MOV     r1, r3
+w_pop:  POP     r0
+        ST      r0, r2, 0
+        INC     r2
+        DJNZ    r1, w_pop
+        MOV     r7, r6
+        SHRI    r7, 12
+        CMPI    r7, 3
+        BZ      w_go                    ; 0011: no WREN
+        CALL    begin
+        LDI     r0, I_WREN
+        CALL    xbn                     ; 4.4: WREN ends with NoMAK
+w_go:   CALL    begin
+        LDI     r0, I_WRITE
+        CALL    xbm
+        LDI     r0, 0
+        CALL    xbm
+        MOV     r0, r6
+        CALL    xbm
+        MOV16   r2, BUF
+w_lp:   LD      r0, r2, 0
+        INC     r2
+        DEC     r3
+        BZ      w_end
+        CALL    xbm
+        JMP     w_lp
+w_end:  CALL    xbn                     ; the last byte, NoMAK
+        CALL    begin                   ; TSS: no standby after a good end (3.1)
+        LDI     r0, I_RDSR
+        CALL    xbm
+        LDI     r3, 0                   ; polls with WIP = 1
+w_pl:   CALL    rb
+        MOV     r6, r0
+        LDI     r0, 0                   ; NoMAK, unless ...
+        MOV     r7, r6
+        ANDI    r7, 1
+        BZ      w_nm                    ; ... WIP = 1
+        CMPI    r3, MAXPOLL
+        BZ      w_nm                    ; given up
+        LDIH    r0, 0x80                ; MAK: send the status again
+        INC     r3
+w_nm:   LDI     r1, 1
+        CALL    xbc
+        CMPI    r0, 0
+        BNZ     w_pl
+        JMP     w_res                   ; in thread 3's quarter
+
+; ---------------------------------------------------------------------------
+; The byte subroutines live in thread 3's quarter (header, Memory). CALL
+; takes an absolute address, so nothing else changes.
+; ---------------------------------------------------------------------------
+        .org    0x180
+
+; begin: a standby (if one is due) or TSS, the start header with its MAK
+; (the NoSAK slot after it not checked, 3.3), the device address with MAK.
+; Returns with TD at Q3 of the address byte's SAK bit.
+begin:  SETD    0
+        CMPI    r5, 0
+        BZ      b_tss
+        LDI     r5, 0
+        WAITD   STBY                    ; 3.1: the line high for TSTBY
+        JMP     b_hdr
+b_tss:  WAITD   TSS                     ; 3.2: TSS after a good end
+b_hdr:  SETP    SCIO, 0, D
+        WAITD   1                       ; the header's fall
+        WAITD   THDR - 1                ; Q3 of a bit before the header's first
+        LDI     r4, 0
+        DEC     r4                      ; the header is byte 0
+        LDI     r0, 0x55                ; 01010101: the slave measures TE on it
+        CALL    xbm
+        LDI     r0, DEVADDR
+        JMP     xbm                     ; a tail call: xbm's RET is begin's
+
+; xbm / xbn: send the byte in r0[7:0] and a MAK / NoMAK. xbc: send the r1
+; bits of r0 from bit 15 (a MAK or NoMAK alone after a byte from the
+; slave). Each enters with TD at Q3 of the bit before; then the SAK bit:
+; the line released at its start, sampled at Q1 and Q3; returns with TD at
+; Q3 of the SAK bit, or jumps to nosak.
+xbn:    SHLI    r0, 1                   ; acknowledge bit 0: NoMAK
+        JMP     xbs
+xbm:    SHLI    r0, 1
+        ORI     r0, 1                   ; acknowledge bit 1: MAK
+xbs:    SHLI    r0, 7                   ; byte in 15:8, MAK in 7
+        LDI     r1, 9
+xbc:    LDSR    r0
+        CSRW    CNT, r1
+xbl:    WAITD   1                       ; Q0: the bit starts
+        SHO                             ; first half (a 0 high, a 1 low)
+        WAITD   2                       ; Q2: the middle
+        SHO                             ; second half: the edge is the bit
+        WAITD   1                       ; Q3
+        BNZ     xbl
+        SETP    SCIO, 1, D              ; released at the SAK bit's start
+        WAITD   1
+        LDI     r7, 0
+        CSRW    FLAGS, r7               ; T = 0 for the decoder
+        WAITD   1                       ; Q1
+        SHI                             ; first half of the SAK bit
+        WAITD   2                       ; Q3
+        SHI                             ; second half; T if no middle edge
+        INC     r4
+        BZ      xret                    ; the header's slot: not checked
+        BT      nosak                   ; no middle edge: NoSAK
+        STSR    r7
+        SHRI    r7, 1                   ; C = the second half
+        BNC     nosak                   ; a falling middle edge is not a SAK
+xret:   RET
+
+; rb: one byte from the slave into r0[7:0]. Enters with TD at Q3 of the SAK
+; bit before; samples each bit at Q1 and Q3; returns with TD at Q3 of the
+; byte's last bit, or jumps to badman if a bit had no middle edge.
+rb:     LDI     r7, 8
+        CSRW    CNT, r7
+        CSRW    FLAGS, r7               ; 8: T = C = Z = 0
+rbl:    WAITD   2                       ; Q1
+        SHI
+        WAITD   2                       ; Q3
+        SHI
+        BNZ     rbl
+        STSR    r0
+        BT      badman
+        RET
+
+; RDSR alone: the status byte, NoMAK.
+c_rdsr: CALL    begin
+        LDI     r0, I_RDSR
+        CALL    xbm
+        CALL    rb
+        MOV     r6, r0
+        LDI     r0, 0                   ; NoMAK
+        LDI     r1, 1
+        CALL    xbc
+        LDI     r3, 0                   ; no poll count
+w_res:  SHLI    r6, 8
+        SHRI    r6, 8
+        SWAP    r3, r3
+        OR      r6, r6, r3              ; 0xppss
+        PUSH    r6
+        JMP     cmd
+
+nosak:  LDI     r7, 0x80                ; the SAK after byte r4 was missing
+        JMP     err
+badman: INC     r4                      ; the byte being received
+        LDI     r7, 0xC0                ; it had a bit with no middle edge
+err:    SWAP    r7, r7
+        OR      r0, r7, r4
+        PUSH    r0
+        LDI     r5, 1                   ; a standby before the next command
+        JMP     cmd
