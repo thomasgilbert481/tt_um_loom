@@ -1,0 +1,163 @@
+; tlc5940_host.loom
+; A host for the TI TLC5940, the 16-channel LED driver with 12-bit
+; grayscale PWM and 6-bit dot correction: it loads the dot correction once,
+; then streams grayscale frames from the host into the chip, and supplies
+; the grayscale clock itself, 4096 GSCLK pulses and a BLANK pulse every PWM
+; cycle, with each new frame latched while BLANK is high.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Two threads, one per half of
+; the job, and no bit engine. It uses:
+;   - the barrel (section 2): thread 0 is a free-running clock generator
+;     that never waits on data, and thread 1 is a serial shifter that
+;     never waits on the clock; neither stalls the other;
+;   - the shared flags (6.5), built for thread hand-offs: a three-flag
+;     handshake puts every XLAT inside a BLANK pulse;
+;   - the host FIFO INQ[1] (6.7), built for the host link, for the dot
+;     correction and grayscale words;
+;   - OUT on a one-pin group (6.3) and ROR, for an MSB-first serial bit in
+;     one slot.
+; What the firmware does that no hardware does: the whole TLC5940
+; interface, the 4096-pulse PWM cycle and its BLANK, the 96-bit and 192-bit
+; packets, the VPRG mode switch, the extra SCLK the first grayscale cycle
+; after dot correction needs, and the tear-free frame update.
+; Weaker than a dedicated driver (an MCU timer, or an FPGA): GSCLK runs at
+; 50 MHz / 12 = 4.17 MHz (one pulse every three slots), where the chip
+; accepts 30 MHz, so the PWM cycle is 1.02 kHz instead of up to 7 kHz; one
+; chip, no cascade (n chips would need n x 16 words a frame and the same
+; code with a longer count); SOUT (status: LED open, thermal error) and
+; XERR are not read; no EEPROM programming (it needs 22 V on VPRG).
+;
+; Source: TI, TLC5940 data sheet, SLVS515D (December 2004, revised November
+; 2015). Section 8.3.1 (MSB first, SCLK rising shifts, XLAT latches, "the
+; XLAT signal should only latch the grayscale data at the end of the
+; grayscale cycle"); 8.4.1 Table 3 (VPRG high: 96-bit dot correction mode;
+; DCPRG high: the DC register drives the outputs); 8.4.2 (16 x 6 bits,
+; OUT15's MSB first); 8.4.3 (16 x 12 bits, OUT15's MSB first; latch "when
+; BLANK is high"; the first grayscale input after dot correction "requires
+; an additional SCLK pulse after the XLAT signal"); 8.4.5 (the PWM cycle
+; starts at BLANK falling, "A BLANK=H signal after 4096 GSCLK pulses"
+; ends it); 6.3 (the AC timing). tools/protomodels/tlc5940.py cites them.
+;
+; Pins (7 outputs; no pin is written by both threads):
+;   thread 0  GSCLK = OUT5, BLANK = BIDIR0 (a board pull-up holds BLANK
+;             high, so the outputs are off from reset to RUN: PIN_OUT
+;             resets to 0 and BLANK on a uo pad would enable them).
+;   thread 1  SIN = OUT0, SCLK = OUT1, XLAT = OUT2, VPRG = OUT3,
+;             DCPRG = OUT4 (driven high: Table 3's DC register mode).
+;
+; Host words, INQ[1]: first 16 dot correction words (bits 5:0, OUT15
+; first, OUT0 last), then any number of frames of 16 grayscale words (bits
+; 11:0, OUT15 first). Higher bits are ignored. A frame is shown from the
+; first PWM cycle that starts after it has been shifted in; until the first
+; frame is in, BLANK stays high and nothing is lit. Push a whole frame at a
+; time: thread 1 shifts each word as it arrives, and the frame is latched
+; only when all 192 bits are in. Nothing is reported on OUTQ.
+;
+; Timing (no tick: neither thread keeps a deadline): a PWM cycle is BLANK
+; low, 4096 GSCLK pulses of 12 clocks (high 4, low 8), BLANK high. With no
+; new frame BLANK is high for 16 clocks and the cycle repeats every 49,176
+; clocks (12,294 slots): 1,016.8 Hz at 50 MHz. A cycle that latches a frame
+; is about 8 slots longer (the jump, the handshake and the XLAT pulse: 32
+; clocks on the model), BLANK high for 48 clocks. Thread 1 shifts a bit in 5 slots, a frame in
+; about 3,900 clocks, well inside one cycle, so a host that keeps INQ fed
+; can change the image every cycle. Equation 9 of 9.2.2.1 (f(GSCLK) = 4096
+; x f(update)) is met with f(update) = 1,017 Hz.
+; Thread 0 takes 17 words, thread 1 38: 55 of the 512.
+; Start both threads together (RUN 0b0011) with SFLAGS 0, 1 and 2 clear.
+;
+; Readings taken on the open spec questions (2026-11-07, QUESTIONS.md):
+;   On-time: an output with value GS is on for GS GSCLK periods, from the
+;   first GSCLK rising edge after BLANK falls (8.4.5); 0 is off.
+;   The extra SCLK: taken as needed once, after the first grayscale XLAT
+;   that follows a dot correction XLAT, and given before BLANK falls.
+;   XLAT is pulsed only while BLANK is high, for dot correction too, though
+;   8.4.2 says BLANK need not be high for it.
+;
+; Readings taken on the open spec questions (2026-11-07): from TI SLVS515D
+; text (its figures could not be read).
+;   On-time is GS GSCLK periods, as equations 8 and 9 imply; figures 21
+;   and 23 would settle the off-by-one and were not read.
+;   The extra SCLK after the first grayscale XLAT that follows dot
+;   correction completes the deferred update.
+;   Dot correction is latched with BLANK high (allowed, not required).
+;   BLANK needs a board pull-up on BIDIR0 to hold the outputs off before
+;   RUN. Not implemented: SOUT, XERR, EEPROM programming, cascading.
+;   Neither thread keeps a deadline: the GSCLK grid is argued from the
+;   listing and measured in the tests, not proved by the checker.
+
+        .imem   512
+        .equ    GS_PULSES = 4096        ; GSCLK pulses a PWM cycle (8.4.5)
+        .equ    CHANNELS = 16
+        .equ    READY = 0               ; shared flag: a frame is shifted in
+        .equ    GO = 1                  ; shared flag: BLANK is high, latch
+        .equ    DONE = 2                ; shared flag: latched
+        .pins   GSCLK = OUT5, BLANK = BIDIR0
+        .pins   SIN = OUT0, SCLK = OUT1, XLAT = OUT2, VPRG = OUT3, DCPRG = OUT4
+
+; ---------------------------------------------------------------- thread 0
+; The PWM clock. r0 pulses left in the cycle, r6 GS_PULSES.
+        .thread 0
+        .tick   1                       ; the reset tick; no deadline here
+pwm:    SETP    BLANK, 1               ; blank before the driver is on
+        OEP     BLANK, 1
+        MOV16   r6, GS_PULSES
+        WAITS   READY                   ; the first frame is shifted in
+latch:  SIG     GO                      ; BLANK is high: thread 1 latches
+        WAITS   DONE
+cycle:  SETP    BLANK, 0                ; the PWM cycle starts (8.4.5)
+        MOV     r0, r6
+gsclk:  SETP    GSCLK, 1                ; the counter counts this edge
+        SETP    GSCLK, 0
+        DJNZ    r0, gsclk
+        SETP    BLANK, 1                ; after 4096: the counter resets
+; A new frame? SETD 0 makes the T form a test: TD is reached at once.
+        SETD    0
+        WAITS   READY, T
+        BT      cycle                   ; none: the next cycle at once
+        JMP     latch
+
+; ---------------------------------------------------------------- thread 1
+; The data shifter. r1 the word being shifted, r2 its bits left, r3 words
+; left in the packet, r5 1 while the extra SCLK is owed, r7 15 (ROR by 15 is
+; a rotate left by one).
+        .thread 1
+data:   SETP    DCPRG, 1                ; the outputs use the DC register
+        SETP    VPRG, 1                 ; 96-bit dot correction mode
+        .csr    OUTGRP, (1 << 5) | 16, r7       ; SIN = OUT0
+        LDI     r7, 15
+        LDI     r3, CHANNELS
+dc:     POP     r1                      ; OUT15's first
+        SHLI    r1, 10                  ; bits 5:0 to 15:10, MSB first
+        LDI     r2, 6
+        CALL    shift
+        DJNZ    r3, dc
+        SETP    XLAT, 1                 ; into the DC register (8.4.2);
+        SETP    XLAT, 0                 ; BLANK is still high
+        SETP    VPRG, 0                 ; 192-bit grayscale mode
+        LDI     r5, 1                   ; the extra SCLK is owed (8.4.3)
+frame:  LDI     r3, CHANNELS
+gs:     POP     r1                      ; OUT15's first
+        SHLI    r1, 4                   ; bits 11:0 to 15:4, MSB first
+        LDI     r2, 12
+        CALL    shift
+        DJNZ    r3, gs
+        SIG     READY                   ; 192 bits in
+        WAITS   GO                      ; until BLANK is high
+        SETP    XLAT, 1                 ; into the GS register
+        SETP    XLAT, 0
+        CMPI    r5, 0
+        BZ      latched
+        SETP    SCLK, 1                 ; completes the first update
+        SETP    SCLK, 0
+        LDI     r5, 0
+latched:
+        SIG     DONE                    ; thread 0 may lower BLANK
+        JMP     frame
+; Shift the top r2 bits of r1 out on SIN, MSB first, one SCLK each.
+shift:  ROR     r1, r1, r7              ; the next bit to bit 0
+        OUT     r1                      ; SIN
+        SETP    SCLK, 1                 ; shifted in on the rising edge
+        SETP    SCLK, 0
+        DJNZ    r2, shift
+        RET
