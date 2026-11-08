@@ -1,0 +1,326 @@
+; magstripe_reader.loom
+; Magnetic stripe card reader (ISO/IEC 7811 F2F, "Aiken biphase") on IN0:
+; the bit cell found from the leading clocking zeros and followed through
+; a hand swipe whose speed changes, the start sentinel, characters with
+; odd parity, the end sentinel and the LRC checked, a swipe read in either
+; direction, and the characters reported to the host through OUTQ[0].
+; Track 2 (5-bit characters) and track 1 (7-bit) by the host's settings.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; magnetic stripes or for F2F. The program times every flux transition with
+; the level waits (`WAITP ... T`, built for the I2C and SPI pins) against a
+; time-out written straight into `TD` (`CSRW TD`, built for the deadline
+; schedule) and reads of `NOW` (the deadline timebase, SEMANTICS 4); it keeps
+; the whole swipe in the data memory (`LD`/`ST`, SEMANTICS 6.11, D-027, built
+; for device emulation), checks character parity with `PAR` (built for the
+; UART's parity bit) and reads the stored bits back in either order. What
+; the firmware does that no hardware does: the F2F decision, the bit-cell
+; tracking, the framing by sentinels, parity and LRC, and the choice of
+; swipe direction.
+;
+; The bit engine does not help: its decoders sample on a fixed tick, and a
+; hand swipe has none; its Manchester decoder reads levels, F2F carries the
+; bit in whether a cell has a middle transition.
+;
+; Pin: RX = IN0, the read head's peak detector as a LEVEL that toggles at
+; every flux transition (either polarity), as the "F2F" output of a read
+; amplifier and the coil-current direction of magstripe_emu.loom give it.
+; A detector that gives a pulse per transition needs a toggle flip-flop in
+; front (a pulse under one slot, 4 clocks, could be missed by WAITE).
+;
+; Sources (secondary, cited by item in tools/protomodels/magstripe.py,
+; which is written from them; ISO/IEC 7811-2 and 7813 were not read): the
+; MagTek "I/O Interface for TTL Magnetic Stripe Readers" manual (99875148),
+; track data formats, parity and LRC, start-sentinel detection,
+; bidirectional reading, character conversion; Wikipedia "Magnetic stripe
+; card" (densities, sentinels); US patent 5,434,400 background (F2F, speed
+; changes in a hand swipe).
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT of the measuring unit, in clocks; 2. its TICK_FRAC.
+;   3. TMAX: the longest bit cell accepted for the first one, in units (the
+;      slowest swipe); 4096 or less, and every cell of the swipe stays
+;      under 8192 units (the time-out, 4 cells, must stay under 2^15).
+;   4. D, data bits a character: 4 (track 2) or 6 (track 1).
+;   5. The start sentinel's value: 0x0B (';', track 2) or 0x05 ('%').
+;   6. The end sentinel's value: 0x0F ('?') or 0x1F ('?').
+;   7. The ASCII offset added to a value: 0x30 (track 2) or 0x20 (track 1).
+;   8. The bit buffer's address, BUFW (40) words of free memory outside
+;      this program's words (0..191): 192 keeps it in thread 1's quarter.
+;
+; Reports (FIFO space read, thread 0), after each swipe: one word per data
+; character between the sentinels (field separators included) as ASCII,
+; then a status word 0x8000 | dir << 8 | errors: dir 1 for a reverse swipe;
+; errors bit 0 a character's parity, bit 1 the LRC, bit 2 no end sentinel,
+; bit 3 no start sentinel (no characters then). The host reads as they come
+; (OUTQ holds four; the reader stalls on a full OUTQ and misses a swipe
+; that starts while it is stalled).
+;
+; Capture. With T the cell estimate, an interval of 3T/4 or more is a whole
+; cell, a 0; less is a half, two halves are a 1, and a half followed by a
+; whole is a lone half, dropped (the whole is a 0). After every bit T
+; becomes the mean of T and the cell just measured. The first interval
+; (no longer than TMAX) is the first leading zero and the first T. Bits are
+; stored from the first 1 on (the start sentinel's first bit, forward; the
+; LRC's or the end sentinel's, reverse) until no transition for 4T: the
+; card has left. A swipe of more than BUFW * 16 bits keeps its first ones.
+;
+; Decoding, after the card has left (MagTek's bidirectional method): a
+; trial pass forward from the first stored bit and one backward from the
+; last stored 1, each framing characters (D data bits LSB first, then odd
+; parity) from a start sentinel to an end sentinel and the LRC (each data
+; column even over the sentinels, the data and the LRC; the LRC has its
+; own parity). The pass with fewer errors wins (forward on a tie, no start
+; sentinel counting worst) and is run again to push the characters.
+;
+; Timing. No WAITD, so no deadline pair. Between the NOW read that stamps
+; a transition and the WAITP for the next one the longest path is a 1
+; stored with its count, 44 slots (176 clocks), and the WAITP sees a
+; transition 2 to 5 clocks after the pad, so every transition is stamped
+; in its own slot while half a cell is 184 clocks or more: 3.7 us at
+; 50 MHz, a swipe of 1,800 in/s on track 2 or 640 on track 1 (a hand
+; swipe is a few to some tens of in/s). Decoding runs after the card has
+; left: about 30 slots a stored bit for each of the three passes.
+;
+; Size: 192 words, 184 of code and 8 of data (the settings, the bit count,
+; the forward trial's errors), so it spills 64 words into thread 1's
+; quarter (0x080..0x0BF; thread 1 must not be started). The two trial
+; passes and the bidirectional framing cost most of it. With the bit
+; buffer at 192..231 (host word 8 = 192, the tests' choice) reader and
+; buffer stay in the first two quarters, and threads 2 and 3 keep theirs.
+;
+; Registers, capture: r0 the buffer word being filled, r1 the bits stored,
+; r2 NOW at the last transition, r3 the cell estimate T, r4 the bit, then
+; scratch, r5 the threshold 3T/4, scratch, r6 the line level, r7 the
+; interval, the time-out, scratch. Decoding: r1 the bit index, r2 the step
+; (+1 or -1), r3 the LRC, r4 the errors (bit 15 set: push), r5 the
+; character, r6 its bit count, r0 and r7 scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): ISO/IEC 7811 and
+; 7813 were not read; figures from a MagTek reader manual and read IC
+; sheet and a patent (secondary).
+;   The LRC covers start sentinel, data and end sentinel.
+;   Track 1 sentinels from MagTek's "ASCII minus 20h" rule, not read.
+;   The head input is a level that toggles at each flux transition (a
+;   peak detector giving pulses needs a toggle in front). No source gives
+;   a speed tolerance: the reader takes a cell 25 % short to 50 % long
+;   against its running estimate. Track 3 is not tested. Test data are
+;   fake numbers only.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0
+        .tick   8                       ; no WAITD: nothing to prove (header)
+        .equ    BUFW = 40               ; bit-buffer words: 640 bits
+        .equ    TMAX = 0                ; cfg offsets: host words 3..8
+        .equ    DBITS = 1
+        .equ    SSV = 2
+        .equ    ESV = 3
+        .equ    OFS = 4
+        .equ    BUF = 5
+        .equ    NBITS = 6               ; one past the last stored 1
+        .equ    EFWD = 7                ; the forward trial's errors
+
+        JMP     start                   ; cfg sits low, so LDI reaches it
+cfg:    .word   0, 0, 0, 0, 0, 0, 0, 0
+
+start:  POP     r7                      ; 1. TICK_INT of the unit
+        CSRW    TICK_INT, r7
+        POP     r7                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r7
+        LDI     r2, cfg
+        LDI     r1, 6
+cload:  POP     r7                      ; 3..8. TMAX, D, SS, ES, offset, buffer
+        ST      r7, r2, 0
+        INC     r2
+        DJNZ    r1, cload
+
+; Wait for a card: the first transition, then the first cell.
+idle:   LDI     r1, 0                   ; nothing stored
+        LDI     r0, cfg
+        ST      r1, r0, NBITS
+        LDI     r6, 0                   ; the line's level now
+        JP      RX, 0, ilvl
+        LDI     r6, 1
+ilvl:   CSRR    r2, NOW
+        MOV16   r7, 0x7FFF              ; as good as no time-out
+        CALL    edge
+        BT      idle                    ; nothing yet: look again
+        LDI     r0, cfg
+        LD      r7, r0, TMAX
+        CALL    edge
+        BT      idle                    ; one stray transition: start over
+        MOV     r3, r7                  ; the first cell, a leading 0: T
+
+; A bit: one whole interval (a 0) or two halves (a 1).
+bit:    ADD     r7, r3, r3              ; time-out 4T
+        ADD     r7, r7, r7
+        CALL    edge
+        BT      fin                     ; the card has left
+        MOV     r5, r3                  ; 3T/4 = T/2 + T/4
+        SHRI    r5, 1
+        MOV     r4, r5
+        SHRI    r4, 1
+        ADD     r5, r5, r4
+        CMP     r7, r5
+        BC      zero                    ; a whole cell
+        MOV     r4, r7                  ; a half: the first of a 1
+        ADD     r7, r3, r3
+        ADD     r7, r7, r7
+        CALL    edge
+        BT      fin
+        CMP     r7, r5
+        BC      zero                    ; a lone half, then a whole: a 0
+        ADD     r7, r7, r4              ; the 1's cell
+        LDI     r4, 1
+        JMP     track
+zero:   LDI     r4, 0
+track:  ADD     r3, r3, r7              ; T = (T + this cell) / 2
+        SHRI    r3, 1
+        TEST    r4, r4
+        BNZ     store                   ; a 1 is always stored
+        TEST    r1, r1
+        BZ      bit                     ; zeros before the first 1: not stored
+store:  MOV     r5, r1
+        ANDI    r5, 15
+        BNZ     keep
+        LDI     r0, 0                   ; a new buffer word
+keep:   SHL     r4, r4, r5              ; bit i at bit i mod 16 of word i / 16
+        OR      r0, r0, r4
+        MOV     r5, r1
+        SHRI    r5, 4
+        CMPI    r5, BUFW
+        BC      bit                     ; the buffer is full: drop the bit
+        LDI     r7, cfg
+        LD      r7, r7, BUF
+        ADD     r5, r5, r7
+        ST      r0, r5, 0
+        INC     r1
+        TEST    r4, r4
+        BZ      bit
+        LDI     r7, cfg                 ; a 1: the stored bits end here
+        ST      r1, r7, NBITS
+        JMP     bit
+
+; The card has left: a trial each way, then the better one pushed.
+fin:    LDI     r0, cfg
+        LD      r7, r0, NBITS
+        TEST    r7, r7
+        BZ      idle                    ; no 1 at all: noise, nothing to say
+        LDI     r4, 0
+        CALL    setf
+        CALL    dec
+        LDI     r0, cfg
+        ST      r4, r0, EFWD
+        LDI     r4, 0
+        CALL    setr
+        CALL    dec
+        LDI     r0, cfg
+        LD      r7, r0, EFWD
+        CMP     r4, r7                  ; C: reverse has no fewer errors
+        LDI     r4, 0x81                ; LDI keeps C
+        BNC     prev
+        LDI     r4, 0x80                ; forward: push, dir 0
+        CALL    setf
+        JMP     push
+prev:   CALL    setr                    ; reverse: push, dir 1
+push:   SWAP    r4, r4                  ; 0x8000 or 0x8100
+        CALL    dec
+        PUSH    r4                      ; the status word
+        JMP     idle
+
+setf:   LDI     r1, 0                   ; from the first stored bit, up
+        LDI     r2, 1
+        RET
+setr:   LDI     r0, cfg                 ; from the last stored 1, down
+        LD      r1, r0, NBITS
+        DEC     r1
+        LDI     r2, 0
+        DEC     r2
+        RET
+
+; dec: frame the track from bit r1 in steps of r2; r4 |= the errors, and
+; with r4 bit 15 set each data character is pushed as ASCII.
+dec:    LDI     r3, 0                   ; the LRC
+        CALL    char
+        LDI     r0, cfg
+        LD      r0, r0, SSV
+        CMP     r5, r0
+        BZ      dnext
+        ORI     r4, 8                   ; no start sentinel
+        RET
+dnext:  LDI     r0, cfg
+        LD      r0, r0, NBITS
+        CMP     r1, r0                  ; unsigned: below 0 is past the end too
+        BC      noes
+        CALL    char
+        LDI     r0, cfg
+        LD      r0, r0, ESV
+        CMP     r5, r0
+        BZ      dlrc
+        MOV     r7, r4
+        SHLI    r7, 1                   ; C: bit 15, push
+        BNC     dnext
+        LDI     r0, cfg
+        LD      r0, r0, OFS
+        ADD     r5, r5, r0
+        PUSH    r5
+        JMP     dnext
+noes:   ORI     r4, 4                   ; no end sentinel
+        RET
+dlrc:   CALL    char                    ; the LRC: every column even
+        TEST    r3, r3
+        BZ      dok
+        ORI     r4, 2
+dok:    RET
+
+; char: D data bits LSB first and the parity bit, from bit r1 in steps of
+; r2; r5 = the value, r3 ^= it, r4 bit 0 set on a parity error. A bit
+; outside the stored ones reads 0.
+char:   LDI     r5, 0
+        LDI     r6, 0
+cbit:   LDI     r0, cfg
+        LD      r0, r0, NBITS
+        CMP     r1, r0
+        LDI     r7, 0                   ; LDI keeps C
+        BC      cgot
+        LDI     r7, cfg
+        LD      r7, r7, BUF
+        MOV     r0, r1
+        SHRI    r0, 4
+        ADD     r0, r0, r7
+        LD      r7, r0, 0
+        MOV     r0, r1
+        ANDI    r0, 15
+        SHR     r7, r7, r0
+        ANDI    r7, 1
+cgot:   ADD     r1, r1, r2
+        SHL     r7, r7, r6              ; to its place
+        LDI     r0, cfg
+        LD      r0, r0, DBITS
+        CMP     r6, r0
+        BZ      cpar
+        OR      r5, r5, r7
+        INC     r6
+        JMP     cbit
+cpar:   OR      r0, r5, r7              ; the parity bit with the data
+        PAR     r0, r0                  ; C: an odd number of 1s
+        BC      cok
+        ORI     r4, 1
+cok:    XOR     r3, r3, r5
+        RET
+
+; edge: wait for the line to go to the other level, at most r7 units after
+; the last transition (T set on a time-out); r7 = the interval, r2 = NOW.
+edge:   ADD     r7, r7, r2
+        CSRW    TD, r7
+        XORI    r6, 1
+        BZ      e0
+        WAITP   RX, 1, T
+        JMP     e1
+e0:     WAITP   RX, 0, T
+e1:     CSRR    r7, NOW
+        SUB     r7, r7, r2
+        ADD     r2, r2, r7
+        RET

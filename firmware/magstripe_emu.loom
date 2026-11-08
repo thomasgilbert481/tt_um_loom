@@ -1,0 +1,146 @@
+; magstripe_emu.loom
+; Magnetic stripe card emulator on OUT0: plays a track 2 the host gives as
+; one swipe at a set speed, in ISO/IEC 7811 F2F ("Aiken biphase"), into the
+; coil driver of a swipe emulator (a coil at a reader's head).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; magnetic stripes or for F2F. The program uses hardware built for other
+; jobs: the deadline-latched pin write (`SETP pin, v, D`, SEMANTICS 6.10,
+; D-016), built so that WS2812 pulses land on the exact clock, puts every
+; flux transition on the exact clock edge of its half-cell tick; `PAR`
+; (built for the UART's parity bit) gives each character its odd parity;
+; the data memory (`LD`/`ST`, SEMANTICS 6.11, D-027, built for device
+; emulation) holds the track while it plays. What the firmware does that no
+; hardware does: the F2F code, the framing (clocking zeros, start sentinel,
+; characters LSB first with odd parity, end sentinel, LRC), the LRC itself.
+;
+; A real swipe's speed changes; this one's does not (the host sets one
+; half-cell tick per swipe). A reader that follows a hand swipe follows a
+; constant one; the speed profiles are the model's job in the tests.
+;
+; Pin: TX = OUT0, push-pull, the coil current's direction as a level: it
+; toggles at every flux transition. Low until RUN, and left at its last
+; level after a swipe (the coil driver should idle at no current; a board
+; with an enable needs a second pin, not given here).
+;
+; Sources (secondary, cited by item in tools/protomodels/magstripe.py):
+; MagTek 99875148 "I/O Interface for TTL Magnetic Stripe Readers" (track
+; 2/3 data format: clocking zeros, start sentinel hex B, end sentinel hex
+; F, LRC; 4 data bits LSB first and odd parity; LRC columns even, its own
+; parity odd); Wikipedia "Magnetic stripe card" (75 bpi on track 2);
+; US patent 5,434,400 (F2F: a transition at every cell, one more in the
+; middle of a 1). ISO/IEC 7811-2 and 7813 were not read.
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT of the half cell, in clocks: 1 / (2 x 75 x speed in in/s),
+;      at 50 MHz 16,667 for 20 in/s; 80 or more (.tick). 2. TICK_FRAC.
+; then for each swipe:
+;   3. Clocking zeros before the start sentinel and after the LRC, 1..255
+;      (MagTek: about 22 on track 2).
+;   4. N, the data characters, 1..40 (0 would load 65,536).
+;   5..4+N. The characters as ASCII, '0'..'?' (only the low 4 bits count),
+;      without the sentinels and the LRC, which the program adds.
+; Nothing is pushed to OUTQ.
+;
+; The swipe. Every cell starts with a transition and a 1 has one more in
+; its middle. The first transition lands 3 ticks after the last character
+; is popped (SETD 2, then the first WAITD 1); after the trailing zeros one more transition closes the last
+; cell, and the line then stays still until the next swipe's words.
+;
+; Timing. Each transition is `SETP TX, v, D` and the WAITD 1 that lands it
+; on the exact clock edge of its tick (6.10 rule 1). The longest half cell
+; is the one that starts the next character (its LD, or the LRC step, then
+; parity): the checker's longest path is 20 slots, 80 clocks. The schedule
+; is proved (27 pairs, no `.bounded`) for a tick of 80 clocks or more
+; (.tick), slack 0 there; the tests run 256 clocks a half cell and more.
+;
+; Size: 107 words, 65 of code and 42 of data (the track buffer: the start
+; sentinel, up to 40 characters, the end sentinel), inside a quarter of the
+; 512-word memory; it runs on any thread. Registers: r0 the
+; character being sent, r1 the characters left, r2 the buffer pointer, r3
+; the LRC, r4 the clocking zeros, r5 a bit count, r6 the line level, r7
+; scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TX = OUT0
+        .tick   80                      ; the shortest half cell proved
+        .equ    SS = 0x0B               ; ';'
+        .equ    ES = 0x0F               ; '?'
+
+        JMP     start                   ; the buffer sits low (MOV16 is one word)
+buf:    .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        .word   0, 0                    ; 42 words: the sentinels too
+
+start:  SETP    TX, 0                   ; no current until the first transition
+        LDI     r6, 0
+        POP     r7                      ; 1. TICK_INT of the half cell
+        CSRW    TICK_INT, r7
+        POP     r7                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r7
+swipe:  POP     r4                      ; 3. clocking zeros
+        POP     r1                      ; 4. N
+        MOV16   r2, buf                 ; the buffer: SS, the characters, ES
+        LDI     r7, SS
+        ST      r7, r2, 0
+        MOV     r5, r1
+load:   INC     r2
+        POP     r7                      ; 5.. the characters
+        ST      r7, r2, 0
+        DJNZ    r5, load
+        INC     r2
+        LDI     r7, ES
+        ST      r7, r2, 0
+        ADDI    r1, 2                   ; the characters to send, LRC aside
+        SETD    2                       ; re-anchor after the unbounded POPs
+        MOV     r5, r4
+lead:   CALL    edge                    ; the leading clocking zeros
+        WAITD   1
+        WAITD   1
+        DJNZ    r5, lead
+        LDI     r3, 0                   ; the LRC
+        MOV16   r2, buf
+chr:    LD      r0, r2, 0
+        INC     r2
+lrcin:  ANDI    r0, 15                  ; a character: 4 data bits, LSB first
+        XOR     r3, r3, r0
+        PAR     r7, r0                  ; C: the data has an odd number of 1s
+        BC      sodd
+        ORI     r0, 16                  ; even: the parity bit is 1
+sodd:   LDI     r5, 5
+sbit:   CALL    edge
+        WAITD   1                       ; the transition at the cell's start
+        SHRI    r0, 1                   ; C: a 1
+        BNC     smid
+        CALL    edge
+smid:   WAITD   1                       ; the middle: a transition for a 1
+        DJNZ    r5, sbit
+        DJNZ    r1, chr
+        TEST    r2, r2
+        BZ      tail                    ; the LRC has gone
+        MOV     r0, r3                  ; the LRC: every column even
+        LDI     r2, 0                   ; and r2 = 0 says so
+        LDI     r1, 1
+        JMP     lrcin
+tail:   MOV     r5, r4
+trail:  CALL    edge                    ; the trailing clocking zeros
+        WAITD   1
+        WAITD   1
+        DJNZ    r5, trail
+        CALL    edge                    ; the transition that ends the last cell
+        WAITD   1
+        JMP     swipe
+
+; edge: stage the next transition (the level r6 toggles) for the next WAITD.
+; It is the only subroutine and every call is followed by a WAITD, so the
+; checker's RET (to after every CALL) closes no loop without an anchor.
+edge:   XORI    r6, 1
+        BZ      elo
+        SETP    TX, 1, D
+        RET
+elo:    SETP    TX, 0, D
+        RET
