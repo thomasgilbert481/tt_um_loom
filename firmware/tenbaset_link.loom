@@ -1,0 +1,191 @@
+; tenbaset_link.loom
+; 10BASE-T link pulses on TD+ (OUT0) / TD- (OUT1): normal link pulses (NLP)
+; or auto-negotiation fast link pulse (FLP) bursts carrying a 16-bit base
+; link code word, fed by the host through INQ[0]. Link layer only, no data.
+;
+; Written on 2026-11-08, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; Ethernet. The program uses the deadline-latched pin write (`SETP pin, v,
+; D`, SEMANTICS 6.10, D-016), built so that WS2812 pulses land on the exact
+; clock, and the bit engine's shifter (`LDSR`/`SHO`, SEMANTICS 6.9), built
+; for serial frames, here only to put one bit of the code word on the pin
+; per data position. What the firmware does that no hardware does: the
+; 100 ns pulse, the 16 ms link pulse schedule, the 33-position FLP burst and
+; its code word, and the switch between NLP and FLP. 10BASE-T *data* is out
+; of reach: a Manchester half bit is 50 ns, 2.5 clocks at 50 MHz, shorter
+; than one slot (docs/CAPABILITY.md); link pulses are the part of Ethernet
+; slow enough for firmware, and the part a switch's link light answers.
+;
+; Wire format (IEEE 802.3, which could not be read for this program: the
+; figures are from tools/protomodels/tenbaset_link.py, which cites them and
+; marks each one checked or unchecked).
+;   NLP: one positive pulse, 100 ns nominal, every 16 ms +- 8 ms while idle
+;        (clause 14, link test pulse).
+;   FLP: a burst of 33 pulse positions, 62.5 us apart: 17 clock pulses
+;        125 us +- 14 us apart, always present, and between each pair a data
+;        position, a pulse for a 1 and none for a 0; D0 is sent first. One
+;        burst every 16 ms +- 8 ms (clause 28, FLP burst).
+; Pins: a pulse is TD+ high with TD- low; TD+ = TD- = 0 is the idle line.
+; TD- is held low throughout (a link pulse is unipolar). A Pmod would need a
+; differential line driver and 10BASE-T magnetics (1:1 transformer, RJ45,
+; 100 ohm termination) to make the 2.5 V peak pulse of the clause.
+;
+; Timing (50 MHz, one tick per clock, set below). A pulse is five clocks,
+; exactly. One latch per thread cannot stage both edges: a second staged
+; write needs its own `SETP .., D` and a `TD` write after the first lands,
+; two slots at least. So the rise is an ordinary pin write, on the thread's
+; 4-clock grid, and the fall is staged: every pulse is the sequence
+;     WAITD k        ; X cycle x: the schedule's deadline is reached
+;     RET            ; x+4
+;     SETD LEAD      ; x+8:  TD = NOW(x) + 8 + 11 = NOW(x) + 19
+;     SETP TDP, 1    ; x+12: the pad rises at edge x+14 (SEMANTICS 2)
+;     SETP TDP, 0, D ; x+16: staged at edge x+18, lands at x+19 (6.10 rule 1)
+; so the fall is 5 clocks after the rise, and the next schedule deadline is
+; TD + K, so pulse positions are PRE + K clocks apart (PRE = 19), K the sum
+; of the WAITDs in between. Because the rise is on the grid, every interval
+; is a multiple of 4 clocks: FLP positions are 3124 clocks (62.48 us) apart,
+; clock pulses 6248 (124.96 us), 20 ns and 40 ns under the nominal; the
+; schedule has no drift and every interval is the same number of clocks.
+; NLPs and bursts are N * 200 clocks (N * 4 us) apart, exactly.
+;
+; Host words (FIFO space, thread 0; nothing is pushed to OUTQ):
+;   bit 15 = 1: configuration. Bit 14: 1 FLP bursts, 0 NLPs. Bits 13:0: N,
+;               the period in 4 us units (16 ms is N = 4000). N = 0 stops
+;               after the current pulse or burst. The shortest N is 2 after
+;               an NLP and 550 after a burst (2.2 ms: a burst lasts 2.0 ms,
+;               and the 205 us of quiet line after it are longer than a
+;               receiver's flp_test_max_timer, 185 us); shorter is
+;               taken as the shortest.
+;   bit 15 = 0: the link code word for the next bursts, bits 14:0 as given
+;               and NP (bit 15) = 0: next pages are not supported. The reset
+;               word is 0x0021: selector 802.3 (00001), 10BASE-T half
+;               duplex. 10BASE-T full duplex is 0x0061; Ack is bit 14.
+; While running, at most one word is taken per NLP or burst, after it, and
+; applies from the next one. Idle (reset, or after N = 0), the program
+; blocks for a word; the first pulse rises about 230 clocks after the starting
+; configuration word is popped.
+;
+; Registers: r0 the link code word, r1 the configuration (bits 14:0), r2 the
+; data positions left in a burst, r3 the gap loop count, r4 the idle loop
+; count, r5 scratch, r6 the popped word, r7 the period mask 0x3FFF.
+;
+; Readings taken on the open spec questions (2026-11-08): IEEE 802.3 was
+; not read (no access); the pulse width, the 16 +- 8 ms period, the 125 +-
+; 14 us clock spacing with data half way, D0 first and the base page
+; layout are from a secondary source. The data window, the link integrity
+; timers, lc_max, flp_test_max_timer and the selector 00001 are from
+; memory and unchecked.
+;   TD- is held low; complementary drive would need a second thread.
+;   Pulse rises are on the 4-clock slot grid (only the fall is latched),
+;   so positions sit 20 to 40 ns short of nominal, inside every window.
+;   Link layer only: 10BASE-T data needs the serializer of D-036.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TDP = OUT0, TDN = OUT1
+        .equ    UNIT  = 200             ; clocks per period unit (4 us)
+        .equ    GAP   = 3124            ; clocks between FLP pulse positions
+        .equ    LEAD  = 11              ; SETD lead: the fall 5 clocks after the rise
+        .equ    PRE   = 19              ; clocks from a deadline to the next fall
+        .equ    KGAP  = GAP - PRE       ; 3105: the WAITDs between two positions
+        .equ    GSTEP = 250
+        .equ    GN    = KGAP / GSTEP    ; 12
+        .equ    GREM  = KGAP - GN * GSTEP ; 105
+        .equ    IREM  = 13              ; the last WAITD of an idle wait
+        .equ    NREM  = UNIT - PRE - IREM ; 168: NLP period N*200 = PRE + 168 + (N-1)*200 + 13
+        .equ    SPAN  = 32 * GAP        ; 99,968: first to last pulse of a burst
+        .equ    FLPQ  = (SPAN + PRE + IREM) / UNIT ; 500: burst period N*200 = SPAN + PRE + (N-500)*200 + 13
+        .equ    FMIN  = FLPQ + 50       ; 550: 205 us of quiet line after a burst
+        .equ    LCW0  = 0x0021          ; selector 00001, A0 = 10BASE-T
+
+start:  .csr    TICK_INT, 1             ; one tick per clock (also the reset value)
+        .csr    BE_PINS, pin(TDP)       ; SHO drives TD+ (BE_CFG 0: NRZ, LSB first)
+        SETP    TDP, 0                  ; the idle line
+        SETP    TDN, 0
+        MOV16   r0, LCW0
+        MOV16   r7, 0x3FFF              ; after the .csr lines, which use r7
+        LDI     r1, 0
+
+; Idle: block for a word. A code word is kept; a configuration with N > 0
+; starts the schedule.
+idle:   POP     r6                      ; blocks while INQ is empty
+        ADD     r5, r6, r6              ; C = bit 15, r5 = bits 14:0 << 1
+        BC      icfg
+        MOV     r0, r6                  ; a link code word
+        JMP     idle
+icfg:   SHRI    r5, 1
+        MOV     r1, r5                  ; the configuration
+        AND     r4, r1, r7              ; N, Z = (N == 0)
+        BZ      idle
+        SETD    0                       ; re-anchor after the unbounded POP
+        LDI     r4, 1                   ; the first pulse 200 + 13 clocks on
+
+; One period: wait, then the NLP or the burst's first clock pulse.
+cycle:  CALL    widle                   ; returns on the deadline (see header)
+        SETD    LEAD
+        SETP    TDP, 1                  ; the rise, on the slot grid
+        SETP    TDP, 0, D               ; the fall, 5 clocks later
+        MOV     r5, r1
+        SHLI    r5, 2                   ; C = bit 14, FLP
+        BC      burst
+
+; NLP: the next pulse N * 200 clocks after this one.
+        CALL    host
+        AND     r4, r1, r7              ; N, Z
+        BZ      idle                    ; 0: stop (the fall has landed)
+        CMPI    r4, 2                   ; C = (N >= 2)
+        BC      nok
+        LDI     r4, 2
+nok:    SUBI    r4, 1                   ; N - 1 units of 200
+        WAITD   NREM
+        JMP     cycle
+
+; FLP: 16 data positions and 16 more clock pulses, GAP clocks apart.
+burst:  LDSR    r0                      ; D0 first
+        LDI     r2, 16
+floop:  CALL    wgap
+        SETD    LEAD
+        SHO                             ; a data pulse if this bit is 1
+        SETP    TDP, 0, D
+        CALL    wgap
+        SETD    LEAD
+        SETP    TDP, 1                  ; a clock pulse
+        SETP    TDP, 0, D
+        DJNZ    r2, floop
+        CALL    host
+        AND     r4, r1, r7              ; N, Z
+        BZ      idle
+        MOV16   r5, FMIN                ; the shortest period after a burst, 550
+        CMP     r4, r5                  ; C = (N >= FMIN)
+        BC      fok
+        MOV     r4, r5
+fok:    SUB     r4, r4, r5
+        ADDI    r4, FMIN - FLPQ         ; N - 500 units of 200
+        JMP     cycle
+
+; At most one host word, without waiting. TD is in the past here (the fall
+; of the last pulse has landed), so the timed WAITB is a test.
+host:   WAITB   INQ_NE, T
+        BT      hret                    ; INQ empty
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ[0] (SEMANTICS 6.7)"
+        POP     r6
+        ADD     r5, r6, r6              ; C = bit 15
+        BC      hcfg
+        MOV     r0, r6                  ; a code word, for the next burst
+        RET
+hcfg:   SHRI    r5, 1
+        MOV     r1, r5                  ; a configuration, for the next period
+hret:   RET
+
+; KGAP clocks after TD, then return on the deadline.
+wgap:   LDI     r3, GN
+wg:     WAITD   GSTEP
+        DJNZ    r3, wg
+        WAITD   GREM
+        RET
+
+; r4 * 200 + IREM clocks after TD (r4 >= 1), then return on the deadline.
+widle:  WAITD   UNIT
+        DJNZ    r4, widle
+        WAITD   IREM
+        RET

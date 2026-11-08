@@ -1,0 +1,156 @@
+; tenbaset_link_rx.loom
+; 10BASE-T link pulse receiver on RD (IN0): the clause 14 link integrity
+; test on normal link pulses (link pass, link fail), and the decoding of a
+; partner's FLP burst into its 16-bit link code word. Thread 1. Link layer
+; only, no data.
+;
+; Written on 2026-11-08, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; Ethernet. The program uses only the general machinery: level waits with
+; a deadline timeout (WAITP .., T, SEMANTICS 6.4), the per-thread tick
+; divider as a microsecond-scale clock (SEMANTICS 4), and the FIFOs. What
+; the firmware does that no hardware does: cutting pulses into NLPs and
+; bursts, telling clock pulses from data pulses by their time after the
+; last clock, the link test timers and the link pulse count.
+;
+; Figures (from tools/protomodels/tenbaset_link.py, which says which were
+; read in a secondary source and which are from memory, unchecked):
+;   a pulse group ends after GRP = 48 ticks (192 us) without a pulse, just
+;   over flp_test_max_timer (165-185 us); a group of one pulse is an NLP;
+;   in a burst, a pulse less than DTH = 23 ticks (92 us) after the last
+;   clock pulse is a data 1 (nominal 62.5 us), a later one the next clock
+;   (nominal 125 us); 17 clocks make a burst, D0 first;
+;   link integrity as the model's LinkIntegrity: in link fail, a pulse less
+;   than T_MIN after the last one sets the count to 0, any other NLP adds
+;   one, a burst sets it to 0, and T_MAX without a pulse sets it to 0;
+;   LCMAX = 3 in a row is link pass. In link pass, T_MAX without a pulse
+;   (link_loss_timer) is link fail. T_MAX serves as link_test_max_timer
+;   and link_loss_timer, whose ranges (25-150 ms, 50-150 ms) overlap.
+; RD comes from a squelch comparator (a Pmod's line receiver behind the
+; magnetics): high while a positive pulse is on the pair. A 100 ns pulse is
+; 5 clocks at 50 MHz, so a level wait, which samples every 4 clocks, cannot
+; miss it.
+;
+; Tick: 200 clocks (4 us at 50 MHz), set below; the program's figures are
+; in ticks, so on another clock the tick is f_clk * 4 us.
+;
+; Host words (FIFO space, thread 1). In, at start: T_MIN then T_MAX, in
+; ticks: 1000 (4 ms) and 25000 (100 ms) are inside the ranges; T_MAX must
+; be under 32768 (the reached() half window, SEMANTICS 4). Out:
+;   0x8001 link pass        0x8000 link fail
+;   0xC000, then the word   a burst with 17 clock pulses and its code word
+;   0x8002                  a burst without 17 clock pulses
+; A PUSH blocks while OUTQ[1] is full, and pulses in that time are missed:
+; the host must read the words as they come.
+;
+; Registers: r0 the code word (scratch outside a burst), r1 the data bit
+; mask, r2 the time of the last clock pulse, r3 the clock pulses in this
+; group, r4 T_MIN, r5 T_MAX, r6 the time of the last pulse (scratch inside
+; a group), r7 the link state: count << 3 | EARLY | TIMING | PASS.
+
+        .imem   512
+        .thread 1
+        .pins   RD = IN0
+        .equ    GRP   = 48              ; ticks without a pulse that end a group
+        .equ    DTH   = 23              ; ticks after a clock: data below, clock above
+        .equ    LCMAX = 3               ; NLPs in a row for link pass
+        .equ    PASS  = 1               ; r7 bits
+        .equ    TIMING = 2              ; a pulse less than T_MAX ago: r6 is valid
+        .equ    EARLY = 4               ; this group came less than T_MIN after the last
+        .equ    ONE   = 8               ; one link count
+
+rx:     .csr    TICK_INT, 200, r0
+        POP     r4                      ; T_MIN
+        POP     r5                      ; T_MAX
+        LDI     r7, 0                   ; link fail, count 0
+
+; Wait for the first pulse of a group; with TIMING, for at most T_MAX.
+wait:   MOV     r0, r7
+        ANDI    r0, TIMING
+        BZ      wfree
+        ADD     r0, r6, r5
+        CSRW    TD, r0                  ; the last pulse + T_MAX
+        WAITP   RD, 1, T
+        BT      expire
+        JMP     first
+wfree:  WAITP   RD, 1
+first:  CSRR    r2, NOW                 ; the first pulse is a clock pulse
+        ANDI    r7, 0x3B                ; clear EARLY
+        MOV     r0, r7
+        ANDI    r0, TIMING
+        BZ      fgo
+        SUB     r0, r2, r6              ; ticks since the last pulse
+        CMP     r0, r4                  ; C = (gap >= T_MIN)
+        BC      fgo
+        ORI     r7, EARLY
+fgo:    LDI     r0, 0
+        LDI     r1, 1
+        LDI     r3, 1
+        WAITP   RD, 0
+
+; The rest of the group: each pulse is a data 1 or the next clock.
+grp:    SETD    GRP
+        WAITP   RD, 1, T
+        BT      gend                    ; GRP ticks without a pulse
+        CSRR    r6, NOW
+        SUB     r6, r6, r2              ; ticks since the last clock
+        CMPI    r6, DTH                 ; C = a clock
+        BC      gclk
+        OR      r0, r0, r1              ; a data 1 at this position
+        JMP     gfall
+gclk:   ADD     r2, r2, r6              ; the new clock time
+        SHLI    r1, 1                   ; the next data position
+        ADDI    r3, 1
+gfall:  WAITP   RD, 0
+        JMP     grp
+
+; The group has ended. TD is the last pulse + GRP.
+gend:   CSRR    r6, TD
+        SUBI    r6, GRP                 ; the time of the last pulse
+        ORI     r7, TIMING
+        CMPI    r3, 1
+        BNZ     flp
+        OR      r0, r0, r0              ; Z = no data pulse
+        BNZ     flp
+
+; An NLP.
+        MOV     r0, r7
+        ANDI    r0, PASS
+        BNZ     wait                    ; link pass: the loss timer restarts
+        MOV     r0, r7
+        ANDI    r0, EARLY
+        BNZ     zero                    ; too soon after the last pulse
+        ADDI    r7, ONE
+        MOV     r0, r7
+        SHRI    r0, 3                   ; the count
+        CMPI    r0, LCMAX               ; C = (count >= LCMAX)
+        BNC     wait
+        ORI     r7, PASS
+        MOV16   r0, 0x8001
+        PUSH    r0                      ; link pass
+        JMP     wait
+zero:   ANDI    r7, PASS | TIMING | EARLY ; count 0
+        JMP     wait
+
+; A burst: report it; in link fail it sets the count to 0.
+flp:    CMPI    r3, 17
+        BNZ     fbad
+        MOV16   r1, 0xC000
+        PUSH    r1
+        PUSH    r0                      ; the code word
+        JMP     fint
+fbad:   MOV16   r1, 0x8002
+        PUSH    r1
+fint:   MOV     r1, r7
+        ANDI    r1, PASS
+        BNZ     wait
+        JMP     zero
+
+; T_MAX without a pulse: count 0, and link fail if it was passing.
+expire: MOV     r0, r7
+        ANDI    r0, PASS
+        LDI     r7, 0
+        BZ      wfree
+        MOV16   r0, 0x8000
+        PUSH    r0                      ; link fail
+        JMP     wfree
