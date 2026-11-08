@@ -1,0 +1,173 @@
+; mbp_tx.loom
+; An IEC 61158-2 MBP transmitter (31.25 kbit/s Manchester bus powered, the
+; physical layer of Foundation Fieldbus H1 and PROFIBUS PA), logic level, to
+; a media attachment unit (MAU). Written on 2026-11-07, after the hardware
+; was complete (D-032), as a protocol Loom was not designed for (D-035): MBP
+; is in no design document.
+;
+; Hardware used, and what it was built for:
+;   - the bit engine's Manchester encoder (ENC = 2, D-026, built for a
+;     generic IEEE 802.3 Manchester line) for the preamble, the octets and
+;     the frame check sequence;
+;   - the same engine in NRZ mode (ENC = 0, built for SPI and UART-like
+;     shifting) for the two delimiters: the Manchester encoder cannot make
+;     the non-data symbols N+ and N- (a level held for a whole bit), so the
+;     firmware writes each delimiter as its sixteen half-bit levels;
+;   - the engine's serial CRC (CRC_EN, built for USB's CRC16) with the
+;     CRC-CCITT polynomial, over the octets only;
+;   - OUT on a two-pin OUTGRP so that TX and TXE change at the same edge.
+; What firmware does that no hardware does: the preamble, both delimiters
+; (N+ and N-), the switch between the two encodings at the delimiter
+; boundaries, the FCS complement, the transmit enable and the underrun
+; abort.
+;
+; Pins (push-pull, to the MAU): TX = OUT0 (the Manchester data), TXE = OUT1
+; (transmit enable, high for the whole frame). Idle: TX = 0, TXE = 0.
+;
+; Rate: one tick is a quarter bit, written by the host before RUN:
+; TICK_INT = 400 at 50 MHz is 31.25 kbit/s exactly (a bit is 32 us). The
+; deadline checker proves every pair at 100 clocks a tick, so any slower
+; tick (a larger TICK_INT) is proved too; the RTL tests run at 100 (125
+; kbit/s, the same waveform four times faster). 400 and 100 are multiples
+; of the 4-clock slot, so every edge is on its grid (SEMANTICS 2).
+;
+; Frame (Fisher-Rosemount US 7,694,061 B2, from IEC 61158-2; secondary):
+;   preamble  1..8 octets of 1 0 1 0 1 0 1 0;
+;   SD        1 N+ N- 1 0 N- N+ 0;
+;   octets    the DLPDU from the host, MSB first (unchecked, QUESTIONS.md);
+;   FCS       16 bits: the ones' complement of the CRC-16 x^16+x^12+x^5+1,
+;             initial value 0xFFFF, over the octets, MSB first (from memory,
+;             unchecked, QUESTIONS.md);
+;   ED        1 N+ N- N+ N- 1 0 1.
+; Manchester: a 1 is low then high (a rising mid-bit edge), a 0 high then
+; low (Kuphaldt, Lessons in Industrial Instrumentation, "H1 FF physical
+; layer"); N+ is high for the whole bit, N- low. The patent above states the
+; opposite polarity; POL = 1 below selects it (INV, and the delimiter
+; patterns follow), QUESTIONS.md.
+;
+; Host words.
+;   INQ[0]:  a header, then n words, one octet each (bits 7:0). Header bits
+;            7:0 n (0 sends the FCS of no octets), bits 11:8 the preamble
+;            octets (0 means 1). The host keeps INQ fed: an octet is due
+;            every 8 bits (256 us at 31.25 kbit/s).
+;   OUTQ[0]: one word per frame: 0 sent, 1 underrun (INQ empty when an
+;            octet was due: the frame is cut off and TXE dropped at once,
+;            so receivers see a coding error; the octets the host still
+;            pushes for that frame must be discarded by resetting the
+;            thread).
+;
+; Memory: thread 0's quarter (0x000..0x07F). Registers: r4 octets left,
+; r5 preamble octets left, r1 scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): IEC 61158-2 was
+; not read; frame structure, N+ and N- and the 32 us bit from a patent's
+; description (secondary).
+;   Manchester polarity: low to high is a 1, as Kuphaldt's text has it
+;   (the patent says the opposite); one .equ switches it.
+;   FCS CRC-16 CCITT, initial 0xFFFF, complemented, residue 0x1D0F; MSB
+;   first in each octet; the +-0.2 % and jitter figures: all from memory
+;   and unchecked. Whether PROFIBUS PA frames carry this FCS is open.
+;   The receiver needs at least four preamble bits to lock.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   TX = OUT0, TXE = OUT1
+        .equ    POL = 0                 ; 0: a 1 is low-high; 1: high-low
+        .equ    CFG_M = (2 << 3) | (1 << 1) | (1 << 9) | (POL << 7)
+                                        ; Manchester, MSB first, CRC_EN
+        .equ    CFG_N = (1 << 1) | (POL << 7)   ; NRZ, MSB first, no CRC
+        .equ    SD_RAW = 0x718E + POL * (0x4DB2 - 0x718E)
+        .equ    ED_RAW = 0x7319 + POL * (0x4CD9 - 0x7319)
+                                        ; the delimiters' half-bit levels
+        .equ    GRP = (2 << 5) | pin(TX) ; OUT writes TX (bit 0) and TXE (bit 1)
+
+        .thread 0
+        .tick   100                     ; the fastest tick proved
+        .csr    BE_PINS, pin(TX), r1    ; out = TX
+        .csr    OUTGRP, GRP, r1
+        .csr    CRC_POLY, 0x1021, r1
+        .csr    CRC_INIT, 0xFFFF, r1
+        LDI     r1, 0
+        OUT     r1                      ; TX = 0, TXE = 0: idle
+
+next:   POP     r4                      ; the header (unbounded)
+        MOV     r5, r4
+        SHRI    r5, 8
+        ANDI    r5, 15                  ; preamble octets
+        BNZ     hdr
+        LDI     r5, 1
+hdr:    SHLI    r4, 8
+        SHRI    r4, 8                   ; n
+        .csr    BE_CFG, CFG_M, r1       ; Manchester; HALF = 0
+        LDI     r1, 2
+        SETD    1
+        OUT     r1                      ; TXE = 1, 2q to 3q before the first half-bit
+
+pre:    MOV16   r1, 0xAA00              ; preamble octet, MSB first
+        LDSR    r1
+        LDI     r1, 8
+        CSRW    CNT, r1
+prl:    WAITD   2                       ; first half: the bit leaves SR
+        SHO
+        WAITD   2                       ; second half; Z = (CNT == 0)
+        SHO
+        BNZ     prl
+        DJNZ    r5, pre
+
+        .csr    BE_CFG, CFG_N, r1       ; NRZ: one SHO per half-bit
+        MOV16   r1, SD_RAW
+        LDSR    r1
+        LDI     r1, 16
+        CSRW    CNT, r1
+sdl:    WAITD   2
+        SHO
+        BNZ     sdl
+
+        .csr    BE_CFG, CFG_M, r1       ; Manchester again, HALF = 0
+        CRCI                            ; CRC = 0xFFFF
+        CMPI    r4, 0
+        BZ      fcs
+oct:    WAITB   INQ_NE, T               ; TD has passed: times out at once
+        BT      under                   ; if INQ is empty
+        .bounded "the WAITB INQ_NE above completed with T = 0, so INQ[0] held a word in that slot's X cycle; only this thread pops INQ[0] (SEMANTICS 6.7)"
+        POP     r1
+        SWAP    r1, r1                  ; the octet to SR[15:8]
+        LDSR    r1
+        LDI     r1, 8
+        CSRW    CNT, r1
+ol:     WAITD   2
+        SHO                             ; the bit enters the CRC
+        WAITD   2
+        SHO
+        BNZ     ol
+        DJNZ    r4, oct
+
+fcs:    STCRC   r1                      ; the CRC of the octets
+        NOT     r1, r1                  ; sent complemented
+        LDSR    r1
+        LDI     r1, 16
+        CSRW    CNT, r1
+fl:     WAITD   2
+        SHO
+        WAITD   2
+        SHO
+        BNZ     fl
+
+        .csr    BE_CFG, CFG_N, r1       ; NRZ for the end delimiter
+        MOV16   r1, ED_RAW
+        LDSR    r1
+        LDI     r1, 16
+        CSRW    CNT, r1
+edl:    WAITD   2
+        SHO
+        BNZ     edl
+        LDI     r1, 0
+        WAITD   2                       ; the end of the last half-bit
+        OUT     r1                      ; TX = 0, TXE = 0
+        PUSH    r1                      ; 0: sent
+        JMP     next
+
+under:  LDI     r1, 0
+        OUT     r1                      ; cut off: TX = 0, TXE = 0 at once
+        LDI     r1, 1
+        PUSH    r1                      ; 1: underrun
+        JMP     next

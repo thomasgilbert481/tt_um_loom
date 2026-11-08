@@ -1,0 +1,209 @@
+; mbp_rx.loom
+; An IEC 61158-2 MBP receiver (31.25 kbit/s Manchester bus powered, the
+; physical layer of Foundation Fieldbus H1 and PROFIBUS PA), logic level,
+; from a media attachment unit (MAU). Written on 2026-11-07, after the
+; hardware was complete (D-032), as a protocol Loom was not designed for
+; (D-035): MBP is in no design document.
+;
+; Hardware used, and what it was built for:
+;   - the bit engine's Manchester decoder (ENC = 2, D-026, built for a
+;     generic IEEE 802.3 Manchester line), whose T flag marks a bit with no
+;     mid-bit transition: in MBP that is either a non-data symbol (N+ or
+;     N-) or a coding error, and the decoder cannot tell which;
+;   - the engine's serial CRC (CRC_EN, built for USB's CRC16) with the
+;     CRC-CCITT polynomial;
+;   - the tick restart (SEMANTICS 4, a TICK_INT write clears ACC, used by
+;     the UART and Manchester receivers) on every mid-bit edge, so the grid
+;     follows a sender that is off rate;
+;   - WAITB OUTQ_NF with T as a non-blocking test of OUTQ inside the frame.
+; What firmware does that no hardware does: preamble lock, the delimiters,
+; and the decision "non-data symbol or coding error". For every bit the
+; firmware keeps the decoder's value s (the second half's level) and a
+; violation bit v (the decoder's T). The pair is lossless: v = 0 means the
+; halves were ~s, s; v = 1 means both were s (N+ if s = 1, N- if s = 0).
+; So the last eight bits are known exactly, and a delimiter is recognised
+; as an exact eight-bit (s, v) pattern:
+;   SD  1 N+ N- 1 0 N- N+ 0   s = 0xD2, v = 0x66
+;   ED  1 N+ N- N+ N- 1 0 1   s = 0xD5, v = 0x78
+; Inside a frame an octet with any v that is not exactly the ED is a coding
+; error, and the frame ends there. A bit with no edge in its window (N+,
+; N- or noise) keeps the grid of the last edge for one bit.
+;
+; Pins: RX = IN0 (the MAU's receive data). Idle level does not matter: the
+; receiver hunts for edges.
+;
+; Rate: one tick is a quarter bit, written by the host before RUN: 400 at
+; 50 MHz for 31.25 kbit/s. The deadline checker proves every pair at 100
+; clocks a tick, so any larger TICK_INT is proved too (the bound is set by
+; the bit after an N+ or N-: its SETD follows a timed-out WAITE, whose
+; phase the checker takes as unknown). The RTL tests run at 100 (125
+; kbit/s). Timing (q = a
+; quarter bit, M = a mid-bit edge, where the grid restarts):
+;   - second-half sample at M + 1q, next bit's first-half sample at M + 3q;
+;   - the next mid-bit edge is taken in [M + 3q, M + 5q), +-8 us at
+;     31.25 kbit/s; the bit-boundary edges (M + 2q, M + 6q) fall outside;
+;   - lock: three edges, each 4q (+-1q) after the last with the level held
+;     between them, which only mid-bit edges of a 1010 run (the preamble)
+;     give; then the SD is searched for, a bit at a time, for at most 80
+;     bits (a preamble of up to 8 octets, 4.2 of the patent).
+;
+; Frame check: the CRC (x^16+x^12+x^5+1, initial 0xFFFF, MSB first) runs
+; over every octet after the SD, the FCS octets included; the value it had
+; before the ED octet must be the residue 0x1D0F of a complemented CRC
+; (from memory, unchecked, QUESTIONS.md). Up to 255 octets (FCS included).
+;
+; Host words, OUTQ[1]: every octet after the SD (bits 7:0), the two FCS
+; octets included, then a report: bit 15 set, bit 14 bad FCS, bit 13 coding
+; error (the frame ended at a violation that is not the ED), bit 12 overrun
+; (OUTQ full when an octet was due, or more than 255 octets), bits 7:0 the
+; octets pushed. A clean frame reports 0x8000 | n. The host must keep OUTQ
+; drained: an octet arrives every 256 us at 31.25 kbit/s.
+;
+; Memory: thread 1's quarter (0x080..0x0FF). Registers: r7 = TICK_INT (for
+; the grid restarts), r2 bits left, r3 the violation bits, r5 octets left
+; (or SD-search bits left), r6 the CRC after the last octet, r0, r1, r4
+; scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   RX = IN0
+        .equ    POL = 0                 ; as mbp_tx.loom
+        .equ    CFG = (2 << 3) | (1 << 1) | (1 << 9) | (POL << 7)
+                                        ; Manchester, MSB first, CRC_EN
+        .equ    SD_S = 0xD2 + POL * (0xB4 - 0xD2)
+        .equ    ED_S = 0xD5 + POL * (0xAD - 0xD5)
+        .equ    SD_V = 0x66
+        .equ    ED_V = 0x78
+        .equ    RESIDUE = 0x1D0F
+        .equ    LOCK = 3                ; edges for preamble lock
+        .equ    HUNT = 80               ; bits searched for the SD
+        .equ    MAXOCT = 255
+
+        .thread 1
+        .tick   100                     ; the fastest tick proved
+        .csr    BE_PINS, pin(RX) << 5, r1
+        .csr    INGRP, (1 << 5) | pin(RX), r1
+        .csr    CRC_POLY, 0x1021, r1
+        .csr    CRC_INIT, 0xFFFF, r1
+        CSRR    r7, TICK_INT            ; P, for the grid restarts
+
+; ------------------------------------------------------------ preamble lock
+hunt:   LDI     r2, LOCK
+        WAITE   RX, ANY                 ; any edge E (unbounded)
+hlk:    CSRW    TICK_INT, r7            ; the grid starts at E
+        DJNZ    r2, hchk
+        BRA     lock
+hchk:   IN      r4                      ; the level after E
+        SETD    3
+        WAITD   0                       ; E + 3q
+        IN      r1
+        CMP     r1, r4
+        BNZ     hunt                    ; an edge between: not mid-bit spaced
+        SETD    2                       ; window end, E + 5q
+        WAITE   RX, ANY, T
+        BT      hunt
+        BRA     hlk
+
+lock:   .csr    BE_CFG, CFG, r1         ; HALF = 0 (SEMANTICS 6.9.1)
+        SETD    1                       ; TD = M + 1q
+        LDI     r3, 0
+        LDI     r5, HUNT
+
+; ------------------------------------------------- SD search, a bit at a time
+; At hn: TD = M + 1q of the last bit (its second half already sampled).
+hn:     WAITD   2                       ; M + 3q: the next bit's first half
+        SHI
+        SETD    2                       ; window end, M + 5q
+        WAITE   RX, ANY, T
+        BT      hnx
+        CSRW    TICK_INT, r7            ; the grid starts at the edge M'
+        SETD    0
+        WAITD   1                       ; M' + 1q
+hs:     SHI                             ; second half: s; T = no transition
+        ADD     r3, r3, r3              ; v <<= 1 (ADD keeps T)
+        BNT     hv
+        ORI     r3, 1
+        LDI     r1, 0
+        CSRW    FLAGS, r1               ; T = 0 for the next bit
+hv:     STSR    r1                      ; s of the last 16 bits
+        SHLI    r1, 8
+        MOV16   r4, SD_S << 8
+        CMP     r1, r4
+        BNZ     hno
+        MOV     r1, r3
+        SHLI    r1, 8
+        LDIH    r4, SD_V                ; low byte of r4 is still 0
+        CMP     r1, r4
+        BZ      sd
+hno:    DJNZ    r5, hn
+        JMP     hunt                    ; no SD after the preamble
+hnx:    LDI     r1, 0                   ; no edge: N+, N- or noise; keep
+        CSRW    FLAGS, r1               ; the grid (M' = M + 4q, now is
+        MOV     r1, r3                  ; M' + 1q) and clear the time-out T;
+        ANDI    r1, 3                   ; a third violation in a row (the SD
+        CMPI    r1, 3                   ; has at most two) means the lock is
+        BZ      hunt                    ; lost: hunt again
+        SETD    0
+        BRA     hs
+
+sd:     CRCI                            ; CRC = 0xFFFF from the first octet
+        LDI     r2, 8
+        LDI     r5, MAXOCT
+
+; --------------------------------------------------------- octets, to the ED
+fn:     WAITD   2                       ; M + 3q
+        SHI
+        SETD    2
+        WAITE   RX, ANY, T
+        BT      fnx
+        CSRW    TICK_INT, r7
+        SETD    0
+        WAITD   1                       ; M' + 1q
+fs:     SHI                             ; s enters SR and the CRC
+        ADD     r3, r3, r3
+        BNT     fv
+        ORI     r3, 1
+        LDI     r1, 0
+        CSRW    FLAGS, r1
+fv:     DJNZ    r2, fn
+        LDI     r2, 8                   ; an octet: s in SR[7:0], v in r3[7:0]
+        STSR    r1
+        SHLI    r1, 8
+        MOV     r4, r3
+        SHLI    r4, 8                   ; Z: no violation in this octet
+        BNZ     fvi
+        SHRI    r1, 8                   ; the octet
+        WAITB   OUTQ_NF, T              ; TD has passed: times out at once
+        BT      fover                   ; if OUTQ is full
+        .bounded "the WAITB OUTQ_NF above completed with T = 0, so OUTQ[1] had room in that slot's X cycle; only this thread pushes OUTQ[1] (SEMANTICS 6.7)"
+        PUSH    r1
+        STCRC   r6                      ; the CRC up to this octet
+        DJNZ    r5, fn
+        BRA     fover                   ; more than MAXOCT octets
+fnx:    LDI     r1, 0
+        CSRW    FLAGS, r1
+        SETD    0
+        BRA     fs
+
+; ------------------------------------------------------------ end of frame
+fvi:    LDI     r0, 0                   ; violations: the ED, or an error
+        LDIH    r0, ED_V
+        CMP     r4, r0
+        BNZ     fcode
+        LDIH    r0, ED_S
+        CMP     r1, r0
+        BNZ     fcode
+        MOV16   r0, RESIDUE             ; the ED: check the FCS
+        LDI     r4, 0x80
+        CMP     r6, r0
+        BZ      frep
+        LDI     r4, 0xC0                ; bad FCS
+        BRA     frep
+fcode:  LDI     r4, 0xA0                ; coding error
+        BRA     frep
+fover:  LDI     r4, 0x90                ; overrun or too long
+frep:   LDI     r1, MAXOCT
+        SUB     r1, r1, r5              ; the octets pushed
+        SWAP    r4, r4
+        OR      r1, r1, r4
+        PUSH    r1                      ; the report (may wait for the host)
+        JMP     hunt
