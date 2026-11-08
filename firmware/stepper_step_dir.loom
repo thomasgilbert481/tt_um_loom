@@ -1,0 +1,87 @@
+; stepper_step_dir.loom
+;
+; A STEP/DIR stepper controller: the input of an Allegro A4988 or any
+; driver with the same interface. From the host, a step period and a
+; signed step count; the program sets DIR, sends that many STEP pulses,
+; then reports the position. It is the worked example of docs/TRY_IT.md,
+; grown from the square wave that `python -m tools.loomnew` generates.
+;
+; Written on 2026-11-08, after the hardware was complete (D-032), as an
+; interface Loom was not designed for (D-035). Nothing in Loom was built
+; for it: there is no step or pulse generator in hardware. It uses:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for clock-exact bit edges of the serial transmitters: every
+;     STEP edge lands on the exact clock of its tick;
+;   - the tick divider and its restart (a CSRW TICK_INT clears ACC,
+;     SEMANTICS 4), built for baud rates: here the half period of STEP is
+;     the tick, so the host's period takes effect at once.
+; What the firmware does that no hardware does: the direction, the count,
+; the clamp to the driver's minimum pulse widths and the position report.
+; Weaker than a dedicated peripheral: no acceleration ramp (each move runs
+; at one rate; the host sends a ramp as a series of short moves, with a
+; gap of three ticks between them), and the duty is fixed at 50 %.
+;
+; Source: Allegro A4988 datasheet, A4988-DS Rev. 8, Figure 1 and its
+; table (page 6): STEP high >= 1 us (tA), STEP low >= 1 us (tB), DIR set
+; up >= 200 ns before the STEP rise (tC) and held >= 200 ns after it (tD);
+; page 9: a DIR change takes effect at the next STEP rising edge.
+; tools/protomodels/stepper.py is the reference, written from the same
+; pages.
+;
+; Pins: STEP = OUT0, DIR = OUT1, push-pull, both low at start. DIR high
+; means positive steps (a convention: the datasheet gives no sign).
+;
+; Host commands (FIFO space, thread 0), two words a move:
+;     P     the half period of STEP in clocks, 1..0x7FFF. Values below 50
+;           are raised to 50, which is tA and tB (1 us) at 50 MHz; at a
+;           slower board clock the host must send at least 1 us of clocks.
+;     S     the step count, signed 16-bit: S > 0 steps with DIR high,
+;           S < 0 with DIR low, 0 sends nothing.
+; Reply (OUTQ, one word a move): the position after the move, signed
+; 16-bit, 0 at start.
+;
+; Timing. DIR is written before the SETD that anchors the move, so it is
+; set up at least three ticks (150 clocks) before the first STEP rise,
+; and it changes only at the next move, at least two ticks after the last
+; rise: tC and tD are kept many times over. The first rise comes 3 ticks
+; after the command is taken (SETD 2, then the first WAITD 1); then every
+; edge is exactly P clocks after the one before. SETD 2, not SETD 1, so the
+; first staged edge cannot land a tick early (docs/TRY_IT.md, "The early
+; staged edge"). Proved at a 50-clock tick, the clamp (.tick below).
+;
+; Words: 27 of thread 0's 128. Tested at P = 50 (500 k steps a second at
+; 50 MHz), P = 2500 (10 k steps a second) and with the clamp.
+
+        .imem   512                     ; thread t starts at t * 128
+        .thread 0
+        .pins   STEP = OUT0, DIR = OUT1
+        .tick   50                      ; the clamp: the shortest half period
+        .equ    PMIN = 50
+
+start:  LDI     r0, 0                   ; position
+        SETP    STEP, 0
+        SETP    DIR, 0
+cmd:    POP     r3                      ; P
+        CMPI    r3, PMIN                ; C = (P >= PMIN)
+        BC      pok
+        LDI     r3, PMIN
+pok:    POP     r1                      ; S
+        ADD     r0, r0, r1              ; the position at the end of the move
+        ADDI    r1, 0
+        BZ      done                    ; S = 0: nothing to send
+        MOV     r5, r1
+        SHRI    r5, 15
+        BNZ     back
+        SETP    DIR, 1                  ; positive steps
+        BRA     go
+back:   SETP    DIR, 0                  ; negative steps
+        NEG     r1, r1                  ; |S|; -32768 gives 32768, as DJNZ wants
+go:     CSRW    TICK_INT, r3            ; one tick per half period, grid restarted
+        SETD    2                       ; the anchor (above)
+pulse:  SETP    STEP, 1, D              ; staged: lands on the next deadline
+        WAITD   1
+        SETP    STEP, 0, D
+        WAITD   1
+        DJNZ    r1, pulse
+done:   PUSH    r0                      ; report the position
+        BRA     cmd
