@@ -1,0 +1,262 @@
+; spdif_tx.loom
+; S/PDIF (IEC 60958 consumer) transmitter on OUT0: two-channel 16-bit linear
+; PCM at 32 kHz, biphase mark code, preambles B, M and W, parity, and the
+; 192-frame channel status block, at the edge of what a slot-per-edge
+; machine can send.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; digital audio interfaces or for biphase mark code. The program uses three
+; pieces of hardware built for other jobs: the bit engine's NRZI encoder
+; (SEMANTICS 6.9.1, built for USB, where a 0 toggles the line) sends the
+; code; the data memory (LD/ST, SEMANTICS 6.11, built for device emulation)
+; holds a ring of encoded words, a nibble table and the channel status;
+; the shared flags (SIG/WAITS) pace two threads. What the firmware does
+; that no hardware does: biphase mark itself (each bit b becomes the
+; half-cell symbols 0, ~b, which NRZI turns into a transition at every bit
+; boundary and one in the middle of a 1), the preambles (code violations,
+; written as fixed toggle patterns), the subframe layout, the even parity,
+; the channel status bit of each frame, the block start, and the samples.
+;
+; Rate and clock. One tick is one half-cell (UI), 128 a frame. The send
+; loop spends exactly 3 slots (12 clocks) a half-cell: a SHO, one spare
+; slot and a WAITD. So:
+;   - 49.152 MHz board clock, TICK_INT 12, TICK_FRAC 0: 32 kHz exactly,
+;     every edge exactly 12 clocks after the last (12 is a multiple of the
+;     4-clock slot grid). This is the rate the program is for.
+;   - 50 MHz, TICK_INT 12, TICK_FRAC 53: 32 kHz on average (12 + 53/256 is
+;     exact), but SHO writes the pin in its own slot, on the 4-clock grid,
+;     so edges are 0 to 3 clocks after their ticks, and up to 0.36 UI peak
+;     to peak in all (measured, test_spdif_tx_50mhz_jitter), more than
+;     ten times the 0.025 UI peak a transmitter is allowed (EBU Tech 3250
+;     6.2.5.1). Out of specification; not claimed.
+;   - 50 MHz, TICK 12: 32.552 kHz (+1.7 %), clean edges, off rate.
+;   - 44.1 and 48 kHz need 8.9 and 8.1 clocks a half-cell at 50 MHz (8 at
+;     49.152 MHz): two slots, under the three this loop needs. Refused.
+; The deadline-latched pin write (SETP pin, v, D), which puts LTC's and
+; WS2812's edges on the exact clock, does not help: it takes the level as
+; an immediate, so the level would have to live in the PC, a branch per
+; half-cell, four or more slots.
+;
+; Threads. Thread 0 only sends: it loads the next 16-symbol word from a
+; 16-word ring in data memory in the spare slots and signals SFLAGS[0]
+; once a word. Thread 1 builds the words (preamble, samples spread into
+; symbols through a nibble table, V = U = 0, the channel status bit, the
+; parity) and stores each into the ring slot thread 0 has just freed, after
+; a WAITS 0; it fills the ring first and then signals SFLAGS[1] to start
+; thread 0. Thread 1 needs at most about 40 of the 48 slots it has a word,
+; so it never misses a signal; if it did, it would fall one word further
+; behind, never overwrite a word not yet sent.
+;
+; Symbols. A word is 16 half-cells, LSB first (BE_CFG DIR = 0). Symbol 0
+; toggles the line, 1 holds it. A data bit d at subframe slot j (0..31)
+; gives bits 2(j%8) = 0 and 2(j%8)+1 = ~d of word j/8, so a word of zero
+; bits is 0xAAAA. The preambles' eight half-cells, as toggles (EBU Tech 3250
+; 2.4: B 11101000, M 11100010, W 11100100 after a 0; the complements after
+; a 1, which give the same toggles) are the low bytes 0xC6, 0x36, 0x96.
+;
+; Subframe (EBU Tech 3250 2.2.1): slots 0..3 preamble, 4..7 auxiliary (0),
+; 8..27 audio LSB first with the MSB in 27, so a 16-bit sample is in 12..27
+; and 4..11 are 0, 28 V, 29 U, 30 C, 31 P (even parity over 4..31). The
+; first subframe of a frame carries M, or B in frame 0 of the block; the
+; second carries W (2.2.2). C bit k of the 192-bit block is sent in frame k,
+; byte k/8 bit k%8, both subframes alike (consumer).
+;
+; Samples: left is a sawtooth (0x0400 added a frame, 500 Hz at 32 kHz),
+; right a square wave of +-0x4000 (32 frames each, 500 Hz). Samples from
+; the host (64 k words a second through INQ) were not attempted.
+;
+; Channel status (consumer, from the public tables; IEC 60958-3 itself was
+; not read, see the model's docstring): byte 0 = 0x04 (consumer, linear
+; PCM, copy permitted, no pre-emphasis, mode 0), byte 1 = 0 (category
+; general), byte 2 = 0, byte 3 = 0x03 (32 kHz: "1100" read as bits 24..27;
+; clock accuracy level II), byte 4 = 0x02 (word length 16 bits, from memory,
+; unchecked), bytes 5..23 = 0.
+;
+; Host words (FIFO space, thread 0), before or after RUN: 1. TICK_INT (12),
+; 2. TICK_FRAC (0 at 49.152 MHz). The host loads the image and starts
+; threads 0 and 1. Nothing is pushed to OUTQ.
+;
+; Size: thread 0 uses 0..85 of its quarter: 39 code words (JMP included),
+; 29 data words (nibble table, channel status, ramp) and the 16-word ring
+; at 32..47; thread 1 uses 87 words of its own. Threads 2 and 3 are
+; free.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .pins   TX = OUT0
+        .equ    CFG  = 1 << 3           ; ENC NRZI (a 0 toggles), DIR LSB first
+        .equ    PRE_B = 0xC6            ; preamble toggles, half-cells 0..7
+        .equ    PRE_M = 0x36
+        .equ    PRE_W = 0x96
+        .equ    ZEROS = 0xAAAA          ; a word of 0 bits: 0, 1 in every pair
+        .equ    TBL  = 1                ; data at fixed addresses (LD imm5 reach)
+        .equ    CS   = 17
+        .equ    RAMP = 29
+        .equ    RING = 32               ; 16 words, 0x20..0x2F
+        .equ    RMASK = 47              ; (p + 1) & 0x2F wraps 0x30 to 0x20
+
+; ------------------------------------------------------------------ data
+        .thread 0
+        .tick   12                      ; 49.152 MHz, 32 kHz: the schedule has no slack
+        JMP     start
+; spreadodd(n): bit i of the nibble n moved to bit 2i + 1
+        .word   0x00, 0x02, 0x08, 0x0A, 0x20, 0x22, 0x28, 0x2A
+        .word   0x80, 0x82, 0x88, 0x8A, 0xA0, 0xA2, 0xA8, 0xAA
+; channel status, 192 bits, bit k in word k/16 bit k%16 (bytes 0,1 | 2,3 | ..)
+        .word   0x0004, 0x0300, 0x0002, 0, 0, 0
+        .word   0, 0, 0, 0, 0, 0
+        .word   0                       ; RAMP: the left sample
+        .org    48                      ; the ring (32..47) is written by thread 1
+
+; ------------------------------------------------------------- thread 0: send
+start:  SETP    TX, 0                   ; low until the first preamble
+        .csr    BE_PINS, pin(TX)
+        .csr    BE_CFG, CFG             ; also clears LVL (6.9.1)
+        POP     r7                      ; 1. TICK_INT of the half-cell
+        CSRW    TICK_INT, r7
+        POP     r7                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r7
+        LDI     r1, RING
+        WAITS   1                       ; thread 1 has filled the ring
+        SETD    1                       ; re-anchor after the unbounded waits
+        WAITD   0                       ; TD = T: the first SHO is at T + 2
+        LD      r0, r1, 0               ; word 0 (two slots)
+        LDSR    r0
+        ADDI    r1, 1
+        NOP
+        NOP                             ; six slots: SHO two ticks after T
+
+; One word, 16 half-cells, 3 slots each. Every SHO is exactly 3 slots after
+; the one before; the WAITDs only keep the schedule on the ticks (at 49.152
+; MHz they never stall but in the half-cells marked "stalls once").
+word:   SHO                             ; hc 0
+        LD      r0, r1, 0               ; the next word (two slots)
+        SHO                             ; hc 1
+        ADDI    r1, 1
+        WAITD   4                       ; hc 14, 15, 0, 1 since the last WAITD
+        SHO                             ; hc 2
+        ANDI    r1, RMASK               ; the ring wraps
+        WAITD   1
+        SHO                             ; hc 3
+        SIG     0                       ; the slot before r1 is free
+        WAITD   1
+        SHO                             ; hc 4 (WAITD stalls once, 4..13)
+        WAITD   1
+        SHO                             ; hc 5
+        WAITD   1
+        SHO                             ; hc 6
+        WAITD   1
+        SHO                             ; hc 7
+        WAITD   1
+        SHO                             ; hc 8
+        WAITD   1
+        SHO                             ; hc 9
+        WAITD   1
+        SHO                             ; hc 10
+        WAITD   1
+        SHO                             ; hc 11
+        WAITD   1
+        SHO                             ; hc 12
+        WAITD   1
+        SHO                             ; hc 13
+        WAITD   1
+        SHO                             ; hc 14
+        NOP
+        NOP
+        SHO                             ; hc 15: SR has given its last symbol
+        LDSR    r0
+        JMP     word
+
+; ------------------------------------------------------------ thread 1: build
+; r0 the word, r1 the ring slot, r2 the frame (0..191), r3 the sample,
+; r4 the ring words still to prefill, r5 r6 scratch, r7 the frame's C bit.
+        .thread 1
+        LDI     r1, RING
+        LDI     r4, 16
+        LDI     r2, 0
+frame:  MOV     r5, r2                  ; C bit f: word f/16, bit f%16
+        SHRI    r5, 4
+        LD      r7, r5, CS
+        MOV     r5, r2
+        ANDI    r5, 15
+        SHR     r7, r7, r5
+        ANDI    r7, 1
+        LDI     r0, PRE_M               ; left: M, or B in frame 0
+        TEST    r2, r2
+        BNZ     fleft
+        LDI     r0, PRE_B
+fleft:  LDIH    r0, hi8(ZEROS)          ; aux slots 4..7 are 0
+        LDI     r6, RAMP
+        LD      r3, r6, 0
+        CALL    subf
+        MOV16   r5, 0x0400              ; the sawtooth steps
+        ADD     r3, r3, r5
+        LDI     r6, RAMP
+        ST      r3, r6, 0
+        MOV16   r3, 0x4000              ; right: +-0x4000, 32 frames each
+        MOV     r5, r2
+        ANDI    r5, 32
+        BZ      fright
+        MOV16   r3, 0xC000
+fright: MOV16   r0, (hi8(ZEROS) << 8) | PRE_W
+        CALL    subf
+        INC     r2                      ; the next frame, 0..191
+        MOV16   r5, 192
+        CMP     r2, r5
+        BNZ     frame
+        LDI     r2, 0
+        JMP     frame
+
+; subf: one subframe, preamble word in r0, sample in r3, C bit in r7.
+subf:   CALL    emit                    ; word 0: preamble, aux
+        MOV     r5, r3                  ; word 1: slots 8..11 are 0, 12..15
+        ANDI    r5, 15                  ; the sample's bits 0..3
+        SHLI    r5, 4
+        CALL    spread
+        CALL    emit
+        MOV     r5, r3                  ; word 2: bits 4..11
+        SHLI    r5, 4
+        SHRI    r5, 8
+        CALL    spread
+        CALL    emit
+        MOV     r5, r3                  ; word 3: bits 12..15, V, U, C, P
+        SHRI    r5, 12
+        MOV     r6, r7
+        SHLI    r6, 6
+        OR      r5, r5, r6
+        XOR     r6, r3, r7              ; P: even parity over 4..31, so the
+        PAR     r6, r6                  ; parity of the sample and C (C flag)
+        LDI     r6, 0                   ; LDI keeps the flags
+        BNC     sp0
+        LDI     r6, 0x80
+sp0:    OR      r5, r5, r6
+        CALL    spread
+        CALL    emit
+        RET
+
+; spread: r0 = ZEROS ^ the byte r5 with bit i moved to bit 2i + 1.
+spread: MOV     r6, r5
+        SHRI    r6, 4
+        LD      r0, r6, TBL             ; the high nibble
+        SWAP    r0, r0
+        ANDI    r5, 15
+        LD      r6, r5, TBL             ; the low nibble
+        OR      r0, r0, r6
+        MOV16   r6, ZEROS
+        XOR     r0, r0, r6
+        RET
+
+; emit: store r0 in the ring. After the prefill, only into the slot thread 0
+; has freed (its SIG 0 comes after it has loaded the slot after it).
+emit:   TEST    r4, r4
+        BNZ     epre
+        WAITS   0
+epre:   ST      r0, r1, 0
+        ADDI    r1, 1
+        ANDI    r1, RMASK
+        TEST    r4, r4
+        BZ      eret
+        DEC     r4
+        BNZ     eret
+        SIG     1                       ; the ring is full: thread 0 starts
+eret:   RET
