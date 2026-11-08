@@ -1,0 +1,253 @@
+; feldhell_tx.loom
+; A Feld-Hell (Hellschreiber) transmitter: ASCII from the host through
+; INQ[0], each character drawn from a 7 x 7 font and sent as a fax of
+; on/off pixels, column by column from the bottom, on an on/off keyed
+; square-wave audio carrier (TONE) with its keying envelope (KEY).
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): no design document names
+; Feld-Hell, and it is not a line code at all but a facsimile of text for
+; a human reading a scrolling display. Nothing in Loom was built for it.
+; The program uses the deadline-latched pin write (`SETP pin, v, D`,
+; SEMANTICS 6.10, D-016), built so that WS2812 pulses land on the exact
+; clock, for every key edge; the tick divider (SEMANTICS 4), built for
+; UART baud rates, as the carrier's half period; and the data memory
+; (`LD`, SEMANTICS 6.11, D-027), built for device emulation, for the font.
+; What the firmware does that no hardware does: the font look-up, the
+; column scan (bottom to top, left to right), the pixel clock of 122.5
+; pixels a second derived from the carrier, the carrier itself and its
+; keying, the blank columns between characters, and keeping the column
+; grid through idle time so the receiver's text never moves up or down.
+;
+; Format (secondary sources, as tools/protomodels/feldhell.py cites
+; them): a character is 7 columns of 7 pixels, sent up each column from
+; the bottom, columns left to right; the glyph takes 5 columns and 2 are
+; blank between letters; each pixel is sent as two half-height pixels of
+; equal value (the two-pixel rule), so a column is 14 half-pixels and no
+; key pulse is shorter than one pixel. 122.5 pixels a second, 8.163 ms a
+; pixel, 57.1 ms a column, 400 ms a character (2.5 a second).
+;
+; Keying is hard (on/off at the pixel boundary), not shaped: shaping
+; needs an amplitude, a sigma-delta stream at a high sample rate as
+; dtmf_gen.loom makes, and the ramp tables, so the carrier would no longer
+; be a plain square wave keyed by the latch. The cost is bandwidth: hard
+; keying at 122.5 baud spreads keying sidebands some 500 Hz each side of
+; the carrier, raised-cosine keying keeps it to about 245 Hz (the source's
+; figures, not measured here). A transmitter's own keying filter, or the
+; audio low-pass that any square carrier needs for its odd harmonics
+; (2940 Hz, 4900 Hz), is the board's. See FW_README.md.
+;
+; Pins: KEY = OUT0, high for an on pixel (the envelope: a CW
+; transmitter's key line). TONE = OUT1, the keyed carrier: a square wave
+; of two ticks during an on pixel (high in the first tick), low otherwise
+; (an audio input through a low-pass). Both idle low.
+;
+; Host words (FIFO space, thread 0), one a character, bits 7:0 ASCII,
+; bits 15:8 ignored. 0x20 .. 0x5F are drawn; 0x60 .. 0x7F are drawn as
+; 0x40 .. 0x5F (lower case as upper; ` { | } ~ as @ [ \ ] ^). Any other
+; byte (control characters, CR and LF included, and bytes over 0x7F) is
+; sent as a space and reported.
+; Report (FIFO space read, thread 0): 0xC0cc, byte cc had no glyph. It is
+; pushed only if OUTQ has room; a report that finds OUTQ full is dropped,
+; so the column grid never stops.
+;
+; Tick (set by the host before RUN): one tick is half a carrier period,
+; TICK = f_clk / (2 f_tone). A half-pixel is 8 ticks (4 carrier cycles), a
+; pixel 16, a column 112, a character 784; so the pixel rate is f_tone / 8
+; and 980 Hz gives exactly 122.5 pixels a second.
+;   50 MHz, 980 Hz: TICK_INT 25510, TICK_FRAC 52: 25510.203 clocks (ideal
+;     25510.204, -0.04 ppm). A pixel 8.163 ms, a character 400.0 ms.
+;   Another tone moves the speed with it (1000 Hz: 125 pixels a second,
+;   +2 %, a slant on the receiver's screen); keep 980 Hz.
+;   The RTL tests: TICK_INT 64, a pixel of 1024 clocks.
+; The deadline schedule is proved for ticks of 64 clocks or more (.tick).
+;
+; Timing. Every key edge is `SETP KEY, v, D` staged in the last tick of
+; a pixel and landed by the WAITD of the next pixel's first tick, on the
+; exact clock of that tick (SEMANTICS 6.10 rule 1). The carrier's edges
+; are ordinary pin writes one slot (4 clocks) after their ticks (the one
+; latch is the key's): OUT (OUTGRP = TONE alone) writes the pixel at the
+; even ticks, SETP TONE, 0 at the odd ones, so the carrier starts with a
+; rise on the pixel's first tick and is low in its last. After a glyph,
+; the two blank columns (224 ticks) are where the next character is taken
+; from INQ and looked up; if INQ is empty the line stays blank one more
+; column (112 ticks) at a time, so every character starts on the column
+; grid set at RUN: a whole number of columns after the one before.
+;
+; Size: 68 words of code (0x000 .. 0x043, thread 0's quarter) and the
+; 192-word font at 320 .. 511 (the top of thread 2's quarter and all of
+; thread 3's), so threads 1 and 2 can run programs of up to 128 and 64
+; words beside it.
+;
+; Registers: r0 the host word, r1 the glyph word being scanned (pixels
+; first in bit 0, a marker 1 above the last), r2 and r4 the glyph's next
+; words, r3 the glyph's words left, r5 the pixel (bit 0), r6 the carrier
+; cycles left in the pixel, r7 scratch.
+;
+; Readings taken on the open spec questions (2026-11-07): secondary
+; sources only.
+;   122.5 pixels a second (the only figure that fits 400 ms a character;
+;   one source says 112.5), each font pixel sent as two equal halves.
+;   The font is a plain 5 x 7 font drawn for this program, not the
+;   historical Hell glyphs; 980 Hz is chosen as 8 carrier cycles a pixel.
+;   Hard keying, not shaped: about 500 Hz of sidebands against about
+;   245 Hz for raised-cosine keying (the source's figures, not measured).
+;   Bytes with no glyph go out as a space.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   KEY = OUT0, TONE = OUT1
+        .tick   64                      ; the shortest tick the schedule is proved for
+        .equ    CPP  = 8                ; carrier cycles a pixel (16 ticks)
+        .equ    GAP  = 224              ; ticks in the two blank columns
+        .equ    COL  = 112              ; ticks in a column
+        .equ    FONT = 320              ; the font, 3 words a glyph, 0x20 .. 0x5F
+
+start:  SETP    KEY, 0                  ; key up
+        SETP    TONE, 0
+        .csr    OUTGRP, (1 << 5) | pin(TONE)    ; OUT writes TONE alone
+        SETD    0                       ; the column grid starts now
+
+; A blank column's first tick, TD there and reached: look for a character.
+glook:  WAITB   INQ_NE, T               ; a test, not a wait: TD is reached
+        BT      gnone
+        .bounded "the WAITB above completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ (SEMANTICS 6.7)"
+        POP     r0
+        LDI     r7, 0xFF
+        AND     r2, r0, r7              ; the byte
+        SUBI    r2, 0x20                ; C: 0x20 or more
+        BNC     unk
+        LDI     r7, 0x60
+        CMP     r2, r7                  ; C: 0x80 or more
+        BC      unk
+        MOV     r7, r2
+        SHRI    r7, 6                   ; Z: 0x20 .. 0x5F
+        BZ      glyph
+        SUBI    r2, 0x20                ; 0x60 .. 0x7F drawn as 0x40 .. 0x5F
+glyph:  MOV     r4, r2                  ; r2 = the glyph's index, 0 .. 63
+        ADD     r4, r4, r2
+        ADD     r4, r4, r2              ; 3 words a glyph
+        MOV16   r7, FONT
+        ADD     r4, r4, r7
+        LD      r1, r4, 0               ; columns 0, 1
+        LD      r2, r4, 1               ; columns 2, 3
+        LD      r4, r4, 2               ; column 4
+        LDI     r3, 3
+        WAITD   GAP - 1                 ; the gap's last tick
+        JMP     shift
+gnone:  WAITD   COL                     ; nothing queued: one more blank column
+        JMP     glook
+
+; A pixel of CPP carrier cycles, entered with r6 = CPP, r5 the pixel and
+; its key edge staged; TD at the tick before the pixel.
+cyc:    WAITD   1                       ; an even tick (the pixel's first: the key edge lands)
+        OUT     r5                      ; TONE = the pixel
+        WAITD   1                       ; an odd tick
+        SETP    TONE, 0
+        DJNZ    r6, cyc
+; The pixel's last tick: the next pixel's key edge is staged here.
+        CMPI    r1, 1                   ; Z: only the marker left, the word is out
+        BNZ     shift
+        DEC     r3                      ; Z: the glyph is out
+        BZ      gap
+        MOV     r1, r2                  ; the next word of the glyph
+        MOV     r2, r4
+shift:  SHRI    r1, 1                   ; C = the pixel
+        BC      on
+        SETP    KEY, 0, D
+        LDI     r5, 0
+        LDI     r6, CPP
+        JMP     cyc
+on:     SETP    KEY, 1, D
+        LDI     r5, 1
+        LDI     r6, CPP
+        JMP     cyc
+
+; The two blank columns after a glyph: the key comes up on their first tick.
+gap:    SETP    KEY, 0, D
+        WAITD   1
+        JMP     glook
+
+; A byte with no glyph: report it if OUTQ has room, then send a space.
+unk:    WAITB   OUTQ_NF, T              ; a test, not a wait: TD is reached
+        BT      unk1                    ; OUTQ full: the report is dropped
+        LDI     r7, 0xC0
+        SWAP    r7, r7
+        LDI     r2, 0xFF
+        AND     r2, r0, r2
+        OR      r2, r2, r7
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ (SEMANTICS 6.7)"
+        PUSH    r2
+unk1:   LDI     r2, 0                   ; the space's glyph
+        JMP     glyph
+
+; The font: glyph i (ASCII 0x20 + i) at FONT + 3 i. Word 0 holds columns 0
+; and 1, word 1 columns 2 and 3, word 2 column 4, each column 7 bits with
+; the bottom pixel first (bit 0), and a marker 1 above the word's last
+; pixel (bit 14, bit 14, bit 7). Generated by
+; tools/protomodels/feldhell.py (font_words) from its font.
+        .org    FONT
+        .word   0x4000, 0x4000, 0x0080  ; 0x20 space
+        .word   0x4000, 0x407D, 0x0080  ; 0x21 !
+        .word   0x7000, 0x7000, 0x0080  ; 0x22 "
+        .word   0x7FA2, 0x7FA2, 0x00A2  ; 0x23 #
+        .word   0x5512, 0x557F, 0x00A4  ; 0x24 $
+        .word   0x7262, 0x4988, 0x00A3  ; 0x25 %
+        .word   0x64B6, 0x5155, 0x0085  ; 0x26 &
+        .word   0x4000, 0x4060, 0x0080  ; 0x27 '
+        .word   0x4E00, 0x60A2, 0x0080  ; 0x28 (
+        .word   0x6080, 0x4E22, 0x0080  ; 0x29 )
+        .word   0x4414, 0x443E, 0x0094  ; 0x2A *
+        .word   0x4408, 0x443E, 0x0088  ; 0x2B +
+        .word   0x4280, 0x4006, 0x0080  ; 0x2C ,
+        .word   0x4408, 0x4408, 0x0088  ; 0x2D -
+        .word   0x4180, 0x4003, 0x0080  ; 0x2E .
+        .word   0x4301, 0x5808, 0x00C0  ; 0x2F /
+        .word   0x62BE, 0x68C9, 0x00BE  ; 0x30 0
+        .word   0x5080, 0x40FF, 0x0080  ; 0x31 1
+        .word   0x61A1, 0x64C5, 0x00B1  ; 0x32 2
+        .word   0x60C2, 0x74D1, 0x00C6  ; 0x33 3
+        .word   0x4A0C, 0x7FA4, 0x0084  ; 0x34 4
+        .word   0x68F2, 0x68D1, 0x00CE  ; 0x35 5
+        .word   0x549E, 0x64C9, 0x0086  ; 0x36 6
+        .word   0x63C0, 0x6848, 0x00E0  ; 0x37 7
+        .word   0x64B6, 0x64C9, 0x00B6  ; 0x38 8
+        .word   0x64B0, 0x6549, 0x00BC  ; 0x39 9
+        .word   0x5B00, 0x4036, 0x0080  ; 0x3A :
+        .word   0x5A80, 0x4036, 0x0080  ; 0x3B ;
+        .word   0x4A08, 0x60A2, 0x0080  ; 0x3C <
+        .word   0x4A14, 0x4A14, 0x0094  ; 0x3D =
+        .word   0x6080, 0x4A22, 0x0088  ; 0x3E >
+        .word   0x6020, 0x6445, 0x00B0  ; 0x3F ?
+        .word   0x64A6, 0x60CF, 0x00BE  ; 0x40 @
+        .word   0x643F, 0x6448, 0x00BF  ; 0x41 A
+        .word   0x64FF, 0x64C9, 0x00B6  ; 0x42 B
+        .word   0x60BE, 0x60C1, 0x00A2  ; 0x43 C
+        .word   0x60FF, 0x60C1, 0x00BE  ; 0x44 D
+        .word   0x64FF, 0x64C9, 0x00C1  ; 0x45 E
+        .word   0x647F, 0x6448, 0x00C0  ; 0x46 F
+        .word   0x60BE, 0x64C9, 0x00AF  ; 0x47 G
+        .word   0x447F, 0x4408, 0x00FF  ; 0x48 H
+        .word   0x6080, 0x60FF, 0x0080  ; 0x49 I
+        .word   0x4082, 0x7F41, 0x00C0  ; 0x4A J
+        .word   0x447F, 0x5114, 0x00C1  ; 0x4B K
+        .word   0x40FF, 0x4081, 0x0081  ; 0x4C L
+        .word   0x507F, 0x5018, 0x00FF  ; 0x4D M
+        .word   0x487F, 0x4208, 0x00FF  ; 0x4E N
+        .word   0x60BE, 0x60C1, 0x00BE  ; 0x4F O
+        .word   0x647F, 0x6448, 0x00B0  ; 0x50 P
+        .word   0x60BE, 0x6145, 0x00BD  ; 0x51 Q
+        .word   0x647F, 0x654C, 0x00B1  ; 0x52 R
+        .word   0x64B1, 0x64C9, 0x00C6  ; 0x53 S
+        .word   0x6040, 0x607F, 0x00C0  ; 0x54 T
+        .word   0x40FE, 0x4081, 0x00FE  ; 0x55 U
+        .word   0x417C, 0x4101, 0x00FC  ; 0x56 V
+        .word   0x40FE, 0x408E, 0x00FE  ; 0x57 W
+        .word   0x4A63, 0x4A08, 0x00E3  ; 0x58 X
+        .word   0x4860, 0x480F, 0x00E0  ; 0x59 Y
+        .word   0x62C3, 0x68C9, 0x00E1  ; 0x5A Z
+        .word   0x7F80, 0x60C1, 0x0080  ; 0x5B [
+        .word   0x5840, 0x4308, 0x0081  ; 0x5C backslash
+        .word   0x6080, 0x7FC1, 0x0080  ; 0x5D ]
+        .word   0x5010, 0x5040, 0x0090  ; 0x5E ^
+        .word   0x4081, 0x4081, 0x0081  ; 0x5F _
