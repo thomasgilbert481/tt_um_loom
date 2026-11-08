@@ -1,0 +1,355 @@
+; xy2_rx.loom
+;
+; XY2-100 receiver, the galvo driver's end: CLOCK, SYNC, X and Y in, the X
+; position to the host through OUTQ[2] and Y through OUTQ[3], parity and
+; framing checked. Written on 2026-11-07, after the hardware was complete
+; (D-032), as a protocol Loom was not designed for (D-035). Two threads,
+; one per axis, each with its bit engine's manual shifter in receive (SHI,
+; built for SPI, UART and CAN) and pin waits (WAITP) on CLOCK and SYNC.
+; What no hardware does: the framing on SYNC, the extraction of control
+; bits, position and parity from a 20-bit word that does not fit the
+; 16-bit shift register, the even-parity check and the reporting are all
+; firmware.
+;
+; Sources (secondary, tools/protomodels/xy2.py): [L] L. Lisseck, XY2_100
+; library (MIT, 2018): 20 bits MSB first, control 001, D15..D0, even
+; parity over all 20; data change with the rising CLOCK edge and are
+; sampled on the falling one; SYNC high for bits 0..18, low for the last.
+;
+; Rate: paced by CLOCK alone, no tick. A bit is
+;     WAITP CLK, 1 ; <1 to 3 ops> ; WAITP CLK, 0 ; SHI
+; SHI samples one slot after the falling edge is seen: 5 to 8 clocks
+; after it with one op in the high half (two synchroniser flops,
+; SEMANTICS 3, and the 4-clock slot grid), up to 12 clocks with three, so
+; the data must hold that long after the falling edge. A standard sender
+; holds them for the whole low half (12.5 clocks at 2 MHz, data change on
+; the rising edge [L]); xy2_ctrl holds them 16 clocks or more. Proven on
+; the bench at 2 MHz and 2.083 MHz.
+;
+; Bit work. The shift register keeps the last 16 bits received:
+;   after bit 15  SR = c2 c1 c0 D15..D3   -> R16 STSR r2, R17 SHRI r2, 13: ctrl
+;   after bit 18  SR = D15..D0            -> R19 STSR r0: the position
+;   after bit 19  SR = D14..D0 P          -> R0 (next frame) STSR r1: P
+; (Rk is the op slot in the high half of bit k.) Then, in the next frame:
+;   R1      SYNC must be high in bit 1, else SIG ERRS and lock again
+;   R1..R4  r1 = P ^ pos ^ ctrl; PAR: C = 1 iff the 20 bits have odd parity
+;   R5      parity error: SIG ERRP and no report
+;   R6..R8  control bits other than 001: SIG ERRC and no report
+;   R9..R11 the same position as the last report: no report
+;   R12..R15 report: PUSH the position if OUTQ has room (a test, never a
+;           wait); a full OUTQ drops it and it is reported again on the
+;           next frame, so the host always ends up with the newest position
+;   R18     clear the no-report flag; R19 wait for SYNC low (bit 19)
+; Lock: wait for SYNC high, then low (bit 19 of some frame), then CLOCK low;
+; the first frame after the lock is checked but its position is reported
+; only if it differs from the last one reported.
+;
+; SFLAGS (sticky, the host reads and clears them): thread 2 ERRP 2, ERRC 3,
+; ERRS 4; thread 3 ERRP 5, ERRC 6, ERRS 7. Flags 0 and 1 are xy2_ctrl's.
+;
+; Flags as results: SHI sets Z from CNT, so every decision is carried in
+; C (which SHI, WAITP and SETP leave alone) from one bit to the next, and
+; a compare and its branch may sit in different bits.
+;
+; Limits. The receiver checks SYNC high in bit 1 and waits for it low in
+; bit 19, so a sender that drops SYNC early is caught only if it is still
+; low in bit 1; a SYNC that falls early elsewhere ends the frame at that
+; point unnoticed (the bits before it are taken as the frame's), and a
+; frame with SYNC never low stalls the receiver until the next SYNC low,
+; which re-aligns it. Positions reach the host only on change, and the
+; first frame after the lock is not reported if its position equals the
+; last one reported (0 at start). Each bit's high half holds 1 to 3 ops.
+;
+; Pins: CLK = IN0, SYNC = IN1, X = IN2, Y = IN3 (any input or BIDIR pins).
+; Words: thread 2 115 of 128, thread 3 115 of 128 (230 of 512); with
+; xy2_ctrl (163) the pair takes 393 of 512.
+;
+; Registers: r0 the position, r1 the parity sum, r2 the control bits, r4
+; the last position reported, r5 the constant 4 (FLAGS with T = 1), r6 the
+; no-report flag, r7 the .csr scratch.
+
+        .imem   512
+        .pins   CLK = IN0, SYNC = IN1, XD = IN2, YD = IN3
+        .equ    CTRL = 1                ; [L] control bits 001
+        .equ    PCTL = 1                ; their share of the parity
+
+
+; ================================================= thread 2: the X line
+        .thread 2
+        .tick   1                       ; no deadline pairs: paced by CLOCK
+        .equ    XERRP = 2
+        .equ    XERRC = 3
+        .equ    XERRS = 4
+xstart: .csr    BE_PINS, pin(XD) << 5    ; SHI samples X
+        .csr    BE_CFG, 2               ; DIR = 1: each bit enters at SR[0]
+        LDI     r5, 4                   ; FLAGS with T = 1
+        LDI     r4, 0                   ; nothing reported yet
+        JMP     xlock
+xlost:  SIG     XERRS                  ; SYNC low in mid-frame
+xlock:  MOV     r0, r4                  ; a frame the checks pass and do not report:
+        PAR     r1, r0                  ; the last position reported, its parity ...
+        CSRR    r1, FLAGS
+        SHRI    r1, 1
+        ANDI    r1, 1
+        XORI    r1, PCTL
+        LDSR    r1                      ; ... as bit 19's P in SR[0]
+        LDI     r2, CTRL
+        LDI     r6, 0
+        WAITP   SYNC, 1
+        WAITP   SYNC, 0                 ; bit 19 of a frame
+        WAITP   CLK, 0
+        JMP     xtop
+
+xtop:   WAITP   CLK, 1                  ; b0
+        STSR    r1                      ; the last frame's P in bit 0
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b1
+        ANDI    r1, 1
+        JP      SYNC, 1, xb1k
+        JMP     xlost
+xb1k:   WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b2
+        XOR     r1, r1, r0              ; ^ position
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b3
+        XOR     r1, r1, r2              ; ^ control bits
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b4
+        PAR     r1, r1                  ; C = 1: odd parity over the 20 bits
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b5
+        BNC     xb5k
+        SIG     XERRP
+        LDI     r6, 1
+xb5k:   WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b6
+        XORI    r2, CTRL
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b7
+        CMPI    r2, 1                   ; C = 1: not the control bits 001
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b8
+        BNC     xb8k
+        SIG     XERRC
+        LDI     r6, 1
+xb8k:   WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b9
+        SUB     r3, r0, r4
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b10
+        CMPI    r3, 1                   ; C = 1: not the position reported last
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b11
+        BC      xb11k
+        LDI     r6, 1
+xb11k:  WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b12
+        CSRW    FLAGS, r5               ; T = 1
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b13
+        CMPI    r6, 1                   ; C = 1: no report
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b14
+        BC      xb14k
+        SETD    0                       ; TD = NOW: the test below is one slot
+        WAITB   OUTQ_NF, T              ; T = 0: OUTQ has room
+xb14k:  WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b15
+        BT      xb15k
+        .bounded "the WAITB OUTQ_NF, T of bit 14 completed with T = 0 (the BT fell through; nothing between them writes T: SHI sets T only for an encoder or stuffing violation, and NRZ without stuffing has none), so OUTQ had room in its X cycle; only this thread pushes OUTQ[2] and the host only pops it (SEMANTICS 6.7)"
+        PUSH    r0
+        MOV     r4, r0
+xb15k:  WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b16
+        STSR    r2                      ; c2 c1 c0 D15..D3
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b17
+        SHRI    r2, 13                  ; the control bits
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b18
+        LDI     r6, 0
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b19
+        STSR    r0                      ; D15..D0: the position
+        WAITP   SYNC, 0                 ; bit 19: SYNC low
+        WAITP   CLK, 0
+        SHI
+        JMP     xtop
+
+; ================================================= thread 3: the Y line
+        .thread 3
+        .tick   1                       ; no deadline pairs: paced by CLOCK
+        .equ    YERRP = 5
+        .equ    YERRC = 6
+        .equ    YERRS = 7
+ystart: .csr    BE_PINS, pin(YD) << 5    ; SHI samples Y
+        .csr    BE_CFG, 2               ; DIR = 1: each bit enters at SR[0]
+        LDI     r5, 4                   ; FLAGS with T = 1
+        LDI     r4, 0                   ; nothing reported yet
+        JMP     ylock
+ylost:  SIG     YERRS                  ; SYNC low in mid-frame
+ylock:  MOV     r0, r4                  ; a frame the checks pass and do not report:
+        PAR     r1, r0                  ; the last position reported, its parity ...
+        CSRR    r1, FLAGS
+        SHRI    r1, 1
+        ANDI    r1, 1
+        XORI    r1, PCTL
+        LDSR    r1                      ; ... as bit 19's P in SR[0]
+        LDI     r2, CTRL
+        LDI     r6, 0
+        WAITP   SYNC, 1
+        WAITP   SYNC, 0                 ; bit 19 of a frame
+        WAITP   CLK, 0
+        JMP     ytop
+
+ytop:   WAITP   CLK, 1                  ; b0
+        STSR    r1                      ; the last frame's P in bit 0
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b1
+        ANDI    r1, 1
+        JP      SYNC, 1, yb1k
+        JMP     ylost
+yb1k:   WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b2
+        XOR     r1, r1, r0              ; ^ position
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b3
+        XOR     r1, r1, r2              ; ^ control bits
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b4
+        PAR     r1, r1                  ; C = 1: odd parity over the 20 bits
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b5
+        BNC     yb5k
+        SIG     YERRP
+        LDI     r6, 1
+yb5k:   WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b6
+        XORI    r2, CTRL
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b7
+        CMPI    r2, 1                   ; C = 1: not the control bits 001
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b8
+        BNC     yb8k
+        SIG     YERRC
+        LDI     r6, 1
+yb8k:   WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b9
+        SUB     r3, r0, r4
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b10
+        CMPI    r3, 1                   ; C = 1: not the position reported last
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b11
+        BC      yb11k
+        LDI     r6, 1
+yb11k:  WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b12
+        CSRW    FLAGS, r5               ; T = 1
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b13
+        CMPI    r6, 1                   ; C = 1: no report
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b14
+        BC      yb14k
+        SETD    0                       ; TD = NOW: the test below is one slot
+        WAITB   OUTQ_NF, T              ; T = 0: OUTQ has room
+yb14k:  WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b15
+        BT      yb15k
+        .bounded "the WAITB OUTQ_NF, T of bit 14 completed with T = 0 (the BT fell through; nothing between them writes T: SHI sets T only for an encoder or stuffing violation, and NRZ without stuffing has none), so OUTQ had room in its X cycle; only this thread pushes OUTQ[3] and the host only pops it (SEMANTICS 6.7)"
+        PUSH    r0
+        MOV     r4, r0
+yb15k:  WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b16
+        STSR    r2                      ; c2 c1 c0 D15..D3
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b17
+        SHRI    r2, 13                  ; the control bits
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b18
+        LDI     r6, 0
+        WAITP   CLK, 0
+        SHI
+
+        WAITP   CLK, 1                  ; b19
+        STSR    r0                      ; D15..D0: the position
+        WAITP   SYNC, 0                 ; bit 19: SYNC low
+        WAITP   CLK, 0
+        SHI
+        JMP     ytop

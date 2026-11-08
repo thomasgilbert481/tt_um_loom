@@ -1,0 +1,307 @@
+; xy2_ctrl.loom
+;
+; XY2-100 galvanometer scanner controller: CLOCK, SYNC, X and Y out, one
+; 16-bit position per axis per frame from the host. Written on 2026-11-07,
+; after the hardware was complete (D-032), as a protocol Loom was not
+; designed for (D-035). Two threads. Thread 0 drives CLOCK with the
+; deadline-latched pin write (SETP pin, v, D, built for clock-exact UART
+; and WS2812 edges), X with its bit engine's manual shifter (SHO, built for
+; SPI, UART and CAN) and SYNC with OUT. Thread 1 drives Y with its own bit
+; engine, paced by thread 0's CLOCK through WAITP on the OUT pin (a pin
+; wait, built for receivers). Both take positions from their INQ. What no
+; hardware does: the continuous 2 MHz clock, the frame layout, SYNC, the
+; parity and the lock-step of two threads on one clock are all firmware.
+; A dedicated XY2-100 core is three 20-bit shift registers on a divider;
+; Loom spends every slot of two threads on it.
+;
+; Sources (secondary; there is no public standard, tools/protomodels/xy2.py):
+;   [L] L. Lisseck, XY2_100 Teensy library, XY2_100.cpp (MIT, 2018):
+;       20 bits MSB first: control 001, D15..D0, even parity over all 20;
+;       CLOCK high in the first half of each bit; SYNC and data change with
+;       the rising edge, so they are sampled on the falling one; SYNC high
+;       for bits 0..18, low for the parity bit; 2 MHz, 10 us a frame.
+;   [T] techoverflow.net (2021): 2 MHz typical, 20 bits at 100 kHz.
+;
+; Rate. A bit is two ticks, CLOCK = clk / (2 * tick); the host sets
+; TICK_INT and TICK_FRAC of thread 0 (debug space) before RUN.
+;     2 MHz (the standard):  TICK_INT 12, TICK_FRAC 128  (12.5 clocks)
+;     2.083 MHz (fastest):   TICK_INT 12, TICK_FRAC 0
+; Arithmetic: a half bit is WAITD; op; SETP CLK, v, D = 3 slots = 12
+; clocks (SEMANTICS 2), proved for .tick 12, so 2 MHz fits with half a
+; clock to spare. Deadlines are absolute, so the mean rate is exact: a
+; frame is 40 ticks = 500 clocks = 10.000 us, and 500 clocks are 125
+; slots, so every frame has the same edge pattern. Each CLOCK edge is a
+; staged write on its tick; at 12.5 clocks the WAITD of a half can issue
+; in its tick's own X cycle after the WAITD before it completed 3 clocks
+; late, and the edge then lands at the WAITD's commit (SEMANTICS 6.10
+; rule 2), up to 3 clocks after its tick. With the tick's own rounding to
+; a clock the edges spread over a band of 3.5 clocks (70 ns) around one
+; ideal 12.5-clock grid (measured on the model: -2.5 to +1.0, and the RTL
+; run passes the same 3.5-clock bound;
+; CLOCK high 12 clocks, low 13). With a tick of 17 clocks or more
+; (CLOCK <= 1.47 MHz) every edge is on its tick; at tick 12 the edges are
+; exactly periodic on the slot grid.
+;
+; Edges and data. SYNC and X change one slot after the rising edge (the
+; op of the rise half), measured 4 clocks after it; Y changes one slot
+; after thread 1 sees CLOCK high, measured 9 clocks after it. So the
+; set-up before the falling (sampling) edge is at least 3 clocks (60 ns)
+; at 2 MHz and the hold after it at least 16 (320 ns). That is the weak
+; point against a hardware shifter, which changes data on the rising edge
+; itself (250 ns set-up); a driver whose receiver needs more than 60 ns
+; set-up should be run at a lower tick, which moves only the falling edge
+; later (set-up = tick - 9 clocks).
+;
+; Frame work, one op per fall half of thread 0 (bit k is 0..19):
+;   F0  LDSR r0        this frame's X position into SR
+;   F1  PAR r1, r0     C = XOR of its 16 bits
+;   F2  CSRR r1, FLAGS ... C is FLAGS bit 1, X's bit in the OUT word
+;   F3  ANDI r1, 2
+;   F4  XORI r1, PX    the parity bit with the control bits' share; SYNC 0
+;   F5  WAITB INQ_NE, T  a test: TD is reached after a WAITD
+;   F6  BT under       nothing queued: keep the position (the head stays)
+;   F7  POP r0         the next frame's position (bounded)
+;   F8..F17 DJNZ       the loop over bits 8..17
+;   F18 LDI r3, NLOOP
+;   F19 JMP top
+; Rise ops: bit 0 OUT r2 (SYNC 1, X = c2), bits 1, 2 SETP X (c1, c0),
+; bits 3..18 SHO (D15..D0), bit 19 OUT r1 (SYNC 0, X = parity).
+; Underrun: a frame whose successor is not queued by bit 5 is repeated,
+; so the galvo holds its position; the clock never stops.
+;
+; Start: CLOCK idles low, SYNC and the data low. Each thread POPs its
+; first position (blocking: the host queues X to INQ[0] and Y to INQ[1]);
+; thread 1 signals ready (SFLAGS[RDY]), thread 0 waits for it, signals GO
+; and starts the clock; thread 1 is at its first WAITP CLK,1 before the
+; first rise. From then on both count 20 bits a frame, on the same edges.
+; The first rise may land one tick early, on the SETD's own deadline
+; (firmware/PORTING.md 5): the first bit's high time is then two ticks.
+;
+; Pins: CLK = OUT0, SYNC = OUT1, X = OUT2, Y = OUT3. X must be SYNC + 1
+; (one OUT writes both). BIDIR pins work; the program drives their enables.
+; Words: thread 0 93 of 128, thread 1 70 of 128 (163 of 512).
+;
+; Registers, thread 0: r0 the position, r1 the bit 19 OUT word, r2 the bit
+; 0 OUT word, r3 the loop count, r7 the .csr scratch. Thread 1: the same
+; with r1 = the parity bit alone.
+;
+; Readings taken on the open spec questions (2026-11-07): no primary
+; source; the frame (control bits 001, D15 to D0, even parity, SYNC low on
+; bit 20, data sampled on the falling clock edge) from an open-source
+; implementation, secondary. The 18- and 20-bit modes are not done.
+;   A limit at 2 MHz: the average rate is exact (500 clocks a frame), but
+;   edges spread over a 70 ns band around the grid, and data are set up
+;   only 60 ns before the sampling edge (a hardware shifter gives about
+;   250 ns). Clock-exact edges need a rate of 1.47 MHz or less.
+;   No source gives set-up, hold or jitter limits; the checker's windows
+;   are this program's choice.
+
+        .imem   512
+        .pins   CLK = OUT0, SYNC = OUT1, X = OUT2, Y = OUT3
+        .equ    CTRL = 1                ; [L] control bits c2 c1 c0 = 001
+        .equ    C2 = (CTRL >> 2) & 1
+        .equ    C1 = (CTRL >> 1) & 1
+        .equ    C0 = CTRL & 1
+        .equ    PCTL = (C2 + C1 + C0) & 1   ; the control bits' share of the parity
+        .equ    W0 = 1 | (C2 << 1)      ; bit 0's OUT word: SYNC 1, X = c2
+        .equ    PX = PCTL << 1          ; bit 19's OUT word: SYNC 0, X = parity
+        .equ    NLOOP = 10              ; thread 0: bits 8..17 in the loop
+        .equ    NLOOPY = 8              ; thread 1: bits 10..17 in the loop
+        .equ    RDY = 0                 ; SFLAGS: thread 1 has its first word
+        .equ    GO = 1                  ; SFLAGS: thread 0 starts the clock
+
+        .thread 0
+        .tick   12                      ; half a bit, at the fastest
+start:  .csr    OUTGRP, pin(SYNC) | (2 << 5)  ; OUT writes SYNC (bit 0) and X (bit 1)
+        .csr    BE_PINS, pin(X)         ; SHO drives X
+        .csr    BE_CFG, 2               ; DIR = 1: MSB first, NRZ, no CRC
+        SETP    CLK, 0
+        SETP    SYNC, 0
+        SETP    X, 0
+        OEP     CLK, 1                  ; no-ops on OUT pins, needed on BIDIR
+        OEP     SYNC, 1
+        OEP     X, 1
+        LDI     r2, W0
+        LDI     r3, NLOOP
+        POP     r0                      ; the first X position
+        WAITS   RDY                     ; thread 1 holds its first Y position
+        SIG     GO
+        SETD    1                       ; anchor after the unbounded waits
+        JMP     top
+
+; ------------------------------------------------- bits 0..7, unrolled
+top:    SETP    CLK, 1, D               ; b0
+        WAITD   1                       ; CLOCK rises
+        OUT     r2                      ; SYNC 1, X = c2
+        SETP    CLK, 0, D
+        WAITD   1                       ; CLOCK falls: the driver samples
+        LDSR    r0                      ; F0: this frame's position
+
+        SETP    CLK, 1, D               ; b1
+        WAITD   1
+        SETP    X, C1
+        SETP    CLK, 0, D
+        WAITD   1
+        PAR     r1, r0                  ; F1: C = XOR of D15..D0
+
+        SETP    CLK, 1, D               ; b2
+        WAITD   1
+        SETP    X, C0
+        SETP    CLK, 0, D
+        WAITD   1
+        CSRR    r1, FLAGS               ; F2: {T, C, Z}
+
+        SETP    CLK, 1, D               ; b3
+        WAITD   1
+        SHO                             ; D15
+        SETP    CLK, 0, D
+        WAITD   1
+        ANDI    r1, 2                   ; F3: C, in X's place
+
+        SETP    CLK, 1, D               ; b4
+        WAITD   1
+        SHO
+        SETP    CLK, 0, D
+        WAITD   1
+        XORI    r1, PX                  ; F4: even parity; SYNC 0
+
+        SETP    CLK, 1, D               ; b5
+        WAITD   1
+        SHO
+        SETP    CLK, 0, D
+        WAITD   1
+        WAITB   INQ_NE, T               ; F5: a test (TD reached): T = 1 if INQ is empty
+
+        SETP    CLK, 1, D               ; b6
+        WAITD   1
+        SHO
+        SETP    CLK, 0, D
+        WAITD   1
+        BT      under                   ; F6: nothing queued: repeat this position
+
+        SETP    CLK, 1, D               ; b7
+        WAITD   1
+        SHO
+        SETP    CLK, 0, D
+        WAITD   1
+        .bounded "the WAITB INQ_NE, T of bit 5 completed with T = 0 (the BT of bit 6 fell through; nothing between them writes T), so INQ held a word in its X cycle; only this thread pops INQ[0] (SEMANTICS 6.7)"
+        POP     r0                      ; F7: the next frame's position
+
+; ------------------------------------------------- bits 8..17
+loop:   SETP    CLK, 1, D
+        WAITD   1
+        SHO
+        SETP    CLK, 0, D
+        WAITD   1
+        DJNZ    r3, loop                ; F8..F17
+
+; ------------------------------------------------- bits 18, 19
+        SETP    CLK, 1, D               ; b18
+        WAITD   1
+        SHO                             ; D0: SR is spent
+        SETP    CLK, 0, D
+        WAITD   1
+        LDI     r3, NLOOP               ; F18
+
+        SETP    CLK, 1, D               ; b19
+        WAITD   1
+        OUT     r1                      ; SYNC 0, X = parity
+        SETP    CLK, 0, D
+        WAITD   1
+        JMP     top                     ; F19
+
+; ------------------------------------------------- b7 on an underrun
+under:  SETP    CLK, 1, D
+        WAITD   1
+        SHO
+        SETP    CLK, 0, D
+        WAITD   1
+        JMP     loop                    ; r0 stays: the frame is repeated
+
+; ================================================= thread 1: the Y line
+; Paced by CLOCK: a half bit is WAITP CLK, v; op = 2 slots, so each op
+; issues at most 11 clocks after its edge, inside the 12-clock half.
+; Rise ops: the Y bit, exactly as thread 0's; fall ops: the frame work,
+; with r1 = the parity bit alone (OUT writes Y only).
+        .thread 1
+        .tick   1                       ; the reset tick: thread 1 has no deadline pairs
+ystart: .csr    OUTGRP, pin(Y) | (1 << 5)   ; OUT writes Y (bit 0)
+        .csr    BE_PINS, pin(Y)         ; SHO drives Y
+        .csr    BE_CFG, 2               ; MSB first
+        SETP    Y, 0
+        OEP     Y, 1
+        LDI     r3, NLOOPY
+        POP     r0                      ; the first Y position
+        SIG     RDY
+        WAITS   GO                      ; thread 0 starts the clock
+
+ytop:   WAITP   CLK, 1                  ; b0
+        SETP    Y, C2
+        WAITP   CLK, 0
+        LDSR    r0                      ; F0
+
+        WAITP   CLK, 1                  ; b1
+        SETP    Y, C1
+        WAITP   CLK, 0
+        PAR     r1, r0                  ; F1
+
+        WAITP   CLK, 1                  ; b2
+        SETP    Y, C0
+        WAITP   CLK, 0
+        CSRR    r1, FLAGS               ; F2
+
+        WAITP   CLK, 1                  ; b3
+        SHO                             ; D15
+        WAITP   CLK, 0
+        SHRI    r1, 1                   ; F3
+
+        WAITP   CLK, 1                  ; b4
+        SHO
+        WAITP   CLK, 0
+        ANDI    r1, 1                   ; F4: C alone
+
+        WAITP   CLK, 1                  ; b5
+        SHO
+        WAITP   CLK, 0
+        XORI    r1, PCTL                ; F5: even parity
+
+        WAITP   CLK, 1                  ; b6
+        SHO
+        WAITP   CLK, 0
+        SETD    0                       ; F6: TD = NOW, so the test below is one slot
+
+        WAITP   CLK, 1                  ; b7
+        SHO
+        WAITP   CLK, 0
+        WAITB   INQ_NE, T               ; F7: T = 1 if INQ[1] is empty
+
+        WAITP   CLK, 1                  ; b8
+        SHO
+        WAITP   CLK, 0
+        BT      yunder                  ; F8
+
+        WAITP   CLK, 1                  ; b9
+        SHO
+        WAITP   CLK, 0
+        .bounded "the WAITB INQ_NE, T of bit 7 completed with T = 0 (the BT of bit 8 fell through; nothing between them writes T), so INQ held a word in its X cycle; only this thread pops INQ[1] (SEMANTICS 6.7)"
+        POP     r0                      ; F9
+
+yloop:  WAITP   CLK, 1                  ; b10..b17
+        SHO
+        WAITP   CLK, 0
+        DJNZ    r3, yloop
+
+        WAITP   CLK, 1                  ; b18
+        SHO                             ; D0
+        WAITP   CLK, 0
+        LDI     r3, NLOOPY
+
+        WAITP   CLK, 1                  ; b19
+        OUT     r1                      ; Y = parity
+        WAITP   CLK, 0
+        JMP     ytop
+
+yunder: WAITP   CLK, 1                  ; b9 on an underrun
+        SHO
+        WAITP   CLK, 0
+        JMP     yloop
