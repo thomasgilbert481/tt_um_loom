@@ -1,0 +1,396 @@
+; wspr_tx.loom
+; A WSPR beacon source: for each message the host queues (callsign,
+; four-character locator, power in dBm) the program packs the 50 source
+; bits, codes them with WSPR's rate 1/2, constraint-length 32
+; convolutional code, interleaves the 162 coded bits by bit reversal,
+; merges them with the 162-bit sync vector and sends the 162 four-level
+; symbols as a phase-continuous 4-FSK square wave at an audio offset, for
+; the audio input of an SSB transmitter, with a push-to-talk line around it.
+;
+; Written on 2026-11-07, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; WSPR: there is no multiplier, no 32-bit register, no oscillator. The
+; program uses
+;   - the per-thread tick (TICK_INT/TICK_FRAC, built for UART baud rates)
+;     as the 96 kHz sample clock of a numerically controlled oscillator;
+;   - the deadline schedule (WAITD 1 every sample, proved by the checker)
+;     and the deadline-latched SETP (D-016, built for clock-exact line-code
+;     edges) for the push-to-talk edges, which land on the exact tick;
+;   - OUT through a two-pin OUTGRP group (built for parallel buses), so the
+;     tone bit and the symbol marker reach their pins at the same edge;
+;   - REV (built for LSB/MSB-first conversions) for the 8-bit address
+;     reversal of the interleaver, and PAR (built for parity bits) for the
+;     parity of each 16-bit half of the AND of register and polynomial;
+;   - the data memory (LD/ST, built for device-emulation tables) for the
+;     sync vector, the tone table, the packed message and the interleaved
+;     bits.
+; What the firmware does that no hardware does: the character mapping and
+; callsign alignment, the source packing (N, 28 bits, and M, 22 bits, by a
+; 16 x 16 shift-and-add multiply in a subroutine), a 32-bit shift register
+; and its two 32-bit tap masks in pairs of 16-bit words, the interleaver,
+; the sync merge, the tone table and the symbol timing.
+;
+; Sources (tools/protomodels/wspr.py cites them in full): A. Talbot G4JNT,
+; "The WSPR Coding Process" (June 2009), a description of K1JT's WSPR
+; encoder: the packing formulas, the polynomials 0xF2D05351 and
+; 0xE4613C47, the bit-reversal interleaver, the sync vector, Symbol[n] =
+; Sync[n] + 2 Data[n], and the tone spacing of 12000 / 8192 Hz with a
+; symbol length of its reciprocal (8192 / 12000 s, 162 symbols in 110.6 s).
+;
+; Sample clock, tones and their error. The tick is the sample period; at
+; fs = 96 000 Hz the 16-bit phase accumulator's step 1 is fs / 65536 =
+; 1.46484375 Hz = 12000 / 8192 Hz, exactly WSPR's tone spacing, and one
+; symbol is 8192 / 12000 s x 96 000 = 65 536 samples exactly. So the host's
+; real settings are base step B (the audio offset is B x 1.46484375 Hz:
+; B = 1024 is 1500.000 Hz, WSPR's 200 Hz window 1400..1600 Hz is B = 956
+; .. 1092), spacing step 1 and 65 536 samples a symbol (written 0). Tone k
+; is step B + k, and the top bit of the accumulator is a square wave whose
+; mean frequency is (B + k) x fs / 65536 exactly; the phase is continuous
+; across symbols. The frequency resolution is therefore 1.4648 Hz for the
+; offset and zero for the spacing; the only errors are the board clock's
+; (e ppm moves every tone and the symbol length by e ppm) and the tick's
+; rounding: at 50 MHz the tick is 50e6 / 96000 = 520.833 clocks, set as
+; TICK_INT = 520, TICK_FRAC = 213 (520.832), +2.6 ppm, 0.004 Hz at 1500 Hz.
+; Edges sit on the sample grid, so each half-period is a whole number of
+; samples: the cycle-to-cycle jitter is one sample (10.4 us), the mean is
+; exact. Harmonics of a 1.4..1.6 kHz square wave start at 4.2 kHz, outside
+; an SSB transmitter's audio passband; the transmitter's filter, not
+; Loom, makes it a sine.
+;
+; Scaled timing for simulation (how the tests run it). Every interval is
+; counted in ticks: samples a symbol is a host word, so a run at 16 to 64
+; samples a symbol and spacing steps of 512 to 2048 (tones far enough apart
+; to tell in a few cycles) is the same program, word for word, at a few
+; thousand times the speed. The tests say which settings they use.
+;
+; Contract on the pins (TONE = OUT0, SYM = OUT1, the next index after TONE,
+; PTT = OUT2; any outputs with --pin, SYM always at TONE + 1). Sample n of a
+; transmission (n = 0 at the tick where PTT rises) shows on TONE bit 15 of
+; the phase after the steps of samples 0 .. n-1 (the phase starts at 0),
+; each sample of symbol j adding the step of symbol j's tone; samples
+; j L .. j L + L - 1 belong to symbol j (L samples a symbol). SYM is high
+; during even symbols and low during odd ones, so it rises with PTT and
+; changes at every symbol boundary. PTT rises on the exact tick of sample
+; 0 and falls on the exact tick of sample 162 L (latched SETP); TONE and SYM
+; change one slot after their tick (4 to 7 clocks).
+;
+; Host interface (FIFO space, thread 0):
+;   INQ, once after start: the base step B, the spacing step S, samples a
+;     symbol L (0 means 65 536);
+;   INQ, then, per message, eleven words: the callsign's six characters,
+;     ASCII upper case, left-justified and padded with spaces as written
+;     ("G4JNT "; the program inserts the leading space that puts a digit in
+;     the third place, as the WSPR rules ask), the locator's four
+;     characters ("IO83"), and the power in dBm (0..60).
+;   The transmission starts when the eleventh word arrives (encoding takes
+;   about 34 000 clocks, 0.7 ms at 50 MHz); WSPR's start, one second into an even UTC
+;   minute, is the host's to keep. Messages queue: the next one is encoded
+;   right after PTT falls. Nothing goes to OUTQ. Input is not validated:
+;   characters other than A-Z, 0-9 and space give a wrong message.
+;
+; The 16-bit arithmetic. N needs 28 bits and M 22: N is built by Horner's
+; rule on a 32-bit pair r3:r4 with mac (r3:r4 = r3:r4 x R + c by R - 1
+; 32-bit additions, the carry taken with BNC/INC: Loom has no add-with-
+; carry and no multiplier); M1 and its products stay below 2^16. The
+; 32-bit shift register is r0:r1, shifted with SHLI and the carry moved by
+; hand; the parity of (register AND polynomial) is PAR of the XOR of the
+; two 16-bit ANDs. The interleaver walks I = 0..255, J = REV(I) >> 8, and
+; produces coded bit P only when J < 162, so the coding and the
+; interleaving are one loop and no array of the 162 coded bits exists.
+;
+; Memory: 0x000 .. 0x0F7 (248 words: 226 emitted, the rest data written
+; before it is read: the tone steps, L, the packed message, the
+; interleaved bits, which also hold the characters while they are
+; packed). That is thread 0's quarter and 120 words of thread 1's (.imem
+; 512), so the program runs as thread 0, alone or with programs in
+; threads 2 and 3; thread 1 must not be started. The data is reached by
+; absolute imm5 offsets below 32 (only r0 = 0 or an index as base), so
+; the program cannot move to another thread's quarter.
+;
+; Deadlines: the longest path from one WAITD 1 to the next is the last
+; sample of a symbol, which sets up the next, 36 slots, 144 clocks; the
+; checker proves every deadline at 144 clocks. The PTT edge needs 5 more:
+; the staged SETP lands on the exact tick only if that WAITD's first issue
+; commits by the tick (SEMANTICS 6.10 rule 1), so 4 x 36 + 2 + 3 (the
+; previous WAITD's lag) = 149 clocks. The program declares 152, 14.6 MHz
+; at 96 kHz; at 50 MHz the tick is 520.83 clocks.
+;
+; Readings taken (QUESTIONS.md): type 1 messages only (no compound
+; callsigns, no six-character locators: those are type 2 and 3 messages
+; and need a second transmission); the third-character rule implemented
+; as "if the third character is not a digit, prefix a space"; the audio
+; square wave is the output (a transmitter filters it), no PWM sine.
+;
+; Readings taken on the open spec questions (2026-11-07): coding from
+; G4JNT's "The WSPR Coding Process" (secondary to K1JT's code). The
+; encoder matches two published 162-symbol lists (G1ABC IO83 37 and
+; KA1BCD AA00 33) from an independent implementation of that
+; description; K1JT's own encoder output was not checked.
+;   Type 1 messages only. The callsign alignment rule is a reading of
+;   G4JNT's "if necessary".
+;   The output is a square wave at the audio offset, not a sine: it
+;   needs a filter before any transmitter.
+
+        .imem   512
+        .thread 0
+        .pins   TONE = OUT0, SYM = OUT1, PTT = OUT2
+        .tick   152                     ; 144 proves every deadline; PTT needs 149
+        .equ    SYMLEN = 1              ; samples a symbol (0 = 65 536)
+        .equ    TONES = 2               ; 4 words: the step of tone 0..3
+        .equ    MSG = 6                 ; 6 words: the 81 bits, MSB first
+        .equ    DATA = 12               ; 11 words: the interleaved bits
+        .equ    CS = DATA               ; 10 words: character values, read
+        .equ    LOC = CS + 6            ;   before DATA is written
+        .equ    SYNC = 23               ; 11 words: the sync vector
+        .equ    CODE = 34
+        .equ    NSYM = 162
+
+        JMP     start
+; The sync vector (G4JNT, "Merge With Sync Vector"), bit j of the vector
+; in bit (j mod 16) of word j / 16: LSB first, as DATA is. Every other
+; word below CODE is stored before it is read, so the image leaves them.
+        .org    SYNC
+        .word   0x7103, 0x07A4, 0x40A4, 0x58B3, 0x9558, 0x5634, 0xC904, 0xE2CD
+        .word   0x0CA0, 0x6358, 0x0000
+
+; ---------------------------------------------------------------- set-up
+        .org    CODE
+start:  .csr    OUTGRP, (2 << 5) | pin(TONE)    ; OUT r: r[0] TONE, r[1] SYM
+        LDI     r0, 0
+        OUT     r0
+        SETP    PTT, 0
+        POP     r1                      ; B, the base step (blocks)
+        POP     r2                      ; S, the spacing step
+        POP     r3                      ; L, samples a symbol
+        ST      r3, r0, SYMLEN
+        ST      r1, r0, TONES           ; tone k: B + k S
+        ADD     r1, r1, r2
+        ST      r1, r0, TONES + 1
+        ADD     r1, r1, r2
+        ST      r1, r0, TONES + 2
+        ADD     r1, r1, r2
+        ST      r1, r0, TONES + 3
+
+; ------------------------------------------------ a message: 11 words
+; r0 = 0 (the base of every absolute LD/ST until the encoder)
+msg:    LDI     r0, 0
+        LDI     r6, 0
+getc:   POP     r3                      ; ASCII (blocks)
+        SUBI    r3, '0'
+        BNC     space                   ; below '0': the space
+        CMPI    r3, 10
+        BNC     put                     ; '0'..'9': 0..9
+        SUBI    r3, 'A' - '0' - 10      ; 'A'..'Z': 10..35
+        BRA     put
+space:  LDI     r3, 36
+put:    ST      r3, r6, CS              ; CS[0..5] callsign, LOC[0..3]
+        INC     r6
+        CMPI    r6, 10
+        BNZ     getc
+        LD      r3, r0, CS + 2          ; a digit third? else shift the
+        CMPI    r3, 10                  ; callsign right by one and put
+        BNC     packn                   ; a space in front (" G4JNT")
+        LDI     r6, 5
+shift:  LD      r3, r6, CS - 1
+        ST      r3, r6, CS
+        DJNZ    r6, shift
+        LDI     r3, 36
+        ST      r3, r0, CS
+
+; N by G4JNT's N1..N6: N = N x R + c for the six characters, R = 36, 10,
+; 27, 27, 27 (the first R is any: N starts at 0), c - 10 for the last
+; three. r3:r4 = N, r7 = the character. mac: r3:r4 = r3:r4 x r2 + r1.
+packn:  LDI     r3, 0
+        LDI     r4, 0
+        LDI     r7, 0
+nchar:  LD      r1, r7, CS
+        LDI     r2, 36
+        CMPI    r7, 2
+        BNC     nmac                    ; characters 0, 1
+        LDI     r2, 10
+        BZ      nmac                    ; character 2 (Z of the CMPI)
+        LDI     r2, 27
+        SUBI    r1, 10                  ; characters 3..5
+nmac:   CALL    mac
+        INC     r7
+        CMPI    r7, 6
+        BNZ     nchar
+        MOV     r1, r4                  ; MSG[0] = N[27:12]
+        SHRI    r1, 12
+        SHLI    r3, 4
+        OR      r3, r3, r1
+        ST      r3, r0, MSG
+        SHLI    r4, 4                   ; MSG[1] = N[11:0], M[21:18]
+        ST      r4, r0, MSG + 1
+
+; M1 = (179 - 10 Loc1 - Loc3) x 180 + 10 Loc2 + Loc4, M = M1 x 128 + dBm
+; + 64 (22 bits). The letters arrive as 10..27 and lose their 10 here.
+; Every product is below 2^16, so r3 stays 0.
+        LD      r4, r0, LOC + 1
+        SUBI    r4, 10
+        LD      r1, r0, LOC + 3
+        LDI     r2, 10
+        CALL    mac                     ; 10 Loc2 + Loc4
+        ST      r4, r0, MSG + 2
+        LD      r4, r0, LOC
+        SUBI    r4, 10
+        LD      r1, r0, LOC + 2
+        LDI     r2, 10
+        CALL    mac                     ; 10 Loc1 + Loc3
+        LDI     r1, 179
+        SUB     r4, r1, r4
+        LD      r1, r0, MSG + 2
+        LDI     r2, 180
+        CALL    mac                     ; M1 (<= 32 220)
+        POP     r7                      ; the power, dBm (the eleventh word)
+        MOV     r1, r4
+        SHRI    r1, 9                   ; r1 = M[21:16]
+        SHLI    r4, 7
+        OR      r4, r4, r7
+        LDI     r2, 64
+        OR      r4, r4, r2              ; r4 = M[15:0]
+        MOV     r2, r1                  ; MSG[1] |= M[21:18]
+        SHRI    r2, 2
+        LD      r3, r0, MSG + 1
+        OR      r3, r3, r2
+        ST      r3, r0, MSG + 1
+        SHLI    r1, 14                  ; MSG[2] = M[17:2]
+        MOV     r2, r4
+        SHRI    r2, 2
+        OR      r1, r1, r2
+        ST      r1, r0, MSG + 2
+        SHLI    r4, 14                  ; MSG[3] = M[1:0], then zeros
+        ST      r4, r0, MSG + 3
+        ST      r0, r0, MSG + 4
+        ST      r0, r0, MSG + 5
+        LDI     r6, 11                  ; DATA = 0 (it held CS and LOC)
+clear:  ST      r0, r6, DATA - 1
+        DJNZ    r6, clear
+
+; ----------------------------------------- coding and interleaving at once
+; For I = 0..255, J = rev8(I); when J < 162 the next coded bit S[P] is
+; made and stored at D[J] (G4JNT "Interleaving"). Coded bit P: for even P
+; message bit P / 2 enters the register r0:r1 and the parity is with
+; 0xF2D05351, for odd P with 0xE4613C47. r5 = I, r6 = P, r7 the message
+; word being read, MSB first.
+        LDI     r0, 0
+        LDI     r1, 0
+        LDI     r5, 0
+        LDI     r6, 0
+enc:    MOV     r2, r5
+        REV     r2, r2
+        SHRI    r2, 8                   ; J
+        MOV16   r3, NSYM
+        CMP     r2, r3
+        BC      next                    ; J >= 162: no bit
+        MOV     r3, r6
+        ANDI    r3, 1
+        BNZ     odd
+        MOV     r3, r6                  ; every 16 message bits (P mod 32
+        ANDI    r3, 31                  ; = 0) the next MSG word
+        BNZ     shin
+        MOV     r3, r6
+        SHRI    r3, 5
+        LD      r7, r3, MSG
+shin:   SHLI    r0, 1                   ; register <<= 1
+        SHLI    r1, 1
+        BNC     1
+        ORI     r0, 1
+        SHLI    r7, 1                   ; + message bit P / 2
+        BNC     1
+        ORI     r1, 1
+        MOV16   r3, 0xF2D0
+        MOV16   r4, 0x5351
+        BRA     par
+odd:    MOV16   r3, 0xE461
+        MOV16   r4, 0x3C47
+par:    INC     r6
+        AND     r3, r3, r0
+        AND     r4, r4, r1
+        XOR     r3, r3, r4
+        PAR     r3, r3                  ; C = the coded bit
+        BNC     next                    ; DATA is clear: a 0 is stored
+        MOV     r3, r2
+        ANDI    r3, 15
+        LDI     r4, 1
+        SHL     r4, r4, r3
+        SHRI    r2, 4
+        LD      r3, r2, DATA
+        OR      r3, r3, r4
+        ST      r3, r2, DATA
+next:   INC     r5
+        MOV     r3, r5
+        SHRI    r3, 8
+        BZ      enc
+
+; ------------------------------------------------------------ transmit
+; r0 phase   r1 the symbol's step   r2 J, the symbol   r4 SYM in bit 1
+; r5 the next TONE/SYM bits   r6 samples left in the symbol   r7 L
+        LDI     r0, 0
+        LD      r7, r0, SYMLEN
+        LDI     r1, 0                   ; a silent sample first ("symbol
+        LDI     r4, 0                   ; -1", one sample long, step 0,
+        LDI     r5, 0                   ; pins low) so that symbol 0 is
+        LDI     r6, 1                   ; set up by newsym like any other
+        LDI     r2, 0
+        DEC     r2
+        SETD    1
+
+; One sample: the bits decided last sample go out right after the tick,
+; then the phase advances by the symbol's step. 6 slots and the WAITD.
+loop:   WAITD   1
+        OUT     r5
+        ADD     r0, r0, r1
+        MOV     r5, r0
+        SHRI    r5, 15                  ; TONE = bit 15 of the phase
+        OR      r5, r5, r4
+        DJNZ    r6, loop
+; The last sample of symbol J has been computed: set up symbol J + 1 in
+; the same sample period, so the sample grid never slips. Symbol J =
+; Sync[J] + 2 Data[J]; r1 = its tone's step, r4 = SYM (high for even J).
+newsym: INC     r2
+        MOV16   r3, NSYM
+        CMP     r2, r3
+        BC      done
+        SETP    PTT, 1, D               ; lands on the symbol's first tick
+        MOV     r3, r2
+        ANDI    r3, 15
+        MOV     r4, r2
+        SHRI    r4, 4
+        LD      r1, r4, DATA
+        LD      r4, r4, SYNC
+        SHR     r1, r1, r3
+        ANDI    r1, 1
+        SHLI    r1, 1
+        SHR     r4, r4, r3
+        ANDI    r4, 1
+        OR      r1, r1, r4
+        LD      r1, r1, TONES
+        MOV     r4, r2
+        ANDI    r4, 1
+        XORI    r4, 1
+        SHLI    r4, 1
+        MOV     r6, r7
+        ANDI    r5, 1                   ; the new symbol's SYM level
+        OR      r5, r5, r4
+        BRA     loop
+done:   SETP    PTT, 0, D               ; lands on sample 162 L's tick
+        WAITD   1
+        LDI     r5, 0                   ; TONE and SYM low
+        OUT     r5
+        BRA     msg
+
+; mac: r3:r4 = r3:r4 x r2 + r1 for r2 >= 1, by r2 - 1 additions of the
+; 32-bit value to its own sum with r1. r2, r5 and r6 are destroyed.
+mac:    MOV     r5, r3
+        MOV     r6, r4
+        ADD     r4, r4, r1
+        BNC     1
+        INC     r3
+mloop:  DJNZ    r2, madd
+        RET
+madd:   ADD     r4, r4, r6
+        BNC     1
+        INC     r3
+        ADD     r3, r3, r5
+        BRA     mloop
