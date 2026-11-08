@@ -59,6 +59,12 @@ Optional features are chosen at construction, ``Machine(features=...)``:
   write the instruction memory as data in two slots of their own thread, the
   ``MEM_PEND``, ``MEM_LD`` and ``MEM_RD`` state and debug 0x28.
   ``CTRL.VERSION`` reads 4 in such a build.
+* ``"ETX"`` (6.12, D-036): the Ethernet serializer, one shared transmit
+  block fed by ``CSRW`` to ``ETX_CFG`` .. ``ETX_STAT`` (0x16..0x1A), with
+  ``RDY`` and ``BUSY`` at ``pin_in(13)`` and ``pin_in(14)`` and TD+/TD- muxed
+  onto ``uo_out[1:0]`` while busy.  Its state is :attr:`Machine.etx`
+  (:class:`tools.loomsim.etx.Etx`).  ``CTRL.VERSION`` reads 5 and
+  ``CAPS[10]`` 1 in such a build.
 
 ``Machine(features=())`` is the M1 build: every instruction of an unbuilt
 feature is a ``NOP`` that sets ``BADOP``, CSRs of unbuilt features read 0, and
@@ -69,9 +75,10 @@ from .alu import (add16, be_count, be_out_bit, be_run_step, be_shift_in,
                   be_shift_out, be_stuff_value, branch_target, crc_step,
                   ldih16, mask16, neg16, next_pc, not16, par16, reached,
                   rev16, ror16, shl16, shr16, sign_extend, sub16, swap16)
+from .etx import Etx
 from .hostmap import (BADOP_ACCESS, BADOP_FIFO, CLI_FEATURES, DEFAULT_VERSION,
-                      DMEM_VERSION, ENC_VERSION, FEATURES, FIFO_DEPTHS,
-                      ID_VALUE)
+                      DMEM_VERSION, ENC_VERSION, ETX_VERSION, FEATURES,
+                      FIFO_DEPTHS, ID_VALUE)
 from .machine import (DEBUG_REGS, DEFAULT_FIFO_DEPTH, DEFAULT_IMEM_WORDS,
                       LoomsimError, Machine, RunResult, image_from_obj,
                       load_image_file)
@@ -84,7 +91,7 @@ __all__ = [
     "load_image_file", "image_from_obj",
     "THREADS", "SLOT_CLOCKS", "DEFAULT_IMEM_WORDS", "DEFAULT_FIFO_DEPTH",
     "DEBUG_REGS", "FEATURES", "CLI_FEATURES", "FIFO_DEPTHS", "ID_VALUE",
-    "DEFAULT_VERSION", "ENC_VERSION", "DMEM_VERSION",
+    "DEFAULT_VERSION", "ENC_VERSION", "DMEM_VERSION", "ETX_VERSION", "Etx",
     "BADOP_FIFO", "BADOP_ACCESS",
     "reached", "add16", "sub16", "shl16", "shr16", "ror16", "not16", "neg16",
     "rev16", "par16", "swap16", "ldih16", "mask16", "sign_extend",
