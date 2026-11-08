@@ -1,0 +1,233 @@
+; composite_ntsc.loom
+; Monochrome composite video, NTSC-M / RS-170A timing (SMPTE 170M): 525
+; lines, 2:1 interlace, 59.94 fields a second, with the pre- and post-
+; equalising pulses and the serrated vertical sync, and a test pattern of
+; eight vertical bars (white, black, ...) plus a white line at a row the
+; host picks (send a new row every frame and the line moves).
+;
+; Written on 2026-11-08, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the fractional tick
+; of SEMANTICS 4 (TICK_FRAC, built for baud rates such as 115200 that are
+; no whole number of clocks), here to make the 63.556 us line an exact
+; count of ticks, and the deadline-latched pin write of SEMANTICS 6.10
+; (SETP pin, v, D, built for clock-exact serial edges such as ws2812 and
+; the DShot frame), here putting every sync and picture edge on its tick.
+; No hardware knows television: the line, the half-line pulses of the
+; vertical interval, the field order and the picture are all firmware.
+; vga_sync.loom and vga_bars.loom do the same for VGA, which Loom also was
+; not designed for; this is the broadcast standard, with interlace.
+;
+; Pins: two push-pull outputs and a resistor DAC on the board into the
+; set's 75 ohm input (3.3 V pins):
+;     SYNC  = OUT0 (uo_out[0]) --[ 620 ohm ]--+--> video out (75 ohm load)
+;     VIDEO = OUT1 (uo_out[1]) --[ 240 ohm ]--+
+;     SYNC 0, VIDEO 0: 0 V      sync tip          (-40 IRE)
+;     SYNC 1, VIDEO 0: 0.28 V   blanking = black  (0 IRE, 0.286 V nominal)
+;     SYNC 1, VIDEO 1: 1.00 V   white             (100 IRE)
+; (140 IRE = 1 V p-p, SMPTE 170M Annex B; the levels assume the pins swing
+; rail to rail and scale with the supply.) SYNC 0 with VIDEO 1 would be a
+; fourth, meaningless level: the program never makes it. Black is the
+; blanking level, with no 7.5 IRE setup, as NTSC-J has none: a set shows
+; it as black. There is no colour burst, so a set shows monochrome.
+;
+; Rate: the program sets TICK_INT 1, TICK_FRAC 255: one tick is 511/256
+; clock, 39.92 ns at 50 MHz; the host must not change it. Against SMPTE
+; 170M (tools/protomodels/composite.py cites each clause):
+;     line    1592 ticks = 3177.781 clocks = 63.5556 us; fH = 2/455 fsc =
+;             15734.265 Hz; this is 15734.248 Hz, -1.09 ppm, inside the
+;             +-2.8 ppm that the subcarrier's +-10 Hz allows (170M 11.1)
+;     half    796 ticks (the vertical interval's pulse spacing, 0.5H)
+;     H sync  118 ticks = 4.711 us  (4.70 +-0.10, Table 2)
+;     front   38 ticks  = 1.517 us  (blanking start to H ref 1.5 +-0.1)
+;     blank   231 ticks = 9.222 us  (H ref to blanking end 9.20 +0.2 -0.1)
+;     eq      58 ticks  = 2.315 us  (2.3 us, Figure 7)
+;     broad   678 ticks low, then the serration 118 ticks = 4.711 us high
+;             (4.7 us, Figure 7)
+; A tick is not a whole clock, so a tick edge is the first clock edge at
+; or after its ideal time: every edge is within one clock (20 ns) of the
+; ideal grid, and a width varies by one clock from pulse to pulse. The
+; firmware edges are latched writes, so the error stops there: no 4-clock
+; slot dither, and no drift (deadlines are absolute).
+;
+; Frame (SMPTE 170M Figure 7). Field 1 starts at the H reference of line 1
+; with six equalising pulses at half-line spacing (lines 1 .. 3), six broad
+; pulses (4 .. 6), six equalising pulses (7 .. 9); lines 10 .. 20 carry
+; H sync only; lines 21 .. 262 the picture; line 263 starts with H sync and
+; field 2 starts half way through it with the same 18 pulses (to the
+; middle of line 272), then half a line with no pulse, H sync only on
+; 273 .. 283, the picture on 284 .. 525. So each field is 525 half lines,
+; and field 2's pulses are half a line later against its H syncs: that is
+; the interlace. The half lines of picture that 170M has at 263 and 283
+; are black here, so each field has 242 picture lines.
+;
+; Picture: bars of 165 or 166 ticks, white first, from H ref + 231 to
+; H ref + 1554 (eight, the last black), on every picture line; the host's
+; row is white across the whole window instead.
+;
+; Host: an INQ[0] word is a picture row, 0 .. 241 of each field (0 the
+; top, line 21 and line 284), drawn white in both fields; 242 or more
+; draws none. The program takes at most one word a frame, at line 1 of
+; field 1 (non-blocking), and keeps the last; before any word there is no
+; white line. Nothing goes to OUTQ.
+;
+; Memory: 110 words of thread 0's quarter (0x000 .. 0x06D); threads 1 .. 3
+; are free. 62 deadline pairs, worst slack 6 clocks as the checker counts
+; it: the checker ignores TICK_FRAC and takes a tick as one clock, while a
+; tick here is two, so the real margin is about twice the budget it shows.
+;
+; Readings taken on the open spec questions (2026-11-08):
+;   170M prints no tolerance for the equalising pulse or the serration:
+;   the program holds both within a tick of Figure 7's 2.3 and 4.7 us.
+;   The half lines of picture at 263 and 283 are sent black.
+;   No 7.5 IRE setup (three levels from two pins): black = blanking.
+;   The timing assumes the 50 MHz board clock; another clock needs other
+;   tick and count values (the line must stay within 2.8 ppm).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   SYNC = OUT0, VIDEO = OUT1
+        .equ    HALF = 796              ; half a line, ticks
+        .equ    LINE = 2 * HALF         ; 1592 ticks = 63.5556 us
+        .equ    HSW = 118               ; H sync low (and the serration high)
+        .equ    EQW = 58                ; equalising pulse low
+        .equ    BRW = HALF - HSW        ; broad pulse low, 678
+        .equ    VON = 231               ; H ref to the end of blanking
+        .equ    FP = 38                 ; the front porch: blanking to H ref
+        .equ    VOFF = LINE - FP        ; 1554, the end of the picture window
+        .equ    NBLANK = 11             ; H-sync-only lines after the pulses
+        .equ    NACT = 242              ; picture lines a field
+
+; Registers: r1 the field (0 field 1, 1 field 2), r3 scratch, r4 NACT - the
+; host's row (0: no white line; r6 never reaches 0 inside the loop), r6 the
+; loop count, r7 the .csr scratch.
+;
+; Every block below is entered just after a deadline at which SYNC fell
+; (a staged SETP SYNC, 0, D), and ends by staging the next block's fall
+; and waiting for it. WAITD takes at most 255 ticks, so long stretches are
+; several WAITDs.
+
+start:  .csr    TICK_INT, 1             ; one tick = 511/256 clock (header)
+        .csr    TICK_FRAC, 255
+        SETP    VIDEO, 0
+        SETP    SYNC, 1                 ; blanking level until the first pulse
+        LDI     r4, 0                   ; no white line
+        SETD    0
+        SETP    SYNC, 0, D
+        WAITD   64                      ; line 1, field 1: the first pulse falls
+
+; Line 1 of field 1 (from the start, or from the end of field 2): take a
+; row if the host sent one (non-blocking: TD, this H ref, has been reached).
+frame:  LDI     r1, 0
+        WAITB   INQ_NE, T               ; T = 0 only if a word is queued
+        BT      vint
+        .bounded "the WAITB INQ_NE, T just before completed by its condition, and only this thread pops INQ[0]"
+        POP     r3
+        LDI     r4, NACT
+        SUB     r4, r4, r3              ; 0 or wrapped for a row >= NACT
+
+; ----------------------------------------------- the 9-line vertical interval
+; 18 half lines from the field's start: 6 equalising, 6 broad, 6 equalising.
+vint:   LDI     r6, 6
+pre:    SETP    SYNC, 1, D
+        WAITD   EQW                     ; an equalising pulse rises
+        WAITD   255
+        WAITD   255
+        SETP    SYNC, 0, D
+        WAITD   HALF - EQW - 510        ; the next half line's pulse falls
+        DJNZ    r6, pre
+        LDI     r6, 6
+broad:  WAITD   255
+        WAITD   255
+        SETP    SYNC, 1, D
+        WAITD   BRW - 510               ; the serration: SYNC rises
+        SETP    SYNC, 0, D
+        WAITD   HSW                     ; the next half line's pulse falls
+        DJNZ    r6, broad
+        LDI     r6, 5
+post:   SETP    SYNC, 1, D
+        WAITD   EQW
+        WAITD   255
+        WAITD   255
+        SETP    SYNC, 0, D
+        WAITD   HALF - EQW - 510
+        DJNZ    r6, post
+        SETP    SYNC, 1, D              ; the 18th pulse (line 9 or mid 272)
+        WAITD   EQW
+        WAITD   255
+        WAITD   255
+        TEST    r1, r1
+        BZ      hsync1
+        WAITD   255                     ; field 2: half a line with no pulse
+        WAITD   255                     ; (the second half of line 272)
+        WAITD   255
+        WAITD   HALF - 765
+hsync1: SETP    SYNC, 0, D
+        WAITD   HALF - EQW - 510        ; H ref of line 10 or 273
+
+; ----------------------------------------------- lines with H sync only
+        LDI     r6, NBLANK
+bline:  SETP    SYNC, 1, D
+        WAITD   HSW                     ; H sync rises
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   VOFF - HSW - 1275       ; H ref + 1554
+        SETP    SYNC, 0, D
+        WAITD   FP                      ; the next line's H ref
+        DJNZ    r6, bline
+
+; ----------------------------------------------- the picture lines
+; r6 counts NACT .. 1; the host's row k is white when r6 == NACT - k.
+        LDI     r6, NACT
+pline:  SETP    SYNC, 1, D
+        WAITD   HSW                     ; H sync rises
+        CMP     r6, r4
+        BZ      wline
+        SETP    VIDEO, 1, D
+        WAITD   VON - HSW               ; H ref + 231: bar 0, white
+        SETP    VIDEO, 0, D
+        WAITD   165                     ; + 396: bar 1, black
+        SETP    VIDEO, 1, D
+        WAITD   166                     ; + 562: bar 2
+        SETP    VIDEO, 0, D
+        WAITD   165                     ; + 727: bar 3
+        SETP    VIDEO, 1, D
+        WAITD   166                     ; + 893: bar 4
+        SETP    VIDEO, 0, D
+        WAITD   165                     ; + 1058: bar 5
+        SETP    VIDEO, 1, D
+        WAITD   166                     ; + 1224: bar 6
+        SETP    VIDEO, 0, D
+        WAITD   165                     ; + 1389: bar 7, black to the end
+        SETP    SYNC, 0, D
+        WAITD   LINE - 1389             ; the next line's H ref
+pnext:  DJNZ    r6, pline
+        TEST    r1, r1
+        BNZ     frame                   ; field 2 is over: line 1 of field 1
+
+; Field 1 ends with line 263: H sync, then field 2's first pulse at 0.5H.
+        SETP    SYNC, 1, D
+        WAITD   HSW
+        WAITD   255
+        WAITD   255
+        SETP    SYNC, 0, D
+        WAITD   HALF - HSW - 510        ; mid 263: field 2 starts
+        LDI     r1, 1
+        JMP     vint
+
+
+; A white line: the whole window from H ref + 231 to + 1554.
+wline:  SETP    VIDEO, 1, D
+        WAITD   VON - HSW
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        WAITD   255
+        SETP    VIDEO, 0, D
+        WAITD   VOFF - VON - 1275       ; + 1554: black
+        SETP    SYNC, 0, D
+        WAITD   FP
+        JMP     pnext
