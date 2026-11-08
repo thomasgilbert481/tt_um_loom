@@ -7,7 +7,9 @@
  *    0..7   BIDIR0..7  uio, readable, writable, per-pin OE and open drain
  *    8..11  IN0..3     ui_in[3:0], read only
  *    12     IN4        ui_in[7],   read only
- *    13..15 reserved, read 0
+ *    13     ETX_RDY    the Ethernet serializer's RDY (SEMANTICS 6.12.7)
+ *    14     ETX_BUSY   the Ethernet serializer's BUSY
+ *    15     reserved, read 0
  *    16..21 OUT0..5    uo_out[5:0], write; reads return the driven value
  *    22..31 reserved, read 0
  * Register views: PIN_OUT[7:0] = uio_out, PIN_OUT[13:8] = uo_out[5:0],
@@ -28,6 +30,12 @@
  *   that apply at this edge (SEMANTICS 6.10), open drain already applied.
  *   It sits between the two: an ordinary pin write of a slot in W wins on
  *   every bit it writes, and a staged write wins over the host.
+ *   Ethernet serializer (6.12.7, D-036): `etx_rdy` and `etx_busy` are
+ *   pin_in(13) and pin_in(14), as visible in cycle x (no synchroniser, like
+ *   16..21); PIN_IN does not show them. While `etx_busy`, uo_out[1:0] are
+ *   the serializer's {etx_tdn, etx_tdp} instead of PIN_OUT[9:8]: a 2:1 mux
+ *   of registers, the last thing before the port and not registered again
+ *   (MF-3). PIN_OUT itself, its writes and pin_in(16/17) are unchanged.
  */
 
 `default_nettype none
@@ -61,6 +69,12 @@ module loom_pins (
     input  wire [7:0]  h_oe,
     input  wire        h_od_we,
     input  wire [7:0]  h_od,
+
+    // Ethernet serializer status and pad pair (registers of loom_etx).
+    input  wire        etx_rdy,
+    input  wire        etx_busy,
+    input  wire        etx_tdp,
+    input  wire        etx_tdn,
 
     // Views
     output wire [31:0] pin_in_vec,
@@ -109,7 +123,7 @@ module loom_pins (
     end
   end
 
-  assign pin_in_vec  = {10'd0, pin_out[13:8], 3'd0, pad_sync};
+  assign pin_in_vec  = {10'd0, pin_out[13:8], 1'b0, etx_busy, etx_rdy, pad_sync};
   assign pin_in_reg  = {3'd0, pad_sync};
   assign pin_out_reg = {2'd0, pin_out};
   assign pin_oe_reg  = pin_oe;
@@ -123,6 +137,8 @@ module loom_pins (
   // 1 in PIN_OUT means "released", as it does in the 6.3 write rules.
   assign uio_out  = pin_out[7:0] & ~od_mask;
   assign uio_oe   = pin_oe & ~(od_mask & pin_out[7:0]);
-  assign out_pins = pin_out[13:8];
+  assign out_pins = {pin_out[13:10],
+                     etx_busy ? etx_tdn : pin_out[9],
+                     etx_busy ? etx_tdp : pin_out[8]};
 
 endmodule

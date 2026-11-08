@@ -1,11 +1,13 @@
-# Loom module interfaces (M3 slice B)
+# Loom module interfaces (M3 slice B and the Ethernet serializer)
 
 Every port of every hand-written module in `src/`, what it means, and the
 cycle in which it is valid. Written by the RTL implementer as part of M1,
 updated with the M2 RTL, again with M3 slice A (the bit-engine encoders,
 stuffing and DIFF of `docs/SEMANTICS.md` 6.9.1) and again with M3 slice B
-(the data memory of 6.11); `docs/ARCHITECTURE.md` section 14 requires this
-file to match the RTL.
+(the data memory of 6.11), and again with the Ethernet serializer (6.12,
+D-036: the new module `loom_etx` and its ports on `loom_core` and
+`loom_pins`); `docs/ARCHITECTURE.md` section 14 requires this file to match
+the RTL.
 
 Cycle names follow `docs/SEMANTICS.md` section 2: a slot of thread `t` starts
 in cycle `k` with `k mod 4 == t` and has stages F (cycle k), D (k+1),
@@ -25,7 +27,7 @@ Tiny Tapeout wrapper: pad mapping only.
 | Port | Dir | Meaning / validity |
 |---|---|---|
 | `ui_in[7:0]` | in | `[4]` HOST_CS_n, `[5]` HOST_SCK, `[6]` HOST_MOSI, `[3:0]` IN0..IN3 (pin index 8..11), `[7]` IN4 (index 12) |
-| `uo_out[7:0]` | out | `[7]` HOST_MISO, `[6]` HOST_IRQ, `[5:0]` OUT0..OUT5 (pin index 16..21). All registers |
+| `uo_out[7:0]` | out | `[7]` HOST_MISO, `[6]` HOST_IRQ, `[5:0]` OUT0..OUT5 (pin index 16..21). All registers, except that `[1:0]` are a 2:1 mux of registers: TD+ and TD- of the Ethernet serializer while it is busy, `PIN_OUT[9:8]` otherwise (SEMANTICS 6.12.7) |
 | `uio_in[7:0]` | in | BIDIR0..7 pad inputs (pin index 0..7) |
 | `uio_out[7:0]` | out | BIDIR outputs, register (`PIN_OUT[7:0]`) |
 | `uio_oe[7:0]` | out | BIDIR output enables, register (`PIN_OE[7:0]`) |
@@ -45,12 +47,17 @@ Instantiates everything; all parameters live here.
 Parameters: `IMEM_IMPL` (`"MACRO"`, the default, or `"FLOPS"`; see
 loom_imem), `IMEM_WORDS` (16 bits, default 512; the macro needs 512),
 `FIFO_DEPTH` (a power of two from 2 to 8, default 4), `ID_VALUE` (0x4C4D),
-`VERSION` (0x0004: 4 from M3 slice B on, SEMANTICS 6.11; 3 was slice A).
+`VERSION` (0x0005: 5 with the Ethernet serializer, SEMANTICS 6.12; 4 was
+M3 slice B, 3 slice A).
 loom_top also arbitrates the single instruction-memory port between the host
 (which may only ask while `core_busy` is low) and the core, whose own write
 is the `ST` of 6.11.
 Derived: `IMEM_AW = $clog2(IMEM_WORDS)`, `CAPS_VAL` (SEMANTICS 5: FIFOs with
-`log2(FIFO_DEPTH)` in bits 2:0, and one bit per M2 feature as it is built).
+`log2(FIFO_DEPTH)` in bits 2:0, and one bit per feature as it is built;
+bit 10 is the Ethernet serializer, so the 512-word build reads 0x96BA).
+loom_top instantiates `loom_etx` beside `loom_pins` and wires
+`loom_core`'s `etx_*` ports to it and its status and pad pair to
+`loom_pins`.
 
 Ports: the eight Tiny Tapeout pad signals above (minus `ena`), plus the
 retire record.
@@ -259,6 +266,9 @@ The barrel pipeline. Parameters `IMEM_AW`, `IMEM_WORDS`, `FIFO_DEPTH`.
 | `cw_out_mask[13:0]`, `cw_out_data[13:0]` | out | bit-masked write to PIN_OUT (bits 7:0 BIDIR, 13:8 OUT0..5), open-drain rule already applied. Valid during W |
 | `cw_oe_mask[7:0]`, `cw_oe_data[7:0]` | out | bit-masked write to PIN_OE, valid during W |
 | `cw_od_we`, `cw_od[7:0]` | out | write to OD_MASK, valid during W |
+| `etx_we[4:0]` | out | `{ETX_STAT, ETX_LAST1, ETX_LAST, ETX_DATA, ETX_CFG}`: a valid slot in W is a `CSRW` of that ETX CSR (6.12.2); at most one bit high; flops of the W stage ANDed with `w_valid`. The write commits at the end of this cycle, edge `x+2` |
+| `etx_wdata[15:0]` | out | the CSR write value of that slot (the W-stage `w_csr_val`), valid with `etx_we` |
+| `etx_cfg_rd[9:0]`, `etx_stat_rd[4:0]` | in | `ETX_CFG` and `ETX_STAT` as visible in X; they join the `csr_rdata` mux for `CSRR` 0x16 and 0x1A (the data CSRs 0x17..0x19 read 0) |
 | `h_*` (run control, debug) | in | see loom_host_ctl; every pulse takes effect at the next edge. The debug thread arrives one-hot (`h_dbg_sel`, D-031); the write side uses it as is, the read side encodes it to a thread number |
 | `h_inq_push[3:0]`, `h_fifo_wdata[15:0]`, `h_outq_pop[3:0]`, `h_badop_set14` | in | the host FIFO port of loom_host_ctl; each pulse takes effect at the next edge. A push into a full INQ is dropped and sets BADOP[14] |
 | `fifo_stat[47:0]`, `outq_head[63:0]`, `outq_next[63:0]` | out | FIFO status words and OUTQ entries for the host, register values valid every cycle |
@@ -423,11 +433,32 @@ The pin index space and the three global pin registers.
 | `pad_in[12:0]` | in | `{IN4, IN3..IN0, BIDIR7..BIDIR0}` raw pads |
 | `cw_valid`, `cw_out_mask/data`, `cw_oe_mask/data`, `cw_od_we`, `cw_od` | in | the core's W-stage write port; the write lands at the end of this cycle, which is edge `x+2` of the slot |
 | `h_out_we`/`h_out`, `h_oe_we`/`h_oe`, `h_od_we`/`h_od` | in | host writes; the core wins on any bit both touch |
-| `pin_in_vec[31:0]` | out | combinational: `[12:0]` synchronised pads, `[15:13]` 0, `[21:16]` the PIN_OUT bits of OUT0..5, `[31:22]` 0. This is the value an instruction sees in cycle `x` |
+| `etx_rdy`, `etx_busy` | in | the serializer's `RDY` and `BUSY` (registers of loom_etx and logic on them), shown as pin_in(13) and pin_in(14) |
+| `etx_tdp`, `etx_tdn` | in | the serializer's TD+ and TD- (registers), on `out_pins[0]` and `out_pins[1]` while `etx_busy` |
+| `pin_in_vec[31:0]` | out | combinational: `[12:0]` synchronised pads, `[13]` `etx_rdy`, `[14]` `etx_busy`, `[15]` 0, `[21:16]` the PIN_OUT bits of OUT0..5, `[31:22]` 0. This is the value an instruction sees in cycle `x` |
 | `pin_in_reg[15:0]` | out | the PIN_IN CSR view, `{3'b0, pad_sync}` |
 | `pin_out_reg[15:0]` | out | `{2'b0, OUT5..OUT0, BIDIR7..0}` |
 | `pin_oe_reg[7:0]`, `od_mask_reg[7:0]` | out | PIN_OE and OD_MASK |
-| `uio_out[7:0]`, `uio_oe[7:0]`, `out_pins[5:0]` | out | pad registers |
+| `uio_out[7:0]`, `uio_oe[7:0]`, `out_pins[5:0]` | out | pad registers; `out_pins[1:0]` is `{etx_tdn, etx_tdp}` while `etx_busy` and `PIN_OUT[9:8]` otherwise, a 2:1 mux of registers not registered again (6.12.7). `PIN_OUT`, its writes and pin_in(16/17) do not change |
+
+---
+
+## loom_etx
+
+The Ethernet serializer (SEMANTICS 6.12, D-036): one global copy, reset by
+`rst_n` only. The state of 6.12.1, encoded as the module header says
+(`EPH` as a busy flop and a 2-bit phase, `TXL` as the pad pair, `SH` and,
+during the FCS, `CRC32` as shift registers); every output is a function of
+its registers only.
+
+| Port | Dir | Meaning / validity |
+|---|---|---|
+| `w_cfg_we`, `w_data_we`, `w_last_we`, `w_last1_we`, `w_stat_we` | in | the W-stage `CSRW` of `ETX_CFG`, `ETX_DATA`, `ETX_LAST`, `ETX_LAST1`, `ETX_STAT` (loom_core `etx_we`), at most one high; committed at the end of this cycle by the rules of 6.12.4 and 6.12.5 |
+| `w_val[15:0]` | in | the value written, valid with the strobes |
+| `cfg_rd[9:0]` | out | `ETX_CFG` = `{IDL, FCS, PRE, HALFN}`, reset 0x1B1 |
+| `stat_rd[4:0]` | out | `ETX_STAT` = `{REF, UNDER, FDONE, RDY, BUSY}`, reset 0x02 |
+| `busy`, `rdy` | out | `BUSY` and `RDY` of 6.12.1, for pin_in(14) and pin_in(13) |
+| `tdp`, `tdn` | out | TD+ and TD- while `busy` (registers): `(TXL, ~TXL)` in `P_PRE`, `P_DATA`, `P_FCS`, `(1, 0)` in `P_TAIL`; meaningless while idle |
 
 ---
 

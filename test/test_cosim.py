@@ -331,8 +331,10 @@ class _Build:
                     "built for it, so this run would compare nothing. Teach "
                     "tools/loomsim the feature (or take the bit out of the RTL)."
                     % (self.caps, what, bit))
-        if caps & 0x0C00:
-            raise BuildError("CAPS %04X sets a reserved bit (11:10)" % self.caps)
+        if caps & (1 << 10):
+            features.append("ETX")       # the Ethernet serializer (6.12, D-036)
+        if caps & 0x0800:
+            raise BuildError("CAPS %04X sets the reserved bit 11" % self.caps)
         self.features = tuple(sorted(features))
         #: Width of one ``INQ_CNT``/``OUTQ_CNT`` field in the RTL vectors.
         self.fifo_width = self.fifo_depth.bit_length()

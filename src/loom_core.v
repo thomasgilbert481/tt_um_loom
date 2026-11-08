@@ -116,6 +116,15 @@
  * MEM_PEND is their valid bit, so there is no separate one, and
  * `CTRL.RESET` or a debug `PC` write clearing MEM_PEND abandons the
  * access: a thread never completes one it did not start.
+ *
+ * Ethernet serializer (SEMANTICS 6.12, D-036): the block is loom_etx in
+ * loom_top. This module only gives it the W-stage writes and reads it back.
+ * `w_etx_we` is one W flop per ETX CSR, loaded from the generated
+ * `csr_etx_*` selects with `dec_ok & is_csrw`, and `etx_we` is it ANDed
+ * with w_valid; the value is `w_csr_val`, the bus every CSRW already uses,
+ * so nothing new sits on the W-stage write path or behind the host debug
+ * decode (docs/AREA.md). ETX_CFG and ETX_STAT join the end of the X-stage
+ * csr_rdata mux; pin_in(13/14) arrive in pin_in_vec from loom_pins.
  */
 
 `default_nettype none
@@ -153,6 +162,15 @@ module loom_core #(
     output wire [13:0]       lw_out_data,
     output wire [7:0]        lw_oe_mask,
     output wire [7:0]        lw_oe_data,
+
+    // ---------------------------------- Ethernet serializer (6.12, D-036)
+    // W-stage CSR writes {ETX_STAT, ETX_LAST1, ETX_LAST, ETX_DATA, ETX_CFG},
+    // qualified by w_valid, committing at the end of W (edge x+2); the reads
+    // join csr_rdata in X.
+    output wire [4:0]        etx_we,
+    output wire [15:0]       etx_wdata,
+    input  wire [9:0]        etx_cfg_rd,
+    input  wire [4:0]        etx_stat_rd,
 
     // ------------------------------------------------------- host control
     input  wire              h_run_we,
@@ -277,7 +295,7 @@ module loom_core #(
   wire [2:0]  d_unused_funct, d_unused_flag;
   wire [1:0]  d_unused_edge, d_unused_cond;
   wire        d_unused_val, d_unused_tmo, d_unused_lat;
-  wire [21:0] d_unused_csrsel;
+  wire [26:0] d_unused_csrsel;
   wire [11:0] d_unused_grp;
   wire [1:0]  d_unused_tmg;
 
@@ -326,7 +344,10 @@ module loom_core #(
       .csr_cnt(d_unused_csrsel[14]),      .csr_crc(d_unused_csrsel[15]),
       .csr_od_mask(d_unused_csrsel[16]),  .csr_pin_out(d_unused_csrsel[17]),
       .csr_pin_oe(d_unused_csrsel[18]),   .csr_pin_in(d_unused_csrsel[19]),
-      .csr_sflags(d_unused_csrsel[20]),   .csr_host_irq(d_unused_csrsel[21])
+      .csr_sflags(d_unused_csrsel[20]),   .csr_host_irq(d_unused_csrsel[21]),
+      .csr_etx_cfg(d_unused_csrsel[22]),  .csr_etx_data(d_unused_csrsel[23]),
+      .csr_etx_last(d_unused_csrsel[24]), .csr_etx_last1(d_unused_csrsel[25]),
+      .csr_etx_stat(d_unused_csrsel[26])
   );
 
   wire _unused_dec_d = &{1'b0, d_unused_a, d_unused_b, d_unused_rel, d_unused_abs,
@@ -368,6 +389,7 @@ module loom_core #(
   reg [4:0]  w_cnt;
   reg [7:0]  w_enc;               // the encoder state after an SHO/SHI
   reg        w_becfg_we, w_bepins_we, w_bereload_we, w_crcpoly_we, w_crcinit_we;
+  reg [4:0]  w_etx_we;              // CSRW of an ETX CSR (6.12), see etx_we
   reg        w_lat;                 // a SETP D completes in this slot
   reg [4:0]  w_lat_pin;
   reg        w_lat_val;
@@ -489,6 +511,7 @@ module loom_core #(
   wire csr_be_pins, csr_be_reload, csr_crc_poly, csr_crc_init, csr_now;
   wire csr_td, csr_flags, csr_tid, csr_sr, csr_cnt, csr_crc, csr_od_mask;
   wire csr_pin_out, csr_pin_oe, csr_pin_in, csr_sflags, csr_host_irq;
+  wire csr_etx_cfg, csr_etx_data, csr_etx_last, csr_etx_last1, csr_etx_stat;
 
   loom_decode u_dec_x (
       .ir(irx),
@@ -526,7 +549,10 @@ module loom_core #(
       .csr_tid(csr_tid), .csr_sr(csr_sr), .csr_cnt(csr_cnt), .csr_crc(csr_crc),
       .csr_od_mask(csr_od_mask), .csr_pin_out(csr_pin_out),
       .csr_pin_oe(csr_pin_oe), .csr_pin_in(csr_pin_in),
-      .csr_sflags(csr_sflags), .csr_host_irq(csr_host_irq)
+      .csr_sflags(csr_sflags), .csr_host_irq(csr_host_irq),
+      .csr_etx_cfg(csr_etx_cfg), .csr_etx_data(csr_etx_data),
+      .csr_etx_last(csr_etx_last), .csr_etx_last1(csr_etx_last1),
+      .csr_etx_stat(csr_etx_stat)
   );
 
   // The X decoder exposes every strobe of the ISA; only some are used at M1
@@ -932,6 +958,8 @@ module loom_core #(
     else if (csr_sr)        csr_rdata = x_sr;
     else if (csr_cnt)       csr_rdata = {11'd0, x_cnt};
     else if (csr_crc)       csr_rdata = x_crc;
+    else if (csr_etx_cfg)   csr_rdata = {6'd0, etx_cfg_rd};
+    else if (csr_etx_stat)  csr_rdata = {11'd0, etx_stat_rd};
   end
 
   // ------------------------------------------------------------- waits
@@ -1104,7 +1132,7 @@ module loom_core #(
       w_sr <= 16'd0; w_crc <= 16'd0; w_cnt <= 5'd0;
       w_enc_we <= 1'b0; w_enc <= 8'd0;
       w_becfg_we <= 1'b0; w_bepins_we <= 1'b0; w_bereload_we <= 1'b0;
-      w_crcpoly_we <= 1'b0; w_crcinit_we <= 1'b0;
+      w_crcpoly_we <= 1'b0; w_crcinit_we <= 1'b0; w_etx_we <= 5'd0;
       w_lat <= 1'b0; w_lat_pin <= 5'd0; w_lat_val <= 1'b0;
       w_tseen <= 1'b0;
       w_mem_req <= 1'b0; w_mem_st <= 1'b0; w_mem_done <= 1'b0;
@@ -1169,7 +1197,10 @@ module loom_core #(
       w_bereload_we <= dec_ok & is_csrw & csr_be_reload;
       w_crcpoly_we  <= dec_ok & is_csrw & csr_crc_poly;
       w_crcinit_we  <= dec_ok & is_csrw & csr_crc_init;
-      w_lat         <= dec_ok & is_setp & f_lat;
+      w_etx_we      <= {5{dec_ok & is_csrw}}
+                       & {csr_etx_stat, csr_etx_last1, csr_etx_last,
+                          csr_etx_data, csr_etx_cfg};
+      w_lat        <= dec_ok & is_setp & f_lat;
       w_lat_pin     <= f_pin;
       w_lat_val     <= f_val;
       // Data memory (6.11). w_mem_req marks the first slot, whose commit
@@ -1189,6 +1220,11 @@ module loom_core #(
   assign cw_oe_data  = w_oe_data;
   assign cw_od_we    = w_od_we;
   assign cw_od       = w_od;
+
+  // The Ethernet serializer's write port (6.12.2): flops of the W stage
+  // ANDed with w_valid, the value is the CSR write bus every CSRW uses.
+  assign etx_we      = w_etx_we & {5{w_valid}};
+  assign etx_wdata   = w_csr_val;
 
   // ==================================================== debug read select
   wire [31:0] dsel     = {30'd0, h_dbg_thread};

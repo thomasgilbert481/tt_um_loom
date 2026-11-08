@@ -23,6 +23,7 @@ PROJECT_SOURCES += loom_timer.v
 PROJECT_SOURCES += loom_pins.v
 PROJECT_SOURCES += loom_fifo.v
 PROJECT_SOURCES += loom_be.v
+PROJECT_SOURCES += loom_etx.v
 
 # The vendored simulation model of the SRAM macro (D-020), as on the sram-smoke
 # branch. Needed for BOTH the RTL and the gate-level case: the netlist
@@ -92,9 +93,9 @@ export PYTHONPATH := $(PWD)/..:$(PYTHONPATH)
 # test skips itself when GATES=yes, exactly as test_flops does, and
 # everything else in it goes through the pins.
 ifneq ($(GATES),yes)
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_mem,test_cosim,test_fw,test_flops
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_mem,test_etx,test_cosim,test_fw,test_flops
 else
-COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_mem
+COCOTB_TEST_MODULES ?= test_host,test_alu,test_ctrl,test_pins,test_timing,test_uart,test_fifo,test_irq,test_be,test_setpd,test_mem,test_etx
 endif
 
 # include cocotb's make rules to take care of the simulator setup

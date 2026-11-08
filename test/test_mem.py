@@ -45,8 +45,9 @@ from spi_host import (
     DBG_PC, DBG_STEPS, DBG_WAIT_ACTIVE, DBG_FLAGS, DBG_MEM,
 )
 
-#: VERSION from M3 slice B on (SEMANTICS 6.11; slice A was 3).
-VERSION_SLICE_B = 0x0004
+#: VERSION of this build: 5 with the Ethernet serializer (SEMANTICS 6.12,
+#: D-036); slice B (6.11) read 4 and slice A 3.
+VERSION_SLICE_B = 0x0005
 
 OUT0, OUT1, OUT2 = 16, 17, 18
 
