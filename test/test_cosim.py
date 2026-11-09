@@ -1175,6 +1175,10 @@ class _Run:
             diffs = _diff_record(rtl, model)
             if diffs:
                 self.fail(k, diffs, rtl, model)
+            # D-036: the serializer's bins (SEMANTICS 6.12.9); the slot in W
+            # commits its ETX write, if any, at edge k+1.
+            COVERAGE.etx.cycle(k, model, context.regs, context.ingrp,
+                               context.outgrp, uo_out & 3)
 
             # ---- M2 events that have no retire record of their own
             self._latch_events(lat_before, model, w_wait_active)
@@ -1345,6 +1349,7 @@ async def _run_programs(dut, programs, spi=False):
                                  "program is for %d" % (probe.mem_words,
                                                         prog.imem_words))
         COVERAGE.note_build(build.features, build.fifo_depth)
+        COVERAGE.etx.begin(prog.seed, build.features)
         run = _Run(dut, probe, prog, label, cycles, build, spi=spi)
         try:
             spent = await run.run()

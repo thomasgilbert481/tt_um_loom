@@ -946,9 +946,12 @@ The other edits the docs commit makes (D-036 step 1):
   which no read exposes. The model must not read RTL state (section 10).
 - The co-simulation generator: one thread writes the ETX CSRs, from random
   `ETX_CFG` values (every N, `PRE`, `FCS`, `IDL` including 0) with random
-  gaps, and with bins that hit: each window end and one edge either side
-  (the load-edge accept with `HV == 1`; the underrun edge `K_{m+1}` with
-  `HV == 0`; one edge before it); refused writes (before `K_0`, after a
+  gaps, and with bins that hit: each window end and one write slot either
+  side (the load-edge accept with `HV == 1`; the underrun edge `K_{m+1}` with
+  `HV == 0`; the slot before it). One thread's writes land on every fourth
+  edge and every load edge falls on that grid (section 2, 6.12.6), so a
+  single writer reaches `K +- 4`, not `K +- 1`; `K +- 1` needs a second
+  writer, which is untested (below). Refused writes (before `K_0`, after a
   last word, in `P_TAIL`, at the release edge, while `UNDER == 1`);
   `ETX_STAT` clears, including one at the edge of a set; `CFG` writes while
   busy; the feeder halted or reset mid-frame; `CSRR ETX_STAT`, `IN` over
