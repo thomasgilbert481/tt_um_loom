@@ -57,6 +57,8 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # FLOPS memory variant) are deliberately not here. test_mem (slice B's LD/ST,
 # 2026-09-22) was missing until 2026-09-24, so a fault only LD/ST reach went
 # untested by every campaign before then; it sits last, unmeasured.
+# test_etx (the Ethernet serializer, SEMANTICS 6.12, D-036) joined on
+# 2026-11-08 (W-122), after test_mem for the same reason.
 L1_MODULES: Tuple[str, ...] = (
     "test_irq",
     "test_timing",
@@ -69,11 +71,13 @@ L1_MODULES: Tuple[str, ...] = (
     "test_fifo",
     "test_alu",
     "test_mem",
+    "test_etx",
 )
 
 # Which L1 modules test a given source file most directly. They are promoted
 # ahead of the rest of the suite so a local fault dies on a local test.
 AFFINITY: Dict[str, Tuple[str, ...]] = {
+    "loom_etx": ("test_etx",),
     "loom_fifo": ("test_fifo",),
     "loom_be": ("test_be",),
     "loom_pins": ("test_pins", "test_timing"),

@@ -402,6 +402,34 @@ async def test_etx_c12_odd_frames_and_cfg(dut):
 
 
 @cocotb.test()
+async def test_etx_idl_top_of_its_range(dut):
+    """IDL is a 4-bit field the block does not range-check (6.12.2), so
+    IDL = 15 and 9 must give TP_IDL like any other value, on each of the
+    three ways into the tail (6.12.5 rule 5 without FCS, rule 6, rule 3's
+    underrun): N * IDL clocks of (1, 0) after a last 0, the release at
+    s + N (2 NBITS + IDL) (6.12.6), FDONE, and UNDER only after the
+    underrun. Added by W-122: every other test used IDL <= 6."""
+    if skip_gl(dut):
+        return
+    u = await unit(dut)
+    n = 2
+    for idl in (15, 9):
+        for fcs in (0, 1):
+            await u.run({u.e + 1: ("CFG", cfg_word(1, 0, fcs, idl))}, until=u.e + 2)
+            s = await frame(u, {0: ("LAST1", 0x0080)})
+            bits, _ = frame_bits([0x0080], True, 0, fcs)
+            assert u.trace(s) == manchester(bits, n) + [(1, 0)] * (n * idl)
+            assert u.busy_until(s) == s + n * (2 * len(bits) + idl)
+            assert u.stat(u.busy_until(s)) & 0x0C == 0x04, "FDONE, no UNDER"
+            await clear(u)
+        s = await frame(u, {0: ("DATA", 0x1234)})       # K_1 = s + 32 N: underrun
+        assert u.busy_until(s) == s + 32 * n + n * idl
+        assert u.trace(s)[32 * n:] == [(1, 0)] * (n * idl)
+        assert u.stat(u.busy_until(s)) & 0x0C == 0x0C, "UNDER and FDONE"
+        await clear(u)
+
+
+@cocotb.test()
 async def test_etx_random_against_text(dut):
     """Random configurations and write streams (every kind, random edges,
     gaps that hit the windows and miss them), compared with the
@@ -693,3 +721,29 @@ async def test_etx_chip_pin_writes_during_frame(dut):
     assert [await host.read_reg(1, n) for n in (4, 5, 6)] == [0b11, 0b10, 0b10]
     assert mon.rows[-1][0] & 3 == 0b10, "PIN_OUT[9:8] = (0, 1) after release"
     assert (await host.read1(SP_CTRL, CTRL_PIN_OUT) >> 8) & 3 == 0b10
+
+
+@cocotb.test()
+async def test_etx_chip_waite_on_status_pins_is_never_true(dut):
+    """6.12.7 and 6.4: WAITE on pin_in(13) (RDY) is never true, because
+    PREV_PINS holds indices 0..12 only, even though RDY reads 1 while the
+    block is idle. With the T bit, a WAITE 13 rise or any must therefore end
+    at the deadline with T set, while WAITP 13 = 1 (the control: RDY really
+    is 1) ends by its condition and clears T. Added by W-122: before D-036
+    index 13 read 0, so nothing checked that the edge rule still excludes
+    it now that it reads a live level."""
+    host = await chip(dut)
+    for edge in (0, 2):                              # rise, any
+        await run_snippet(host, [asm("CSRW", csr=0x0B, ra=1),
+                                 asm("SETD", imm=40),
+                                 asm("WAITE", pin=13, edge=edge, tmo=1),
+                                 asm("CSRR", rd=2, csr=0x0B)],
+                          regs={1: 0, 2: 0})
+        assert await host.read_reg(0, 2) & 0x4, \
+            f"WAITE 13 edge {edge} fired on RDY; it must time out (T = 1)"
+    await run_snippet(host, [asm("CSRW", csr=0x0B, ra=1),
+                             asm("SETD", imm=40),
+                             asm("WAITP", pin=13, val=1, tmo=1),
+                             asm("CSRR", rd=2, csr=0x0B)],
+                      regs={1: 0x4, 2: 0})
+    assert await host.read_reg(0, 2) & 0x4 == 0, "WAITP 13 = 1 must succeed"
