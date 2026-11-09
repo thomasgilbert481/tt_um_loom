@@ -1,0 +1,246 @@
+; eth_tx.loom
+; A 10BASE-T transmitter: Ethernet frames from a buffer in data memory,
+; sent through the Ethernet serializer on TD+ (OUT0) / TD- (OUT1), with the
+; interframe gap and normal link pulses (NLP) between frames. Transmit only.
+;
+; Written on 2026-11-08, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). It uses the Ethernet
+; serializer of D-036 (SEMANTICS 6.12), built for this: it adds the
+; preamble, SFD, Manchester coding, CRC-32 FCS and TP_IDL to 16-bit words
+; written to ETX_DATA / ETX_LAST / ETX_LAST1. It also uses `LD`/`ST` (slice
+; B, 6.11), built for device emulation (the 24C02), for the frame buffer, and
+; the deadline-latched pin write (6.10, built for WS2812) for the link pulse.
+; What the firmware does that no hardware does: the frame buffer and the host
+; commands, the padding to the 60-byte minimum, the feed at the serializer's
+; pace, the 9.6 us interframe gap, the 16 ms NLP schedule restarted by every
+; frame, and the detection and report of an underrun. Not done: receive (no
+; RD path, no collision detection, no link integrity test: half duplex
+; carrier sense and the jabber function are the MAU's, and absent here),
+; and frames above 772 octets (data memory).
+;
+; Clock: a 40 MHz board clock, N = 2 clocks a half bit, is exactly 10 Mbit/s
+; (ETX_CFG HALFN = 1). The constants below (UNIT, the gap) assume it; another
+; clock needs them and HALFN changed. 10BASE-T asks 10 MHz +- 0.01 %
+; [S, unchecked: SEMANTICS 6.12.2], so the board needs a 100 ppm oscillator.
+;
+; Line side: TD+/TD- are 3.3 V logic. A board needs a differential line
+; driver (or the two pins through series resistors), the 10BASE-T pre-
+; emphasis/filter network, a 1:1 transformer with centre taps (magnetics,
+; or an RJ45 with them built in) and the 100 ohm termination; 802.3 clause
+; 14's 2.2 to 2.8 V peak differential and its template are for that network
+; to meet, not for the pins.
+;
+; Host commands (INQ[0]); results in OUTQ[0]:
+;   0x8000 | L  send the frame in the buffer, L bytes (DA, SA, EtherType or
+;               length, payload: everything before the FCS), 1 <= L <= 768.
+;               L < 60 is padded to 60 with zero bytes, written into the
+;               buffer. Result 0x8000 | {REF, UNDER, FDONE} << 2 of ETX_STAT
+;               after the release: 0x8004 a good frame, 0x800C an underrun
+;               (the frame was cut: no FCS, a receiver rejects it), 0x8010 bit
+;               set if a write was refused. L = 0 or L > 768: no frame, result
+;               0xC000 | L.
+;   0x4000 | P  link pulses every P * 4 us (P <= 0x3FFF; 4000 = 16 ms, the
+;               reset value). P = 0: none. 1 <= P < 4 is taken as 4. Restarts
+;               the schedule from now.
+;   0x0000 | W  load: the next W words (W <= 0x3FFF) are stored at BUF, BUF+1,
+;               ... (two bytes a word, the first byte low: SEMANTICS 6.12.2);
+;               words past 384 are taken and dropped. No result.
+; The host may also write the buffer through IMEM while the thread is halted
+; (SEMANTICS 7: IMEM is single-port), then RUN, then send. OUTQ results are
+; pushed only if OUTQ has room (a guarded PUSH); a host that never reads loses
+; results, never frames.
+;
+; Buffer: BUF = 0x080, the three quarters after the code (384 words, 768
+; bytes), so the program runs alone. The largest frame is 768 bytes + FCS.
+;
+; Timing (tick = 1 clock; thread 0's slots every 4 clocks):
+;   Feed. A word lasts 64 clocks on the wire (16 slots); the loop takes 6
+;   slots (LD 2, ADDI, JP, CSRW, DJNZ), so each word is written within about
+;   40 clocks of its window opening (6.12.6), 24 clocks before it closes. The
+;   ready test is a JP spin, not WAITP 13: RDY stays 0 once UNDER is set, so
+;   a WAITP would hang; the spin leaves on BUSY = 0 and reports the underrun.
+;   Gap. The serializer's release ends TP_IDL. The program sees it (WAITP 14,
+;   X cycle release + 2), anchors TD 6 clocks after the release and waits 474
+;   clocks (3 UNIT - 6) before it looks at INQ again: >= 96 bit times (384
+;   clocks, clause 4.4.2 [S]) after both the release and the last FCS bit.
+;   NLPs. 16 ms +- 8 ms from the end of a frame or the last pulse (clause 14
+;   [S: UNH-IOL 14.1.1]). A pulse is TD+ high, TD- low, 4 clocks (100 ns):
+;   the rise is staged (`SETP TDP, 1, D`, lands 10 ticks after its SETD) and
+;   the fall an ordinary write 4 clocks later. Rise to rise is P * 160 clocks
+;   exactly, and the first rise after a frame is release + P * 160 exactly;
+;   after an underrun within 8 clocks of it. A command (other than a send or
+;   a period) taken between pulses stretches that interval by the time it
+;   takes; the schedule is checked once per UNIT (4 us), so a send waits at
+;   most 4 us to start.
+;
+; Registers: r0 the NLP period P, r1 the buffer pointer, r2 a word count,
+; r4 the units left to the next NLP, r5 the length / scratch, r6 a word,
+; r7 the .csr scratch and constants.
+;
+; Readings taken on the open spec questions (2026-11-08):
+;   Link pulse timer: this program restarts it at the end of TP_IDL; IEEE
+;   802.3 14.2.1.1 (as a secondary source quotes it, and as SEMANTICS
+;   6.12.6 says) restarts it at the start. The difference is 300 ns
+;   against a +-8 ms window.
+;   ETX_CFG is fixed in the program (N = 2): a 40 MHz board clock for
+;   exact 10 Mbit/s. The 96-bit interframe gap is met from the last FCS
+;   bit (604 clocks, 15.1 us); where 802.3 measures it from is unchecked.
+;   The buffer keeps 768 bytes (0x080 to 0x1FF), so eth_tx runs alone; a
+;   1518-byte frame does not fit in the 512-word memory.
+;   Transmit only: Loom cannot receive 10BASE-T (no clock recovery at 2
+;   samples a half bit, no squelch).
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   TDP = OUT0, TDN = OUT1
+        .equ    HALFN = 1               ; N = 2 clocks a half bit: 10 Mbit/s at 40 MHz
+        .equ    IDL   = 6               ; TP_IDL: 300 ns after a last 0, 350 after a 1
+        .equ    CFG   = IDL * 64 + 0x30 + HALFN ; FCS, PRE: 0x01B1, the reset value
+        .equ    STK   = 0x1C            ; ETX_STAT REF, UNDER, FDONE (write 1 to clear)
+        .equ    BUF   = 0x080           ; the frame buffer, two bytes a word
+        .equ    MAXW  = 384             ; to the end of the 512 words
+        .equ    MAXB  = 2 * MAXW        ; 768 bytes before the FCS
+        .equ    MINB  = 60              ; the minimum frame before the FCS
+        .equ    UNIT  = 160             ; 4 us, the NLP period unit
+        .equ    LEAD  = 10              ; SETD lead of the staged rise
+        .equ    REM   = UNIT - 16       ; 144: last WAITD + 4 slots + LEAD - 2 = UNIT
+        .equ    GAP   = 237             ; twice: release + 6 + 474 = release + 3 UNIT
+        .equ    P0    = 4000            ; 16 ms
+        .equ    PMIN  = 4               ; the post-frame path counts 3 units
+
+start:  .csr    TICK_INT, 1             ; one tick per clock (also the reset value)
+        .csr    ETX_CFG, CFG            ; while idle (6.12.2); ETX_STAT is clear at reset
+        SETP    TDP, 0                  ; the idle line when the serializer is idle
+        SETP    TDN, 0
+        MOV16   r0, P0
+        SETD    2                       ; TD on the X + 2 grid of a pulse rise
+
+; Idle: P units of 4 us from the last rise (TD), INQ tested after each; then
+; an NLP. TD is always on the grid X + 2 (X: this thread's X cycles mod 4), so
+; the WAITD REM completes 2 clocks after its tick and the rise is exact.
+arm:    OR      r4, r0, r0              ; P, Z = (P == 0)
+        BZ      quiet
+        SUBI    r4, 1                   ; P - 1 units, then REM
+wait:   WAITD   UNIT
+wtest:  WAITB   INQ_NE, T               ; TD is reached: a test, one slot
+        BNT     cmd                     ; T = 0: a host word
+        DJNZ    r4, wait
+        WAITD   REM                     ; X cycle = its tick + 2
+        SETD    LEAD                    ; TD = the rise, P * UNIT after the last
+        SETP    TDP, 1, D               ; staged: lands on TD (6.10 rule 1)
+        NOP
+        SETP    TDP, 0                  ; the fall, 4 clocks (100 ns) after
+        JMP     arm
+
+; Commands.
+quiet:  POP     r6                      ; no NLPs: block for a command
+        JMP     cmd1
+cmd:    .bounded "the WAITB INQ_NE, T at wtest completed with T = 0, so INQ held a word in that slot's X cycle; only this thread pops INQ[0] (SEMANTICS 6.7)"
+        POP     r6
+cmd1:   ADD     r5, r6, r6              ; C = bit 15, r5 = bits 14:0 << 1
+        BC      send
+        ADD     r7, r5, r5              ; C = bit 14
+        BC      period
+        MOV16   r1, BUF                 ; load: W = r6 (bits 15:14 are 0)
+        MOV16   r7, BUF + MAXW
+        OR      r2, r6, r6              ; Z = (W == 0)
+        BZ      resume
+lloop:  POP     r6
+        CMP     r1, r7                  ; C = (r1 >= BUF + MAXW): full, drop
+        BC      ldrop
+        ST      r6, r1, 0
+        ADDI    r1, 1
+ldrop:  DJNZ    r2, lloop
+resume: SETD    2                       ; on the grid; r4 units still to go
+        OR      r5, r0, r0
+        BZ      quiet
+        JMP     wait
+
+period: MOV16   r7, 0x3FFF
+        AND     r0, r6, r7              ; P, Z = (P == 0)
+        BZ      pset
+        CMPI    r0, PMIN                ; C = (P >= PMIN)
+        BC      pset
+        LDI     r0, PMIN
+pset:   SETD    2
+        JMP     arm
+
+bad:    LDI     r6, 0x20                ; result 0x8020: refused, no frame
+        LDIH    r6, 0x80
+        WAITB   OUTQ_NF, T              ; TD is in the past: a test
+        BT      resume
+        .bounded "the WAITB OUTQ_NF, T above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[0]"
+        PUSH    r6
+        JMP     resume
+
+; Send L bytes from BUF. Pad to MINB first (before the start, untimed).
+send:   SHRI    r5, 1                   ; L, Z = (L == 0)
+        BZ      bad
+        MOV16   r7, MAXB
+        CMP     r7, r5                  ; C = (MAXB >= L)
+        BNC     bad
+        CMPI    r5, MINB                ; C = (L >= MINB)
+        BC      full
+        MOV16   r2, BUF
+        MOV     r1, r5
+        SHRI    r1, 1                   ; L / 2, C = L odd
+        BNC     peven
+        ADD     r1, r1, r2
+        LD      r6, r1, 0               ; the odd last word: clear its high byte
+        LDI     r7, 0xFF
+        AND     r6, r6, r7
+        ST      r6, r1, 0
+        ADDI    r1, 1
+        JMP     pz
+peven:  ADD     r1, r1, r2
+pz:     MOV16   r7, BUF + MINB / 2
+        LDI     r6, 0
+pzl:    CMP     r1, r7                  ; C = (r1 >= BUF + 30)
+        BC      pdone
+        ST      r6, r1, 0
+        ADDI    r1, 1
+        JMP     pzl
+pdone:  LDI     r5, MINB
+
+; The feed: M = (L + 1) / 2 words, M - 1 through ETX_DATA and the last
+; through ETX_LAST (or ETX_LAST1 for an odd L). 6 slots a word of 16.
+full:   MOV     r2, r5
+        ADDI    r2, 1
+        SHRI    r2, 1                   ; M
+        SUBI    r2, 1                   ; M - 1 >= 29
+        MOV16   r1, BUF                 ; sticky bits: cleared after every frame
+feed:   LD      r6, r1, 0               ; the next word, before its window opens
+        ADDI    r1, 1
+fw:     JP      ETX_RDY, 1, fgo         ; HOLD empty (or idle: the start)
+        JP      ETX_BUSY, 1, fw
+        JMP     under                   ; idle and never ready: the frame underran
+fgo:    CSRW    ETX_DATA, r6
+        DJNZ    r2, feed
+        LD      r6, r1, 0
+lw:     JP      ETX_RDY, 1, lgo
+        JP      ETX_BUSY, 1, lw
+        JMP     under
+lgo:    SHRI    r5, 1                   ; C = L odd
+        BC      ogo
+        CSRW    ETX_LAST, r6
+        JMP     fin
+ogo:    CSRW    ETX_LAST1, r6
+fin:    WAITP   ETX_BUSY, 0             ; the release: X cycle release + 2 (header)
+
+; After the frame: report, the gap, then the NLP schedule from the release.
+under:  SETD    0                       ; TD = release + 6 (after an underrun: + 6..13)
+        CSRR    r6, ETX_STAT
+        LDI     r7, STK
+        AND     r6, r6, r7              ; REF, UNDER, FDONE
+        CSRW    ETX_STAT, r7            ; clear them
+        LDIH    r6, 0x80                ; the result word 0x80xx
+        WAITB   OUTQ_NF, T              ; TD is reached: a test
+        BT      gap
+        .bounded "the WAITB OUTQ_NF, T above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[0]"
+        PUSH    r6
+gap:    WAITD   GAP
+        WAITD   GAP                     ; TD = release + 3 UNIT: 474 clocks of gap
+        OR      r4, r0, r0              ; P, Z
+        BZ      quiet
+        SUBI    r4, PMIN - 1            ; as after the third unit of arm
+        JMP     wtest
