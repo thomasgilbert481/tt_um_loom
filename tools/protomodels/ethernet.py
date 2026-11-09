@@ -34,8 +34,10 @@ What it does, in the order a receiver meets it:
 5. **TP_IDL** (clause 14.3.1.2.1, Figure 14-10 [S: UNH-IOL 10BASE-T test
    14.1.7]): after the last bit the line stays high for a start-of-idle pulse
    and then goes to no drive.  Its length in clocks is reported; with
-   ``clock_hz`` it is checked against 250 to 450 ns [S, unchecked: secondary
-   sources only; IEEE 802.3 itself not read].
+   ``clock_hz`` it is checked against 250 to 450 ns: IEEE 802.3-2022
+   14.3.1.2.1, the start-of-idle template (positive from the last zero
+   crossing until at least 2.25 to 2.5 BT, full amplitude no later than
+   4.5 BT; checked 2026-11-09).
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ from typing import List, Optional, Sequence
 
 CRC32_POLY = 0x04C11DB7
 CRC32_RESIDUE = 0xC704DD7B
-#: TP_IDL start-of-idle pulse window in ns [S, unchecked].
+#: TP_IDL start-of-idle pulse window in ns (802.3-2022 14.3.1.2.1 template).
 TP_IDL_MIN_NS = 250.0
 TP_IDL_MAX_NS = 450.0
 SFD_BITS = (1, 0, 1, 0, 1, 0, 1, 1)

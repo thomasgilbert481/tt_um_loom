@@ -644,14 +644,17 @@ the UNH-IOL 10BASE-Te test suite, test 14.1.7; the 250 ns minimum from
 secondary sources only, unchecked]; 0 is for loopback tests. The block
 does not enforce the range.
 
-**Unchecked against IEEE 802.3 clause 14.** Two figures here come from
-secondary sources only (the UNH-IOL 10BASE-T MAU material and Wikipedia)
-and have not been read in IEEE 802.3 itself: the 250 ns minimum of the
-TP_IDL start-of-idle pulse (14.3.1.2.1, Figure 14-10), on which `IDL`'s
-reset value and range above rest, and the 10BASE-T transmit clock
-tolerance of 10 MHz +-0.01 %, which a board clock of 40 MHz at N = 2 must
-meet for the block to be 10BASE-T. If clause 14 gives other values, `IDL`'s
-reset value and range change with it (D-036).
+**Checked against IEEE 802.3-2022 (Section One), 2026-11-09.** The start of
+idle, 14.3.1.2.1 and its template (Figure 14-11 in the text, drawn as "Fig
+14-10"): from the zero crossing of the last transition, TD+ is at least
+585 mV from 0.25 BT to 2.25 BT and may cross zero from 2.5 BT, so it is
+positive for at least about 2.5 BT (250 ns); full amplitude may last no
+later than 4.5 BT and the voltage is below +50 mV by 6.0 BT; a negative
+swing after 2.5 BT is back within +-50 mV by 45 BT. `IDL`'s reset value
+of 6 half bits gives 3 BT after a final 1 and 3.5 BT after a final 0 (the
+extra transition of 14.3.1.2.1's CD0 rule), both inside. The signalling
+rate is 10 Mb/s +-0.01 % (7.3.2), so a board clock of 40 MHz +-100 ppm at
+N = 2 meets it.
 
 Byte order: bit `k` of a data word is sent `k`-th, `k` = 0..15 (0..7 for
 `ETX_LAST1`), so the low byte goes first and each byte goes LSB first, the
@@ -814,9 +817,10 @@ With the start at edge `s` (so `s = x + 2` for the `CSRW` whose X cycle is
 - Firmware leaves `PIN_OUT[8]` and `PIN_OUT[9]` at 0 across a frame, so the
   pads fall to the idle line at the release; the block does not check it.
 - The interframe gap (96 bit times, 9.6 us, clause 4.4.2 [S: secondary])
-  is firmware's: wait for `BUSY == 0`, then `DLY`. The NLP timer restarts
-  at the start of TP_IDL: 16 ms +- 8 ms from there to the first link pulse
-  [S: UNH-IOL test 14.1.1, citing 802.3-2008 14.2.1.1].
+  is firmware's: wait for `BUSY == 0`, then `DLY`. After a packet and its
+  start of idle, the link test pulse sequence starts with a period of
+  silence of 16 ms +- 8 ms (802.3-2022 14.2.1.1), so the NLP timer counts
+  from the end of the start of idle, that is from the release.
 
 #### 6.12.7 Pads and pins
 
