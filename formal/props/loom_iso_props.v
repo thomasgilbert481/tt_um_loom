@@ -71,6 +71,12 @@ module loom_iso_view #(
     input wire        csr_pin_oe,
     input wire        csr_od_mask,
     input wire        csr_host_irq,
+    input wire        csr_etx_cfg,
+    input wire        csr_etx_data,
+    input wire        csr_etx_last,
+    input wire        csr_etx_last1,
+    input wire        csr_etx_stat,
+    input wire        is_csrr,
     input wire        cond_hit,
     input wire        x_stall,
 
@@ -347,14 +353,20 @@ module loom_iso_view #(
   // SFLAGS, a pin register or the host interrupt: SETP (ordinary or
   // deadline-latched, 6.10), OEP, OUT, SHO (6.9, which drives a pin and with
   // DIFF a second one), SIG, CLR, WAITS (a test-and-clear, 6.5) and
-  // CSRW of SFLAGS / PIN_OUT / PIN_OE / OD_MASK / HOST_IRQ (6.6).
+  // CSRW of SFLAGS / PIN_OUT / PIN_OE / OD_MASK / HOST_IRQ (6.6), and,
+  // since D-036, CSRW of any ETX CSR: SEMANTICS 6.12.7, "ISO-1's
+  // precondition gains 'no other thread writes ETX_*'". ETX_STAT is in the
+  // list because its write-1-to-clear changes the shared sticky bits.
+  // Reading the ETX CSRs or pin_in(13/14) is not constrained.
   // Nothing constrains thread T, and nothing constrains the other threads'
   // ALU, branch, FIFO, timer or bit-engine-register work.
   // ==================================================================
   wire x_writes_shared =
         is_setp | is_oep | is_out | is_sho | is_sig | is_clr | is_waits
       | (is_csrw & (csr_sflags | csr_pin_out | csr_pin_oe
-                    | csr_od_mask | csr_host_irq));
+                    | csr_od_mask | csr_host_irq
+                    | csr_etx_cfg | csr_etx_data | csr_etx_last
+                    | csr_etx_last1 | csr_etx_stat));
 
   always @(*) if (f_past_valid && rst_n) begin
     if (vx && (tx_th != TT)) assume (!x_writes_shared);
@@ -415,6 +427,7 @@ module loom_iso_view #(
   wire c_pipe_full  = vd && vx && w_valid;
   wire c_t_store    = s_mp_we;                         // T's ST stores
   wire c_t_load     = s_mp_en && s_mpend && s_mld;     // T's LD reads
+  wire c_t_etxrd    = c_x_t && is_csrr && csr_etx_stat; // T reads ETX_STAT
 
 endmodule
 
@@ -431,7 +444,10 @@ bind loom_core loom_iso_view #(.T(`ISO_T), .FAW(2), .AW(IMEM_AW)) u_view (
     .is_sig(is_sig), .is_clr(is_clr), .is_waits(is_waits), .is_waitd(is_waitd),
     .is_csrw(is_csrw), .csr_sflags(csr_sflags), .csr_pin_out(csr_pin_out),
     .csr_pin_oe(csr_pin_oe), .csr_od_mask(csr_od_mask),
-    .csr_host_irq(csr_host_irq), .cond_hit(cond_hit), .x_stall(x_stall),
+    .csr_host_irq(csr_host_irq),
+    .csr_etx_cfg(csr_etx_cfg), .csr_etx_data(csr_etx_data),
+    .csr_etx_last(csr_etx_last), .csr_etx_last1(csr_etx_last1),
+    .csr_etx_stat(csr_etx_stat), .is_csrr(is_csrr), .cond_hit(cond_hit), .x_stall(x_stall),
     .h_reset(h_reset), .h_dbg_req(h_dbg_req), .h_dbg_wr(h_dbg_wr),
     .h_dbg_thread(h_dbg_thread), .h_dbg_sel(h_dbg_sel), .h_dbg_reg(h_dbg_reg),
     .pc_all(pc_all), .z_all(z_all), .c_all(c_all), .t_all(t_all),

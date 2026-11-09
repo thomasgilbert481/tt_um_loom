@@ -35,7 +35,7 @@ source scripts/dev_env.sh
 
 # Every group, cheapest first so a broken harness shows up in seconds. `iso`
 # is last and is by far the most expensive: it is the only two-copy harness.
-GROUPS_ALL="isa fifo timer pins spi isacore sched wait iso"
+GROUPS_ALL="isa fifo timer pins etx spi isacore sched wait iso"
 
 # What `quick` leaves out: bounded runs that an unbounded proof in the same
 # group already subsumes, plus the long ISO-1 and WAIT-1 runs, which belong
@@ -83,9 +83,10 @@ for g in $groups; do
   fi
   echo
   echo "=== $g ==="
-  # The task names are the lines of the file's [tasks] section.
+  # The task names are the first words of the lines of the file's [tasks]
+  # section (a second word is an sby task group, as in etx.sby's `t0 term`).
   tasks=$(sed -n '/^\[tasks\]/,/^\[options\]/p' "$g.sby" \
-          | sed -n 's/^\([A-Za-z0-9_]\{1,\}\)[[:space:]]*$/\1/p')
+          | sed -n 's/^\([A-Za-z0-9_]\{1,\}\)\([[:space:]].*\)\{0,1\}$/\1/p')
   for t in $tasks; do
     case " $QUICK_SKIP " in
       *" $g:$t "*) if [ "$mode" = "quick" ]; then

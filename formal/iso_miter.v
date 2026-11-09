@@ -15,8 +15,10 @@
  *
  * ------------------------------------------------------------------ the model
  *
- * Two `loom_core` instances, A and B, each with its own `loom_pins`, on one
- * clock and one reset. `loom_imem`, `loom_host_ctl` and `loom_spi_host` are
+ * Two `loom_core` instances, A and B, each with its own `loom_pins` and (since
+ * D-036) its own `loom_etx`, wired as in loom_top, on one clock and one reset.
+ * Under the precondition that no other thread writes ETX_* (6.12.7), thread T
+ * owns the serializer and its state is compared like T's own. `loom_imem`, `loom_host_ctl` and `loom_spi_host` are
  * outside the miter: the instruction word is a free input per copy, exactly
  * as in `sched.sby`, and the host port is free per copy. So the proof covers
  * every instruction stream, including words no assembler emits, and every
@@ -237,6 +239,19 @@ module loom_iso_miter #(
   wire [15:0] iwd_a;
   wire [7:0]  uio_out_a, uio_oe_a;
   wire [5:0]  out_pins_a;
+  // The Ethernet serializer (SEMANTICS 6.12, D-036), wired as in loom_top.
+  wire [4:0]  etx_we_a;
+  wire [15:0] etx_wd_a;
+  wire [9:0]  etx_cfg_a;
+  wire [4:0]  etx_stat_a;
+  wire        etx_rdy_a, etx_busy_a, etx_tdp_a, etx_tdn_a;
+
+  loom_etx u_etxa (
+      .clk(clk), .rst_n(rst_n),
+      .w_cfg_we(etx_we_a[0]), .w_data_we(etx_we_a[1]), .w_last_we(etx_we_a[2]),
+      .w_last1_we(etx_we_a[3]), .w_stat_we(etx_we_a[4]), .w_val(etx_wd_a),
+      .cfg_rd(etx_cfg_a), .stat_rd(etx_stat_a),
+      .busy(etx_busy_a), .rdy(etx_rdy_a), .tdp(etx_tdp_a), .tdn(etx_tdn_a));
 
   loom_core #(.IMEM_AW(IMEM_AW), .IMEM_WORDS(IMEM_WORDS),
               .FIFO_DEPTH(FIFO_DEPTH)) u_a (
@@ -251,6 +266,8 @@ module loom_iso_miter #(
       .cw_od_we(cwod_a), .cw_od(cwodv_a),
       .lw_out_mask(lwom_a), .lw_out_data(lwod14_a),
       .lw_oe_mask(lwem_a), .lw_oe_data(lwed_a),
+      .etx_we(etx_we_a), .etx_wdata(etx_wd_a),
+      .etx_cfg_rd(etx_cfg_a), .etx_stat_rd(etx_stat_a),
       .h_run_we(h_run_we), .h_run(h_run_a), .h_reset(h_reset_a),
       .h_step_we(h_step_we), .h_step(h_step_a),
       .h_rpc_we(h_rpc_we), .h_rpc_sel(h_rpc_sel), .h_rpc(h_rpc),
@@ -282,6 +299,8 @@ module loom_iso_miter #(
       .h_out_we(h_pout_we), .h_out(h_pout),
       .h_oe_we(h_poe_we), .h_oe(h_poe),
       .h_od_we(h_od_we), .h_od(h_od),
+      .etx_rdy(etx_rdy_a), .etx_busy(etx_busy_a),
+      .etx_tdp(etx_tdp_a), .etx_tdn(etx_tdn_a),
       .pin_in_vec(pin_in_vec_a), .pin_in_reg(pin_in_reg_a),
       .pin_out_reg(pin_out_reg_a), .pin_oe_reg(pin_oe_reg_a),
       .od_mask_reg(od_mask_reg_a),
@@ -314,6 +333,18 @@ module loom_iso_miter #(
   wire [15:0] iwd_b;
   wire [7:0]  uio_out_b, uio_oe_b;
   wire [5:0]  out_pins_b;
+  wire [4:0]  etx_we_b;
+  wire [15:0] etx_wd_b;
+  wire [9:0]  etx_cfg_b;
+  wire [4:0]  etx_stat_b;
+  wire        etx_rdy_b, etx_busy_b, etx_tdp_b, etx_tdn_b;
+
+  loom_etx u_etxb (
+      .clk(clk), .rst_n(rst_n),
+      .w_cfg_we(etx_we_b[0]), .w_data_we(etx_we_b[1]), .w_last_we(etx_we_b[2]),
+      .w_last1_we(etx_we_b[3]), .w_stat_we(etx_we_b[4]), .w_val(etx_wd_b),
+      .cfg_rd(etx_cfg_b), .stat_rd(etx_stat_b),
+      .busy(etx_busy_b), .rdy(etx_rdy_b), .tdp(etx_tdp_b), .tdn(etx_tdn_b));
 
   loom_core #(.IMEM_AW(IMEM_AW), .IMEM_WORDS(IMEM_WORDS),
               .FIFO_DEPTH(FIFO_DEPTH)) u_b (
@@ -328,6 +359,8 @@ module loom_iso_miter #(
       .cw_od_we(cwod_b), .cw_od(cwodv_b),
       .lw_out_mask(lwom_b), .lw_out_data(lwod14_b),
       .lw_oe_mask(lwem_b), .lw_oe_data(lwed_b),
+      .etx_we(etx_we_b), .etx_wdata(etx_wd_b),
+      .etx_cfg_rd(etx_cfg_b), .etx_stat_rd(etx_stat_b),
       .h_run_we(h_run_we), .h_run(h_run_b), .h_reset(h_reset_b),
       .h_step_we(h_step_we), .h_step(h_step_b),
       .h_rpc_we(h_rpc_we), .h_rpc_sel(h_rpc_sel), .h_rpc(h_rpc),
@@ -359,6 +392,8 @@ module loom_iso_miter #(
       .h_out_we(h_pout_we), .h_out(h_pout),
       .h_oe_we(h_poe_we), .h_oe(h_poe),
       .h_od_we(h_od_we), .h_od(h_od),
+      .etx_rdy(etx_rdy_b), .etx_busy(etx_busy_b),
+      .etx_tdp(etx_tdp_b), .etx_tdn(etx_tdn_b),
       .pin_in_vec(pin_in_vec_b), .pin_in_reg(pin_in_reg_b),
       .pin_out_reg(pin_out_reg_b), .pin_oe_reg(pin_oe_reg_b),
       .od_mask_reg(od_mask_reg_b),
@@ -496,6 +531,26 @@ module loom_iso_miter #(
     assert (uio_oe_a   == uio_oe_b);
     assert (out_pins_a == out_pins_b);
 
+    // ---- the Ethernet serializer (SEMANTICS 6.12.7, "Ownership and
+    // ISO-1"): under the precondition that no other thread writes ETX_*
+    // (loom_iso_props.v), thread T is the block's owner, and "the owner's
+    // view (pin_in(13/14), ETX_STAT, ETX_CFG) then depends only on its own
+    // writes and the clock". The views first, then the 6.12.1 state in the
+    // RTL's encoding: not part of the claim, and listed so that a failure
+    // shows a cycle or more before it reaches a read (as the pipeline
+    // registers below do).
+    assert (etx_cfg_a  == etx_cfg_b);
+    assert (etx_stat_a == etx_stat_b);
+    assert (etx_rdy_a  == etx_rdy_b && etx_busy_a == etx_busy_b);
+    assert (etx_tdp_a  == etx_tdp_b && etx_tdn_a  == etx_tdn_b);
+    assert (u_etxa.eph == u_etxb.eph && u_etxa.div == u_etxb.div);
+    assert (u_etxa.hb  == u_etxb.hb  && u_etxa.pos == u_etxb.pos);
+    assert (u_etxa.txb == u_etxb.txb && u_etxa.sh  == u_etxb.sh);
+    assert (u_etxa.sl  == u_etxb.sl  && u_etxa.s1  == u_etxb.s1);
+    assert (u_etxa.hold == u_etxb.hold && u_etxa.hv == u_etxb.hv);
+    assert (u_etxa.hl  == u_etxb.hl  && u_etxa.h1  == u_etxb.h1);
+    assert (u_etxa.lseen == u_etxb.lseen && u_etxa.crc == u_etxb.crc);
+
     // ---- thread T's retire record (SEMANTICS 8)
     assert (u_a.u_view.s_tr_v == u_b.u_view.s_tr_v);
     if (u_a.u_view.s_tr_v) begin
@@ -586,6 +641,10 @@ module loom_iso_miter #(
     cover (f_diverged && u_a.u_view.c_t_store);
     // 11. thread T's LD reads while the other thread has diverged
     cover (f_diverged && u_a.u_view.c_t_load);
+    // 12. thread T starts an Ethernet frame while the other thread has
+    // diverged (6.12.4 start), and 13. reads ETX_STAT during one
+    cover (f_diverged && u_etxa.start);
+    cover (f_diverged && etx_busy_a && u_a.u_view.c_t_etxrd);
   end
 
   // Lint sink: outputs the miter does not compare at this level (the

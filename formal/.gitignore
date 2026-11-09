@@ -14,3 +14,7 @@ sched/
 spi/
 timer/
 wait/
+*_tcover/
+etx_t[0-9]*/
+etx_term/
+etx/
