@@ -98,8 +98,12 @@ def test_equivalents_are_keyed_to_the_current_source():
     from tools.mutate.__main__ import collect
     from tools.mutate.report import load_equivalents
     from tools.mutate.runner import TARGET_MODULES
-    ids = {m.ident for m in collect(list(TARGET_MODULES), None, [])}
-    stale = sorted(set(load_equivalents()) - ids)
+    equivalents = load_equivalents()
+    # The six of MUT-TARGET, plus any other module an entry names (loom_etx
+    # since W-122), so that such an entry is checked too, not called stale.
+    modules = set(TARGET_MODULES) | {i.split("_L", 1)[0] for i in equivalents}
+    ids = {m.ident for m in collect(sorted(modules), None, [])}
+    stale = sorted(set(equivalents) - ids)
     assert stale == [], "equivalents.json names mutants the source no longer has: %s" % stale
 
 

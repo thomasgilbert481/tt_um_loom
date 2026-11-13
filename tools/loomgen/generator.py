@@ -37,6 +37,12 @@ that is not are ``NOP`` + ``BADOP`` (SEMANTICS 9) and come from the unbuilt
 pool, as ``LD``/``ST`` always do. Both implementations are then run with the
 same build, so a program means the same thing to both.
 
+With the Ethernet serializer (``"ETX"``, ``CAPS[10]``, SEMANTICS 6.12) one
+running thread is drawn as the only writer of the ETX CSRs and opens its
+main loop with a frame; every thread also reads the block's status
+(:mod:`tools.loomgen.etxgen`). A build without it draws the same stream as
+before the feature existed (``tools/tests/test_loomgen_etx.py`` pins it).
+
 How each M2 construct stays live
 --------------------------------
 
@@ -86,6 +92,7 @@ from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 from tools.loomisa import Isa
 from tools.loomisa import load as load_isa
 
+from . import etxgen
 from .hostplan import HostPlan, build_host_plan
 from .stimulus import StimulusPlan, build_plan
 
@@ -150,7 +157,11 @@ M2_CSR_NAMES: Tuple[str, ...] = UNBUILT_CSR_NAMES
 #: once :meth:`be_cfg_value` is taught them. ``DMEM`` (slice B, CAPS[5]) is
 #: accepted the same way; ``LD``/``ST`` are emitted only through the unbuilt
 #: cycle until the generator learns a data area to address (integration).
-FEATURES: FrozenSet[str] = frozenset(("FIFO", "BE", "SETPD", "BEENC", "DMEM"))
+#: ``ETX`` (the Ethernet serializer, SEMANTICS 6.12, CAPS[10]) makes one
+#: running thread the writer of the ETX CSRs and lets the others read them
+#: (:mod:`tools.loomgen.etxgen`); a build without it draws exactly the random
+#: stream it drew before the feature existed.
+FEATURES: FrozenSet[str] = frozenset(("FIFO", "BE", "SETPD", "BEENC", "DMEM", "ETX"))
 #: The M2 chip: ``CAPS`` reports the FIFOs (depth 4), the manual bit engine
 #: and the deadline-latched ``SETP``. What :func:`generate` assumes unless told.
 DEFAULT_FEATURES: Tuple[str, ...] = ("BE", "FIFO", "SETPD")
@@ -464,6 +475,12 @@ PROFILES: Dict[str, Dict[str, int]] = {
     },
 }
 
+#: Emitter weights added in a build with the serializer (D-036): the
+#: observers' reads in every thread, and the writer's frames on top of the
+#: one that opens its main loop.
+ETX_OBS_WEIGHT = 6
+ETX_FRAME_WEIGHT = 5
+
 #: Probability that a thread's program contains one ``HALT``.
 HALT_RATE = 0.12
 #: Share of conditional waits that are untimed on something that may never
@@ -485,7 +502,8 @@ class _ThreadBuilder:
                  others_running: bool, flag_pool: Sequence[int],
                  avoid: FrozenSet[str], features: Sequence[str] = (),
                  fifo_depth: int = DEFAULT_FIFO_DEPTH,
-                 host_traffic: bool = False, entry: int = 0):
+                 host_traffic: bool = False, entry: int = 0,
+                 etx_writer: bool = False):
         self.rng = rng
         self.isa = isa
         self.thread = thread
@@ -499,6 +517,9 @@ class _ThreadBuilder:
         self.be_enc = "BEENC" in self.features
         self.be = "BE" in self.features
         self.setpd = "SETPD" in self.features
+        # D-036: the serializer; one thread writes its CSRs (etx_writer).
+        self.etx = "ETX" in self.features
+        self.etx_writer = self.etx and etx_writer
         # Slice B: the top DATA_WORDS words of the region are data, never code.
         self.dmem = "DMEM" in self.features
         self.data_base = entry + size - DATA_WORDS
@@ -532,7 +553,9 @@ class _ThreadBuilder:
         self.bidir = tuple(sorted(p for p, d in pins.items() if d["dir"] == "bidir"))
         self.inputs = tuple(sorted(p for p, d in pins.items() if d["dir"] == "in"))
         self.outputs = tuple(sorted(p for p, d in pins.items() if d["dir"] == "out"))
-        self.reserved_pins = tuple(p for p in range(32) if p not in pins)
+        # status indices (dir: status, D-036) have no pad: reserved, as before
+        self.reserved_pins = tuple(p for p in range(32)
+                                   if p not in pins or pins[p]["dir"] == "status")
         self.reserved_words = _reserved_words(isa, rng)
         self.unbuilt_cycle = list(unbuilt_mnemonics(self.features))
         rng.shuffle(self.unbuilt_cycle)
@@ -1143,6 +1166,26 @@ class _ThreadBuilder:
         if not self.fit(words, droppable=optional):
             self._emit_setp()
 
+    # ------------------------------------------ D-036: the serializer (6.12)
+    def _emit_etx_frame(self) -> None:
+        """One frame of the ETX writer (:func:`tools.loomgen.etxgen.frame_block`);
+        a smaller one if it does not fit, else nothing (the caller pads)."""
+        if not self.etx_writer:
+            return self._emit_etx_obs()
+        for _ in range(4):
+            words = etxgen.frame_block(self)
+            if len(words) <= self.room:
+                self.push(words)
+                return
+
+    def _emit_etx_obs(self) -> None:
+        """A read of the serializer's status (:func:`tools.loomgen.etxgen.observer_block`)."""
+        if not self.etx:
+            return self._emit_nop()
+        words = etxgen.observer_block(self)
+        if len(words) <= self.room:
+            self.push(words)
+
     # ------------------------------------------------------------- assembly
     def build(self, weights: Dict[str, int], want_halt: bool) -> List[_Block]:
         self.emit_prologue()
@@ -1152,6 +1195,14 @@ class _ThreadBuilder:
         for flag in self.flag_pool:
             if self.rng.random() < 0.75:
                 self.one("SIG", flag=flag)
+        if self.etx:
+            # Only a build with the serializer gets these names, so the draws
+            # of a build without it are the ones it always made.
+            weights = dict(weights)
+            weights["etx_obs"] = ETX_OBS_WEIGHT
+            if self.etx_writer:
+                weights["etx_frame"] = ETX_FRAME_WEIGHT
+                self._emit_etx_frame()       # every lap of the writer sends a frame
         names = sorted(n for n in weights if weights[n] > 0)
         totals = [weights[n] for n in names]
         halt_at = None
@@ -1434,12 +1485,16 @@ def generate(seed: int, threads: int = 1, imem_words: int = 256,
 
     image: Dict[int, int] = {}
     heads: List[int] = []
+    # D-036: one running thread writes the ETX CSRs (SEMANTICS 6.12.7); drawn
+    # only in a build with the serializer.
+    etx_writer = rng.choice(running) if "ETX" in feature_names else None
     for thread in running:
         builder = _ThreadBuilder(rng, isa, thread, stride, profile, plan,
                                  len(running) > 1, flag_pool, avoid,
                                  features=feature_names, fifo_depth=fifo_depth,
                                  host_traffic=host_traffic,
-                                 entry=entry_list[thread])
+                                 entry=entry_list[thread],
+                                 etx_writer=thread == etx_writer)
         blocks = builder.build(chosen_weights, rng.random() < HALT_RATE)
         _place(blocks, entry_list[thread])
         loop_head = blocks[builder.loop_head_index].addr

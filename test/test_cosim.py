@@ -331,8 +331,10 @@ class _Build:
                     "built for it, so this run would compare nothing. Teach "
                     "tools/loomsim the feature (or take the bit out of the RTL)."
                     % (self.caps, what, bit))
-        if caps & 0x0C00:
-            raise BuildError("CAPS %04X sets a reserved bit (11:10)" % self.caps)
+        if caps & (1 << 10):
+            features.append("ETX")       # the Ethernet serializer (6.12, D-036)
+        if caps & 0x0800:
+            raise BuildError("CAPS %04X sets the reserved bit 11" % self.caps)
         self.features = tuple(sorted(features))
         #: Width of one ``INQ_CNT``/``OUTQ_CNT`` field in the RTL vectors.
         self.fifo_width = self.fifo_depth.bit_length()
@@ -1173,6 +1175,10 @@ class _Run:
             diffs = _diff_record(rtl, model)
             if diffs:
                 self.fail(k, diffs, rtl, model)
+            # D-036: the serializer's bins (SEMANTICS 6.12.9); the slot in W
+            # commits its ETX write, if any, at edge k+1.
+            COVERAGE.etx.cycle(k, model, context.regs, context.ingrp,
+                               context.outgrp, uo_out & 3)
 
             # ---- M2 events that have no retire record of their own
             self._latch_events(lat_before, model, w_wait_active)
@@ -1343,6 +1349,7 @@ async def _run_programs(dut, programs, spi=False):
                                  "program is for %d" % (probe.mem_words,
                                                         prog.imem_words))
         COVERAGE.note_build(build.features, build.fifo_depth)
+        COVERAGE.etx.begin(prog.seed, build.features)
         run = _Run(dut, probe, prog, label, cycles, build, spi=spi)
         try:
             spent = await run.run()

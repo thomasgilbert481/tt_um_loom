@@ -257,7 +257,8 @@ class _Assembler:
                 except ValueError:
                     raise ValueError("--pin %s=%s: isa.yaml has no pin called %s"
                                      % (name, text, text)) from None
-        if index not in self.isa.pins:
+        # a status index (dir: status, D-036) is named but has no pad
+        if index not in self.isa.pins or self.isa.pins[index]["dir"] == "status":
             raise ValueError("--pin %s=%s: pin index %d is not a pad" % (name, value, index))
         return index
 

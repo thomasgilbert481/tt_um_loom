@@ -12,7 +12,13 @@
  * The retire record (tr_*) is simulation and debug only; it is exported so a
  * testbench can reach it, and left unconnected in tt_um_loom.
  *
- * VERSION reads 4 from M3 slice B on (SEMANTICS 6.11): the data memory is
+ * VERSION reads 5 with the Ethernet serializer (SEMANTICS 6.12, D-036),
+ * loom_etx, which sits here beside loom_pins: loom_core feeds it the
+ * W-stage writes of the ETX CSRs and reads ETX_CFG and ETX_STAT back into
+ * its X-stage CSR mux, and loom_pins takes its status for pin_in(13/14)
+ * and its pad pair for uo_out[1:0] while it is busy.
+ *
+ * VERSION read 4 from M3 slice B (SEMANTICS 6.11): the data memory is
  * the instruction memory, reached by LD/ST through the thread's own fetch
  * cycle. Slice A (VERSION 3) added the NRZI and Manchester encoders, USB and
  * CAN stuffing and the DIFF bit.
@@ -36,7 +42,7 @@ module loom_top #(
     parameter [15:0]  IMEM_WORDS = 16'd512,
     parameter integer FIFO_DEPTH = 4,
     parameter [15:0]  ID_VALUE   = 16'h4C4D,
-    parameter [15:0]  VERSION    = 16'h0004
+    parameter [15:0]  VERSION    = 16'h0005
 ) (
     input  wire [7:0] ui_in,
     output wire [7:0] uo_out,
@@ -62,12 +68,14 @@ module loom_top #(
   localparam integer IMEM_AW = $clog2(IMEM_WORDS);
   localparam [31:0]  IMEM_LOG2 = $clog2(IMEM_WORDS);
   localparam [31:0]  FIFO_LOG2 = $clog2(FIFO_DEPTH);
-  // CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:10] zero,
+  // CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11] zero,
+  // [10] Ethernet serializer (6.12, D-036),
   // [9] bit-engine encoders, stuffing and DIFF (M3 slice A, 6.9.1),
   // [8] bit engine auto mode, [7] deadline-latched SETP, [6] boot ROM,
   // [5] data memory, [4] bit engine (manual mode), [3] FIFOs,
   // [2:0] log2(FIFO_DEPTH).
-  localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 2'd0,
+  localparam [15:0]  CAPS_VAL = {IMEM_LOG2[3:0], 1'b0,
+                                 1'b1,    // [10] Ethernet serializer (6.12)
                                  1'b1,    // [9] encoders, stuffing, DIFF (slice A)
                                  1'b0,    // [8] bit engine auto mode (M3)
                                  1'b1,    // [7] deadline-latched SETP
@@ -101,6 +109,11 @@ module loom_top #(
   wire [15:0] h_pout;
   wire [7:0]  h_poe, h_od;
   wire [5:0]  out_pins;
+  wire [4:0]  etx_we;
+  wire [15:0] etx_wdata;
+  wire [9:0]  etx_cfg_rd;
+  wire [4:0]  etx_stat_rd;
+  wire        etx_rdy, etx_busy, etx_tdp, etx_tdn;
 
   loom_pins u_pins (
       .clk(clk), .rst_n(rst_n),
@@ -113,10 +126,21 @@ module loom_top #(
       .h_out_we(h_pout_we), .h_out(h_pout),
       .h_oe_we(h_poe_we), .h_oe(h_poe),
       .h_od_we(h_od_we), .h_od(h_od),
+      .etx_rdy(etx_rdy), .etx_busy(etx_busy),
+      .etx_tdp(etx_tdp), .etx_tdn(etx_tdn),
       .pin_in_vec(pin_in_vec), .pin_in_reg(pin_in_reg),
       .pin_out_reg(pin_out_reg), .pin_oe_reg(pin_oe_reg),
       .od_mask_reg(od_mask_reg),
       .uio_out(uio_out), .uio_oe(uio_oe), .out_pins(out_pins)
+  );
+
+  // ------------------------------------------------- Ethernet serializer
+  loom_etx u_etx (
+      .clk(clk), .rst_n(rst_n),
+      .w_cfg_we(etx_we[0]), .w_data_we(etx_we[1]), .w_last_we(etx_we[2]),
+      .w_last1_we(etx_we[3]), .w_stat_we(etx_we[4]), .w_val(etx_wdata),
+      .cfg_rd(etx_cfg_rd), .stat_rd(etx_stat_rd),
+      .busy(etx_busy), .rdy(etx_rdy), .tdp(etx_tdp), .tdn(etx_tdn)
   );
 
   // ------------------------------------------------------ instruction memory
@@ -170,6 +194,8 @@ module loom_top #(
       .cw_od_we(cw_od_we), .cw_od(cw_od),
       .lw_out_mask(lw_out_mask), .lw_out_data(lw_out_data),
       .lw_oe_mask(lw_oe_mask), .lw_oe_data(lw_oe_data),
+      .etx_we(etx_we), .etx_wdata(etx_wdata),
+      .etx_cfg_rd(etx_cfg_rd), .etx_stat_rd(etx_stat_rd),
       .h_run_we(h_run_we), .h_run(h_run), .h_reset(h_reset),
       .h_step_we(h_step_we), .h_step(h_step),
       .h_rpc_we(h_rpc_we), .h_rpc_sel(h_rpc_sel), .h_rpc(h_rpc),

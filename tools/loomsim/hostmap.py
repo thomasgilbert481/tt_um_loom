@@ -26,6 +26,10 @@ ENC_VERSION = 0x0003
 #: model advances it once more; see ``docs/spec-questions/loomsim-m3b.md``
 #: (item 2).  A build with both slices reads this value.
 DMEM_VERSION = 0x0004
+#: ``CTRL.VERSION`` of a build with the Ethernet serializer: "``VERSION``
+#: reads 5 when it is built" (SEMANTICS 6.12, 6.12.8), whatever else is built
+#: (W-117 Q2).
+ETX_VERSION = 0x0005
 
 # ------------------------------------------------------------------ features
 #: Optional features a Machine can be built with.  ``FIFO`` (SEMANTICS 6.7:
@@ -34,8 +38,10 @@ DMEM_VERSION = 0x0004
 #: the differential output, which need ``BE``), ``SETPD`` (6.10:
 #: deadline-latched SETP), ``DMEM`` (6.11, M3 slice B, D-027: ``LD``/``ST``
 #: on the instruction memory, the ``MEM`` state and debug 0x28).
+#: ``ETX`` (6.12, D-036: the Ethernet serializer, its CSRs 0x16..0x1A, status
+#: pins 13 and 14 and the ``uo_out[1:0]`` pad mux).
 #: ``BOOTROM`` only sets its CAPS bit.
-FEATURES = frozenset({"FIFO", "BE", "BEENC", "SETPD", "DMEM", "BOOTROM"})
+FEATURES = frozenset({"FIFO", "BE", "BEENC", "SETPD", "DMEM", "ETX", "BOOTROM"})
 #: The features the command line offers.
 CLI_FEATURES = ("FIFO", "BE", "BEENC", "SETPD")
 #: Legal ``FIFO_DEPTH`` build parameters (SEMANTICS 6.7): the counts must fit
@@ -56,6 +62,7 @@ CAPS_BOOTROM = 1 << 6
 CAPS_SETPD = 1 << 7
 CAPS_BE_AUTO = 1 << 8        # M3; never set by this model
 CAPS_BEENC = 1 << 9          # M3 slice A: encoders, stuffing and DIFF (SEMANTICS 6.9.1)
+CAPS_ETX = 1 << 10           # the Ethernet serializer (SEMANTICS 6.12, D-036)
 
 # ----------------------------------------------------------------- CTRL space
 CTRL: Dict[str, int] = {

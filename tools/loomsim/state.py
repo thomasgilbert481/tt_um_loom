@@ -319,7 +319,8 @@ class CycleTrace:
 
     All values describe the state *during* ``cycle``, before the edge that ends
     it, so a pad write with X cycle ``x`` first shows up in the entry for cycle
-    ``x + 2``.  ``uo_out`` is ``PIN_OUT[13:8]`` (pads ``uo_out[5:0]``);
+    ``x + 2``.  ``uo_out`` is ``PIN_OUT[13:8]`` (pads ``uo_out[5:0]``), with
+    bits 1:0 the Ethernet serializer's TD+/TD- while it is busy (6.12.7);
     ``host_irq`` is the registered ``HOST_IRQ`` output, pad ``uo_out[6]``
     (SEMANTICS 6.8).
     """
@@ -409,6 +410,10 @@ class Commit:
     mem_rd: Optional[int] = None
     mem_addr: Optional[int] = None
     mem_data: Optional[int] = None
+    #: Ethernet serializer (SEMANTICS 6.12, feature ``"ETX"``): the
+    #: ``(csr, value)`` of a ``CSRW`` to one of ``ETX_*``, committing at the
+    #: slot's W edge.  Global state, but carried by the slot's commit.
+    etx_write: Optional[Tuple[int, int]] = None
     #: Host debug writes of ``STEPS`` and ``TICK_SEEN`` (HOST_PROTOCOL space 4).
     steps: Optional[int] = None
     tick_seen: Optional[int] = None

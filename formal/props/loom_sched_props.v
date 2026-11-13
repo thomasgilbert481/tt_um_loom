@@ -32,6 +32,7 @@ module loom_sched_props #(
 ) (
     input wire        clk,
     input wire        rst_n,
+    input wire [4:0]  etx_we,
 
     // Slot grid as the RTL keeps it.
     input wire [1:0]  ph,
@@ -306,6 +307,18 @@ module loom_sched_props #(
     end
   endgenerate
 
+  // ==================================================================
+  // SCHED-ETX (D-036): the caller's side of SEMANTICS 6.12.2, "Only one
+  // slot is in W at any edge, so at most one ETX write commits at any
+  // edge", which formal/etx_top.v assumes of the write port. The strobes
+  // are one per ETX CSR, at most one high, and only with a valid slot in W.
+  // ($onehot0 written out: the slang frontend does not have it.)
+  // ==================================================================
+  always @(*) if (f_past_valid) begin
+    assert ((etx_we & (etx_we - 5'd1)) == 5'd0);
+    if (etx_we != 5'd0) assert (w_valid);
+  end
+
   // ------------------------------------------------- cover (anti-vacuity)
   wire [9:0] c_pc0 = pc_all[9:0];
   always @(posedge clk) if (f_past_valid && $past(rst_n)) begin
@@ -316,12 +329,14 @@ module loom_sched_props #(
     cover (!run_r[0] && !$past(run_r[0]) && (c_pc0 != $past(c_pc0)));
     cover (h_reset[0]);
     cover (h_dbg_req && h_dbg_wr);
+    cover (etx_we[1]);                               // an ETX_DATA write
   end
 
 endmodule
 
 // The port expressions are elaborated in the scope of the loom_core instance.
 bind loom_core loom_sched_props #(.FIFO_DEPTH(4), .FAW(2)) u_sched_props (
+    .etx_we(etx_we),
     .clk(clk), .rst_n(rst_n),
     .ph(ph), .vd(vd), .td_th(td_th), .vx(vx), .tx_th(tx_th),
     .w_valid(w_valid), .w_thread(w_thread),

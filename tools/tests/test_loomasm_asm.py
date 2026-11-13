@@ -748,7 +748,7 @@ def pin_warnings(program):
     return [d for d in program.warnings if d.kind == "pin"]
 
 
-@pytest.mark.parametrize("index", [13, 14, 15, 22, 27, 31])
+@pytest.mark.parametrize("index", [15, 22, 27, 31])
 def test_a_pin_index_isa_yaml_does_not_name_warns(index):
     program = asm(src(".thread 0", "SETP %d, 1" % index))
     assert program.errors == []
@@ -769,7 +769,7 @@ def test_a_named_pin_never_warns(index):
 
 def test_the_warning_is_not_dodged_by_a_pins_alias():
     program = asm(src(".thread 0",
-                      ".pins SPARE = 13",
+                      ".pins SPARE = 15",
                       "SETP SPARE, 1",
                       "JP SPARE, 1, 0"))
     # once per use, not also at the declaration

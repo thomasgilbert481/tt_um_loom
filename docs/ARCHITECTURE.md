@@ -75,7 +75,7 @@ timing closure simple. `rst_n` is synchronous, active low, as in the TT template
 | ui_in[7] | IN4 | in | pin index 12 |
 | uo_out[7] | HOST_MISO | out | |
 | uo_out[6] | HOST_IRQ | out | any enabled shared flag or halted thread |
-| uo_out[5:0] | OUT0..OUT5 | out | pin index 16..21 |
+| uo_out[5:0] | OUT0..OUT5 | out | pin index 16..21; `uo_out[1:0]` carry TD+ and TD- of the Ethernet serializer while it is busy, and `PIN_OUT[9:8]` otherwise (SEMANTICS 6.12.7) |
 | uio[7:0] | BIDIR0..BIDIR7 | bidir | pin index 0..7, per-pin OE and open-drain mode |
 
 The host pins are fixed by the top-level wrapper, not by firmware. They were
@@ -91,7 +91,9 @@ use uniformly:
 index  0..7   BIDIR0..7  read, write, OE          (uio)
 index  8..11  IN0..3     read only                 (ui_in[3:0])
 index 12      IN4        read only                 (ui_in[7])
-index 13..15  reserved   reads 0
+index 13      ETX_RDY    read only                 (Ethernet serializer RDY, SEMANTICS 6.12.7)
+index 14      ETX_BUSY   read only                 (Ethernet serializer BUSY)
+index 15      reserved   reads 0
 index 16..21  OUT0..5    write; read returns the driven value  (uo_out[5:0])
 index 22..31  reserved
 ```
@@ -182,6 +184,11 @@ Global: `SFLAGS[7:0]` shared flags, `OD_MASK[7:0]` open-drain mode per BIDIR pin
 | 0x13 | PIN_IN | R | 16 | synchronised inputs |
 | 0x14 | SFLAGS | RW | 8 | shared flags (write sets bits; use `CLR` to clear one) |
 | 0x15 | HOST_IRQ | W | 1 | pulse HOST_IRQ |
+| 0x16 | ETX_CFG | RW | 10 | global: Ethernet serializer config `{IDL[3:0], FCS, PRE, HALFN[3:0]}`, reset 0x01B1; written only while idle (SEMANTICS 6.12) |
+| 0x17 | ETX_DATA | W | 16 | global: next frame word, low byte first; starts a frame when idle |
+| 0x18 | ETX_LAST | W | 16 | global: last frame word, both bytes |
+| 0x19 | ETX_LAST1 | W | 16 | global: last frame word, low byte only |
+| 0x1A | ETX_STAT | RW | 5 | global: `{REF, UNDER, FDONE, RDY, BUSY}`, reset 0x0002; write 1 to clear bits 4:2 |
 
 Reserved CSR numbers read 0 and ignore writes.
 
@@ -239,7 +246,10 @@ Reserved CSR numbers read 0 and ignore writes.
 - Ownership is by convention, not enforced: two threads writing the same pin get
   last-writer-wins at clock granularity. Firmware assigns pins to threads; the
   assembler can check that no two threads' `OUTGRP`/`SETP` sets overlap when
-  given the whole program (M3 nice-to-have).
+  given the whole program (M3 nice-to-have). The same convention covers the
+  Ethernet serializer's CSRs (`ETX_CFG`, `ETX_DATA`, `ETX_LAST`, `ETX_LAST1`,
+  `ETX_STAT`): one thread owns them, and a second writer's writes apply in
+  commit order (SEMANTICS 6.12.7).
 - `JP pin, v, rel` branches on a single pin. `WAITP`/`WAITE` wait on a level or
   an edge (rise, fall, any). Pattern waits on a pin *group* (mask + value, for
   I2C START = SDA falling while SCL high) are done with `WAITE` on the edge pin
@@ -309,8 +319,10 @@ Serial LFSR, one data bit per update, `CRC_POLY` programmable, `CRCI` loads
 `CRC_INIT`. Convention: an n-bit CRC is left-aligned in the 16-bit accumulator,
 and so is its polynomial. The assembler ships presets: USB CRC5 (0x05, init
 0x1F), USB CRC16 (0x8005, init 0xFFFF), CAN CRC15 (0x4599), CRC-8 SMBus (0x07).
-Ethernet FCS (CRC-32) is not covered by the 16-bit unit; a shared 32-bit unit
-was not built (section 15, item 5), so the host computes it.
+Ethernet FCS (CRC-32) is not covered by the 16-bit unit; a general shared
+32-bit unit was not built (section 15, item 5). The Ethernet serializer
+(SEMANTICS 6.12, D-036) computes the FCS in its own CRC-32 register and
+appends it to every frame it sends.
 
 ## 9. FIFOs, shared flags, host interrupt
 

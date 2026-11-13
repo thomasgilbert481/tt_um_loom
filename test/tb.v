@@ -96,6 +96,26 @@ module tb ();
       .rst_n  (rst_n_flops)
   );
 
+  // A standalone Ethernet serializer (SEMANTICS 6.12) for test_etx.py's
+  // edge-exact unit tests: cocotb drives its write port directly, so a
+  // write can commit at any edge, not only on a thread's 4-clock grid.
+  // Nothing else toggles clk_etx. RTL only, like the FLOPS instance.
+  reg        clk_etx;
+  reg        rst_n_etx;
+  reg  [4:0] etx_we;       // {STAT, LAST1, LAST, DATA, CFG}
+  reg  [15:0] etx_val;
+  wire [9:0] etx_cfg_rd;
+  wire [4:0] etx_stat_rd;
+  wire       etx_busy, etx_rdy, etx_tdp, etx_tdn;
+
+  loom_etx etx_unit (
+      .clk(clk_etx), .rst_n(rst_n_etx),
+      .w_cfg_we(etx_we[0]), .w_data_we(etx_we[1]), .w_last_we(etx_we[2]),
+      .w_last1_we(etx_we[3]), .w_stat_we(etx_we[4]), .w_val(etx_val),
+      .cfg_rd(etx_cfg_rd), .stat_rd(etx_stat_rd),
+      .busy(etx_busy), .rdy(etx_rdy), .tdp(etx_tdp), .tdn(etx_tdn)
+  );
+
   // The same unwritten-word check for the FLOPS build.
   always @(posedge clk_flops)
     if (user_project_flops.u_loom.u_core.vd === 1'b1

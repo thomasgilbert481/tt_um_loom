@@ -1,0 +1,88 @@
+[tasks]
+prove
+cover
+t0 term
+t1 term
+t2 term
+t3 term
+t4 term
+t5 term
+t6 term
+t7 term
+t8 term
+t9 term
+t10 term
+t11 term
+t12 term
+t13 term
+t14 term
+t15 term
+tcover
+
+[options]
+# ETX-1, ETX-2, ETX-4, ETX-5 and ETX-READ on the block beside the pins,
+# unbounded (abc pdr closes all of them; k-induction does not).
+prove: mode prove
+prove: depth 16
+cover: mode cover
+cover: depth 40
+# ETX-3 (BUSY falls within 2N(64+16+32) + N IDL clocks of the last accepted
+# write) with its strengthening (ETX_TERM in props/loom_etx_props.v), on
+# loom_etx alone, once per HALFN: t<h> checks the frames sent with
+# HALFN = h, so t0 .. t15 together cover every frame (the solvers cannot
+# close the product N * x with N free). Each closes by k-induction.
+term:  mode prove
+term:  depth 4
+tcover: mode cover
+tcover: depth 8
+timeout 3600
+
+[engines]
+prove: abc pdr
+prove: smtbmc yices
+cover: smtbmc yices
+term:  smtbmc yices
+term:  abc pdr
+tcover: smtbmc yices
+
+[script]
+plugin -i slang
+# Yosys's own frontend ignores `bind`; slang implements it (formal/README.md).
+prove: read_slang --top loom_etx_fv loom_etx.v loom_pins.v loom_sync.v etx_top.v loom_etx_props.v
+cover: read_slang --top loom_etx_fv loom_etx.v loom_pins.v loom_sync.v etx_top.v loom_etx_props.v
+t0: read_slang -DETX_TERM -DETX_HALFN=0 --top loom_etx loom_etx.v loom_etx_props.v
+t1: read_slang -DETX_TERM -DETX_HALFN=1 --top loom_etx loom_etx.v loom_etx_props.v
+t2: read_slang -DETX_TERM -DETX_HALFN=2 --top loom_etx loom_etx.v loom_etx_props.v
+t3: read_slang -DETX_TERM -DETX_HALFN=3 --top loom_etx loom_etx.v loom_etx_props.v
+t4: read_slang -DETX_TERM -DETX_HALFN=4 --top loom_etx loom_etx.v loom_etx_props.v
+t5: read_slang -DETX_TERM -DETX_HALFN=5 --top loom_etx loom_etx.v loom_etx_props.v
+t6: read_slang -DETX_TERM -DETX_HALFN=6 --top loom_etx loom_etx.v loom_etx_props.v
+t7: read_slang -DETX_TERM -DETX_HALFN=7 --top loom_etx loom_etx.v loom_etx_props.v
+t8: read_slang -DETX_TERM -DETX_HALFN=8 --top loom_etx loom_etx.v loom_etx_props.v
+t9: read_slang -DETX_TERM -DETX_HALFN=9 --top loom_etx loom_etx.v loom_etx_props.v
+t10: read_slang -DETX_TERM -DETX_HALFN=10 --top loom_etx loom_etx.v loom_etx_props.v
+t11: read_slang -DETX_TERM -DETX_HALFN=11 --top loom_etx loom_etx.v loom_etx_props.v
+t12: read_slang -DETX_TERM -DETX_HALFN=12 --top loom_etx loom_etx.v loom_etx_props.v
+t13: read_slang -DETX_TERM -DETX_HALFN=13 --top loom_etx loom_etx.v loom_etx_props.v
+t14: read_slang -DETX_TERM -DETX_HALFN=14 --top loom_etx loom_etx.v loom_etx_props.v
+t15: read_slang -DETX_TERM -DETX_HALFN=15 --top loom_etx loom_etx.v loom_etx_props.v
+tcover: read_slang -DETX_TERM -DETX_HALFN=15 --top loom_etx loom_etx.v loom_etx_props.v
+prove: prep -top loom_etx_fv
+cover: prep -top loom_etx_fv
+term:  prep -top loom_etx
+tcover: prep -top loom_etx
+# The words and the CRC never decide when anything happens (6.12.5 reads
+# only EPH, DIV, HB, POS, S1, SL, HV, HL, H1, IDL), so the ETX-3 runs free
+# them every cycle: an over-approximation, which keeps ETX-3 sound and
+# spares the solvers the CRC. (ETX-4 reads them and is left out there.)
+term:  cutpoint loom_etx/w:crc loom_etx/w:sh loom_etx/w:hold loom_etx/w:txb
+tcover: cutpoint loom_etx/w:crc loom_etx/w:sh loom_etx/w:hold loom_etx/w:txb
+memory_map
+setundef -undriven -anyseq
+
+[files]
+../src/loom_etx.v
+../src/loom_pins.v
+../src/loom_sync.v
+etx_top.v
+props/loom_etx_props.v

@@ -45,7 +45,10 @@ Optional features (SEMANTICS 9: an instruction of an unbuilt feature is a
 * ``"DMEM"`` (M3 slice B, 6.11, D-027): ``LD`` and ``ST`` on the instruction
   memory as two-slot instructions, the ``MEM_PEND``/``MEM_LD``/``MEM_RD``
   state of section 5 and debug 0x28.  ``CTRL.VERSION`` reads 4 in such a
-  build, whether or not slice A is in it.
+  build, whether or not slice A is in it;
+* ``"ETX"`` (6.12, D-036): the Ethernet serializer (:mod:`.etx`), its CSRs
+  0x16..0x1A, ``pin_in(13)``/``pin_in(14)`` and the ``uo_out[1:0]`` mux.
+  ``CTRL.VERSION`` reads 5 and ``CAPS[10]`` 1 in such a build.
 
 ``Machine(features=())`` is the M1 core: its instruction behaviour, pads and
 retire records are unchanged by everything above.  The host registers of
@@ -64,6 +67,7 @@ from tools.loomisa import load as load_isa
 
 from . import alu
 from . import hostmap as H
+from .etx import ETX_CSRS, PIN_BUSY, PIN_RDY, Etx
 from .state import (
     THREADS, SLOT_CLOCKS, PC_MASK, WORD_MASK,
     CSR_BE_CFG, CSR_BE_PINS, CSR_BE_RELOAD, CSR_CNT, CSR_CRC, CSR_CRC_INIT,
@@ -223,6 +227,7 @@ class Machine:
         self._be_enc = "BEENC" in built
         self._setpd = "SETPD" in built
         self._dmem = "DMEM" in built
+        self._etx = "ETX" in built
         self.imem_words = imem_words
         self.imem_mask = imem_words - 1
         self.fifo_depth = fifo_depth
@@ -231,8 +236,11 @@ class Machine:
         if version is None:
             # SEMANTICS 6.9.1: VERSION reads 3 from slice A on; 6.11: with
             # slice B "VERSION advances" again, to 4, whether or not slice A
-            # is in the same build (loomsim-m3b.md item 2).
-            if self._dmem:
+            # is in the same build (loomsim-m3b.md item 2); 6.12: 5 with the
+            # Ethernet serializer.
+            if self._etx:
+                version = H.ETX_VERSION
+            elif self._dmem:
                 version = H.DMEM_VERSION
             elif self._be_enc:
                 version = H.ENC_VERSION
@@ -278,6 +286,10 @@ class Machine:
         self.od_mask = 0
         self.pin_out = 0
         self.pin_oe = 0
+        #: The Ethernet serializer's global state (SEMANTICS 6.12.1), reset by
+        #: ``rst_n`` only.  Present in every build; only an ``"ETX"`` build
+        #: lets a write reach it, so elsewhere it stays at reset and unseen.
+        self.etx = Etx()
         self.ui_in = 0
         self.uio_in = 0
         self._ff1 = 0
@@ -314,8 +326,18 @@ class Machine:
 
         ``uo_out[6]`` is :attr:`host_irq`; ``uo_out[7]`` (HOST_MISO) belongs to
         the SPI port, which the model does not contain.
+
+        With ``"ETX"`` built, ``uo_out[1:0]`` is the mux of SEMANTICS 6.12.7:
+        TD+ and TD- while the serializer is ``BUSY``, else ``PIN_OUT[9:8]``,
+        a function of the state in this cycle (not re-registered), so
+        ``PIN_OUT`` is back in cycle ``r``, the one that begins at the
+        release edge (W-117 Q3).
         """
-        return (self.pin_out >> 8) & 0x3F
+        value = (self.pin_out >> 8) & 0x3F
+        if self._etx and self.etx.busy:
+            tdp, tdn = self.etx.pads(self.pin_out)
+            value = (value & ~0x3) | tdp | (tdn << 1)
+        return value
 
     @property
     def uio_out(self) -> int:
@@ -358,6 +380,13 @@ class Machine:
             return (self._ff2 >> index) & 1
         if 16 <= index <= 21:
             return (self.pin_out >> (index - 8)) & 1
+        if self._etx:
+            # SEMANTICS 3 and 6.12.7: RDY and BUSY as visible in this cycle,
+            # no synchroniser; 0 in a build without the serializer.
+            if index == PIN_RDY:
+                return self.etx.rdy
+            if index == PIN_BUSY:
+                return self.etx.busy
         return 0
 
     @property
@@ -386,6 +415,8 @@ class Machine:
             value |= H.CAPS_SETPD
         if self._be_enc:
             value |= H.CAPS_BEENC
+        if self._etx:
+            value |= H.CAPS_ETX
         return value & 0xFFFF
 
     @property
@@ -1040,6 +1071,14 @@ class Machine:
         pre_lat = [(th.lat_valid, th.lat_pin, th.lat_val) for th in self.threads]
         pre_td = [th.td for th in self.threads]
         pad_sample = self._sample_pads()
+
+        if self._etx:
+            # SEMANTICS 6.12.4: the serializer reads only its own pre-edge
+            # state and the one ETX write landing here (one slot is in W).
+            writes = [cm.etx_write for cm in landing if cm.etx_write is not None]
+            if len(writes) > 1:
+                raise LoomsimError("two ETX writes at one edge (SEMANTICS 6.12.2)")
+            self.etx.edge(writes[0] if writes else None)
 
         # Host first, thread second: on a same-edge conflict the thread wins.
         host = [cm for cm in landing if not cm.is_slot]
@@ -1848,6 +1887,8 @@ class Machine:
             return self.pin_in_word
         if number == CSR_SFLAGS:
             return self._visible_sflags(x)
+        if number in ETX_CSRS and self._etx:
+            return self.etx.read(number)     # 6.12.2, the value in cycle x
         return 0                    # write-only and unimplemented CSRs read 0
 
     def _csr_write(self, cm: Commit, th: ThreadState, t: int, number: int,
@@ -1883,6 +1924,11 @@ class Machine:
             cm.sflags_set |= value & 0xFF
         elif number == CSR_HOST_IRQ:
             cm.swirq_set |= 1 << t
+        elif number in ETX_CSRS:
+            # SEMANTICS 6.12.2/6.12.4: the write reaches the serializer at the
+            # commit edge x + 2; without "ETX" it is ignored, with no BADOP.
+            if self._etx:
+                cm.etx_write = (number, value & WORD_MASK)
         # NOW, TID, PIN_IN are read-only; unimplemented CSRs ignore writes.
         return z, c_flag, t_flag
 

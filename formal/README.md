@@ -63,6 +63,12 @@ one to two hours between them, nearly all of it `iso:prove` (about
 37). The F-7 times were taken with the laptop running other proofs
 beside them, so they are upper bounds.
 
+Re-run whole on 2026-11-08 for D-036 (the Ethernet serializer, W-120):
+every group as recorded, with the `etx` group new. `etx` adds 19 tasks and
+about 10 minutes to `quick` (the sixteen ETX-3 tasks, 9 to 68 s each on a
+loaded laptop), so `quick` is now about 15 minutes; split `etx:t*` into the
+nightly if the `formal-quick` budget needs it.
+
 | ID | Property | File / task | Mode | Engine | Depth | Result | Time |
 |---|---|---|---|---|---|---|---|
 | ISA-1A | every 16-bit pattern matches at most one instruction of `isa.yaml` | `isa.sby:prove` | prove | smtbmc yices | comb. | **proved** | 1 s |
@@ -89,6 +95,14 @@ beside them, so they are upper bounds.
 | PIN-1CORE | same, firmware only (no host pin write in the trace) | `pins.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** (was F-2) | 3 s |
 | PIN-1R | the pads never carry a one on an open-drain pin: `OD_MASK & uio_out == 0` | `pins.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** (was F-2, as the register claim `OD_MASK & PIN_OUT == 0`) | 3 s |
 | — | 6 cover points | `pins.sby:cover` | cover | smtbmc yices | 16 | 6/6 | 1 s |
+| ETX-1 | while `BUSY`, `uo_out[0] != uo_out[1]`, and `(1, 0)` in `P_TAIL`; while not `BUSY`, `uo_out[1:0] == PIN_OUT[9:8]`; the first half bit is `(~v, v)` and only a data write starts a frame (SEMANTICS 6.12.7, 6.12.3; D-036, added 2026-11-08) | `etx.sby:prove` | prove | abc pdr | unbounded | **proved** | 62 s |
+| ETX-2 | while `BUSY` the pad pair changes only at `s + i N`, `BUSY` falls only there, and every bit has its mid transition outside the tail | `etx.sby:prove` | prove | abc pdr | unbounded | **proved** | 62 s |
+| ETX-3 | `BUSY` falls within `2 N (64 + 16 + 32) + N IDL` clocks of the start or the last accepted data write | `etx.sby:t0` .. `t15` | prove | smtbmc yices (k-ind.) | 4 | **proved**, one task per `HALFN` (all 16) | 9 to 94 s each |
+| ETX-4 | every data write is stored where 6.12.4 puts it or sets `REF`; ETX-4B: a word in `HOLD` is given up only to `SH` at a load | `etx.sby:prove` | prove | abc pdr | unbounded | **proved** | 62 s |
+| ETX-5 | against a second `loom_pins` with the block absent: `PIN_OUT`, `PIN_OE`, `OD_MASK`, `PIN_IN`, `uio_out`, `uio_oe`, `uo_out[7:2]` and `pin_in` other than 13 and 14 identical; `uo_out[1:0]` identical while not `BUSY`; `pin_in(13/14) = RDY, BUSY` | `etx.sby:prove` | prove | abc pdr | unbounded | **proved** | 62 s |
+| ETX-READ | `ETX_CFG` 0x01B1 and `ETX_STAT` 0x0002 after reset, `ETX_CFG` written only while idle (else `REF`), `ETX_STAT[1:0] = {RDY, BUSY}`, the `FDONE` set/clear law; and 6.12.1's `POS < IDL` in `P_TAIL` | `etx.sby:prove` | prove | abc pdr | unbounded | **proved** | 62 s |
+| SCHED-ETX | `loom_core`'s ETX write strobes: at most one high, only with a valid slot in W (the caller's half of 6.12.2, assumed by the ETX harness) | `sched.sby:prove` | prove | abc pdr | unbounded | **proved** | 44 s |
+| — | 10 cover points (start, load-edge accept, a refusal setting `REF`, the tail, a release, an underrun end, a pin write mid-frame, `PIN_OUT` back on the pad, a half-bit boundary at N = 3) and `tcover` (a frame of the case under test) | `etx.sby:cover`, `etx.sby:tcover` | cover | smtbmc yices | 40 / 8 | 9/9 (the two tail covers are one signal after `opt`), 1/1 | 39 s, 3 s |
 | **TIMER-1** | `reached` is monotone: once true it stays true until TD changes | `timer.sby:xfail` | bmc | smtbmc yices | 16 | **FAILS, step 4, all four threads** — finding F-1 | 1 s |
 | TIMER-1B | the only way `reached` falls with TD unchanged is `NOW - TD` going `0x7FFF -> 0x8000` | `timer.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** | 2 s |
 | TIMER-1C | `NOW` only ever advances by one | `timer.sby:prove` | prove | smtbmc yices (k-ind.) | 12 | **proved** | 2 s |
@@ -100,12 +114,12 @@ beside them, so they are upper bounds.
 | SPI-1 | bounded cross-check (one full byte plus margin) | `spi.sby:bmc` | bmc | smtbmc yices | 70 | pass | 19 s |
 | SPI-1 | same, without "the chip is not reset mid-transaction" | `spi.sby:xfail` | bmc | smtbmc yices | 80 | **FAILS, steps 63-76** — finding F-3 | 16 s |
 | — | 5 cover points, including two bytes in one transaction | `spi.sby:cover` | cover | smtbmc yices | 140 | 5/5 | 65 s |
-| **ISO-1** | two traces that agree on thread 0's inputs keep thread 0's whole architectural state identical, whatever the other three threads run (two-copy miter, no host debug traffic); since F-7 the state includes `MEM` and the held access, and thread 0's stores are compared | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 1 953 s |
-| ISO-1 | the same for threads 1, 2 and 3 (`-DISO_T=<n>` on the `read_slang` lines) | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 2 125 / 2 117 / 3 456 s |
-| ISO-1 | same, bounded cross-check | `iso.sby:bmc` | bmc | btor btormc | 24 | pass | 2 201 s |
+| **ISO-1** | two traces that agree on thread 0's inputs keep thread 0's whole architectural state identical, whatever the other three threads run (two-copy miter, no host debug traffic); since F-7 the state includes `MEM` and the held access, and thread 0's stores are compared | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 1 953 s; 5 496 s on 2026-11-08 with the serializer (120 assertions, D-036) |
+| ISO-1 | the same for threads 1, 2 and 3 (`-DISO_T=<n>` on the `read_slang` lines) | `iso.sby:prove` | prove | abc pdr | unbounded | **proved** | 2 125 / 2 117 / 3 456 s; with the serializer 8 086 / 6 544 / 7 001 s |
+| ISO-1 | same, bounded cross-check | `iso.sby:bmc` | bmc | btor btormc | 24 | pass | 2 201 s; 2 188 s with the serializer |
 | ISO-1 | same, with the host's whole debug traffic identical in the two traces | `iso.sby:dbg` | bmc | btor btormc | 16 | **FAILS, step 5** — finding F-4 | 23 s |
 | ISO-1 | same, with only the debug transactions addressed to thread 0 identical (the L4 wording taken literally) | `iso.sby:xfail` | bmc | btor btormc | 16 | **FAILS, step 5** — finding F-4 | 20 s |
-| — | 11 cover points: the other thread's PCs parted, it decodes a different word in the two copies, thread 0 advances / stalls / blocks on SFLAGS / fires a WAITS / commits a pin write / applies a deadline-latched write with the other thread diverged, both pipes full, and (F-7) thread 0 stores and loads with the other thread diverged; the same 11 for threads 1 to 3 | `iso.sby:cover` | cover | smtbmc yices | 20 | 11/11 | 73 s |
+| — | 11 cover points: the other thread's PCs parted, it decodes a different word in the two copies, thread 0 advances / stalls / blocks on SFLAGS / fires a WAITS / commits a pin write / applies a deadline-latched write with the other thread diverged, both pipes full, and (F-7) thread 0 stores and loads with the other thread diverged; the same 11 for threads 1 to 3 | `iso.sby:cover` | cover | smtbmc yices | 20 | 11/11; 13/13 with the serializer (12: thread T starts a frame, 13: it reads `ETX_STAT` mid-frame, the other thread diverged) | 73 s; 103 s |
 | WAIT-1A | a `WAITD` is `done` exactly when `reached(NOW, TD')`; a re-issue leaves `TD` where the first issue put it; a wait-class slot that stalls leaves `PC` alone | `wait.sby:prove` | prove | abc pdr (k-induction at 12 also closes it) | unbounded | **proved** | 11 s |
 | **WAIT-1** | a timed wait retires within `TD - NOW + 2` of the thread's slots, all four threads, at the reset tick period (`TICK_INT = 1`, `TICK_FRAC = 0`), for deadlines up to 8 ticks away | `wait.sby:bmc` | bmc | btor btormc | 40 | pass | 163 s |
 | WAIT-1 | the same bound with the tick period free | `wait.sby:xfail` | bmc | btor btormc | 40 | **FAILS, step 17, thread 1** — finding F-5 | 23 s |
@@ -116,6 +130,7 @@ it (the byte counter needs a deeper invariant than 20 cycles), which is why the
 group lists two engines and takes the first conclusive answer.
 
 **ISO-1 is proved, unbounded**, by `abc pdr`, for each of the four threads:
+since D-036 (2026-11-08) 120 assertions, the 21 new ones the serializer's views and state, with each copy carrying its own `loom_etx`; 1.5 to 2.3 h per thread, run four at once beside the rest of the set on a loaded laptop (upper bounds). Before that:
 99 assertions since F-7 (89 before, 35 minutes for thread 0) over a design
 of two `loom_core`s and two `loom_pins`, thread 0 in 33 min. The two
 assertions `pdr` closes last are the OUTQ head and next-entry comparisons,
@@ -416,12 +431,53 @@ the depth-24 cross-check and all 11 cover points pass. `iso.sby:prove`'s
 timeout is now 3 hours (it was 1). What slice B changes about the claim
 itself is under "What is outside the miter" below.
 
+## ETX: the Ethernet serializer (D-036, SEMANTICS 6.12.10)
+
+Added 2026-11-08 (W-120) for `src/loom_etx.v` at 2ef9be2. The properties
+are written from SEMANTICS 6.12 over what 6.12.1 calls observable: the pads
+`uo_out[1:0]`, `ETX_CFG` (`cfg_rd`), `ETX_STAT` (`stat_rd`), `pin_in(13)`
+and `pin_in(14)`, and `PIN_OUT[9:8]`.
+
+- **Harness.** `etx_top.v` (`loom_etx_fv`) wires `loom_etx` beside
+  `loom_pins` as `loom_top` does, plus a second `loom_pins` (`u_ref`) on the
+  same inputs with the block's four outputs held at 0, the reference for
+  ETX-5. The ETX write port, the three pin write ports and the pads are free.
+  The one assumption is 6.12.2's "at most one ETX write commits at any
+  edge", which SCHED-ETX proves of `loom_core`. `props/loom_etx_props.v`,
+  bound into `loom_etx`, holds ETX-3, ETX-4 and ETX-READ.
+- **Internal registers, and why.** No read tells `P_TAIL` from the bit
+  phases, the first half of a bit from the second, or where a word went, so:
+  ETX-1 and ETX-2(c) read `EPH` (`busy_r`, `eph`) for "in `P_TAIL`"; ETX-2
+  ties its own half-bit counter to `HB` and `DIV` (the induction needs it);
+  ETX-4 reads `HOLD`, `HV`, `HL`, `H1`, `SH` (`sh` and `txb`), `SL`, `S1`
+  to say the word was stored; ETX-3 counts from the RTL's own `start` /
+  `accept` (the one place 6.12.4's decision is made; a refused write does
+  not restart the count, the stronger reading) and its strengthening reads
+  `EPH`, `DIV`, `HB`, `POS`, `SL`, `S1`, `HV`, `HL`, `H1`. Three helper
+  invariants from the text sit with ETX-READ: `POS < IDL` in `P_TAIL`
+  (6.12.1), nothing held while idle or in the tail, no pending last word
+  while idle (6.12.5, "enter the tail", "release").
+- **ETX-3 as sixteen tasks.** The bound is a bounded response, made a
+  safety property by a 13-bit counter. Plain `abc pdr` proved every other
+  ETX assertion in about a minute and left ETX-3 open after 15 minutes. The
+  `term` group adds the remaining time to the release, computed from the
+  6.12.1 state by 6.12.5: T1, it falls by exactly one every busy cycle
+  without a start or accept and is 1 before the release; T2, count +
+  remaining <= bound; T3, the shape facts it needs. That closes by
+  k-induction in seconds once N is a constant, and not at all with N free
+  (the products `N * x`; boolector, bitwuzla, suprove and pdr were tried).
+  So `t<h>` checks every frame sent with `HALFN = h`; nothing is assumed
+  about the other frames, so `t0` .. `t15` together cover all of them.
+  The `term` tasks free the CRC, `SH`, `HOLD` and `TXB` every cycle
+  (`cutpoint`), an over-approximation: 6.12.5 decides timing from none of
+  them. `tcover` shows the guarded case is reachable.
+
 ## ISO-1: what the miter assumes
 
 ISO-1 is the one L4 property that is a relation between two traces, so it is
 the one harness that is not a property module bound into a single design.
 `formal/iso_miter.v` instantiates two `loom_core`s (A and B), each with its
-own `loom_pins`, on one clock and one reset, and asserts that thread `t`'s
+own `loom_pins` and (since D-036) its own `loom_etx`, on one clock and one reset, and asserts that thread `t`'s
 architectural state is the same in both at every cycle. `t` is `ISO_T`,
 0 by default; re-run the group for another thread with
 `-DISO_T=<n>` on the `read_slang` line. `props/loom_iso_props.v` holds
@@ -456,7 +512,10 @@ sentence that puts the duty on the other side.
    or deadline-latched, 6.10), `OEP`, `OUT`, `SHO` (6.9, which drives a pin,
    and a second one with `DIFF`), `SIG`, `CLR`, `WAITS` (a test-and-clear,
    6.5) and `CSRW` of `SFLAGS` / `PIN_OUT` / `PIN_OE` / `OD_MASK` /
-   `HOST_IRQ` (6.6). This is the "except through explicit shared state" of
+   `HOST_IRQ` (6.6), and since D-036 `CSRW` of any `ETX_*` CSR (SEMANTICS
+   6.12.7: "ISO-1's precondition gains 'no other thread writes `ETX_*`'";
+   reads of the ETX CSRs and of `pin_in(13/14)` stay free). This is the
+   "except through explicit shared state" of
    ARCHITECTURE 1 and of SEMANTICS 2's shared state visibility rule, and it
    is what makes the property say something: a thread that writes `SFLAGS` or
    a pin is *meant* to be visible to the others. Nothing constrains thread
@@ -497,7 +556,9 @@ file's storage, plus the write port as it reaches `t`; `NOW`, `TD`, `DT`,
 6.9.1 encoder state; `LAT_VALID`/`LAT_PIN`/`LAT_VAL`; `INQ_CNT`, `OUTQ_CNT`
 and the FIFO head words; `SFLAGS` whole; thread `t`'s pin-write commit
 (masks and data, ordinary and staged), the three shared pin registers and
-the three pad buses; thread `t`'s retire record; and, to localise a failure
+the three pad buses; the serializer's views (`ETX_CFG`, `ETX_STAT`, `RDY`,
+`BUSY`, the pad pair) and its 6.12.1 state, thread `t` being its owner
+(D-036); thread `t`'s retire record; and, to localise a failure
 early, `t`'s own D, X and W pipeline registers. The slot grid (`ph`) is
 asserted against SEMANTICS 1 in both copies.
 
@@ -558,6 +619,7 @@ under that guard, and the unguarded version fails:
 | `spi.sby`, `props/loom_spi_props.v` | SPI-1 on `loom_spi_host` |
 | `iso.sby`, `iso_miter.v`, `props/loom_iso_props.v` | ISO-1, the two-copy thread-isolation miter: two `loom_core` and two `loom_pins` |
 | `wait.sby`, `props/loom_wait_props.v` | WAIT-1 (bounded liveness of a timed wait) and WAIT-1A (the completion rule of SEMANTICS 6.4) on `loom_core` |
+| `etx.sby`, `etx_top.v`, `props/loom_etx_props.v` | ETX-1..5 and ETX-READ, the Ethernet serializer (SEMANTICS 6.12) beside `loom_pins` |
 
 The two ISA property files are generated. Everything else is hand-written from
 `docs/SEMANTICS.md`; each property carries the sentence it encodes in a comment
@@ -574,6 +636,7 @@ above it, and the RTL was read only for signal names.
 | `timer` | `loom_timer` | everything: any sequence of TD, DT, TICK_INT and TICK_FRAC writes |
 | `spi` | `loom_spi_host` | the three pads, minus the HOST_PROTOCOL electrical rules (SCK period >= 8 clocks, CPOL 0, `CS_n` low 4 clocks before the first edge and 4 after the last) |
 | `isa` | `loom_decode` | `ir`: all 2^16 words |
+| `etx` | `loom_etx_fv` (`loom_etx` + two `loom_pins`); `loom_etx` alone for `t0`..`t15` | the ETX write port minus "one ETX write per edge" (6.12.2, discharged by SCHED-ETX), the pin write ports, the pads |
 | `iso` | `loom_iso_miter` (two `loom_core` + two `loom_pins`, `IMEM_WORDS = 512`, `FIFO_DEPTH = 4`) | `imem_rdata` and the whole host port, per copy and independently, minus what the ISO-1 hypothesis ties together and the assumptions listed below |
 
 `loom_fifo` is proved at `DEPTH = 4`, the build parameter of `loom_top`; the

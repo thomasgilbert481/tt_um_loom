@@ -49,6 +49,9 @@ from typing import Dict, List, Sequence, Tuple
 
 import cosim_coverage
 from cosim_coverage import Coverage, pin_class
+from cosim_coverage_etx import UNREACHABLE as ETX_UNREACHABLE
+from cosim_coverage_etx import EtxCoverage
+from cosim_coverage_etx import bins as etx_bins
 from tools.loomgen import (M2_CSR_NAMES, M2_MNEMONICS, WAITB_BE_IDLE,
                            WAITB_INQ_NE, WAITB_OUTQ_NF, WAITB_TICK,
                            instruction_built)
@@ -66,7 +69,7 @@ BE_CFG_M2_MASK = BE_CFG_DIR | BE_CFG_INV | BE_CFG_CRC_EN
 BE_CFG_ENC_SHIFT, BE_CFG_STUFF_SHIFT, BE_CFG_DIFF = 3, 5, 1 << 10
 
 M2_GROUPS = ("m2_fifo", "m2_be", "m2_csr", "m2_setpd", "m2_irq", "m2_host",
-             "m3a_be", "m3b_mem")
+             "m3a_be", "m3b_mem", "etx")
 
 IRQ_CAUSES = ("SWIRQ", "SFLAGS", "INQ_NOT_FULL", "OUTQ_NOT_EMPTY", "HALTED")
 PIN_CLASSES = ("bidir", "bidir_od", "out", "readonly", "reserved")
@@ -112,6 +115,11 @@ class M2Coverage(Coverage):
             group, bin_name = name
             self.bins[group][bin_name] = 0
         self.be_csr_numbers = {isa.csr_by_name[n]: n for n in M2_CSR_NAMES}
+        # D-036 (SEMANTICS 6.12.9): the serializer's bins, fed per cycle by
+        # the harness through self.etx (test/cosim_coverage_etx.py).
+        self.etx = EtxCoverage(isa, self.hit)
+        for name, why in ETX_UNREACHABLE.items():
+            cosim_coverage.UNREACHABLE.setdefault(name, why)
         self.builds = set()
         # "BE idle" is true whenever the bit engine is built (auto mode is
         # M3) and the instruction is NOP + BADOP when it is not, so the wait
@@ -138,12 +146,13 @@ class M2Coverage(Coverage):
         # The slice-A bins exist only in a build with the encoders (CAPS[9]),
         # the slice-B bins only with the data memory (CAPS[5]).
         for group, feature, why in (("m3a_be", "BEENC", "slice A (the encoders) is not built: CAPS[9] = 0"),
-                                    ("m3b_mem", "DMEM", "slice B (LD/ST) is not built: CAPS[5] = 0")):
+                                    ("m3b_mem", "DMEM", "slice B (LD/ST) is not built: CAPS[5] = 0"),
+                                    ("etx", "ETX", "the serializer is not built: CAPS[10] = 0")):
             present = any(feature in f for f, _ in self.builds)
             for g, bin_name in _m2_bins():
                 if g != group:
                     continue
-                if present:
+                if present and bin_name not in ETX_UNREACHABLE:
                     cosim_coverage.UNREACHABLE.pop(bin_name, None)
                 else:
                     cosim_coverage.UNREACHABLE.setdefault(bin_name, why)
@@ -178,6 +187,11 @@ class M2Coverage(Coverage):
                 self.slots += 1
                 self.hit("mnemonic", "%s@t%d" % (name, record.thread))
                 self._note_be_csr(name, fields, ctx)
+                return
+            if name in ("CSRR", "CSRW") and "ETX" in ctx.features                     and fields["csr"] in self.etx.csr_names:
+                # Built CSRs of the serializer; the etx group has their bins.
+                self.slots += 1
+                self.hit("mnemonic", "%s@t%d" % (name, record.thread))
                 return
             if name == "SETP" and fields["lat"] and "SETPD" in ctx.features:
                 self._note_setp_d(fields, record, ctx)
@@ -302,6 +316,12 @@ class M2Coverage(Coverage):
                         if name in cosim_coverage.UNREACHABLE else "  <-- EMPTY"
                 lines.append("      %-34s %9d%s" % (name, count, note))
             lines.append("")
+        if self.etx.mismatch_count:
+            lines.append("  ETX tracker disagreements with both implementations: %d "
+                         "(first ones; a person decides them by SEMANTICS 6.12):"
+                         % self.etx.mismatch_count)
+            lines += ["      " + m for m in self.etx.mismatches[:20]]
+            lines.append("")
         empty = self.holes()
         lines.append("  empty bins at the end of the run: %d%s" % (
             len(empty), "" if not empty else ":"))
@@ -316,6 +336,8 @@ class M2Coverage(Coverage):
                          for f, d in sorted(self.builds)]
         obj["unreachable"] = dict(cosim_coverage.UNREACHABLE)
         obj["holes"] = ["%s/%s" % h for h in self.holes()]
+        obj["etx_mismatches"] = {"count": self.etx.mismatch_count,
+                                 "first": list(self.etx.mismatches)}
         return obj
 
 
@@ -368,6 +390,7 @@ def _m2_bins() -> List[Tuple[str, str]]:
         "fired:ordinary_write_wins")
     add("m2_setpd", *["staged:%s" % c for c in PIN_CLASSES])
     add("m2_setpd", *["fired:%s" % c for c in PIN_CLASSES])
+    add("etx", *etx_bins())
     add("m2_irq", "HOST_IRQ:rise", "HOST_IRQ:clear")
     add("m2_irq", *["cause:%s" % c for c in IRQ_CAUSES])
     add("m2_host", "BADOP14:host_push_full", "BADOP14:host_read_empty",

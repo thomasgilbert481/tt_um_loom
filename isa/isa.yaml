@@ -1,4 +1,6 @@
-# Loom ISA, single source of truth. Frozen as 1.0 at milestone M1.
+# Loom ISA, single source of truth. The version is meta.version below. It was
+# planned to freeze as 1.0 at milestone M1 and did not: 0.4.0 carries the M2
+# encodings, 0.5.0 adds the Ethernet serializer's CSRs and status pins (D-036).
 #
 # tools/loomisa is the only code that parses this file. Python tools (assembler,
 # golden model, tests) call loomisa.load()/encode()/decode() at run time and
@@ -13,7 +15,7 @@
 
 meta:
   name: loom
-  version: "0.4.0"
+  version: "0.5.0"
   word_bits: 16
   registers: 8
   register_bits: 16
@@ -164,9 +166,15 @@ csrs:
   0x13: {name: PIN_IN,    rw: R,  bits: 16, doc: synchronised inputs}
   0x14: {name: SFLAGS,    rw: RW, bits: 8,  doc: shared flags; write sets}
   0x15: {name: HOST_IRQ,  rw: W,  bits: 1,  doc: pulse HOST_IRQ}
+  0x16: {name: ETX_CFG,   rw: RW, bits: 10, doc: "ETX (Ethernet serializer, SEMANTICS 6.12) config {IDL[9:6], FCS[5], PRE[4], HALFN[3:0]}; reset 0x01B1; written only while idle"}
+  0x17: {name: ETX_DATA,  rw: W,  bits: 16, doc: "ETX: next frame word, low byte first; starts a frame when idle"}
+  0x18: {name: ETX_LAST,  rw: W,  bits: 16, doc: "ETX: last frame word, both bytes"}
+  0x19: {name: ETX_LAST1, rw: W,  bits: 16, doc: "ETX: last frame word, low byte only"}
+  0x1A: {name: ETX_STAT,  rw: RW, bits: 5,  doc: "ETX: {REF, UNDER, FDONE, RDY, BUSY}; write 1 to clear bits 4:2; reset 0x0002"}
 
 pins:
-  # index: name, direction (from the chip's point of view), TT pad
+  # index: name, direction (from the chip's point of view: in, out, bidir, or
+  # status for a read-only internal signal with no pad, D-036), TT pad
   0:  {name: BIDIR0, dir: bidir, pad: "uio[0]"}
   1:  {name: BIDIR1, dir: bidir, pad: "uio[1]"}
   2:  {name: BIDIR2, dir: bidir, pad: "uio[2]"}
@@ -180,6 +188,8 @@ pins:
   10: {name: IN2,    dir: in,    pad: "ui[2]"}
   11: {name: IN3,    dir: in,    pad: "ui[3]"}
   12: {name: IN4,    dir: in,    pad: "ui[7]"}   # ui[4..6] are the host SPI pins
+  13: {name: ETX_RDY,  dir: status, pad: "none (Ethernet serializer status, SEMANTICS 6.12)"}
+  14: {name: ETX_BUSY, dir: status, pad: "none (Ethernet serializer status, SEMANTICS 6.12)"}
   16: {name: OUT0,   dir: out,   pad: "uo[0]"}
   17: {name: OUT1,   dir: out,   pad: "uo[1]"}
   18: {name: OUT2,   dir: out,   pad: "uo[2]"}

@@ -20,11 +20,12 @@ from tools.loomisa import load
 ISA = load()
 IMEM_WORDS = 512    # the SRAM macro (D-020); test_flops.py covers the 256-word flops
 FIFO_DEPTH = 4
-VERSION = 0x0004    # M3 slice B: LD/ST on the instruction memory (6.11); slice A was 3
+VERSION = 0x0005    # the Ethernet serializer (6.12, D-036); slice B (6.11) was 4
 #: What this build reports: log2(IMEM_WORDS) = 9 in [15:12], the slice-A
 #: encoders [9], data memory [5] (slice B), FIFOs with depth 4 (log2 = 2),
-#: the bit engine in manual mode and the deadline-latched SETP.
-EXPECT_CAPS = 0x9000 | 0x200 | 0x80 | 0x20 | 0x10 | 0x08 | 0x02
+#: the bit engine in manual mode, the deadline-latched SETP and the Ethernet
+#: serializer [10] (6.12): 0x96BA.
+EXPECT_CAPS = 0x9000 | 0x400 | 0x200 | 0x80 | 0x20 | 0x10 | 0x08 | 0x02
 
 
 @cocotb.test()
@@ -34,12 +35,13 @@ async def test_id_version_caps(dut):
     await host.start()
     assert await host.read1(SP_CTRL, CTRL_ID) == 0x4C4D
     assert await host.read1(SP_CTRL, CTRL_VERSION) == VERSION
-    # CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11:10] zero,
-    # [9] slice-A encoders, [8] BE auto mode, [7] deadline-latched SETP,
+    # CAPS (docs/SEMANTICS.md 5): [15:12] log2(IMEM_WORDS), [11] zero,
+    # [10] Ethernet serializer, [9] slice-A encoders, [8] BE auto mode, [7] deadline-latched SETP,
     # [6] ROM, [5] DMEM, [4] BE manual mode, [3] FIFO, [2:0] log2(FIFO_DEPTH).
     caps = await host.read1(SP_CTRL, CTRL_CAPS)
     assert caps >> 12 == IMEM_WORDS.bit_length() - 1, f"CAPS {caps:#06x}"
-    assert (caps >> 10) & 0x3 == 0, "CAPS bits 11:10 are reserved"
+    assert (caps >> 11) & 0x1 == 0, "CAPS bit 11 is reserved"
+    assert caps & 0x400, "the Ethernet serializer (6.12) must report present"
     assert caps & 0x200, "slice A (encoders, stuffing, DIFF) must report present"
     assert caps & 0x100 == 0, "no bit-engine auto mode before M3"
     assert caps & 0x40 == 0, "no boot ROM"

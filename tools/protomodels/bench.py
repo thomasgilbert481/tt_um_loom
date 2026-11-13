@@ -222,7 +222,7 @@ class Bench:
             for model in models:
                 model.drive(d, cycle)
             pin_out = m.pin_out
-            uo = (pin_out >> 8) & 0x3F
+            uo = m.uo_out          # PIN_OUT[13:8], or the ETX mux (SEMANTICS 6.12.7)
             uio_out = pin_out & 0xFF
             oe = m.pin_oe & 0xFF
             ui = (self.ui_idle & ~d.ui_mask) | (d.ui_val & d.ui_mask)

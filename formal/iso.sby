@@ -55,11 +55,11 @@ plugin -i slang
 # ISO_T selects the thread under test; ISO_DBG_FREE says what the host's
 # debug port may do (0 nothing, 1 free per copy, 2 the same in both), see
 # the header of formal/iso_miter.v.
-bmc:   read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
-prove: read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
-cover: read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
-dbg:   read_slang --top loom_iso_miter -DISO_T=0 -DISO_DBG_FREE=2 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
-xfail: read_slang --top loom_iso_miter -DISO_T=0 -DISO_DBG_FREE=1 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v iso_miter.v loom_iso_props.v
+bmc:   read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v loom_etx.v iso_miter.v loom_iso_props.v
+prove: read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v loom_etx.v iso_miter.v loom_iso_props.v
+cover: read_slang --top loom_iso_miter -DISO_T=0 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v loom_etx.v iso_miter.v loom_iso_props.v
+dbg:   read_slang --top loom_iso_miter -DISO_T=0 -DISO_DBG_FREE=2 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v loom_etx.v iso_miter.v loom_iso_props.v
+xfail: read_slang --top loom_iso_miter -DISO_T=0 -DISO_DBG_FREE=1 loom_core.v loom_decode.v loom_regfile.v loom_alu.v loom_be.v loom_timer.v loom_fifo.v loom_pins.v loom_sync.v loom_etx.v iso_miter.v loom_iso_props.v
 prep -top loom_iso_miter
 # As in sched.sby: `abc pdr` exports AIGER, which refuses x or z constants,
 # and the undefined initial contents of the register file and of the FIFO
@@ -80,5 +80,6 @@ setundef -undriven -anyseq
 ../src/loom_fifo.v
 ../src/loom_pins.v
 ../src/loom_sync.v
+../src/loom_etx.v
 iso_miter.v
 props/loom_iso_props.v
