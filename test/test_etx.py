@@ -490,6 +490,60 @@ class ChipMon:
         self.task.cancel()
 
 
+class PadMon(ChipMon):
+    """The pads-only monitor for a netlist, which has no retire record:
+    every cycle (sampled mid-cycle) uo_out alone, so rows[c][0] is uo_out
+    in cycle c as in ChipMon."""
+
+    def __init__(self, dut):
+        self.dut, self.rows, self.sig = dut, [], ()
+
+
+def chip_mon(dut):
+    """ChipMon on the RTL, PadMon on a netlist."""
+    return (PadMon if gl(dut) else ChipMon)(dut).start()
+
+
+def pad_trace(mon):
+    """(uo_out[0], uo_out[1]) in every recorded cycle."""
+    return [(r[0] & 1, (r[0] >> 1) & 1) for r in mon.rows]
+
+
+def pad_frame(mon, idle=(0, 0)):
+    """Find the frame on the pads alone: its start is the first cycle the
+    pads leave `idle` = (0, 0), PIN_OUT[9:8] before the frame (a frame's
+    first half bit always differs from it, 6.12.7: TD+ != TD-). While BUSY
+    the pads are never (0, 0) (complementary, or (1, 0) in P_TAIL), so with
+    PIN_OUT[9:8] still (0, 0) the release is the first cycle from there in
+    which they are back at (0, 0); None if they never are. Returns (s, rel,
+    pads)."""
+    assert idle == (0, 0)
+    pads = pad_trace(mon)
+    s = next((c for c, p in enumerate(pads) if p != idle), None)
+    assert s is not None, f"no frame on uo_out[1:0]: pads stay at {idle}"
+    rel = next((c for c in range(s, len(pads)) if pads[c] == idle), None)
+    return s, rel, pads
+
+
+def check_pad_frame(pads, s, expect, after=(0, 0)):
+    """The pads from cycle s are exactly `expect` (Manchester and the
+    tail), then `after` (PIN_OUT[9:8]) in every cycle to the end of the
+    record, from the cycle after the release on."""
+    end = s + len(expect)
+    assert pads[s:end] == expect, \
+        f"pad trace from cycle {s} differs from manchester(frame_bits) + tail"
+    assert len(pads) > end, "record ends before the cycle after the release"
+    bad = [c for c in range(end, len(pads)) if pads[c] != after]
+    assert not bad, f"pads not {after} after the release, cycle {bad[0]}"
+
+
+async def fw_etx_stat(host):
+    """ETX_STAT as firmware reads it now: CSRR into r1 of thread 0, read
+    back through the host port (works on a netlist)."""
+    await run_snippet(host, [asm("CSRR", rd=1, csr=ETX_STAT)])
+    return await host.read_reg(0, 1)
+
+
 def replay(mon, decode, pin_pair=(0, 0)):
     """Rebuild the ETX write stream from the retire record (`decode` maps an
     instruction word to (kind, value), ('PIN', (bit, v)) or None), run the
@@ -622,9 +676,19 @@ async def test_etx_chip_frame_from_firmware(dut):
     1..3 read ETX_STAT, IN 13..14 and JP 14 in every other cycle (C10: the
     cycles of the start and of the release are among them). The pads are
     compared with the transcription in every cycle and decode to
-    '123456789' with the zlib FCS."""
-    if skip_gl(dut):
-        return
+    '123456789' with the zlib FCS.
+
+    On both backends, from the pads alone: the frame starts in the first
+    cycle uo_out[1:0] leaves PIN_OUT[9:8] = (0, 0), the trace from there is
+    manchester(frame_bits(C1), 2) and 12 clocks of (1, 0), then (0, 0) to
+    the end; the readers' last values are ETX_STAT 0x06 (threads 1 and 3)
+    and IN 13..14 = 0b01 (thread 2), and a firmware CSRR after the run reads
+    ETX_STAT 0x06 (FDONE, RDY; no UNDER, no REF). On the RTL also: the
+    retire-record replay, the pad start equal to the commit of the first
+    data CSRW, and C10. C10 (that the start and release cycles are among
+    the readers' X cycles, and each read's value in its X cycle) cannot be
+    judged from the pads: it needs the retire record, which a netlist does
+    not have."""
     host = await chip(dut)
     regs0 = {0: cfg_word(pre=0)}
     regs0.update({i + 1: w for i, w in enumerate(C1_WORDS)})
@@ -636,17 +700,28 @@ async def test_etx_chip_frame_from_firmware(dut):
               asm("CSRW", csr=ETX_LAST1, ra=5),
               asm("WAITP", pin=14, val=0), asm("HALT")]
     readers, extra = reader_threads()
-    mon = ChipMon(dut).start()
+    mon = chip_mon(dut)
     await run_threads(host, {0: feeder, **readers}, regs={0: regs0},
                       csrs={2: {CSR_INGRP: (2 << 5) | 13}})
     await finish(host, mon)
+    bits, _ = frame_bits(C1_WORDS, True, 0, 1)
+    expect = manchester(bits, 2) + [(1, 0)] * 12
+    ps, prel, pads = pad_frame(mon)
+    check_pad_frame(pads, ps, expect)
+    assert prel == ps + len(expect)
+    dut._log.info(f"pads: frame from monitor cycle {ps}, release {prel}")
+    assert [await host.read_reg(t, n) for t, n in ((1, 1), (2, 2), (3, 1))] \
+        == [0x06, 0b01, 0x06], "readers' last ETX_STAT / IN 13..14"
+    assert await fw_etx_stat(host) == 0x06, "FDONE, RDY; no UNDER, no REF"
+    if gl(dut):
+        return
     states, writes, reads = replay(mon, decoder({0: regs0}, extra))
     s = min(c for c, w in writes.items() if w[0] != "CFG")
     xs = {x for x, *_ in reads}
     rel = next(c for c in range(s, len(states)) if not states[c][0])
     assert {s - 1, s, s + 1, rel - 1, rel} <= xs, "C10 cycles not all read"
+    assert (ps, prel) == (s, rel), "pads-only frame start/release"
     tr = [((r[0] & 1), (r[0] >> 1) & 1) for r in mon.rows[s:rel]]
-    bits, _ = frame_bits(C1_WORDS, True, 0, 1)
     assert tr == manchester(bits, 2) + [(1, 0)] * 12
     assert states[rel][2] & 0x1C == 0x04, "FDONE, no UNDER, no REF"
 
@@ -655,32 +730,60 @@ async def test_etx_chip_frame_from_firmware(dut):
 async def test_etx_chip_feeder_stops(dut):
     """C9: a feeder that HALTs after its first word, and one that is halted
     and given CTRL.RESET by the host mid-frame: each frame ends by itself
-    by underrun (UNDER, FDONE), and the pads return to PIN_OUT."""
-    if skip_gl(dut):
-        return
+    by underrun (UNDER, FDONE), and the pads return to PIN_OUT.
+
+    On both backends, from the pads alone (reset ETX_CFG: PRE = 1, FCS = 1,
+    N = 2, IDL = 6): the frame starts in the first cycle uo_out[1:0] leaves
+    (0, 0); an underrun frame of k words is 128 N clocks of preamble and
+    SFD, 32 N per word, then N IDL of (1, 0), so k follows from the release
+    cycle, and the trace must equal manchester(frame_bits(k words, no FCS))
+    and the tail, then (0, 0) to the end; k is 1 for the first feeder and
+    more than 10 for the second (the RTL's count of ETX_DATA commits). A
+    firmware CSRR after each frame reads ETX_STAT 0x0C (UNDER, FDONE). On
+    the RTL also the retire-record replay in every cycle."""
     host = await chip(dut)
+    n, idl = 2, 6
+
+    def underrun_frame(mon, word, min_words):
+        s, rel, pads = pad_frame(mon)
+        assert rel is not None, f"the frame from cycle {s} never released"
+        k, r = divmod(rel - s - n * (128 + idl), 32 * n)
+        assert r == 0 and k >= min_words, f"busy {rel - s} clocks: not k words"
+        bits, _ = frame_bits([word] * k, False, 1, 0)
+        check_pad_frame(pads, s, manchester(bits, n) + [(1, 0)] * (n * idl))
+        dut._log.info(f"pads: {k}-word underrun frame, cycles {s}..{rel}")
+        return k
+
     regs0 = {1: 0x1234}
-    mon = ChipMon(dut).start()
+    mon = chip_mon(dut)
     await run_threads(host, {0: [asm("CSRW", csr=ETX_DATA, ra=1), asm("HALT")]},
                       regs={0: regs0})
     await finish(host, mon, cycles=2 * 2 * (64 + 16 + 16) + 100)
-    states, writes, _ = replay(mon, decoder({0: regs0}))
-    assert len(writes) == 1 and states[-1][2] == 0x0C       # UNDER, FDONE
-    assert mon.rows[-1][0] & 3 == 0
+    assert underrun_frame(mon, 0x1234, 1) == 1
+    assert await fw_etx_stat(host) == 0x0C, "UNDER, FDONE"
+    if not gl(dut):
+        states, writes, _ = replay(mon, decoder({0: regs0}))
+        assert len(writes) == 1 and states[-1][2] == 0x0C   # UNDER, FDONE
+        assert mon.rows[-1][0] & 3 == 0
     # A looping feeder, halted and reset by the host after about 1,000 cycles.
     host = await chip(dut)
     regs0 = {1: 0xA55A}
     rdy = asm("WAITP", pin=13, val=1)
     loop = [asm("CSRW", csr=ETX_DATA, ra=1), rdy,
             asm("CSRW", csr=ETX_DATA, ra=1), asm("JMP", abs=1)]
-    mon = ChipMon(dut).start()
+    mon = chip_mon(dut)
     await run_threads(host, {0: loop}, regs={0: regs0})
     await ClockCycles(dut.clk, 1000)
     await host.halt()
     await host.reset_thread(0)
     await ClockCycles(dut.clk, 2 * 2 * 32 + 200)
     mon.stop()
+    k = underrun_frame(mon, 0xA55A, 11)
+    assert await fw_etx_stat(host) == 0x0C, "UNDER, FDONE"
+    if gl(dut):
+        return
     states, writes, _ = replay(mon, decoder({0: regs0}))
+    assert len(writes) == k, "every ETX_DATA commit is a word on the pads"
     assert len(writes) > 10 and states[-1][2] == 0x0C
     assert not states[-1][0] and mon.rows[-1][0] & 3 == 0
 
@@ -690,9 +793,17 @@ async def test_etx_chip_pin_writes_during_frame(dut):
     """C11: SETP 16, SETP 17 and OUT to 16..17 during a frame commit to
     PIN_OUT, are not seen on the pads while BUSY, and are seen from the
     cycle after the release; pin_in(16/17) and PIN_OUT keep the register
-    value throughout."""
-    if skip_gl(dut):
-        return
+    value throughout.
+
+    On both backends, from the pads alone: the frame starts in the first
+    cycle uo_out[1:0] leaves (0, 0) (PIN_OUT[9:8] before the pin writes,
+    which wait for BUSY), the trace from there is exactly
+    manchester(frame_bits(C1), 2) and 12 clocks of (1, 0), so none of the
+    three pin writes reaches a pad while BUSY, and from the cycle after the
+    release to the end the pads are (0, 1), the final PIN_OUT[9:8]; the
+    IN reads, CTRL_PIN_OUT and a firmware CSRR of ETX_STAT (0x06) go
+    through the host port. On the RTL also the replay, which places each
+    pin write at its commit cycle."""
     host = await chip(dut)
     regs0 = {0: cfg_word(pre=0)}
     regs0.update({i + 1: w for i, w in enumerate(C1_WORDS)})
@@ -709,7 +820,7 @@ async def test_etx_chip_pin_writes_during_frame(dut):
               asm("HALT")]
     extra = {(1, s16): ("PIN", [(0, 1)]), (1, s17): ("PIN", [(1, 1)]),
              (1, out): ("PIN", [(0, 0), (1, 1)])}
-    mon = ChipMon(dut).start()
+    mon = chip_mon(dut)
     await run_threads(host, {0: feeder, 1: pinner},
                       regs={0: regs0, 1: {3: 0b10}},
                       csrs={1: {CSR_OUTGRP: (2 << 5) | 16,
@@ -717,10 +828,20 @@ async def test_etx_chip_pin_writes_during_frame(dut):
     await host.wait_halted(0b11)
     await ClockCycles(dut.clk, 20)
     mon.stop()
-    states, writes, _ = replay(mon, decoder({0: regs0}, extra))
+    bits, _ = frame_bits(C1_WORDS, True, 0, 1)
+    expect = manchester(bits, 2) + [(1, 0)] * 12
+    ps, _, pads = pad_frame(mon)                 # PIN_OUT[9:8] ends (0, 1)
+    check_pad_frame(pads, ps, expect, after=(0, 1))
+    dut._log.info(f"pads: frame from monitor cycle {ps}, "
+                  f"release {ps + len(expect)}")
+    if not gl(dut):
+        states, writes, _ = replay(mon, decoder({0: regs0}, extra))
+        s = min(c for c, w in writes.items() if w[0] != "CFG")
+        assert ps == s, "pads-only frame start"
     assert [await host.read_reg(1, n) for n in (4, 5, 6)] == [0b11, 0b10, 0b10]
     assert mon.rows[-1][0] & 3 == 0b10, "PIN_OUT[9:8] = (0, 1) after release"
     assert (await host.read1(SP_CTRL, CTRL_PIN_OUT) >> 8) & 3 == 0b10
+    assert await fw_etx_stat(host) == 0x06, "FDONE, RDY; no UNDER, no REF"
 
 
 @cocotb.test()
