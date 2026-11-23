@@ -5,6 +5,8 @@
 
 Exit status: 0 when the image was produced, 1 when assembly failed (or, with
 ``--strict``, when the deadline check found an infeasible schedule).
+``--staged-edges`` adds warnings for staged ``SETP ... D`` edges that can land
+late; they never fail ``--strict`` (W-124).
 
 ``--pin SCL=BIDIR2`` moves a pin the source's ``.pins`` names, for example
 to put a program on a Tiny Tapeout Pmod's pins without editing it
@@ -49,6 +51,12 @@ def main(argv=None) -> int:
                         help="the deadline rule from before tools finding "
                              "T-1: take each SETD to run on its tick. "
                              "Optimistic; for comparison only")
+    parser.add_argument("--staged-edges", action="store_true",
+                        help="also warn when a staged SETP ... D edge can land "
+                             "after its tick: a pair into the WAITD after it "
+                             "with slack under 5 clocks (SEMANTICS 6.10 rule "
+                             "2). A warning even with --strict, because "
+                             "shipped firmware trips it (W-124)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="print errors only, not warnings")
     parser.add_argument("--pin", action="append", default=[], metavar="NAME=PIN",
@@ -69,7 +77,7 @@ def main(argv=None) -> int:
                                 deadline_check=not args.no_deadline_check,
                                 imem_words=args.imem_words,
                                 sound_setd=not args.optimistic_setd,
-                                pins=pins)
+                                pins=pins, staged_check=args.staged_edges)
     except AsmError as exc:
         _report(exc.diagnostics, sys.stderr)
         return 1

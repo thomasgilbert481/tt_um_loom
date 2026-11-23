@@ -58,6 +58,26 @@ REL_BRANCHES = frozenset({"BZ", "BNZ", "BC", "BNC", "BT", "BNT", "DJNZ", "JP"})
 
 UNBOUNDED = math.inf
 
+#: Clocks from a slot's X cycle to its commit edge (SEMANTICS 2: X is cycle
+#: ``k + 2``, every effect is registered at edge ``k + 4``).
+COMMIT_CLOCKS = 2
+
+
+def staged_exact_slack(slot_clocks: int = SLOT_CLOCKS) -> int:
+    """The least slack, in clocks, at which a staged edge is always exact.
+
+    SEMANTICS 6.10: a ``SETP ... D`` write lands on the tick at which ``NOW``
+    reaches the new ``TD`` (rule 1) only if the ``WAITD`` that sets that
+    ``TD`` has committed by then; when its first issue (X cycle ``x``)
+    commits at ``x + 2`` after the tick, rule 2 lands the write at ``x + 2``
+    instead. A pair with slack ``s`` lets that first issue come as late as
+    ``slot_clocks - 1 - s`` clocks after the tick (the slot-grid grace the
+    deadline check allows, SEMANTICS 2), so the edge can be up to
+    ``slot_clocks - 1 + COMMIT_CLOCKS - s`` clocks late: 5 - s with 4-clock
+    slots, and exact only from s = 5.
+    """
+    return slot_clocks - 1 + COMMIT_CLOCKS
+
 
 @dataclasses.dataclass(frozen=True)
 class Node:
@@ -120,6 +140,14 @@ class DeadlinePair:
     #: set the ``NOW`` it reads (T-1); None for a ``WAITD`` anchor, whose
     #: three clocks are the grace of the slot grid and cancel out.
     src_phase: Optional[int] = None
+    #: The longest path, in slots, among the paths of this pair that pass a
+    #: staged ``SETP ... D`` (whose write lands at this target, SEMANTICS
+    #: 6.10); None when no path does. See :data:`STAGED_EXACT_SLACK`.
+    staged_slots: Optional[float] = None
+    #: Address and source line of that ``SETP ... D`` (the one on the longest
+    #: such path).
+    staged_addr: Optional[int] = None
+    staged_line: Optional[int] = None
 
     @property
     def unbounded(self) -> bool:
@@ -163,6 +191,29 @@ class DeadlinePair:
         slack = self.slack
         return None if slack is None else slack >= 0
 
+    @property
+    def staged(self) -> bool:
+        """True when a staged ``SETP ... D`` on some path lands at the target."""
+        return self.staged_slots is not None
+
+    @property
+    def staged_slack(self) -> Optional[int]:
+        """The slack of the longest path through the staged ``SETP ... D``."""
+        if (not self.staged or self.limit is None
+                or self.staged_slots == UNBOUNDED):
+            return None
+        return self.limit - int(self.staged_slots) * self.slot_clocks
+
+    @property
+    def staged_late(self) -> Optional[int]:
+        """The most clocks the staged edge can land after its tick: 0 when it
+        is exact, None when it cannot be decided (or there is no staged write,
+        or the deadline itself is missed, which is reported as such)."""
+        slack = self.staged_slack
+        if slack is None or slack < 0:
+            return None
+        return max(0, staged_exact_slack(self.slot_clocks) - slack)
+
 
 @dataclasses.dataclass(frozen=True)
 class Declaration:
@@ -187,6 +238,14 @@ class ThreadDeadlines:
     pairs: List[DeadlinePair] = dataclasses.field(default_factory=list)
     notes: List[str] = dataclasses.field(default_factory=list)
     declarations: List[Declaration] = dataclasses.field(default_factory=list)
+    #: Set by the assembler when the late-staged-edge check is on (W-124);
+    #: the summary then marks those pairs.
+    staged_check: bool = False
+
+    @property
+    def late_staged(self) -> List[DeadlinePair]:
+        """Pairs whose staged ``SETP ... D`` edge can land after its tick."""
+        return [p for p in self.pairs if p.staged_late]
 
     @property
     def infeasible(self) -> List[DeadlinePair]:
@@ -348,6 +407,62 @@ def _longest_paths(graph: _Graph,
     return result
 
 
+def is_staged_setp(node: Node) -> bool:
+    """``SETP pin, v, D``: the write lands at the thread's next deadline."""
+    return node.name == "SETP" and bool(node.fields.get("lat", 0))
+
+
+def _longest_before(graph: _Graph, anchor: int) -> Dict[int, float]:
+    """For every node reachable from ``anchor`` in the cut graph, the longest
+    slot count of the nodes strictly between the anchor and it (math.inf
+    when a cycle lies on some path to it)."""
+    starts = graph.raw_succs(anchor)
+    region: Set[int] = set()
+    for start in starts:
+        region |= graph.reach_from(start)
+    indegree = {addr: 0 for addr in region}
+    for addr in region:
+        for succ in graph.cut_succs(addr):
+            if succ in region:
+                indegree[succ] += 1
+    before: Dict[int, float] = {addr: (0.0 if addr in starts else -1.0)
+                                for addr in region}
+    ready = [addr for addr in region if indegree[addr] == 0]
+    done: Set[int] = set()
+    while ready:
+        addr = ready.pop()
+        done.add(addr)
+        out = before[addr] + _slot_cost(graph.nodes[addr])
+        for succ in graph.cut_succs(addr):
+            if succ not in region:
+                continue
+            before[succ] = max(before[succ], out)
+            indegree[succ] -= 1
+            if indegree[succ] == 0:
+                ready.append(succ)
+    for addr in region - done:
+        before[addr] = UNBOUNDED            # on or after a cycle
+    return before
+
+
+def _staged_paths(graph: _Graph, anchor: int,
+                  solved: Dict[int, Dict[int, "_Path"]]
+                  ) -> Dict[int, Tuple[float, Node]]:
+    """For each target, the longest path from ``anchor`` that passes a staged
+    ``SETP ... D``, and that ``SETP``."""
+    before = _longest_before(graph, anchor)
+    out: Dict[int, Tuple[float, Node]] = {}
+    for addr in sorted(before):
+        node = graph.nodes[addr]
+        if not is_staged_setp(node):
+            continue
+        for target, (cost, _) in solved[addr].items():
+            total = before[addr] + cost
+            if target not in out or total > out[target][0]:
+                out[target] = (total, node)
+    return out
+
+
 #: The phase is not known: the SETD may read NOW at any point of a tick.
 UNKNOWN_PHASE = math.inf
 
@@ -465,6 +580,7 @@ def analyse_thread(thread: int, nodes: Sequence[Node], period: Optional[int],
                     merged[target] = (max(old_cost, cost), old_flag or rewritten)
                 else:
                     merged[target] = (cost, rewritten)
+        staged = _staged_paths(graph, anchor.addr, solved)
         for target in sorted(merged):
             dst = table[target]
             cost, rewritten = merged[target]
@@ -478,12 +594,17 @@ def analyse_thread(thread: int, nodes: Sequence[Node], period: Optional[int],
                     src_phase = int(min(known, period - 1))
             else:
                 src_ticks = 0               # WAITD anchors add nothing of their own
+            staged_slots = staged_addr = staged_line = None
+            if target in staged:
+                staged_slots, setp = staged[target]
+                staged_addr, staged_line = setp.addr, setp.line
             report.pairs.append(DeadlinePair(
                 thread=thread, src_addr=anchor.addr, src_name=anchor.name,
                 src_line=anchor.line, dst_addr=target, dst_line=dst.line,
                 ticks=int(dst.fields.get("imm", 0)), slots=cost,
                 period=period, slot_clocks=slot_clocks, src_ticks=src_ticks,
-                src_phase=src_phase))
+                src_phase=src_phase, staged_slots=staged_slots,
+                staged_addr=staged_addr, staged_line=staged_line))
     if any(not p.anchor_credit_known for p in report.pairs):
         report.notes.append(
             "a CSRW TD lies between a SETD and a WAITD on some path, so that "
@@ -500,10 +621,37 @@ def _budget_text(pair: DeadlinePair) -> str:
     return text
 
 
-def diagnostics_for(report: ThreadDeadlines, filename: str) -> List[Diagnostic]:
-    """Turn a thread report into warnings (unbounded) and errors (infeasible)."""
+def staged_message(pair: DeadlinePair) -> Optional[str]:
+    """The late-staged-edge text for a pair, or None when its staged edge is
+    exact (or it has none, or the pair is unbounded or missed, which other
+    diagnostics already report)."""
+    late = pair.staged_late
+    if not late:
+        return None
+    return ("staged edge may land up to %d clock%s late (thread %d: 0x%03X %s "
+            "-> 0x%03X WAITD %d, SETP ... D at 0x%03X line %d): slack %d "
+            "clocks, an exact staged edge needs %d (SEMANTICS 6.10 rule 2); "
+            "add slack or write the pin unstaged" % (
+                late, "" if late == 1 else "s", pair.thread, pair.src_addr,
+                pair.src_name, pair.dst_addr, pair.ticks, pair.staged_addr,
+                pair.staged_line, pair.staged_slack,
+                staged_exact_slack(pair.slot_clocks)))
+
+
+def diagnostics_for(report: ThreadDeadlines, filename: str,
+                    staged_check: bool = False) -> List[Diagnostic]:
+    """Turn a thread report into warnings (unbounded) and errors (infeasible).
+
+    With ``staged_check`` a pair whose staged ``SETP ... D`` edge can land late
+    (:func:`staged_message`) is a warning too. It stays a warning under
+    ``--strict``: shipped firmware trips it (W-124, ``README.md``)."""
     out: List[Diagnostic] = []
     for pair in report.pairs:
+        if staged_check:
+            text = staged_message(pair)
+            if text is not None:
+                out.append(Diagnostic(WARNING, DEADLINE, filename,
+                                      pair.dst_line, text))
         where = "thread %d: 0x%03X %s -> 0x%03X WAITD %d" % (
             pair.thread, pair.src_addr, pair.src_name, pair.dst_addr, pair.ticks)
         if pair.unbounded:
@@ -552,6 +700,8 @@ def summary_lines(report: ThreadDeadlines) -> List[str]:
             mark += "  (SETD phase <= %d)" % pair.src_phase
         if not pair.anchor_credit_known:
             mark += "  (TD rewritten: SETD ticks not credited)"
+        if report.staged_check and pair.staged_late:
+            mark += "  (staged edge up to %d late)" % pair.staged_late
         lines.append("  %-22s %-22s %6d %8d %6d %9s %9s%s" % (
             src, dst, int(pair.slots), pair.clocks, pair.budget_ticks,
             budget, slack, mark))
@@ -565,6 +715,8 @@ def summary_lines(report: ThreadDeadlines) -> List[str]:
         tail += ", longest path %d slots" % report.worst_slots
     if report.declarations:
         tail += ", %d bounded by declaration" % len(report.declarations)
+    if report.staged_check:
+        tail += ", %d with a late staged edge" % len(report.late_staged)
     lines.append(tail)
     return lines
 

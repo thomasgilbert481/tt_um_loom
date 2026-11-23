@@ -810,7 +810,8 @@ class _Assembler:
     # ------------------------------------------------------------------ result
     def finish(self, stmts: List[Stmt], source: str,
                run_deadline_check: bool,
-               sound_setd: bool = dl.SOUND_SETD_DEFAULT) -> Program:
+               sound_setd: bool = dl.SOUND_SETD_DEFAULT,
+               staged_check: bool = False) -> Program:
         program = Program(isa_version=self.isa.version, source=source,
                           imem_words=self.imem_words)
         program.words = dict(self.words)
@@ -841,8 +842,10 @@ class _Assembler:
                     self.slot_clocks, self.td_csr,
                     entry=self.thread_origin(thread),
                     tick_csrs=self.tick_csrs, sound_setd=sound_setd)
+                report.staged_check = staged_check
                 program.deadlines[thread] = report
-                self.diagnostics.extend(dl.diagnostics_for(report, self.filename))
+                self.diagnostics.extend(dl.diagnostics_for(
+                    report, self.filename, staged_check=staged_check))
         program.diagnostics = sorted(
             self.diagnostics, key=lambda d: (d.line, d.column, d.message))
         return program
@@ -853,7 +856,8 @@ def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" =
                   strict: bool = False, deadline_check: bool = True,
                   imem_words: "Optional[int]" = None,
                   sound_setd: bool = dl.SOUND_SETD_DEFAULT,
-                  pins: "Optional[Dict[str, object]]" = None) -> Program:
+                  pins: "Optional[Dict[str, object]]" = None,
+                  staged_check: bool = False) -> Program:
     """Assemble source text. See :func:`assemble` for the argument meanings."""
     from .listing import build_listing
 
@@ -866,7 +870,8 @@ def assemble_text(text: str, filename: str = "<text>", *, isa: "Optional[Isa]" =
     # Pass 2 always runs: statements that failed to size emit nothing, so every
     # operand error in the file is reported alongside the layout errors.
     asm.pass2(stmts)
-    program = asm.finish(stmts, filename, deadline_check, sound_setd)
+    program = asm.finish(stmts, filename, deadline_check, sound_setd,
+                         staged_check)
     program.listing = build_listing(program, stmts, isa)
     fatal = [d for d in program.diagnostics if d.fatal]
     if fatal or (strict and program.errors):
@@ -878,19 +883,22 @@ def assemble_file(path, *, isa: "Optional[Isa]" = None, strict: bool = False,
                   deadline_check: bool = True,
                   imem_words: "Optional[int]" = None,
                   sound_setd: bool = dl.SOUND_SETD_DEFAULT,
-                  pins: "Optional[Dict[str, object]]" = None) -> Program:
+                  pins: "Optional[Dict[str, object]]" = None,
+                  staged_check: bool = False) -> Program:
     path = pathlib.Path(path)
     text = path.read_text(encoding="utf-8")
     return assemble_text(text, str(path).replace(os.sep, "/"), isa=isa,
                          strict=strict, deadline_check=deadline_check,
-                         imem_words=imem_words, sound_setd=sound_setd, pins=pins)
+                         imem_words=imem_words, sound_setd=sound_setd, pins=pins,
+                         staged_check=staged_check)
 
 
 def assemble(text_or_path, *, filename: "Optional[str]" = None,
              isa: "Optional[Isa]" = None, strict: bool = False,
              deadline_check: bool = True,
              imem_words: "Optional[int]" = None,
-             pins: "Optional[Dict[str, object]]" = None) -> Program:
+             pins: "Optional[Dict[str, object]]" = None,
+             staged_check: bool = False) -> Program:
     """Assemble a file or a block of source text.
 
     A :class:`pathlib.Path` is always read from disk. A ``str`` is treated as
@@ -906,9 +914,13 @@ def assemble(text_or_path, *, filename: "Optional[str]" = None,
     must be an alias the source defines; the value is an isa.yaml pin name or
     an index. A program re-pins correctly only if everything that depends on
     its pins is written with ``pin(NAME)``.
+
+    ``staged_check`` also warns about a staged ``SETP ... D`` edge that can
+    land after its tick (slack under 5 clocks, W-124); off by default, and a
+    warning even with ``strict``.
     """
     kwargs = dict(isa=isa, strict=strict, deadline_check=deadline_check,
-                  imem_words=imem_words, pins=pins)
+                  imem_words=imem_words, pins=pins, staged_check=staged_check)
     if isinstance(text_or_path, pathlib.Path):
         return assemble_file(text_or_path, **kwargs)
     text = str(text_or_path)

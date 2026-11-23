@@ -396,6 +396,21 @@ demo.loom:24: error: deadline cannot be met (thread 0: 0x004 WAITD -> 0x00C WAIT
 The listing shows the slack of every pair, so the margin is visible before it
 runs out.
 
+**Late staged edge** (`--staged-edges`, `staged_check=True`; off by
+default). "Met" includes the slot grid's 3-clock grace, but a staged
+`SETP ... D` write is exact only if the `WAITD` that sets its deadline has
+committed, two clocks after its X cycle, by the tick (`SEMANTICS.md` 2 and
+6.10 rule 2). So a pair that passes a `SETP ... D` on its way to the `WAITD`
+lets the staged edge land up to `5 - slack` clocks late, and needs a slack of
+5 clocks to be exact (not 3: the 74HC595 run that found this had a thread
+phase of 1 clock, not 3; `tools/tests/test_loomasm_staged.py` shows all four
+on the model). Only paths through the `SETP ... D` count. The warning reads
+`staged edge may land up to N clocks late (...): slack S clocks, an exact
+staged edge needs 5 ...; add slack or write the pin unstaged`, and the
+listing marks the pair. It stays a warning under `--strict`, because 19
+shipped programs trip it (W-124); the bound is worst case over the thread's
+phase, so a program with a fixed phase may in fact be exact.
+
 ### What it is sound about
 
 - Paths are over-approximated, never under-approximated: unreachable paths and
