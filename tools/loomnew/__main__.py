@@ -13,14 +13,23 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m tools.loomnew",
         description="Create firmware/<name>.loom, tools/protomodels/<name>.py "
-                    "and tools/tests/test_fw_<name>.py: a square wave that "
-                    "assembles --strict and passes its test as generated.")
+                    "and tools/tests/test_fw_<name>.py: a square wave (or, "
+                    "with --rx, a byte receiver and the pin model that drives "
+                    "it) that assembles --strict, staged edges checked, and "
+                    "passes its test as generated.")
     ap.add_argument("name", help="protocol name: lower case, digits and _")
-    ap.add_argument("--pin", default="OUT0",
-                    help="output pin for the generated wave, OUT0..OUT5 (default OUT0)")
-    ap.add_argument("--tick", type=int, default=25,
-                    help="half period in clocks the generated test uses "
-                         "(default 25: 1 MHz at 50 MHz; 16 or more)")
+    ap.add_argument("--rx", action="store_true",
+                    help="write a receiver: an 8N1 byte receiver on an input "
+                         "pin, a pin model that drives it, and its test")
+    ap.add_argument("--pin", default=None,
+                    help="the wave's output pin, OUT0..OUT5 (default OUT0); "
+                         "with --rx the input pin, IN0..IN4 or BIDIR0..7 "
+                         "(default IN0)")
+    ap.add_argument("--tick", type=int, default=None,
+                    help="clocks a tick the generated test uses: the wave's "
+                         "half period (default 25: 1 MHz at 50 MHz; 17 or "
+                         "more), or with --rx a sixteenth of a bit (default 8: "
+                         "128 clocks a bit, 390.625 kbaud; 4 or more)")
     ap.add_argument("--root", default=None,
                     help="repository root to write into (default: this one)")
     ap.add_argument("--force", action="store_true",
@@ -29,13 +38,18 @@ def main(argv=None) -> int:
 
     from tools.loomisa import REPO, load
     pins = {n.upper() for n in load().pin_by_name}
-    if args.pin.upper() not in pins or not args.pin.upper().startswith("OUT"):
+    pin = (args.pin or ("IN0" if args.rx else "OUT0")).upper()
+    if args.rx:
+        if pin not in pins or not pin.startswith(("IN", "BIDIR")):
+            ap.error("--pin %s: use an input pin, IN0..IN4 or BIDIR0..BIDIR7"
+                     % args.pin)
+    elif pin not in pins or not pin.startswith("OUT"):
         ap.error("--pin %s: use an output pin, OUT0..OUT5 (a BIDIR pin also "
                  "needs its output enable set; see docs/ISA.md)" % args.pin)
     root = pathlib.Path(args.root).resolve() if args.root else REPO
     try:
-        where = create(args.name, root, pin=args.pin.upper(), tick=args.tick,
-                       force=args.force)
+        where = create(args.name, root, pin=pin, tick=args.tick,
+                       force=args.force, rx=args.rx)
     except (ValueError, FileExistsError) as exc:
         print("loomnew: %s" % exc, file=sys.stderr)
         return 1
