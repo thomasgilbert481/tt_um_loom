@@ -57,9 +57,10 @@ def grid_band(board):
     A whole tick: 0 (SEMANTICS 2, constant lateness). A fractional tick
     below 17 clocks: each tick edge is on a whole clock, up to half a clock
     after the ideal time (SEMANTICS 4), and a staged edge lands on its tick
-    or, when the WAITD of its half issued late, at that WAITD's commit,
-    up to 3 clocks after the tick (SEMANTICS 6.10 rule 2: a half bit is
-    3 slots, 12 clocks, against 12.5): a band of 3.5 clocks."""
+    or, when the WAITD of its half issued late, at that WAITD's commit
+    (SEMANTICS 6.10 rule 2: a half bit is 3 slots, 12 clocks, against
+    12.5), on the slot grid 1 to 5 clocks after the tick (W-125): the
+    edges still sit within a band of 3.5 clocks around one ideal grid."""
     return 0.0 if board.tick[1] == 0 else 3.5
 
 

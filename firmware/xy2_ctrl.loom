@@ -31,16 +31,15 @@
 ; clock to spare. Deadlines are absolute, so the mean rate is exact: a
 ; frame is 40 ticks = 500 clocks = 10.000 us, and 500 clocks are 125
 ; slots, so every frame has the same edge pattern. Each CLOCK edge is a
-; staged write on its tick; at 12.5 clocks the WAITD of a half can issue
-; in its tick's own X cycle after the WAITD before it completed 3 clocks
-; late, and the edge then lands at the WAITD's commit (SEMANTICS 6.10
-; rule 2), up to 3 clocks after its tick. With the tick's own rounding to
-; a clock the edges spread over a band of 3.5 clocks (70 ns) around one
-; ideal 12.5-clock grid (measured on the model: -2.5 to +1.0, and the RTL
-; run passes the same 3.5-clock bound;
-; CLOCK high 12 clocks, low 13). With a tick of 17 clocks or more
-; (CLOCK <= 1.47 MHz) every edge is on its tick; at tick 12 the edges are
-; exactly periodic on the slot grid.
+; staged write; at 12.5 clocks a half (12) is shorter than a tick, so the
+; WAITD of a half first issues at or after its tick and the edge lands at
+; that WAITD's commit (SEMANTICS 6.10 rule 2), on the slot grid, 1 to 5
+; clocks after its tick (golden model, 2026-11-24). Seven halves of 12
+; clocks and one of 16 make 100 clocks = 8 ticks, so the edges spread
+; over a band of 3.5 clocks (70 ns) around one ideal 12.5-clock grid
+; (the model and the RTL run pass the same bound). With a tick of 17
+; clocks or more (CLOCK <= 1.47 MHz) every edge is on its tick; at tick 12
+; the edges are exactly periodic on the slot grid, 3 clocks after it.
 ;
 ; Edges and data. SYNC and X change one slot after the rising edge (the
 ; op of the rise half), measured 4 clocks after it; Y changes one slot
