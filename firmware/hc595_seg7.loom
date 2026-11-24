@@ -1,0 +1,130 @@
+; hc595_seg7.loom
+;
+; A 74HC595 serial-in, parallel-out shift register driving one common-
+; cathode 7-segment digit. The host pushes a digit; the program looks up
+; its segment byte, shifts it out on SER/SRCLK MSB first, then pulses RCLK
+; so the storage register (and the digit) changes in one step.
+;
+; Written on 2026-11-19, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; a 74HC595. It uses:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for the clock-exact bit edges of the serial transmitters: every
+;     SER, SRCLK and RCLK edge lands on the exact clock of its tick;
+;   - the data memory (LD, SEMANTICS 6.11, D-027), built for tables: the
+;     16-entry segment font is read from this thread's own section.
+; What the firmware does that no hardware does: the font, the decimal
+; point, the three-pin clock/latch sequence and the report.
+;
+; Provenance: written on 2026-11-19 by a fresh agent playing a judge, from
+; firmware/PORTING.md and docs/TRY_IT.md alone (303 s from opening the guide
+; to RTL green). Integrated on the night of 2026-11-23/24 (W-126), which
+; changed the datasheet figures below (checked against the PDF), the latch
+; tail of the SER-0 path (see "Late edges") and the word count. Everything
+; else is as written.
+;
+; Source: TI SN74HC595 datasheet, SCLS041J (December 1982, revised October
+; 2021), section 6.6 "Timing Requirements", SN74HC595 column (TA = -40 to
+; 85 C, section 6.3), MIN at VCC = 4.5 V [at 2 V]: tw, SRCLK or RCLK high
+; or low, 20 ns [100]; tsu, SER before SRCLK rise, 25 ns [125]; tsu, SRCLK
+; rise before RCLK rise, 19 ns [94] (note 1); th, SER after SRCLK rise,
+; 0 ns [0]; fclock MAX 25 MHz [5]. (The trial's header called these the
+; TA = 25 C figures and had 25 ns for SRCLK before RCLK; the 25 C column is
+; 16, 20, 15, 0 ns, 31 MHz.) Loom's pads are 3.3 V and the datasheet has no
+; 3.3 V column, so the reference checks the 4.5 V column by default and a
+; test checks the 2 V column too: at T = 24 and 50 MHz both are met.
+; Data is shifted on the SRCLK rise (QA <- SER, QB <- QA, ...) and the shift
+; register is copied to the storage register on the RCLK rise. SRCLR is
+; tied high and OE low on the board. tools/protomodels/hc595_seg7.py is the
+; reference, written from the same table.
+;
+; Pins: SER = OUT0, SRCLK = OUT1, RCLK = OUT2, push-pull, all low at start.
+; Segment wiring: QA..QG = segments a..g, QH = the decimal point. Sent MSB
+; first, so the first bit out (bit 7) ends in QH and the byte latched in
+; QH..QA is the byte sent.
+;
+; Host commands (FIFO space, thread 0), one word a digit:
+;     D     bits 3:0 the digit 0..F (hex font), bit 4 the decimal point;
+;           other bits ignored.
+; Reply (OUTQ, one word a digit): the segment byte latched, DP in bit 7.
+;
+; Timing, in ticks T (the host sets TICK_INT; the program is proved for
+; T >= 24 clocks, .tick below). Each bit takes three ticks: SER changes,
+; one tick later SRCLK rises, one tick later SRCLK falls. So SER is set up
+; T before the rise and held 2T after it, SRCLK is high T and low 2T. After
+; the eighth fall, RCLK rises one tick later (2T after the last SRCLK rise)
+; and falls one tick after that. At 50 MHz and T = 24 every window is at
+; least 480 ns, far above the datasheet. The first SER edge comes 2 ticks
+; after the anchor (SETD 2); the stretch from SETD to the first WAITD is
+; at most 5 slots (20 clocks), under one tick, so the staged edge cannot
+; land early (docs/TRY_IT.md, "The early staged edge").
+;
+; Late edges. A first version tested the next bit after the SRCLK fall and
+; was proved by --strict at T = 24 with slack 0, yet on the model its SER
+; edge after a 1-to-0 bit landed 3 clocks late at T = 24 and 1 clock late at
+; T = 25 and 26: a WAITD can issue up to 3 clocks after its tick, and a
+; staged write then lands at that WAITD's commit, not on the tick. The
+; trial kept every pair at slack >= 3: the next bit is decided while SRCLK
+; is high, and the loop is unrolled into a SER-0 and a SER-1 tail. That
+; run is what found the 5-clock rule of loomasm --staged-edges (W-124): a
+; staged edge is exact only with slack >= 5, worst case over the thread's
+; phase. The trial's one pair under 5 was the last bit sent as 0 (WAITD,
+; SETP SER, DJNZ, BRA last, SETP RCLK, WAITD: slack 4, RCLK rise up to 1
+; clock late). W-126 puts a copy of the RCLK rise after that DJNZ, so no
+; BRA comes before its WAITD. Now --strict --staged-edges is clean: 10
+; pairs, worst slack 8.
+;
+; Words: 60 of thread 0's 128 (44 code, 16 font).
+
+        .imem   512                     ; thread t starts at t * 128
+        .thread 0
+        .tick   24                      ; the shortest proved tick
+        .pins   SER = OUT0, SRCLK = OUT1, RCLK = OUT2
+
+start:  SETP    SER, 0
+        SETP    SRCLK, 0
+        SETP    RCLK, 0
+cmd:    POP     r1                      ; D, from the host
+        MOV     r2, r1
+        ANDI    r1, 15                  ; the digit
+        MOV16   r3, font
+        ADD     r3, r3, r1
+        LD      r3, r3, 0               ; its segments, DP clear
+        ANDI    r2, 16                  ; the decimal point bit
+        BZ      nodp
+        LDI     r4, 0x80
+        OR      r3, r3, r4
+nodp:   MOV     r4, r3
+        SHLI    r4, 8                   ; bit 7 to bit 15, for C
+        LDI     r1, 8                   ; eight bits
+        SETD    2                       ; anchor
+        SHLI    r4, 1                   ; C = bit 7, sent first
+        BC      first1
+        SETP    SER, 0, D
+        BRA     bit
+first1: SETP    SER, 1, D
+bit:    WAITD   1                       ; SER lands
+        SETP    SRCLK, 1, D
+        WAITD   1                       ; SRCLK rises: shift
+        SETP    SRCLK, 0, D
+        SHLI    r4, 1                   ; C = the next bit, decided while SRCLK is high
+        BC      one
+        WAITD   1                       ; SRCLK falls
+        SETP    SER, 0, D               ; staged for the next bit's first tick
+        DJNZ    r1, bit
+        SETP    RCLK, 1, D              ; the latch rise inline: no BRA before its WAITD
+        WAITD   1                       ; RCLK rises: latch
+        BRA     unlat
+one:    WAITD   1                       ; SRCLK falls
+        SETP    SER, 1, D
+        DJNZ    r1, bit
+last:   SETP    RCLK, 1, D              ; replaces the ninth SER write, never sent
+        WAITD   1                       ; RCLK rises: latch
+unlat:  SETP    RCLK, 0, D
+        WAITD   1
+        PUSH    r3                      ; report the byte latched
+        BRA     cmd
+
+; The hex font, common cathode, bit 0 = a ... bit 6 = g.
+font:   .word   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07
+        .word   0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71
