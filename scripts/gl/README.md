@@ -10,6 +10,7 @@ that led to these scripts: `docs/tt_cmos5l_facts.md` section 12, BUGS 4.
 | `diff.sh FETCH_DIR MODULE TEST [--max N] [--xscan C,...]` | WSL | runs one test on the RTL and on the netlist with the same named signals dumped and compares them clock by clock |
 | `mkdump.py`, `diffvcd.py` | (used by `diff.sh`) | the dump lists and the comparison |
 | `sdf_filter.py IN OUT [--cells-only]` | WSL | makes a post-route SDF (the `GDS_logs` artifact's `runs/wokwi/final/sdf/<corner>/`) that Icarus can annotate: drops the SRAM macro, whose model has no specify block; `--cells-only` drops the wire delays too |
+| `sdf_groups.sh FETCH_DIR SDF_FILE [N] [TAG ...]` | WSL | runs the PHY-GL-SDF scenario groups listed in `sdf_groups.txt` (every group, or the TAGs given) with that SDF, N at a time, one build directory each; prints one result line a group |
 
 With `SDF=<file>` in the environment, `run.sh` runs the netlist with that
 SDF's delays (`test/Makefile` adds `-gspecify -ginterconnect`, `test/tb.v`
