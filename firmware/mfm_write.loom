@@ -1,0 +1,256 @@
+; mfm_write.loom
+; IBM System/34 double-density floppy sector writer: one sector (gap I, ID
+; field, gap II, data field, gap III) written as MFM flux transitions on
+; WRITE DATA, one short active-low pulse a transition, inside WRITE GATE.
+;
+; Written on 2026-11-24, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; floppy disks or for MFM. The program places every pulse with
+; deadline-latched pin writes (`SETP ... D`, SEMANTICS 6.10, built so that
+; WS2812 and UART edges land on an exact clock), computes the CRC-CCITT of
+; each field with the bit engine's CRC (6.9, built for USB and CAN) fed by
+; `SHO` on a pin index that is not writable (so it moves no pin), and reads
+; the payload from the data memory (`LD`, 6.11, built for device
+; emulation). What the firmware does that no hardware does: the MFM
+; encoder itself, a code with one bit of memory (the clock cell between two
+; data bits is a 1 only when both are 0), the A1* sync mark written with
+; its clock deliberately missing (a cell pattern ordinary data never
+; makes), the sector layout and its gaps.
+;
+; The bit engine's encoders do not help: NRZI and Manchester (6.9.1) have
+; no memory of the previous data bit, and the engine writes a level per
+; bit, while a drive wants a pulse per flux transition.
+;
+; Pins: WD = OUT0, WRITE DATA, idle high, a pulse low for one tick (400 ns)
+; at the start of every cell holding a 1; WG = OUT1, WRITE GATE, low from
+; 10 ticks (4 us) before the first cell to at least 5 ticks (2 us) after
+; the last pulse. Push-pull; a real drive's inputs want open-collector
+; drivers on the board (a 7438), which this program does not model.
+;
+; Sources (tools/protomodels/mfm.py cites them item by item): English
+; Wikipedia, "Modified frequency modulation" (the rule, RLL(1,3), the A1
+; sync with its fifth clock bit changed), and the Western Digital FD179X-01
+; data sheet, Oct 1979: CRC logic (p. 5: x^16 + x^12 + x^5 + 1, preset to
+; ones), sector length codes (p. 9), the F5 = A1* with missing clock
+; between bits 4 and 5 (p. 13, p. 16), the System 34 layout (p. 17: gap II
+; exactly 22 x 4E, 12 x 00, exactly 3 x A1*), write timing (p. 19, doubled
+; at CLK 1 MHz: cells 2 us, flux intervals 4, 6, 8 us; Twp 300-500 ns,
+; typical 400; Twg 2 us). The A1* pattern 0x4489 is derived from those.
+;
+; Rates. 250 kbit/s (5.25-inch and 3.5-inch double density): a cell (half
+; a bit) is 2 us. The tick is the pulse width, a fifth of a cell: 400 ns,
+; TICK 20 at 50 MHz, 18 at the signed-off 45 MHz (both checked: the
+; deadline checker at 18, the tests at 20 and 18). A cell is 5 ticks: the
+; fall is staged on its first tick, the rise on its second. 500 kbit/s
+; would need a 10-clock tick, which leaves a staged edge no slack: refused.
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT (20 at 50 MHz, 18 at 45 MHz)   2. TICK_FRAC
+; then for each sector:
+;   3. C << 8 | H      4. R << 8 | N      (track, head, sector, length code)
+;   5. the payload's data-memory address, two bytes a word, the first byte
+;      in the high half      6. the payload's length in words, 1 to 255
+; The sector is written at once; then the CRC of its data field is
+; reported (one word) and the program waits for the next sector's words 3
+; to 6. N is written as given: N = 0 says 128 bytes, and a test payload of
+; another length is a non-standard sector (the reader is told the length).
+;
+; Layout written ([FD] p. 17): 32 x 4E, 12 x 00, A1* A1* A1*, FE, C, H, R,
+; N, CRC, CRC, 22 x 4E, 12 x 00, A1* A1* A1*, FB, payload, CRC, CRC,
+; 24 x 4E. Each CRC covers A1 A1 A1, the mark and the field: the program
+; works out the CRC of A1 A1 A1 from ones at start-up and makes it CRC_INIT,
+; so the CRCI before each mark starts every field from it.
+;
+; Timing. Every edge is staged. Proved at the 18-clock tick (45 MHz):
+; from a rise to the next cell's fall (4 ticks, 72 clocks) the longest
+; path is 16 slots, 64 clocks, slack 8: a byte change through a caller
+; (RET, at most 6 slots of caller, the entry, the first bit; the checker
+; follows every RET to every return site, so the callers are kept short
+; enough for any of them). From a fall to its rise (one tick) at most 3
+; slots, slack 6. Both are at least 5, so every edge lands on its exact
+; clock (TRY_IT, the late staged edge), and `--staged-edges` is clean.
+;
+; Size: 152 words, more than a quarter: it spills into thread 1's
+; quarter (0x080-0x097), so thread 1 holds nothing else. The tests run it
+; on thread 0 alone (payload at 0x100), and beside mfm_read.loom on
+; thread 2 (payload at 0x0A0).
+;
+; Registers: r0 the byte (or word) being written, MSB first; r1 the last
+; data bit written, for the next call; r2 bits left in the byte; r3 bytes
+; left in the call; r4 the payload pointer; r5 payload words left; r6 what
+; refills r0 between the bytes of a call (0x4E in a gap, 0 otherwise, and
+; 0 is the base of ch, rn, mk); r7 the cells left of the A1*s, the mark
+; switch, the data CRC.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   WD = OUT0, WG = OUT1
+        .tick   18                      ; 400 ns at 45 MHz, the shortest (header)
+        .equ    GAP1 = 32               ; [FD] p. 17: gap I, 4E
+        .equ    GAP2 = 22               ; gap II, exact
+        .equ    GAP3 = 24               ; gap III, minimum
+        .equ    SYNC = 12               ; 00 before each A1*
+
+        JMP     start
+ch:     .word   0                       ; C H of the sector being written
+rn:     .word   0                       ; R N
+mk:     .word   0                       ; 0: the ID field next, else the data field
+
+start:  SETP    WG, 1                   ; gate off first: the drive model arms on WD
+        SETP    WD, 1
+        .csr    CRC_POLY, 0x1021        ; x^16 + x^12 + x^5 + 1
+        .csr    CRC_INIT, 0xFFFF        ; preset to ones
+        .csr    BE_CFG, 0x202           ; MSB first (DIR), CRC_EN
+        .csr    BE_PINS, 15             ; SHO writes index 15: no pin (6.3)
+        CRCI
+        MOV16   r0, 0xA100
+        LDI     r1, 3
+crca1:  LDSR    r0                      ; A1 A1 A1 through the CRC
+        LDI     r2, 8
+crcb:   SHO
+        DJNZ    r2, crcb
+        DJNZ    r1, crca1
+        STCRC   r0
+        CSRW    CRC_INIT, r0            ; what CRCI loads before each mark
+        POP     r0                      ; 1. TICK_INT
+        CSRW    TICK_INT, r0
+        POP     r0                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r0
+
+cmd:    LDI     r6, 0                   ; the base of ch, rn, mk
+        POP     r0                      ; 3. C H
+        ST      r0, r6, ch
+        POP     r0                      ; 4. R N
+        ST      r0, r6, rn
+        POP     r4                      ; 5. payload address
+        POP     r5                      ; 6. payload words
+        ST      r6, r6, mk              ; mk = 0: the ID field first
+        LDI     r1, 1                   ; no clock pulse in the first cell
+        LDI     r2, 8
+        SETP    WG, 0                   ; WRITE GATE on
+        SETD    10                      ; 4 us before the first cell (Twg 2 us)
+        LDI     r3, GAP1
+
+; A field: r3 bytes of 4E, 12 x 00, A1* A1* A1*, the mark in mk, then the
+; ID field's bytes or the data field's.
+field:  LDI     r0, 0x4E
+        LDIH    r0, 0x4E
+        LDI     r6, 0x4E
+        CALL    sendrun
+        LDI     r0, 0                   ; 12 x 00
+        LDI     r6, 0
+        LDI     r3, SYNC
+        CALL    sendrun
+        CRCI                            ; the CRC of A1 A1 A1 (sendsync has no SHO)
+        LD      r7, r6, mk              ; r6 is 0 from here on
+        CMPI    r7, 0
+        BNZ     dsync
+        CALL    sendsync
+        LDIH    r0, 0xFE                ; ID address mark (r0 is 0 here)
+        LDI     r3, 1
+        CALL    sendrun
+        LD      r0, r6, ch              ; C H
+        LDI     r3, 2
+        CALL    sendrun
+        LD      r0, r6, rn              ; R N
+        LDI     r3, 2
+        CALL    sendrun
+        STCRC   r0                      ; the ID field's CRC
+        ST      r2, r6, mk              ; mk = 8: the data field next
+        LDI     r3, 2
+        CALL    sendrun
+        LDI     r3, GAP2
+        JMP     field
+dsync:  CALL    sendsync
+        LDIH    r0, 0xFB                ; data address mark
+        LDI     r3, 1
+        CALL    sendrun
+data:   LD      r0, r4, 0               ; two payload bytes
+        ADDI    r4, 1
+        LDI     r3, 2
+        CALL    sendrun
+        DJNZ    r5, data
+        STCRC   r0                      ; the data field's CRC
+        MOV     r7, r0
+        LDI     r3, 2
+        CALL    sendrun
+        LDI     r0, 0x4E                ; gap III
+        LDIH    r0, 0x4E
+        LDI     r6, 0x4E
+        LDI     r3, GAP3
+        CALL    sendrun
+        WAITD   5                       ; 2 us after the last pulse
+        SETP    WG, 1                   ; WRITE GATE off
+        PUSH    r7                      ; report: the data field's CRC
+        JMP     cmd
+
+
+; sendrun: r3 bytes, MSB first, from r0's high byte; after each byte r0's
+; low byte (now high) OR r6 is the next. Entered with the deadline at the
+; rise of the last cell written (or the SETD), r2 = 8, r1 the last data bit.
+; A cell is 5 ticks: a pulse cell stages the fall, WAITD 4 (the cell's
+; start), stages the rise, WAITD 1; a cell with no pulse is one WAITD 5.
+; s0/s1: the last data bit was 0/1. A 0 after a 0 pulses the clock cell
+; (path A), a 0 after a 1 pulses nothing (path C), a 1 pulses the data cell
+; (path B), whatever came before. Leaves r2 = 8 and r1 for the next call.
+sendrun: LDSR   r0                      ; the CRC sees what is written
+        CMPI    r1, 0
+        BNZ     s1
+s0:     SHLI    r0, 1                   ; C = the data bit
+        SHO                             ; and the CRC takes it
+        BC      cb
+        SETP    WD, 0, D                ; A: the clock cell pulses
+        WAITD   4
+        SETP    WD, 1, D
+        WAITD   1
+        JMP     t0
+s1:     SHLI    r0, 1
+        SHO
+        BC      cb
+        WAITD   5                       ; C: no pulse in the clock cell
+t0:     DJNZ    r2, t0m                 ; the data cell of a 0: no pulse
+        OR      r0, r0, r6              ; the byte is done: the next one
+        LDSR    r0
+        LDI     r2, 8
+        LDI     r1, 0
+        SUBI    r3, 1
+t0m:    CMPI    r3, 0
+        WAITD   5
+        BNZ     s0
+        RET
+cb:     WAITD   5                       ; B: no pulse in the clock cell
+        DJNZ    r2, t1m
+        OR      r0, r0, r6
+        LDSR    r0
+        LDI     r2, 8
+        LDI     r1, 1
+        SUBI    r3, 1
+t1m:    SETP    WD, 0, D                ; the data cell pulses
+        WAITD   4
+        SETP    WD, 1, D
+        CMPI    r3, 0                   ; flags survive the WAITD
+        WAITD   1
+        BNZ     s1
+        RET
+
+; sendsync: A1* A1* A1*, each the cells 0x4489 (A1 with the clock between
+; data bits 4 and 5 left out), written cell by cell from r0's top bit. A
+; word is done when r0 is 0, which happens only after its last cell, a 1
+; (so the test sits in the pulse path). Ends after that pulse: r1 = 1.
+sendsync: LDI   r1, 1
+        LDI     r7, 48                  ; cells in three A1*
+sy0:    MOV16   r0, 0x4489
+sy:     SHLI    r0, 1
+        BC      syp
+        WAITD   5                       ; a 0 cell
+        DJNZ    r7, sy
+        RET                             ; not reached: an A1* ends in a 1
+syp:    SETP    WD, 0, D                ; a 1 cell
+        WAITD   4
+        SETP    WD, 1, D
+        CMPI    r0, 0                   ; Z: this A1* is done
+        WAITD   1
+        DJNZ    r7, syn                 ; DJNZ leaves the flags alone
+        RET
+syn:    BZ      sy0
+        JMP     sy

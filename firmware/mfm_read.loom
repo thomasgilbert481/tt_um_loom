@@ -1,0 +1,266 @@
+; mfm_read.loom
+; IBM System/34 double-density floppy field reader: a data separator for
+; MFM. Times every flux pulse on READ DATA, classifies each interval as
+; 2T, 3T or 4T against a window, rebuilds the data bits, hunts for the
+; missing-clock sync A1* A1* A1*, then reads the mark and the field the
+; host asked for, checks its CRC and reports it through OUTQ[0].
+;
+; Written on 2026-11-24, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; floppy disks or for MFM. The program times pulses with the level waits
+; (`WAITP`, built for I2C and SPI, with the deadline timeout `T` as the
+; lost-signal guard) and reads of the `NOW` tick counter (built as the
+; deadline timebase, SEMANTICS 4), runs each data bit through the bit
+; engine's CRC (6.9, built for USB and CAN) with `SHO` on a pin index that
+; is not writable, and parks the field in the data memory (`ST`, 6.11,
+; built for device emulation) so a slow host costs nothing while the field
+; passes. What the firmware does that no hardware does: the interval
+; classifier, the rebuilding of data bits from intervals (the phase of the
+; next cell, clock or data, is where the program is: two copies of the
+; loop), the search for the cell pattern 0x4489 that ordinary data never
+; makes, and the framing.
+;
+; The bit engine's decoders do not help: they sample a level on a fixed
+; tick, and an MFM bit is carried by where a pulse falls, not by a level.
+;
+; Pins: RD = IN0, READ DATA, idle high, one active-low pulse a flux
+; transition (wider than one slot, 4 clocks: [FD] p. 19 note 1 gives
+; 200-600 ns at 250 kbit/s).
+;
+; Sources (tools/protomodels/mfm.py cites them item by item): English
+; Wikipedia, "Modified frequency modulation", and the Western Digital
+; FD179X-01 data sheet, Oct 1979: CRC logic (p. 5), the A1* (p. 13, 16),
+; the System 34 layout (p. 17), input data timing (p. 19: at 250 kbit/s a
+; read window is one 2 us cell, RAW READ pulses 200-600 ns).
+;
+; Rates. 250 kbit/s, a cell 2 us. The tick is the measuring unit, a
+; sixteenth of a cell, 125 ns: TICK 6 + 64/256 at 50 MHz, 5 + 160/256 at
+; the signed-off 45 MHz (both tested). 2T, 3T and 4T are 32, 48 and 64
+; units. An interval of 24 to 39 units is 2T, 40 to 55 3T, 56 up to the
+; timeout 4T; shorter than 24, or no pulse within 72 units (9 us), inside a
+; field is a lost field. So each interval may be off by up to half a cell
+; (1 us) less the unit and the stamp's 4-clock grain, about 0.4 cell, and
+; each transition by about 0.2 cell when both ends of an interval move
+; against each other (tested: 0.18 cell everywhere, one transition moved
+; 0.35 cell). This is a fixed window edge to edge: a controller's data
+; separator (a PLL, [FD] p. 19 RCLK) gives each transition its own window
+; of half a cell either way and follows the spindle's speed. This program
+; does neither: it is weaker than that hardware, by about half.
+;
+; Host words (FIFO space, thread 0), after RUN:
+;   1. TICK_INT of the unit     2. TICK_FRAC of the unit
+; then one command a field:
+;   3. MARK << 8 | K: read the next field (the next A1* A1* A1*), its mark
+;      and K 16-bit words after it (3 for an ID field: C H R N CRC CRC;
+;      n / 2 + 1 for a data field of n bytes), MARK the mark expected.
+; Report (FIFO space read, thread 0): STATUS << 8 | MARK, then the K words
+; (the first byte in the high half) unless the field was lost. STATUS bit
+; 0: CRC error; bit 1: the mark is not MARK; bit 2: lost (an interval out
+; of the window, or no pulse for 10 us; no words follow). Then the next
+; command. The field is reported after it has passed, so the host has the
+; gap to read the report and send the next command; while it does, pulses
+; are not timed.
+;
+; Timing. Pulses are stamped by a WAITP for the low level and a CSRR of
+; NOW, so a pulse that comes while the program is busy is stamped late
+; (still low), not lost, as long as it is wider than the overrun. No WAITD,
+; so no deadline pair: the SETD is the timeout of the next WAITP. The
+; longest stretch from a stamp to the WAITP that sees the next pulse is 29
+; slots (116 clocks): a 3T in p1 or a 4T in p0, two bits, the second
+; completing a word (e0, then e1 with the store). The shortest interval
+; the window takes is 1.5 cells, 3 us: 150 clocks at 50 MHz, 135 at 45
+; MHz, so every pulse is stamped in its own slot at both clocks.
+;
+; Size: 166 words, more than a quarter: on thread 0 it spills into thread
+; 1's quarter (0x080-0x0A5). The tests run it alone on thread 0, and on
+; thread 2 (0x100-0x1A5) beside mfm_write.loom on thread 0. The field is
+; stored at 0x1B0 (BUF), 80 words: K up to 79, a data field up to 156
+; bytes (N = 0, 128 bytes, takes 65).
+;
+; Registers: hunting, r0 the last 16 cells, r1 NOW at the last pulse, r2
+; the interval, r3 cells since the last A1*, r4 K + 1, r5 0x4489, r6 A1*
+; seen in a row, r7 NOW; reading, r0 the data bits, r3 bits left in the
+; word, r4 the store pointer, r5 words left to store, r6 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RD = IN0
+        .tick   11                      ; no WAITD: nothing to prove (header)
+        .equ    BUF = 0x1B0             ; the field: 80 words at the top of memory
+        .equ    SYNCW = 0x4489          ; A1* with its missing clock
+        .equ    T2 = 24                 ; 1.5 cells: shorter is noise
+        .equ    T3 = 40                 ; 2.5 cells: 3T from here
+        .equ    T4 = 56                 ; 3.5 cells: 4T from here
+        .equ    TO = 72                 ; 4.5 cells (9 us) without a pulse: lost
+
+        JMP     start
+cmdw:   .word   0                       ; the command being served
+
+start:  .csr    CRC_POLY, 0x1021        ; x^16 + x^12 + x^5 + 1
+        .csr    CRC_INIT, 0xFFFF        ; preset to ones
+        .csr    BE_CFG, 0x200           ; LSB first: SHO takes SR[0]; CRC_EN
+        .csr    BE_PINS, 15             ; SHO writes index 15: no pin (6.3)
+        CRCI
+        LDI     r0, 0x85                ; A1 bit-reversed: SHO sends A1 MSB first
+        LDI     r1, 3
+crca1:  LDSR    r0                      ; A1 A1 A1 through the CRC
+        LDI     r2, 8
+crcb:   SHO
+        DJNZ    r2, crcb
+        DJNZ    r1, crca1
+        STCRC   r0
+        CSRW    CRC_INIT, r0            ; what CRCI loads at each sync
+        POP     r0                      ; 1. TICK_INT
+        CSRW    TICK_INT, r0
+        POP     r0                      ; 2. TICK_FRAC
+        CSRW    TICK_FRAC, r0
+
+cmd:    POP     r4                      ; 3. MARK << 8 | K
+        MOV16   r7, cmdw
+        ST      r4, r7, 0
+        LDI     r7, 0xFF
+        AND     r4, r4, r7
+        ADDI    r4, 1                   ; the mark word and K words
+        MOV16   r5, SYNCW
+        LDI     r0, 0
+        LDI     r6, 0
+        CSRR    r1, NOW
+
+; Hunting: every interval shifts its cells into r0 (k - 1 zeros, a one);
+; three windows of 0x4489 exactly 16 cells apart are A1* A1* A1*.
+hunt:   WAITP   RD, 1
+        WAITP   RD, 0
+        CSRR    r7, NOW
+        SUB     r2, r7, r1
+        MOV     r1, r7
+        CMPI    r2, T3
+        BC      h34
+        CMPI    r2, T2
+        BNC     hbad
+        SHLI    r0, 2                   ; 2T
+        ADDI    r3, 2
+        JMP     hone
+h34:    CMPI    r2, T4
+        BC      h4
+        SHLI    r0, 3                   ; 3T
+        ADDI    r3, 3
+        JMP     hone
+h4:     SHLI    r0, 4                   ; 4T
+        ADDI    r3, 4
+hone:   ORI     r0, 1
+        CMP     r0, r5
+        BNZ     hunt
+        CMPI    r3, 16                  ; an A1*: 16 cells after the last?
+        BZ      hnext
+        LDI     r6, 0
+hnext:  ADDI    r6, 1
+        LDI     r3, 0
+        CMPI    r6, 3
+        BNZ     hunt
+        MOV     r5, r4                  ; sync: words to store
+        MOV16   r4, BUF
+        LDI     r3, 8                   ; the mark first: 8 bits
+        CRCI                            ; the CRC of A1 A1 A1
+        SETD    TO
+        JMP     p0                      ; an A1* ends on a data cell
+hbad:   LDI     r0, 0
+        LDI     r6, 0
+        JMP     hunt
+
+; Reading. p0: the next cell is a clock cell; p1: a data cell. An interval
+; of k cells ends on a 1 and has k - 1 zeros before it; the data bits are
+; the data cells among those k: p0 2T -> 1 (p0), 3T -> 0 (p1), 4T -> 0 1
+; (p0); p1 2T -> 0 (p1), 3T -> 0 1 (p0), 4T -> 0 0 (p1).
+p0:     WAITP   RD, 1                   ; the last pulse is over
+        WAITP   RD, 0, T
+        CSRR    r7, NOW
+        BT      lost                    ; nothing for 10 us
+        SUB     r2, r7, r1
+        MOV     r1, r7
+        SETD    TO
+        CMPI    r2, T3
+        BC      p0b
+        CMPI    r2, T2
+        BNC     lost
+        CALL    e1                      ; 2T
+        JMP     p0
+p0b:    CMPI    r2, T4
+        BC      p0c
+        CALL    e0                      ; 3T
+        JMP     p1
+p0c:    CALL    e0                      ; 4T
+        CALL    e1
+        JMP     p0
+p1:     WAITP   RD, 1
+        WAITP   RD, 0, T
+        CSRR    r7, NOW
+        BT      lost
+        SUB     r2, r7, r1
+        MOV     r1, r7
+        SETD    TO
+        CMPI    r2, T3
+        BC      p1b
+        CMPI    r2, T2
+        BNC     lost
+        CALL    e0                      ; 2T
+        JMP     p1
+p1b:    CMPI    r2, T4
+        BC      p1c
+        CALL    e0                      ; 3T
+        CALL    e1
+        JMP     p0
+p1c:    CALL    e0                      ; 4T
+        CALL    e0
+        JMP     p1
+
+; e1, e0: one data bit into r0 and through the CRC (SR[0] is the bit); at
+; the end of a word store it; after the last word, the report.
+e1:     SHLI    r0, 1
+        ORI     r0, 1
+        LDSR    r0
+        SHO
+        DJNZ    r3, eret
+        JMP     store
+e0:     SHLI    r0, 1
+        LDSR    r0
+        SHO
+        DJNZ    r3, eret
+store:  ST      r0, r4, 0
+        ADDI    r4, 1
+        LDI     r3, 16
+        DJNZ    r5, eret
+        JMP     done                    ; the return address is dropped
+eret:   RET
+
+; The report: STATUS << 8 | MARK, then the K words.
+done:   LDI     r6, 0
+        STCRC   r2                      ; 0 over a field and its own CRC
+        CMPI    r2, 0
+        BZ      crcok
+        LDI     r6, 1                   ; CRC error
+crcok:  MOV16   r7, cmdw
+        LD      r3, r7, 0               ; MARK << 8 | K
+        MOV16   r7, BUF
+        LD      r0, r7, 0               ; the mark, under leftover bits
+        LDI     r2, 0xFF
+        AND     r0, r0, r2
+        MOV     r2, r3
+        SHRI    r2, 8
+        CMP     r0, r2
+        BZ      mok
+        ORI     r6, 2                   ; not the mark asked for
+mok:    SHLI    r6, 8
+        OR      r6, r6, r0
+        PUSH    r6
+        LDI     r2, 0xFF
+        AND     r3, r3, r2              ; K
+        BZ      rdone
+wl:     LD      r0, r7, 1
+        ADDI    r7, 1
+        PUSH    r0
+        DJNZ    r3, wl
+rdone:  JMP     cmd
+lost:   LDI     r6, 0
+        LDIH    r6, 4                   ; STATUS 4, no words
+        PUSH    r6
+        JMP     cmd
