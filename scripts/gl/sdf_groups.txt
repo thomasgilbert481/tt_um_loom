@@ -68,3 +68,4 @@ c5	test_fw	test_fw_ltc,test_fw_lanc	(test_ltc_together|test_lanc_ctrl_and_cam_to
 c6	test_fw	test_fw_magstripe,test_fw_psk31	(test_magstripe_emu_to_model|test_psk31_square_text)
 c7	test_fw	test_fw_wspr,test_fw_feldhell	(test_wspr_rtl_prefix|test_feldhell_word)
 h1	test_fw	test_fw_hc595_seg7	test_hc595_seg7_three_digits
+m1	test_fw	test_fw_mfm	test_mfm_write_short_sector
