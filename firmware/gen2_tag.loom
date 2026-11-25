@@ -1,0 +1,463 @@
+; gen2_tag.loom
+; An EPC Gen2 UHF RFID tag (ISO/IEC 18000-63) at baseband: it decodes the
+; reader's PIE commands from the demodulated envelope, calibrates its own
+; decoder and its own backscatter clock from the command's preamble, and
+; answers Query with an RN16 and ACK with PC + EPC + PacketCRC, in FM0 or in
+; Miller-M (M = 2, 4, 8), with the preamble and pilot tone the Query asks for.
+;
+; Written on 2026-11-25, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; RFID. The program times the reader's symbols with the level waits
+; (`WAITP`, built for I2C and SPI, with the deadline timeout `T` as the end
+; of a frame) and reads of the `NOW` tick counter (the deadline timebase,
+; SEMANTICS 4); it checks the Query's CRC-5 and computes the PacketCRC with
+; the bit engine's CRC (6.9, built for USB and CAN; `SHO` on pin index 15,
+; which drives no pin); it puts its backscatter edges on the tick with the
+; deadline-latched pin write (`SETP ... D`, 6.10, built for exact edges) and
+; turns the tick itself into its link clock: TICK_INT/TICK_FRAC (built for
+; UART baud rates) are written at run time with half a backscatter cycle,
+; computed from the TRcal it measured. Parameters and the reply words live in
+; the data memory (`LD`/`ST`, 6.11, built for device emulation).
+; What the firmware does that no hardware does: the PIE decoder and its
+; self-calibration (pivot = RTcal / 2, 6.3.1.2.8), the BLF arithmetic
+; (BLF = DR / TRcal, eq. 1), the FM0 and Miller coders (one toggle rule for
+; both, below), the preambles, the T1 timing, the RN16 and the tag's states.
+;
+; Baseband only. ENV = IN0 is the reader's demodulated RF envelope as a
+; logic level: high = CW, low = the reader's modulated pulse (PW, the
+; delimiter). BS = OUT0 is the backscatter modulator: 1 = the reflecting
+; state of the first high of a preamble, 0 = the state during CW before a
+; reply (6.3.1.3). There is no RF here: a front end demodulates and switches.
+;
+; Sources (tools/protomodels/gen2.py cites them item by item): GS1 EPC Gen2
+; UHF RFID Standard, Release 3.0.1, Feb 2026: 6.3.1.2.3 (PIE), 6.3.1.2.4
+; (Tari), Table 6-5 (PW), 6.3.1.2.8 and Figure 6-4 (preamble, frame-sync,
+; RTcal, pivot, TRcal, eq. 1 and 2), 6.3.1.3.2.1-4 and Figures 6-8 to 6-15
+; (FM0, Miller, dummy bit, preambles), Table 6-9 (BLF tolerances), Table 6-10
+; (M), 6.3.1.5 and Tables 6-11, 6-12, Annex F.1 (CRC-16, CRC-5), 6.3.1.6
+; Table 6-16 (T1), 6.3.2.12.2.1 Table 6-33/6-34 (Query, RN16), 6.3.2.12.2.6
+; Table 6-46 (ACK), Table 6-18 and 6.3.2.1.2.1 (PC, EPC, PacketCRC).
+;
+; Reception (tick 1 clock). A frame is timed rising edge to rising edge (the
+; end of each PW): the delimiter's rise, then data-0 (Tari), then RTcal,
+; then either TRcal (longer than RTcal: a preamble) or the first data bit (a
+; frame-sync). An interval i is a data-1 when 2i >= RTcal (pivot = RTcal/2).
+; No falling edge within 1.5 RTcal of the last rise ends the frame (a data
+; symbol is shorter than RTcal, T4 between commands is 2 RTcal); while TRcal
+; may still come the wait is 3 RTcal (eq. 2). A bad CRC-5 Query, an ACK
+; with the wrong RN16 and an ACK with no RN16 out all leave the tag silent
+; in arbitrate (6.3.2.12.2.1, 6.3.2.12.2.6; for the bad Query, Table C-34
+; was not read: arbitrate is this program's reading). Commands
+; are told by their first bits: 01 = ACK (18 bits), 1000 = Query (22 bits);
+; any other frame is skipped to its end. The delimiter's length is not
+; checked (it overlaps PW at Tari 25 us); RTcal is not checked against Tari.
+;
+; Reply (tick = half a backscatter cycle). DR = 8: TRcal / 16 clocks; DR =
+; 64/3: 3 TRcal / 128 clocks, in 1/256 clocks (stamp error +-8 clocks, 0.3 %
+; at TRcal 50 us, against +-7 % or more in Table 6-9). Half periods shorter
+; than HMIN clocks (BLF above about 225 kHz at 45 MHz) are refused: the tag
+; stays silent. The first rising edge comes T1 = MAX(RTcal, 10 Tpri) after
+; the last rising edge of the command (Table 6-16), within a slot. Each half
+; cycle the line either toggles or holds. FM0: toggle at every symbol
+; boundary and in the middle of a data-0. Miller-M (2M halves a bit): toggle
+; at every half, except at the middle of a data-1 and at the boundary between
+; two data-0s (the baseband inversion cancels the subcarrier's). Preambles:
+; FM0 the 12-half toggle pattern of "1 0 1 0 v 1" (Figure 6-11), after 12
+; zeros if TRext; Miller 4 M (16 M if TRext) halves of pilot then 010111
+; (Figure 6-15). Every reply ends with the dummy 1, then BS returns to 0.
+;
+; Host words (INQ thread 0), after RUN: 1. the RN16 seed; 2. N, EPC words
+; (1..8); 3. the N EPC words. PC = N << 11 (UMI, XI, T, AFI 0); PacketCRC =
+; ~CRC-16 over PC and EPC, computed once. Nothing is reported on OUTQ.
+;
+; Limits, honestly: only Query and ACK. Sel, Session and Target are not
+; evaluated (the tag answers every Query); the slot counter is drawn from Q,
+; and a tag whose slot is not 0 stays silent for the round (no QueryRep or
+; QueryAdjust, no inventoried flags). An ACK with the wrong RN16 sends it
+; back to arbitrate; an ACK with no Query before it is ignored. No QueryX,
+; no extended preamble for delayed replies, no Select, Read or Kill. The
+; RN16 is a 16-bit LFSR step mixed with NOW, not a true random source.
+;
+; Memory (data words at BASE, thread 3's quarter top): +0 the prefix word
+; of an RN16 reply, +1 RN16, +2 0x8000 (its dummy bit), +3 the prefix word of
+; an EPC reply, +4 PC, +5.. EPC, then PacketCRC and 0x8000; +16 TICK_INT of
+; the reply, +17 TICK_FRAC, +18 ONES (a half-bit's toggle pattern), +19 the
+; Query's first 8 bits (1000 DR M TRext), +20 T1 lead, +21 state (0
+; arbitrate, 1 reply), +22 TRcal in clocks, +23 bits of the EPC reply,
+; +24 THR, +25 VIDX (the preamble's special bits, at "send" below).
+;
+; Registers, receiving: r0 the bits, r1 the last rise, r2 the interval, r3
+; RTcal, r4 the timeout (1.5 or 3 RTcal), r5 bits so far, r6 the
+; command's length, r7 scratch.
+; Sending: r0 the word, r1 half-bits left, r2 the next word, r3 the line,
+; r4 the last bit, r5 bits left in r0, r6 BASE, r7 the pattern.
+;
+; Size: 355 words, 0x000-0x162: it spills over thread 1 and 2's quarters
+; (the listing says so); the tag runs alone, on thread 0. Data at 0x1E0-0x1F9.
+; Timing: the half-cycle loop's longest stretch is 29 slots (116 clocks) and
+; the first, from the new grid, 30 (120): --strict proves both at a 128-clock
+; half (worst slack 9 clocks), so every staged edge lands on its tick.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   ENV = IN0, BS = OUT0
+
+        .equ    HMIN = 128              ; clocks: shorter half cycles are refused
+        .tick   HMIN                    ; the shortest half cycle sent (header)
+        .equ    BASE = 0x1E0
+        .equ    LAG = 12                ; clocks from the T1 wait to the new grid
+        .equ    PATF = 0xBB20           ; FM0 preamble: toggle (1) or hold, a half
+
+        SETP    BS, 0                   ; no backscatter
+        .csr    BE_PINS, 15             ; SHO drives no pin (6.3)
+        .csr    BE_CFG, 0x202           ; CRC_EN, MSB first
+        .csr    CRC_POLY, 0x1021        ; x^16 + x^12 + x^5 + 1 (Table 6-11)
+        .csr    CRC_INIT, 0xFFFF
+        MOV16   r6, BASE
+        POP     r0                      ; 1. the RN16 seed
+        ST      r0, r6, 1
+        MOV16   r0, 0x8000
+        ST      r0, r6, 2
+        POP     r1                      ; 2. N
+        MOV     r2, r1
+        SHLI    r2, 11                  ; PC: L = N
+        ST      r2, r6, 4
+        CRCI
+        LDSR    r2
+        CALL    sh16
+        MOV     r3, r6
+        ADDI    r3, 5
+        MOV     r4, r1
+cfg:    POP     r0                      ; 3. the EPC words
+        ST      r0, r3, 0
+        LDSR    r0
+        CALL    sh16
+        ADDI    r3, 1
+        DJNZ    r4, cfg
+        STCRC   r0
+        NOT     r0, r0                  ; ones-complement (6.3.1.5)
+        ST      r0, r3, 0
+        MOV16   r0, 0x8000
+        ST      r0, r3, 1
+        ADDI    r1, 2
+        SHLI    r1, 4
+        ADDI    r1, 1                   ; PC, EPC, CRC and the dummy bit
+        ST      r1, r6, 23
+        LDI     r0, 0
+        ST      r0, r6, 21              ; arbitrate
+        ST      r0, r6, 22              ; no TRcal yet: a reply is refused
+        .csr    BE_CFG, 0x200           ; CRC_EN, LSB first: SHO takes SR[0]
+        .csr    CRC_POLY, 0x4800        ; x^5 + x^3 + 1, left-aligned (Table 6-12)
+        .csr    CRC_INIT, 0x4800        ; preset 01001
+
+; ---------------------------------------------------------------- receive
+idle:   WAITP   ENV, 1                  ; CW
+        WAITP   ENV, 0                  ; the delimiter
+        WAITP   ENV, 1
+        CSRR    r1, NOW
+        CALL    edge                    ; data-0
+        CALL    edge                    ; RTcal
+        MOV     r3, r2
+        ADD     r4, r2, r2
+        ADD     r4, r4, r2              ; TRcal is up to 3 RTcal (eq. 2)
+        CALL    edget
+        BT      idle
+        LDI     r0, 0
+        LDI     r5, 0
+        CRCI
+        MOV     r4, r3
+        SHRI    r4, 1
+        ADD     r4, r4, r3              ; 1.5 RTcal: the end of a frame
+        CMP     r2, r3
+        BNC     bit                     ; shorter than RTcal: frame-sync, a bit
+        MOV16   r6, BASE
+        ST      r2, r6, 22              ; TRcal: a preamble
+        CALL    edget
+        BT      idle
+bit:    SHLI    r0, 1
+        SHLI    r2, 1
+        CMP     r2, r3                  ; C = (interval >= pivot): data-1
+        BNC     b0
+        ORI     r0, 1
+b0:     LDSR    r0
+        SHO                             ; the bit through the CRC-5
+        ADDI    r5, 1
+        CMPI    r5, 2
+        BNZ     b4
+        CMPI    r0, 1
+        BZ      isack
+        CMPI    r0, 2
+        BNZ     skip                    ; 00, 11: not ours
+        LDI     r6, 4
+        JMP     nb
+isack:  LDI     r6, 18
+        JMP     nb
+b4:     CMP     r5, r6
+        BZ      fin
+        CMPI    r5, 8
+        BNZ     nb
+        CMPI    r6, 22                  ; a Query (not an ACK's 8th bit)
+        BNZ     nb
+        MOV16   r7, BASE
+        ST      r0, r7, 19              ; 1000 DR M TRext
+nb:     CALL    edget
+        BT      idle                    ; the frame ended early
+        JMP     bit
+fin:    CMPI    r5, 4
+        BNZ     fin2
+        CMPI    r0, 8
+        BNZ     skip                    ; 10xx but not Query
+        LDI     r6, 22
+        JMP     nb
+fin2:   CMPI    r5, 18
+        BZ      ack
+        JMP     query
+skip:   CALL    edget                   ; to the end of the frame
+        BT      idle
+        JMP     skip
+
+; edget: the next rising edge, or T after 1.5 RTcal with no falling edge;
+; edge: the same without a timeout. r2 = the interval, r1 = the new rise.
+edget:  MOV     r7, r4
+        ADD     r7, r7, r1
+        CSRW    TD, r7
+        WAITP   ENV, 0, T
+        BT      eret
+e1:     WAITP   ENV, 1
+        CSRR    r7, NOW
+        SUB     r2, r7, r1
+        MOV     r1, r7
+eret:   RET
+edge:   WAITP   ENV, 0
+        JMP     e1
+sh16:   LDI     r7, 16                  ; 16 bits of SR through the CRC
+sh:     SHO
+        DJNZ    r7, sh
+        RET
+
+
+; ------------------------------------------------------------------ Query
+query:  STCRC   r7
+        CMPI    r7, 0                   ; residue 00000 (Annex F.1)
+        BNZ     arb                     ; a CRC-5 error: invalid, ignored
+        MOV16   r6, BASE
+        LD      r2, r6, 1               ; RN16: an LFSR step mixed with NOW
+        CSRR    r7, NOW
+        XOR     r2, r2, r7
+        SHRI    r2, 1
+        BNC     q1
+        MOV16   r7, 0xB400
+        XOR     r2, r2, r7
+q1:     ST      r2, r6, 1
+        MOV     r7, r0
+        SHRI    r7, 5
+        ANDI    r7, 15                  ; Q
+        LDI     r5, 1
+        SHL     r5, r5, r7
+        SUBI    r5, 1
+        AND     r5, r5, r2              ; the slot, 0 .. 2^Q - 1, from the RN16
+        BNZ     arb                     ; not slot 0: silent for the round
+        LD      r2, r6, 22              ; TRcal, clocks
+        LD      r4, r6, 19              ; 1000 DR M TRext
+        MOV     r7, r4
+        ANDI    r7, 8
+        BNZ     dr64
+        MOV     r5, r2                  ; DR = 8: half = TRcal / 16
+        SHRI    r5, 4
+        MOV     r7, r2
+        ANDI    r7, 15
+        SHLI    r7, 4
+        ST      r7, r6, 17
+        MOV     r7, r2
+        SHRI    r7, 2
+        ADD     r2, r2, r7              ; 10 Tpri = 20 halves = 5 TRcal / 4
+        JMP     q2
+dr64:   MOV     r7, r2                  ; DR = 64/3: half = 3 TRcal / 128
+        ADD     r2, r2, r7
+        ADD     r2, r2, r7
+        MOV     r5, r2
+        SHRI    r5, 7
+        MOV     r7, r2
+        SHLI    r7, 9
+        SHRI    r7, 8
+        ST      r7, r6, 17
+        MOV     r7, r2
+        SHRI    r7, 3
+        SHRI    r2, 5
+        ADD     r2, r2, r7              ; 20 halves = 5 (3 TRcal) / 32
+q2:     LDI     r7, HMIN
+        CMP     r5, r7
+        BNC     arb                     ; BLF too high: refused, silent
+        ST      r5, r6, 16
+        CMP     r2, r3
+        BC      q3
+        MOV     r2, r3                  ; T1 = MAX(RTcal, 10 Tpri)
+q3:     SUB     r2, r2, r5              ; the first edge is a half after the grid
+        SUBI    r2, LAG
+        ST      r2, r6, 20
+        MOV     r7, r4
+        SHRI    r7, 1
+        ANDI    r7, 3                   ; M: 0 FM0, 1..3 Miller 2, 4, 8
+        LDI     r5, 1
+        SHL     r5, r5, r7              ; K halves a half-bit
+        ADDI    r5, 1
+        MOV16   r7, 0xFFFF
+        SHR     r7, r7, r5
+        NOT     r7, r7                  ; ONES: K toggles and the end mark
+        ST      r7, r6, 18
+        LDI     r7, 1
+        ST      r7, r6, 21              ; reply
+        ADD     r2, r2, r1
+        CSRW    TD, r2                  ; T1 after the last rise
+        MOV     r2, r6
+        ADDI    r2, 1                   ; RN16 and its dummy bit
+        LDI     r1, 17
+        JMP     tx
+
+; -------------------------------------------------------------------- ACK
+ack:    MOV16   r6, BASE
+        LD      r7, r6, 21
+        CMPI    r7, 0
+        BZ      arb                     ; no RN16 out: ignored
+        LD      r7, r6, 1
+        CMP     r7, r0                  ; the echoed RN16
+        BNZ     arb
+        LD      r2, r6, 20
+        ADD     r2, r2, r1
+        CSRW    TD, r2
+        LD      r1, r6, 23
+        MOV     r2, r6
+        ADDI    r2, 4                   ; PC, EPC, PacketCRC, dummy
+        JMP     tx
+arb:    MOV16   r6, BASE
+        LDI     r7, 0
+        ST      r7, r6, 21
+        JMP     idle
+
+; --------------------------------------------------------------------- send
+; In: r2 = the first data word, r1 = data bits (with the dummy), TD = the
+; T1 target in clocks. The preamble is sent as bits ahead of the data: its
+; first bits preloaded in r0, the rest (TRext) in the prefix word before the
+; data. Two bits are special: FM0's v (a 1 without its boundary toggle,
+; VIDX) and Miller's pilot (zeros that keep their boundary toggles, THR).
+; Every half-bit plays ONES (K toggles then an end mark), its first toggle
+; cleared by the rules: FM0 boundary never (but v), middle of a 1; Miller
+; boundary between two 0s, middle of a 1. r1 counts half-bits: odd after
+; the decrement is a boundary, even a middle.
+tx:     LD      r7, r6, 19              ; 1000 DR M TRext
+        MOV     r3, r7
+        ANDI    r3, 6
+        BNZ     smil
+        ANDI    r7, 1                   ; FM0
+        BZ      sf0
+        LDI     r0, 0x2B                ; 12 zeros, 1 0 1 0 v 1: 18 bits
+        SUBI    r2, 1
+        ST      r0, r2, 0
+        LDI     r0, 0
+        LDI     r5, 2
+        ADDI    r1, 18
+        LDI     r3, 16                  ; v is bit 16
+        JMP     sfc
+sf0:    MOV16   r0, 0xAC00              ; 1 0 1 0 v 1
+        LDI     r5, 6
+        ADDI    r1, 6
+        LDI     r3, 4
+sfc:    SHLI    r1, 1
+        SHLI    r3, 1
+        ADDI    r3, 1
+        SUB     r7, r1, r3
+        ST      r7, r6, 25              ; VIDX = 2N - 1 - 2i
+        LDI     r7, 0
+        ST      r7, r6, 24              ; THR 0: FM0 never clears a boundary
+        JMP     sgo
+smil:   ANDI    r7, 1                   ; Miller
+        BZ      sm0
+        LDI     r0, 0x17                ; 16 zeros of pilot, 010111: 22 bits
+        SUBI    r2, 1
+        ST      r0, r2, 0
+        LDI     r0, 0
+        LDI     r5, 6
+        ADDI    r1, 22
+        LDI     r3, 16
+        JMP     smc
+sm0:    MOV16   r0, 0x05C0              ; 4 zeros of pilot, 010111
+        LDI     r5, 10
+        ADDI    r1, 10
+        LDI     r3, 4
+smc:    SHLI    r1, 1
+        SHLI    r3, 1
+        ADDI    r3, 1
+        SUB     r7, r1, r3
+        ST      r7, r6, 24              ; THR = 2N - 2 pilot - 1: through 010's 0
+        MOV16   r7, 0xFFFF
+        ST      r7, r6, 25              ; no v
+sgo:    LD      r4, r6, 17
+        LD      r3, r6, 16
+        WAITD   0                       ; T1 less a half cycle
+        CSRW    TICK_FRAC, r4
+        CSRW    TICK_INT, r3            ; the grid restarts here (SEMANTICS 4)
+        SETD    0
+        LDI     r3, 0                   ; the line is 0
+        LDI     r4, 1
+        JMP     refill                  ; the first bit
+
+hw:     WAITD   1                       ; one half cycle
+hl:     SHLI    r7, 1                   ; C = toggle; Z = the end mark went
+        BZ      refill
+        BNC     hw
+tg:     XORI    r3, 1
+        BZ      hz
+        SETP    BS, 1, D
+        JMP     hw
+hz:     SETP    BS, 0, D
+        JMP     hw
+hf:     SHLI    r7, 1                   ; a half-bit's first half: never the mark
+        BNC     hw
+        JMP     tg
+
+refill: SUBI    r1, 1
+        BNC     tend                    ; no half-bits left
+        MOV     r7, r1
+        ANDI    r7, 1
+        BZ      mid
+        SHLI    r0, 1                   ; a boundary: C = the next bit
+        BC      rone
+        CMPI    r4, 0
+        BNZ     rz1                     ; 0 after 1: toggle
+        LD      r7, r6, 24
+        CMP     r1, r7
+        BC      rz1                     ; FM0, or the pilot: toggle
+        LD      r7, r6, 18
+        SHLI    r7, 1                   ; 0 after 0 (Miller): no toggle
+        SHRI    r7, 1
+        LDI     r4, 0
+        JMP     hf
+rz1:    LD      r7, r6, 18
+        LDI     r4, 0
+        JMP     hf
+rone:   LD      r7, r6, 25
+        CMP     r1, r7
+        LD      r7, r6, 18
+        LDI     r4, 1
+        BNZ     hf
+        SHLI    r7, 1                   ; FM0's v: no boundary toggle
+        SHRI    r7, 1
+        JMP     hf
+mid:    DJNZ    r5, m1                  ; r0 empty after this bit: the next word
+        LD      r0, r2, 0
+        ADDI    r2, 1
+        LDI     r5, 16
+m1:     LD      r7, r6, 18
+        CMPI    r4, 0
+        BZ      hf                      ; the middle of a 0: toggle
+        SHLI    r7, 1                   ; the middle of a 1: none
+        SHRI    r7, 1
+        JMP     hf
+
+tend:   SETP    BS, 0, D                ; after the dummy bit: back to 0
+        WAITD   1
+        LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, 1
+        CSRW    TICK_INT, r7            ; tick = 1 clock again
+        JMP     idle
