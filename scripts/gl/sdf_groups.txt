@@ -70,3 +70,5 @@ c7	test_fw	test_fw_wspr,test_fw_feldhell	(test_wspr_rtl_prefix|test_feldhell_wor
 h1	test_fw	test_fw_hc595_seg7	test_hc595_seg7_three_digits
 m1	test_fw	test_fw_mfm	test_mfm_write_short_sector
 g1	test_fw	test_fw_gen2	test_gen2_query_rn16_miller4
+z1	test_fw	test_fw_ieee802154	(test_zb868_tx_to_model_decoder|test_zb868_rx_from_model_source)$
+r1	test_fw	test_fw_rds	test_rds_dec_syncs_mid_block$
