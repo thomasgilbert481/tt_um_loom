@@ -1,0 +1,223 @@
+; zb868_rx.loom
+; IEEE 802.15.4 868 MHz BPSK PHY receiver, at baseband: it recovers the
+; chip clock from the chip stream on IN0, despreads every data bit by
+; correlating its 15 chips against the PN sequence, undoes the
+; differential encoding, finds the SFD, reads the PHR and the PSDU, checks
+; the FCS and hands the octets and a status word to the host. The receive
+; side of zb868_tx.loom: wire OUT0 to IN0.
+;
+; Written on 2026-11-26, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). The hardware it uses, and
+; what that hardware was built for:
+;   - the edge wait with a timeout (WAITE ANY, T) and the tick restart on
+;     a TICK_INT write (SEMANTICS 4), built for UART start bits: the chip
+;     clock recovery of pocsag_rx.loom, at a fifteenth of a chip;
+;   - IN, built for parallel buses, to read the chip as a number;
+;   - OUT, built for parallel buses, to put each decoded bit on RXD (OUT2),
+;     and the bit engine's shift register, bit counter and CRC unit (6.9),
+;     built for USB, CAN and the serial buses, fed by SHI from the PIN_OUT
+;     view of RXD (as ax25_rx.loom does): SR assembles the octets and finds
+;     the SFD, CNT counts the bits, and the CRC (CRC_POLY 0x1021, CRC_INIT 0)
+;     runs the FCS of 7.2.1.9 over the PSDU, which leaves 0 for a good frame;
+;   - OUTQ for the octets and the reports.
+; What the firmware does that no hardware does: the despreading (a running
+; count of the chips that disagree with the sequence), the bit decision
+; and the "no signal" test on the correlation, the serial search for the
+; code phase, the differential decoding (6.6.2.2), the SFD, PHR and frame
+; logic.
+;
+; Out of scope: the carrier and the BPSK demodulator. IN0 takes the chip
+; stream at baseband (a chip 1 high), as a demodulator's chip slicer would
+; give it, or zb868_tx.loom's OUT0; the line idles low between frames.
+;
+; Standard: IEEE Std 802.15.4-2006; tools/protomodels/ieee802154.py gives
+; the clauses.
+;
+; Chip clock (tick = 1/15 chip): the thread samples at TD, does the chip's
+; work, and from 5/15 of a chip after the sample to the next sample watches
+; IN0 with WAITE ANY, T. An edge restarts the tick grid and puts the next
+; sample 4 ticks later (0.27 chip plus about 28 clocks of detection,
+; restart and the slots to the IN, measured on the model: about 0.45 of
+; the chip at 45 MHz); with no edge the sample free-
+; runs a chip after the last. After the 15th chip of a bit the bit's work
+; takes up to the next sample (WAITD 15): that boundary's edge is not
+; watched. Drift: Table 27's sequence has runs of at most 4 equal chips,
+; and a bit boundary joins at most 3 + 4, so at most about 8 chips go by
+; without a re-centring edge. An edge more than about 0.15 chip early is
+; missed (the window opens about 0.85 chip after a re-centred edge), so the
+; chip rate may be off by about 1 per cent (tested at +-1 %);
+; 6.6.3.3 asks for +-40 ppm. The length of the frame does not matter.
+;
+; Correlation and decision. d counts the chips of a bit that disagree with
+; the 0 sequence of Table 27 (IN, XOR the expected chip, AND 1, ADD: 5
+; slots a chip; the expected chips shift out of r0, whose bit 15 is a
+; sentinel that ends the bit). The correlation is 15 - 2d, so the encoded
+; bit E is 1 when d >= 8 (bit 3 of d), the sign of the correlation; with up
+; to 7 chips wrong it is right. R = E xor E_prev (6.6.2.2) goes to RXD.
+;   Acquisition (code phase unknown): a bit is taken as aligned only when
+;   |correlation| >= 9 (d <= 3 or d >= 12). The preamble is the sequence
+;   repeated (all its bits are 0, so every E is 0): at a wrong code phase
+;   the periodic autocorrelation of the m-sequence gives d = 8, and with
+;   up to 3 wrong chips d stays in 5..11, so the search cannot lock on a
+;   wrong phase. The first edge is taken as c0; after a bit that is not
+;   aligned the search slips one chip (a one-chip "bit"), at most 14 times:
+;   15 bits of the 32-bit preamble. With 4 or more wrong chips in the
+;   preamble's bits the search may slip past the SFD and miss the frame.
+;   Locked: a bit with |correlation| <= 5 (5 <= d <= 10) is "no signal":
+;   before the SFD the receiver starts again, after it the frame ends with
+;   a "lost" report. So a bit decodes with up to 4 wrong chips; with 5 or
+;   more the frame is lost or, from 8 on, the bit is wrong (the FCS says so).
+; The SFD must come within 48 bits of the lock, else the search restarts.
+; SR holds the last 16 decoded bits, LSB first: the SFD is SR = 0xA700, the
+; 0xA7 of Figure 17 after eight preamble zeros. Then CNT counts the octets
+; of the PHR and the PSDU; the CRC restarts after the PHR.
+;
+; Tick (set by the host before RUN): 1/15 chip. 868 MHz band: 10 at 45 MHz
+; (exact), 11 + 28/256 at 50 MHz (200 ppm short of 11.11, which the edge
+; tracking takes out). Proved for ticks of 10 clocks and more (.tick 10;
+; worst slack 0 clocks, the PHR octet's bit: 36 slots in one chip). The 915 MHz band (75 clocks
+; a chip at 45 MHz, a tick of 5) does not fit: a chip's work is 8 slots, 32
+; clocks, in a window of 5/15 chip, 25 clocks, and a bit's work is 36
+; slots, 140 clocks, in one chip of 75.
+;
+; Host words (FIFO space, thread 2), one frame at a time:
+;   an octet word per PSDU octet as its eighth bit is in (bits 7:0, 15:8 =
+;     0), the FCS octets included;
+;   then a report: bit 15 = 1 (never set in an octet word); bit 14 bad FCS
+;     (or a length under 2, no room for one); bit 13 lost (a bit with no
+;     signal inside the frame: the frame ends there); bit 12 overflow (OUTQ
+;     was full and octets were dropped); bits 6:0 the PHR's frame length
+;     (its reserved bit is not reported). All of 14:12 clear: a good frame.
+;   A full OUTQ drops octets (and sets bit 12); the report itself waits for
+;   room, and the receiver does not hunt again until it is in.
+; Nothing is read from INQ.
+;
+; Registers: r0 the expected chips (sentinel at the top), r1 8 (CNT
+; reload), r2 d, r3 the mode, r4 bits or octets left, r5 E_prev in bit 3,
+; r6 the report's low bits (scratch while hunting), r7 scratch.
+;
+; Memory: 122 words, 0x100-0x179, inside thread 2's quarter; with
+; zb868_tx.loom (83 words, 0x000-0x052) both run together as threads 0
+; and 2. --strict: 4 deadline pairs, worst slack 0 clocks, one .bounded
+; PUSH guarded by a WAITB OUTQ_NF, T; no SETP ... D, so no staged edge.
+
+        .imem   512
+        .thread 2
+        .pins   RX = IN0, RXD = OUT2
+        .tick   10                      ; the shortest tick (1/15 chip) proved
+        .equ    PN = 0x09AF             ; Table 27, a 0, c0 = bit 0
+        .equ    PNS = PN | 0x8000       ; with the sentinel
+        .equ    ACQ = 0                 ; r3: searching for the code phase
+        .equ    SLIP = 1                ;   a one-chip slip of the search
+        .equ    HUNT = 2                ;   aligned, looking for the SFD
+        .equ    PHR = 3                 ;   reading the PHR
+        .equ    PSDU = 4                ;   reading the PSDU
+        .equ    HUNTMAX = 48            ; bits from the lock to the SFD, at most
+
+start:  .csr    BE_PINS, pin(RXD) << 5 | 13 ; SHI reads RXD; SHO (unused) to no pin
+        .csr    CRC_POLY, 0x1021        ; CRC_INIT stays 0 (7.2.1.9, Figure 43)
+        .csr    BE_CFG, 1 << 9          ; CRC_EN, LSB first, NRZ
+        .csr    INGRP, 1 << 5 | pin(RX) ; IN: the chip
+        .csr    OUTGRP, 1 << 5 | pin(RXD) ; OUT: the decoded bit
+        LDI     r1, 8
+rearm:  LDI     r3, ACQ
+        LDI     r5, 0
+        MOV16   r0, PNS
+        LDI     r2, 0
+        WAITE   RX, RISE                ; a frame's first chip (c0 of a 0 is 1)
+edge:   CSRR    r7, TICK_INT            ; restart the tick grid on the edge
+        CSRW    TICK_INT, r7
+        SETD    4                       ; and sample 4/15 chip later
+wait:   WAITE   RX, ANY, T              ; an edge, or the sample time
+        SETD    0                       ; TD = NOW: one slot after, same tick
+        BNT     edge
+smp:    IN      r7                      ; the sample: the chip
+        XOR     r7, r7, r0
+        ANDI    r7, 1                   ; 1: it disagrees with the 0 sequence
+        ADD     r2, r2, r7
+        SHRI    r0, 1
+        CMPI    r0, 2                   ; C: chips of this bit still to come
+        BC      nrm
+
+; ---------------------------------------------- a bit's 15 chips are in: d
+        MOV16   r0, PNS                 ; the next bit's chips
+        XOR     r7, r2, r5              ; bit 3: R = E xor E_prev (6.6.2.2)
+        SHRI    r7, 3
+        OUT     r7                      ; R to RXD
+        MOV     r5, r2
+        ANDI    r5, 8                   ; E_prev = E = (d >= 8)
+        CMPI    r3, HUNT
+        BNC     unl                     ; not aligned yet
+        SUBI    r2, 5                   ; no signal: 5 <= d <= 10
+        CMPI    r2, 6
+        BNC     weak
+        CMPI    r3, PSDU
+        BZ      psdu
+        CMPI    r3, PHR
+        BZ      phr
+        SHI                             ; HUNT: RXD into SR
+        STSR    r7
+        MOV16   r6, 0xA700              ; the SFD after eight zeros
+        CMP     r7, r6
+        BZ      sfd
+        DJNZ    r4, lng
+        JMP     rearm                   ; no SFD: search again
+sfd:    LDI     r3, PHR
+        CSRW    CNT, r1
+        JMP     lng
+psdu:   SHI                             ; RXD into SR and the CRC
+        BNZ     lng                     ; Z: an octet is in
+        STSR    r7
+        SHRI    r7, 8                   ; LSB first: it was in SR[15:8]
+        WAITB   OUTQ_NF, T              ; a test: TD is reached
+        BT      ovf
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[2] (SEMANTICS 6.7)"
+        PUSH    r7
+ocnt:   CSRW    CNT, r1
+        DJNZ    r4, lng
+        STCRC   r7                      ; the last octet: the FCS check
+        TEST    r7, r7
+        MOV16   r7, 0x8000
+        BZ      report
+        MOV16   r7, 0xC000              ; bad FCS
+report: OR      r7, r7, r6
+        PUSH    r7                      ; waits for room; outside any deadline
+        JMP     rearm
+ovf:    MOV16   r7, 0x1000
+        OR      r6, r6, r7
+        JMP     ocnt
+phr:    SHI
+        BNZ     lng
+        STSR    r4                      ; the PHR is SR[15:8]
+        SHLI    r4, 1
+        SHRI    r4, 9                   ; the 7-bit frame length (6.3.3)
+        MOV     r6, r4
+        CRCI                            ; the FCS covers the PSDU only
+        CSRW    CNT, r1
+        LDI     r3, PSDU
+        CMPI    r4, 2
+        BC      lng
+        MOV16   r7, 0xC000              ; no room for an FCS
+        JMP     report
+weak:   CMPI    r3, PHR
+        BNC     rearm                   ; before the SFD: search again
+        MOV16   r7, 0xA000              ; lost inside the frame
+        JMP     report
+unl:    CMPI    r3, SLIP
+        BZ      slipd
+        SUBI    r2, 4                   ; aligned: d <= 3 or d >= 12
+        CMPI    r2, 8
+        BNC     slip
+        LDI     r3, HUNT
+        LDI     r4, HUNTMAX
+        JMP     lng
+slip:   LDI     r3, SLIP                ; the next "bit" is one chip
+        LDI     r0, 2
+        JMP     lng
+slipd:  LDI     r3, ACQ
+lng:    WAITD   15                      ; the bit's work fits in one chip
+        LDI     r2, 0                   ; d of the next bit
+        JMP     smp
+nrm:    WAITD   5                       ; a chip's work fits in 5/15 of one
+        SETD    10                      ; the next sample, a chip after this one
+        JMP     wait

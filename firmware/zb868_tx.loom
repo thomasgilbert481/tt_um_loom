@@ -1,0 +1,151 @@
+; zb868_tx.loom
+; IEEE 802.15.4 868 MHz BPSK PHY transmitter, at baseband: frames from the
+; host go out on OUT0 as the chip stream of 6.6.2, 300 kchip/s, every data
+; bit spread to 15 chips. The transmit side of zb868_rx.loom: wire OUT0 to
+; IN0.
+;
+; Written on 2026-11-26, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): 802.15.4 is in no design
+; document. The hardware it uses, and what that hardware was built for:
+;   - the deadline-latched pin write (SETP ... D, SEMANTICS 6.10, D-016),
+;     built for clock-exact edges of any period (WS2812, the NEC carrier):
+;     every chip edge lands on its tick's exact clock;
+;   - the fractional tick (SEMANTICS 4), built for UART baud rates: one
+;     chip is one tick, 166 + 171/256 clocks at 50 MHz;
+;   - the bit engine's shift register, bit counter and CRC unit (6.9),
+;     built for USB, CAN and the serial buses: SHO takes each raw bit of
+;     an octet out LSB first onto TXD (a debug view) and through the CRC,
+;     which with CRC_POLY 0x1021 and CRC_INIT 0 is the FCS of 7.2.1.9
+;     (Figure 43: register at zero, bits in transmission order);
+;   - INQ for the frames, OUTQ for the reports.
+; What the firmware does that no hardware does: the PPDU framing (preamble,
+; SFD, PHR, the FCS appended r0 first), the differential encoding of every
+; bit (6.6.2.2; the engine's NRZI toggles on a 0, as USB has it, while
+; 802.15.4's E_n = R_n xor E_(n-1) toggles on a 1, and running the engine
+; on inverted data would put the complement through the CRC), and the
+; direct-sequence spreading: each encoded bit becomes the 15-chip PN
+; sequence of Table 27 or its inverse.
+;
+; Out of scope: the carrier, BPSK itself and the raised-cosine pulse
+; (6.6.2.4). OUT0 carries the chip stream at baseband, a chip 1 high and a
+; chip 0 low, as the input of an external BPSK modulator would take it,
+; and idles low between frames. A real radio needs that modulator.
+;
+; Standard: IEEE Std 802.15.4-2006; tools/protomodels/ieee802154.py gives
+; the clauses. Preamble 32 zero bits, SFD 0xA7 bit 0 first, PHR = the
+; PSDU length (7 bits) and a reserved 0, the PSDU, all LSB first (6.3).
+; E_0 = 0 at every frame (6.6.2.2). Chip c0 first (6.6.2.4.2).
+;
+; Tick (set by the host before RUN): one chip. 868 MHz band (300 kchip/s):
+; TICK_INT 150 at 45 MHz (exact), 166 + 171/256 at 50 MHz (5 ppm long;
+; 6.6.3.3 allows +-40 ppm). Proved for ticks of 150 clocks and more (.tick
+; 150, worst slack and staged-edge slack in the listing). The 915 MHz band
+; (600 kchip/s, 75 clocks a chip at 45 MHz) is not claimed: an octet
+; boundary needs about 24 slots (96 clocks) in one chip.
+;
+; Host words (FIFO space, thread 0):
+;   INQ: L, the PSDU length in octets with the FCS (2..127), then the L - 2
+;     octets of the MHR and payload, one a word (bits 7:0). The program
+;     appends the FCS. The octets must keep up: one goes out every 8 bits
+;     (18 000 clocks at 45 MHz), INQ holds 4.
+;   OUTQ, one word a frame, after its last chip: L when it went out whole;
+;     0x8000 | 0x4000 | the octets sent, when INQ was empty at an octet
+;     boundary (an underrun: the line goes low at the end of that chip and
+;     the frame is cut short); 0xA000 for a length outside 2..127,
+;     refused, nothing sent (send no octets after it).
+;
+; Registers: r0 the chips of this bit, r1 chips left, r2 E as 0 or 0xFFFF
+; (chips = PN xor r2), r3 octets left, r4 L, r5 the octet, r6 octets sent,
+; r7 scratch.
+;
+; Memory: 83 words, 0x000-0x052, inside thread 0's quarter. --strict and
+; --staged-edges: 10 deadline pairs, worst slack 38 clocks (every staged
+; edge has at least 5), one .bounded POP guarded by a WAITB INQ_NE, T.
+
+        .imem   512
+        .thread 0
+        .pins   ZB = OUT0, TXD = OUT1
+        .tick   150                     ; the shortest tick (one chip) proved
+        .equ    PN = 0x09AF             ; Table 27, a 0: c0..c14 = 111101011001000, c0 = bit 0
+        .equ    SFD = 0xA7              ; Figure 17
+        .equ    POLY = 0x1021           ; x^16 + x^12 + x^5 + 1 (7.2.1.9)
+
+start:  .csr    BE_PINS, pin(TXD)       ; SHO to TXD
+        .csr    CRC_POLY, POLY          ; CRC_INIT stays 0 (Figure 43)
+        .csr    BE_CFG, 1 << 9          ; CRC_EN, LSB first, NRZ
+        SETP    ZB, 0
+idle:   POP     r4                      ; L: waits for the host
+        MOV     r7, r4
+        SUBI    r7, 2
+        CMPI    r7, 63                  ; L - 2 in 0..125?  (two compares:
+        BNC     lok                     ;  imm6 reaches 63)
+        SUBI    r7, 63
+        CMPI    r7, 63
+        BNC     lok
+        MOV16   r5, 0xA000
+        PUSH    r5                      ; refused
+        JMP     idle
+lok:    LDI     r2, 0                   ; E_0 = 0
+        LDI     r6, 0
+        LDI     r3, 4                   ; preamble: four octets of zeros
+        SETD    2                       ; anchor: the first chip 3 ticks on
+pre:    LDI     r5, 0
+        CALL    send8
+        DJNZ    r3, pre
+        LDI     r5, SFD
+        CALL    send8
+        MOV     r5, r4                  ; PHR: length, reserved bit 0
+        CALL    send8
+        CRCI                            ; the FCS covers the PSDU only
+        MOV     r3, r4
+        SUBI    r3, 2
+        BZ      fcs
+dat:    WAITB   INQ_NE, T               ; a test: TD (this chip) is reached
+        BT      under
+        .bounded "the WAITB above completed with T = 0, so INQ[0] held a word in that slot's X cycle; only this thread pops it (SEMANTICS 6.7)"
+        POP     r5
+        CALL    send8
+        INC     r6
+        DJNZ    r3, dat
+fcs:    STCRC   r5                      ; r0..r15 = CRC[15..0]
+        REV     r5, r5                  ; r0 to SR[0]: sent first
+        LDSR    r5
+        LDI     r5, 16
+        CSRW    CNT, r5
+        CALL    sendsr
+        SETP    ZB, 0, D                ; low at the end of the last chip
+        WAITD   1
+        PUSH    r4                      ; sent whole
+        JMP     idle
+under:  SETP    ZB, 0, D                ; INQ empty: cut short at this chip's end
+        WAITD   1
+        MOV16   r5, 0xC000
+        OR      r6, r6, r5
+        PUSH    r6
+        JMP     idle
+
+; One octet in r5, or SR and CNT already loaded (sendsr), bit by bit.
+; Entered and left in the chip time after a chip's WAITD (or after the
+; SETD anchor): the next bit's first chip is staged inside that chip.
+send8:  LDSR    r5
+        LDI     r5, 8
+        CSRW    CNT, r5
+sendsr: SHO                             ; R: the next raw bit, to TXD and the CRC
+        JP      TXD, 0, enc
+        NOT     r2, r2                  ; R = 1: E_n = not E_(n-1) (6.6.2.2)
+enc:    MOV16   r0, PN
+        XOR     r0, r0, r2              ; this bit's 15 chips (Table 27)
+        LDI     r1, 15
+chip:   SHRI    r0, 1                   ; C = the chip, c0 first (6.6.2.4.2)
+        BC      one
+        SETP    ZB, 0, D
+        WAITD   1
+        DJNZ    r1, chip
+        JMP     next
+one:    SETP    ZB, 1, D
+        WAITD   1
+        DJNZ    r1, chip
+next:   CSRR    r5, CNT                 ; bits of the field still to go?
+        TEST    r5, r5
+        BNZ     sendsr
+        RET
