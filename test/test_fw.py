@@ -152,6 +152,7 @@ from tools.tests import test_fw_hc595_seg7                        # noqa: E402
 from tools.tests import test_fw_mfm                               # noqa: E402
 from tools.tests import test_fw_gen2                              # noqa: E402
 from tools.tests import test_fw_ieee802154                        # noqa: E402
+from tools.tests import test_fw_rds                               # noqa: E402
 from tools.tests.fw_backend import scenarios                      # noqa: E402
 
 MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
@@ -185,7 +186,7 @@ MODULES = (test_fw_uart, test_fw_spi, test_fw_spi_slave, test_fw_i2c,
            test_fw_xy2, test_fw_mstp, test_fw_spdif, test_fw_i3c,
            test_fw_stepper, test_fw_tenbaset_link, test_fw_eth_tx,
            test_fw_hc595_seg7, test_fw_mfm, test_fw_gen2,
-           test_fw_ieee802154)
+           test_fw_ieee802154, test_fw_rds)
 
 
 def _make(scenario):

@@ -1,0 +1,364 @@
+; rds_dec.loom
+; RDS / RBDS (IEC 62106, NRSC-4) decoder at baseband: the biphase-coded
+; data signal from a 57 kHz demodulator's data slicer on IN0. Recovers the
+; bit clock, undoes the biphase and the differential coding, finds the
+; blocks by syndrome, corrects bursts, and reports every block to the host
+; through OUTQ[1] with the name of its offset word.
+;
+; Written on 2026-11-26, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035): RDS is in no design
+; document. Hardware reused from other jobs: the level and edge waits
+; (`WAITE ... T`, built for the serial receivers) time the line; the tick
+; restart on a TICK_INT write (SEMANTICS 4, built for UART start bits) is
+; the clock recovery; `IN` reads the line; `LD`/`ST` (SEMANTICS 6.11,
+; D-027, built for device emulation) hold the state and the tables. The
+; bit engine does not help here (its SHI shifts pin levels, and an RDS
+; bit is the XOR of two consecutive levels; its CRC unit keeps a running
+; remainder, not the remainder of a 26-bit window). What the firmware does
+; that no hardware does: the clock recovery and the biphase decision, the
+; differential decoding, the syndrome of the last 26 bits at every bit,
+; block and group synchronisation with no sync word, burst-error
+; correction by error trapping, loss of sync, and the reports.
+;
+; Clock recovery: a tick is a sixteenth of a bit. Biphase has an edge in
+; the middle of every bit (NRSC-4-A 1.7). The thread watches the line from
+; 14/16 to 20/16 of a bit after the last mid-bit edge (WAITE RXD, ANY, T);
+; an edge restarts the tick grid and the line is sampled 4 ticks later,
+; in the second half-symbol. No edge by 20/16 means the thread was
+; following the edges between bits (a run of 0s has them too): it moves
+; half a bit (SETD 8) and watches again, and a bit is lost; after start-up
+; that happens at most once, at the first 1. The first edge after RUN is
+; taken as a mid-bit edge. The bit clock is not a PLL: every bit is timed
+; from its own mid-bit edge, so a rate error only moves the sample within
+; the half-symbol (1 % is tested; BS.643-3 allows 0.0105 %).
+;
+; Decoding: the bit is this half-symbol's level XOR the last one's
+; (1.6 Table 2: either polarity). The window of the last 26 bits is r1
+; (bits 25..10 back, so at a block's end r1 is its information word) and
+; r0[15:6] (the newest 10). Its remainder mod g(x) is kept in r2 at every
+; bit: s = s x + d, reduced by
+; g, and x^26 mod g = 0x0EE taken out when the bit 26 back is a 1. A clean
+; block's remainder is its offset word (Annex A; Table B.1's syndromes
+; are these times x^325 mod g: tools/protomodels/rds.py checks it).
+;
+; Synchronisation (Annex C C.1): searching, every bit position whose
+; remainder is one of the five offset words is a candidate; the 26th bit
+; after it must give an offset word that follows it in a group (A B C|C' D
+; A); then the decoder is in sync and reports that second block. While a
+; candidate waits its 26 bits, other matches are ignored; if it fails,
+; the search goes on from that bit. In sync, every 26th bit ends a block:
+; clean if the remainder is the expected offset (C or C' for block 3),
+; otherwise the burst is searched for. LOSS (`cfg`, 8 in the image; C.1.2
+; suggests deciding over up to 50 blocks) blocks in a row that are not
+; clean lose sync, and the search starts again at the next bit.
+;
+; Burst correction (2.3: any single burst of span 5 or less; Annex B.2.2
+; traps it in the syndrome register): t = remainder XOR offset is
+; multiplied by x^-1 mod g (if odd, XOR g, then halve) for p = 0..21; the
+; first t < 32 is the error t x^p, and its part in bits 25..10 is XORed
+; into the information word. One step a bit, over the 22 bits after the
+; block, so a corrected or bad block is reported up to 22 bits late. No
+; t < 32 by p = 21: the block is bad (two bursts, or one longer than 5).
+; Block 3's offset for the search is C' when the last block 2 that was not
+; bad had B0 = 1 (NRSC-4-A 3.1.2).
+;
+; Host words (FIFO space, thread 1), two per block, nothing in INQ:
+;   A: the information word (corrected if bit 3 of B is set);
+;   B: 2:0 the offset (0 A, 1 B, 2 C, 3 C', 4 D; the expected one when the
+;      block was not clean), 3 corrected, 4 bad (not correctable; A as
+;      received), 5 overflow (reports were dropped before this one), 6
+;      sync (the block that confirmed a candidate), 7 lost (sync lost
+;      after this block). 15:8 zero.
+;   A report whose A word finds OUTQ full is dropped and the next carries
+;   the overflow bit; a B word that finds it full goes out at the next
+;   bit with room, and reports made meanwhile are dropped.
+;
+; Tick (set by the host before RUN): 1/16 of a bit: 2631 + 148/256 at
+; 50 MHz, 2368 + 108/256 at 45 MHz. The work is proved for ticks of 64
+; clocks or more (.tick 64: 1024 clocks a bit).
+;
+; Registers: r0 r1 the window, r2 its remainder, r3 bits to the
+; candidate's or the block's end, r5 flags (bit 0 the last level), r6 the
+; offset the remainder matches (5: none), r4 r7 scratch. The rest is in
+; `V` (data memory), placed before the code so every table address is a
+; one-word MOV16.
+;
+; Size: 256 words, 0x080-0x17F: 218 of code and 38 of data (0x081-0x0A6).
+; It fills thread 1's quarter and thread 2's, so thread 2 must not be
+; started with this image; thread 3's quarter is free. With rds_enc.loom
+; (0x000-0x074) the pair takes 359 of 512 words as threads 0 and 1. No CALL: the deadline checker returns a RET to
+; every call site, so a subroutine called twice on one path would be a
+; loop with no anchor. `--strict` and `--staged-edges`: two deadline pairs,
+; the worst (the sample's WAITD 4 to the WAITD 10 that closes the bit's
+; work) 128 slots, slack 128 clocks at the 64-clock tick; two `.bounded`
+; PUSHes, each guarded by a `WAITB OUTQ_NF, T` just before it that
+; completed with T = 0.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 1
+        .pins   RXD = IN0
+        .tick   64                      ; the shortest tick (1/16 bit) the work is proved for
+        .equ    LEVEL = 1               ; r5: the last half-symbol level
+        .equ    CAND = 2                ;   a candidate waits (searching)
+        .equ    SYNC = 4                ;   in sync
+        .equ    OWED = 8                ;   a report's B word waits for room
+        .equ    TRAP = 16               ;   a burst search is running
+        .equ    OVF = 32                ;   reports dropped (B bit 5)
+        .equ    CORR = 8                ; B bits
+        .equ    BAD = 16
+        .equ    SYNCED = 64
+        .equ    LOST = 128
+        .equ    GX = 0x5B9              ; g(x) (2.3)
+        .equ    GINV = GX >> 1          ; (t ^ g) >> 1 for odd t: t x^-1 mod g
+        .equ    VT = 0                  ; fields of V (data memory)
+        .equ    VP = 1
+        .equ    VTINFO = 2
+        .equ    VSTAT = 3
+        .equ    VBRUN = 4
+        .equ    VB0 = 5
+        .equ    VCINFO = 6
+        .equ    VOWED = 7
+        .equ    VLOSS = 8
+        .equ    VK = 9
+        .equ    VCAND = 10
+
+start:  JMP     init
+
+; ------------------------------------------------------------ data (first, so a
+; table's address is a one-word MOV16)
+V:      .word   0, 0, 0, 0, 0, 0, 0, 0  ; t, p, info, status, bad run, B0, -, owed B
+cfg:    .word   8                       ; LOSS: blocks in a row not clean that lose sync
+        .word   0, 0                    ; the block in the group, the candidate's offset
+ht:     .word   0x17FF, 0x17FF, 0x0968, 0x17FF, 0x0F50, 0x11B4, 0x0598, 0x00FC
+offs:   .word   0x0FC, 0x198, 0x168, 0x350, 0x1B4   ; A B C C' D (Annex A Table A.1)
+nxt:    .word   0x02, 0x0C, 0x10, 0x10, 0x01        ; offsets that may follow, as bit masks
+kn:     .word   1, 2, 3, 3, 0           ; the block in the group after that offset's
+kx:     .word   0, 1, 2, 4              ; a block's offset: A B C D
+km:     .word   0x01, 0x02, 0x0C, 0x10  ; the offsets a block may carry, as bit masks
+
+init:   .csr    INGRP, 1 << 5 | pin(RXD)    ; IN reads RXD into bit 0
+        LDI     r0, 0
+        LDI     r1, 0
+        LDI     r2, 0
+        LDI     r5, 0
+        WAITE   RXD, ANY                ; the first edge, taken as a mid-bit edge
+
+; ------------------------------------------------------------ the bit clock
+edge:   CSRR    r7, TICK_INT            ; restart the tick grid on the mid-bit edge
+        CSRW    TICK_INT, r7
+        SETD    0
+        WAITD   4                       ; the second half-symbol
+        IN      r7                      ; its level
+        XOR     r7, r7, r5
+        ANDI    r7, 1                   ; d = this level ^ the last (Table 2)
+        XOR     r5, r5, r7              ; LEVEL = this level
+        SHLI    r2, 1                   ; the remainder: s x + d mod g
+        OR      r2, r2, r7
+        MOV     r4, r2
+        SHRI    r4, 10
+        BZ      w0
+        MOV16   r4, GX
+        XOR     r2, r2, r4
+w0:     SHLI    r1, 1                   ; C = the bit 26 back, leaving the window
+        BNC     w1
+        LDI     r4, 0xEE                ; x^26 mod g
+        XOR     r2, r2, r4
+w1:     SHLI    r0, 1                   ; C = the bit 10 back, into r1
+        BNC     w2
+        ORI     r1, 1
+w2:     SHLI    r7, 6
+        OR      r0, r0, r7              ; the new bit at r0[6]
+        MOV     r7, r5                  ; an owed B word goes when OUTQ has room
+        ANDI    r7, OWED
+        BZ      w3
+        WAITB   OUTQ_NF, T              ; a test: TD is reached
+        BT      w3
+        MOV16   r7, V
+        LD      r7, r7, VOWED
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[1] (SEMANTICS 6.7)"
+        PUSH    r7
+        XORI    r5, OWED
+w3:     MOV     r7, r2                  ; r6 = the offset whose word the remainder is
+        SHRI    r7, 2
+        ANDI    r7, 7                   ; (bits 4:2 tell the five apart)
+        MOV16   r4, ht
+        ADD     r4, r4, r7
+        LD      r4, r4, 0               ; that offset's word | its number << 10
+        MOV     r6, r4
+        SHRI    r6, 10
+        XOR     r4, r4, r2
+        SHLI    r4, 6                   ; Z = the low 10 bits are the remainder
+        BZ      w4
+        LDI     r6, 5                   ; none
+w4:     MOV     r7, r5
+        ANDI    r7, SYNC | CAND         ; (never both)
+        BZ      hnew
+        CMPI    r7, CAND
+        BZ      hcand
+        JMP     insync
+
+; ------------------------------------------------------------ searching (C.1.1)
+hnew:   CMPI    r6, 5
+        BZ      tstep
+        MOV16   r4, V                   ; a candidate: wait 26 bits
+        ST      r6, r4, VCAND
+        ORI     r5, CAND
+        LDI     r3, 26
+        JMP     tstep
+hcand:  SUBI    r3, 1
+        BNZ     tstep                   ; other matches meanwhile are ignored
+        XORI    r5, CAND                ; the candidate's 26th bit:
+        MOV16   r4, V
+        LD      r4, r4, VCAND
+        MOV16   r7, nxt
+        ADD     r7, r7, r4
+        LD      r7, r7, 0
+        SHR     r7, r7, r6
+        ANDI    r7, 1                   ; an offset that follows it in a group?
+        BZ      hnew                    ; no: search on from this bit
+        MOV16   r4, kn                  ; sync, on this block
+        ADD     r4, r4, r6
+        LD      r4, r4, 0
+        MOV16   r7, V
+        ST      r4, r7, VK              ; the next block in the group
+        LDI     r4, 0
+        ST      r4, r7, VBRUN
+        ORI     r5, SYNC
+        LDI     r3, 26
+        LDI     r7, SYNCED
+        OR      r7, r7, r6
+        JMP     repw                    ; report it, flagged sync
+
+; ------------------------------------------------------------ in sync: a block ends
+insync: SUBI    r3, 1
+        BNZ     tstep
+        MOV16   r4, V
+        LD      r7, r4, VK              ; r7 = the block in the group
+        MOV     r3, r7
+        ADDI    r3, 1
+        ANDI    r3, 3
+        ST      r3, r4, VK
+        LDI     r3, 26
+        MOV16   r4, km
+        ADD     r4, r4, r7
+        LD      r4, r4, 0
+        SHR     r4, r4, r6
+        ANDI    r4, 1                   ; an offset this block may carry (C or C')?
+        BNZ     clean
+        MOV16   r4, kx                  ; not clean: the expected offset
+        ADD     r4, r4, r7
+        CMPI    r7, 2
+        LD      r7, r4, 0
+        BNZ     dirty
+        MOV16   r4, V
+        LD      r4, r4, VB0
+        ADD     r7, r7, r4              ; block 3 of a version B group: C'
+dirty:  MOV16   r4, offs                ; t = remainder ^ expected offset word
+        ADD     r4, r4, r7
+        LD      r4, r4, 0
+        XOR     r4, r4, r2
+        MOV16   r6, V
+        ST      r4, r6, VT
+        ST      r7, r6, VSTAT
+        LDI     r4, 0
+        ST      r4, r6, VP
+        ST      r1, r6, VTINFO          ; the information word as received
+        LD      r4, r6, VBRUN
+        ADDI    r4, 1
+        ST      r4, r6, VBRUN
+        LD      r7, r6, VLOSS
+        CMP     r4, r7                  ; C = LOSS blocks in a row not clean
+        BNC     dl
+        LD      r4, r6, VSTAT
+        LDI     r7, LOST
+        OR      r4, r4, r7
+        ST      r4, r6, VSTAT
+        XORI    r5, SYNC                ; sync lost: search from the next bit
+dl:     ORI     r5, TRAP                ; the burst search runs over the next bits
+        JMP     done
+
+; ------------------------------------------------------------ burst trapping (B.2.2)
+; One step a bit: t x^p is the error if t < 32; else t <- t x^-1 mod g
+; (if t is odd XOR g, then halve), p <- p + 1; p = 0..21 over 22 bits.
+tstep:  MOV     r7, r5
+        ANDI    r7, TRAP
+        BZ      done
+        MOV16   r6, V
+        LD      r4, r6, VT
+        CMPI    r4, 32
+        BNC     tfound                  ; t < 32: a burst of span <= 5 at p
+        SHRI    r4, 1                   ; C = t was odd
+        BNC     t1
+        MOV16   r7, GINV
+        XOR     r4, r4, r7
+t1:     ST      r4, r6, VT
+        LD      r4, r6, VP
+        ADDI    r4, 1
+        ST      r4, r6, VP
+        CMPI    r4, 22
+        BNC     done                    ; p < 22: on at the next bit
+        XORI    r5, TRAP                ; p = 0..21 tried: not correctable
+        LD      r4, r6, VSTAT
+        ORI     r4, BAD
+        ST      r4, r6, VSTAT
+        LD      r4, r6, VTINFO          ; as received
+        JMP     rep
+tfound: XORI    r5, TRAP
+        LD      r7, r6, VP              ; the error is t x^p; its bits 25..10:
+        CMPI    r7, 10
+        BC      thi
+        NEG     r7, r7
+        ADDI    r7, 10
+        SHR     r4, r4, r7              ; t >> (10 - p)
+        JMP     tx
+thi:    SUBI    r7, 10
+        SHL     r4, r4, r7              ; t << (p - 10)
+tx:     LD      r7, r6, VTINFO
+        XOR     r4, r4, r7              ; the corrected information word
+        LD      r7, r6, VSTAT
+        ORI     r7, CORR
+        ST      r7, r6, VSTAT
+        JMP     rep
+
+; ------------------------------------------------------------ reports
+; clean: a block in sync that was clean (r6 its offset), then repw.
+; repw: r7 = the status, the information word from the window (r1).
+; rep: r4 = the information word, r6 = V, VSTAT the status.
+clean:  MOV16   r4, V
+        LDI     r7, 0
+        ST      r7, r4, VBRUN
+        MOV     r7, r6                  ; the status: the offset found
+repw:   MOV16   r6, V
+        ST      r7, r6, VSTAT
+        MOV     r4, r1
+rep:    LD      r7, r6, VSTAT           ; a block 2 (offset B), not bad: keep its B0
+        ANDI    r7, 7 | BAD
+        CMPI    r7, 1
+        BNZ     rp
+        MOV     r7, r4
+        SHRI    r7, 11
+        ANDI    r7, 1
+        ST      r7, r6, VB0
+rp:     MOV     r7, r5
+        ANDI    r7, OWED
+        BNZ     rdrop                   ; the last B still waits: drop this report
+        WAITB   OUTQ_NF, T
+        BT      rdrop
+        .bounded "the WAITB above completed with T = 0, so OUTQ had room in that slot's X cycle; only this thread pushes OUTQ[1] (SEMANTICS 6.7)"
+        PUSH    r4                      ; A
+        LD      r7, r6, VSTAT
+        MOV     r4, r5
+        ANDI    r4, OVF
+        OR      r7, r7, r4              ; B: the overflow bit, once
+        XOR     r5, r5, r4
+        ST      r7, r6, VOWED           ; B goes from the next bit on
+        ORI     r5, OWED
+        JMP     done
+rdrop:  ORI     r5, OVF
+done:   WAITD   10                      ; the work fits in 10 ticks: 14/16 after the edge
+        SETD    6                       ; the next mid-bit edge is due at 16/16
+watch:  WAITE   RXD, ANY, T
+        BT      slip
+        JMP     edge
+slip:   SETD    8                       ; none by 20/16: half a bit off, look again
+        JMP     watch
