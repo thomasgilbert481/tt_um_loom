@@ -72,3 +72,4 @@ m1	test_fw	test_fw_mfm	test_mfm_write_short_sector
 g1	test_fw	test_fw_gen2	test_gen2_query_rn16_miller4
 z1	test_fw	test_fw_ieee802154	(test_zb868_tx_to_model_decoder|test_zb868_rx_from_model_source)$
 r1	test_fw	test_fw_rds	test_rds_dec_syncs_mid_block$
+f1	test_fw	test_fw_iso14443a	test_nfca_card_reqa_to_sak$
