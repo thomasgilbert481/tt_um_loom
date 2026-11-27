@@ -1,0 +1,511 @@
+; nfca_card.loom
+; An ISO/IEC 14443 Type A card (PICC, NFC-A, 106 kbit/s) at baseband, with a
+; single-size (4-byte) UID: it reads the reader's modified Miller pauses,
+; answers REQA and WUPA with ATQA, answers the cascade level 1 ANTICOLLISION
+; with the rest of its UID only when the reader's prefix (NVB bytes and bits)
+; matches its own, and answers SELECT with SAK and CRC_A. A prefix or a UID
+; that is not its own leaves it silent.
+;
+; Written on 2026-11-26, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; NFC. The program times the reader's pauses with the level waits (`WAITP`,
+; built for I2C and SPI, the deadline timeout `T` as the end of a frame) and
+; reads of the `NOW` tick counter (the deadline timebase, SEMANTICS 4). It
+; makes the 847.5 kHz subcarrier with the deadline-latched pin write
+; (`SETP ... D`, 6.10, built for exact edges) on a tick of half a subcarrier
+; period, a fractional tick (TICK_FRAC, built for UART baud rates) written
+; at run time, so the subcarrier keeps fc/16 on average at any clock. Its
+; tables live in the data memory (`LD`/`ST`, 6.11, built for device
+; emulation). What the firmware does that no hardware does: the modified
+; Miller decoder, the Manchester-on-subcarrier coder, the odd parity, CRC_A,
+; the frame delay time and the card's states.
+;
+; Baseband only: there is no 13.56 MHz carrier and no RF. ENV = IN0 is the
+; reader's field as a logic level, high = carrier on, low = a pause (100 %
+; ASK). LM = OUT0 is the load modulation switch: high = loaded. The
+; subcarrier is on-off keyed onto LM; a front end makes the field and loads
+; the coil.
+;
+; Sources (tools/protomodels/iso14443a.py cites them item by item): NXP
+; MFRC522 data sheet Rev. 3.9 (Table 4: 106 kBd = 100 % ASK modified Miller
+; one way, subcarrier fc/16 Manchester load modulation the other, bit 128/fc;
+; Figure 6: start bit, 8 data bits, odd parity; Tables 49/50: CollPos;
+; Table 56: CRC preset 6363h). Proxmark3 armsrc/iso14443a.c (sequences X, Y,
+; Z, D, E, F; start Z, end logic 0 then Y; the answer 1172 or 1236 carrier
+; periods after the reader; SEL 93h, NVB, BCC, SAK cascade bit 04h). libnfc
+; iso14443-subr.c (CRC_A). The ISO text is paywalled: what no source above
+; states is marked "from memory, unchecked" in the model.
+;
+; Receiving (tick 1 clock). Pauses start on the half-bit grid: Z at a bit's
+; start, X at its middle, and all have one length, so they are timed by
+; their rises (stamped at once, decoded after: a decode can outlast a
+; pause, never the 2 halves to the next rise). From one rise to the next is
+; 2, 3 or 4 half bits: thresholds 2.5 and 3.5 halves (5T/4, 7T/4), a
+; margin of half a half bit (118 clocks at 50 MHz). With the parity of
+; the last pause's position (even = Z, odd = X): even + 2 -> 0, even + 3 ->
+; 1, odd + 2 -> 1, odd + 3 -> 0 0, odd + 4 -> 0 1; even + 4 (a Y after a 0)
+; is illegal and drops the frame. No pause within 4.5 halves (9T/4) ends the
+; frame; a last pause on an even position was the end's Z, so its 0 is
+; dropped. Bits are packed 9 to a word, LSB first: 8 data bits and the odd
+; parity at bit 8, as the tables are, so a whole-word compare checks the
+; parity too. A frame of 9n + 8 bits (no parity after a whole byte) or over
+; 20 words is dropped.
+;
+; Replying (tick h = 8/fc, half a subcarrier period). A bit is 16 ticks: D
+; (1) = subcarrier for 8 ticks then none, E (0) = none then 8 ticks; start D,
+; end F (the line stays low). The first rise comes FDT after the rising edge
+; of the reader's last pause: 1236/fc if the last pause was an X (last data
+; bit 1), 1172/fc if a Z. The next bit is fetched in the half bit without
+; subcarrier; the one step with one tick to spare is E followed by D (4
+; slots, slack 10 clocks at a 26-clock tick).
+;
+; Host words (INQ thread 0), after RUN: 1. TICK_INT and 2. TICK_FRAC of h;
+; 3. T, the bit in clocks; 4. FDT after a 1 and 5. after a 0, in clocks;
+; 6. UID0 | UID1 << 8; 7. UID2 | UID3 << 8; 8. ATQA (sent low byte first);
+; 9. SAK. Nothing is reported on OUTQ.
+;
+; States (this program's reading of ISO/IEC 14443-3, from memory, unchecked):
+; IDLE answers REQA and WUPA (then READY); READY answers REQA and WUPA again,
+; a matching ANTICOLLISION (stays READY) and a matching SELECT (then ACTIVE);
+; anything else leaves READY silent. ACTIVE answers nothing: no HLTA, no
+; ISO/IEC 14443-4 (RATS), no MIFARE commands.
+;
+; Limits, honestly: cascade level 1 only (no 7- or 10-byte UID, no cascade
+; tag), 106 kbit/s only, no HALT state. The card's bit grid comes from its
+; own clock, not from the reader's carrier as a real card's does; the
+; fractional tick keeps the subcarrier within 1 clock of the fc/16 grid.
+;
+; Memory: RXB = 0x1C0, the received frame (up to 20 words); BASE = 0x1E0:
+; +0..+8 the SELECT this card answers (93h 70h UID0..3 BCC CRC_A), +9/+10
+; ATQA, +11..+13 SAK and its CRC_A, each byte | parity << 8; +16 5T/4,
+; +17 7T/4, +18 9T/4, +19/+20 the FDTs less the lead, +21/+22 TICK_INT /
+; TICK_FRAC, +23 the state (0 IDLE, 1 READY, 2 ACTIVE), +24 the last
+; pause's rise, +25 the last pause's parity.
+;
+; Registers, receiving: r1 the last rise, r2 the interval, r3 the parity of
+; the last pause, r4 the word pointer, r5 the word, r6 the bit mask, r0/r7
+; scratch. Sending: r1 the byte pointer, r2 the word, r3 bits left in it,
+; r5 bytes left, r6 the next bit (0, 1, 2 = end), r0/r7 scratch.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   ENV = IN0, LM = OUT0
+
+        .equ    HMIN = 26               ; clocks: the shortest h (45 MHz)
+        .tick   HMIN
+        .equ    RXB = 0x1C0
+        .equ    BASE = 0x1E0
+        .equ    LAG = 11                ; clocks from the FDT wait to the new grid
+
+        SETP    LM, 0                   ; unloaded
+        MOV16   r6, BASE
+        POP     r0                      ; 1. TICK_INT of h
+        ST      r0, r6, 21
+        MOV     r1, r0
+        POP     r0                      ; 2. TICK_FRAC of h
+        ST      r0, r6, 22
+        POP     r0                      ; 3. T
+        MOV     r2, r0
+        SHRI    r2, 2                   ; T/4
+        ADD     r3, r0, r2
+        ST      r3, r6, 16              ; 5T/4: 2.5 halves
+        MOV     r4, r0
+        SHRI    r4, 1
+        ADD     r3, r3, r4
+        ST      r3, r6, 17              ; 7T/4: 3.5 halves
+        ADD     r3, r0, r0
+        ADD     r3, r3, r2
+        ST      r3, r6, 18              ; 9T/4: the end of a frame
+        POP     r0                      ; 4. FDT after a 1
+        SUB     r0, r0, r1
+        SUBI    r0, LAG
+        ST      r0, r6, 19              ; less the lead: h + LAG
+        POP     r0                      ; 5. FDT after a 0
+        SUB     r0, r0, r1
+        SUBI    r0, LAG
+        ST      r0, r6, 20
+        MOV16   r0, 0x93                ; SEL, cascade level 1
+        ST      r0, r6, 0
+        LDI     r0, 0x70                ; NVB of a SELECT: 7 bytes, 0 bits
+        ST      r0, r6, 1
+        POP     r0                      ; 6. UID0 | UID1 << 8
+        MOV     r2, r0
+        SHLI    r2, 8
+        SHRI    r2, 8
+        ST      r2, r6, 2
+        SHRI    r0, 8
+        ST      r0, r6, 3
+        XOR     r3, r2, r0              ; BCC = UID0 ^ UID1 ^ UID2 ^ UID3
+        POP     r0                      ; 7. UID2 | UID3 << 8
+        MOV     r2, r0
+        SHLI    r2, 8
+        SHRI    r2, 8
+        ST      r2, r6, 4
+        SHRI    r0, 8
+        ST      r0, r6, 5
+        XOR     r3, r3, r2
+        XOR     r3, r3, r0
+        ST      r3, r6, 6
+        MOV16   r3, 0x8408              ; x^16 + x^12 + x^5 + 1, reflected
+        MOV16   r2, 0x6363              ; CRC_A preset
+        MOV     r1, r6
+        LDI     r5, 7
+cl:     LD      r0, r1, 0
+        CALL    crcb
+        ADDI    r1, 1
+        DJNZ    r5, cl
+        MOV     r0, r2
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r6, 7               ; CRC_A, low byte first
+        SHRI    r2, 8
+        ST      r2, r6, 8
+        POP     r0                      ; 8. ATQA
+        MOV     r2, r0
+        SHLI    r2, 8
+        SHRI    r2, 8
+        ST      r2, r6, 9
+        SHRI    r0, 8
+        ST      r0, r6, 10
+        POP     r0                      ; 9. SAK
+        ST      r0, r6, 11
+        MOV16   r2, 0x6363
+        CALL    crcb
+        MOV     r0, r2
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r6, 12
+        SHRI    r2, 8
+        ST      r2, r6, 13
+        MOV     r1, r6
+        LDI     r5, 14
+pl:     LD      r0, r1, 0               ; every byte | odd parity << 8
+        CALL    par
+        ST      r0, r1, 0
+        ADDI    r1, 1
+        DJNZ    r5, pl
+        LDI     r0, 0
+        ST      r0, r6, 23              ; IDLE
+        JMP     rx
+
+; crcb: r2 = CRC_A updated with the byte r0, LSB first (r3 = 8408h; r4)
+crcb:   XOR     r2, r2, r0
+        LDI     r4, 8
+cb1:    SHRI    r2, 1
+        BNC     cb2
+        XOR     r2, r2, r3
+cb2:    DJNZ    r4, cb1
+        RET
+; par: r0 = the byte r0 with its odd parity at bit 8 (r3, r4, r7)
+par:    MOV     r7, r0
+        LDI     r4, 8
+        LDI     r3, 1
+p1:     SHRI    r7, 1
+        BNC     p2
+        XORI    r3, 1
+p2:     DJNZ    r4, p1
+        SHLI    r3, 8
+        OR      r0, r0, r3
+        RET
+; emit: one received bit (e1: a 1, e0: a 0) into r5 at the mask r6; every
+; ninth bit stores the word at r4 (r0)
+e1:     OR      r5, r5, r6
+e0:     SHLI    r6, 1
+        MOV     r0, r6
+        SHRI    r0, 9
+        BZ      eret
+        ST      r5, r4, 0
+        LDI     r5, 0
+        LDI     r6, 1
+        MOV     r0, r4
+        ANDI    r0, 63
+        CMPI    r0, 20
+        BC      eret                    ; 20 words: no further
+        ADDI    r4, 1
+eret:   RET
+
+; ---------------------------------------------------------------- receive
+rx:     WAITP   ENV, 1                  ; the field, no pause
+        WAITP   ENV, 0                  ; the start of communication (a Z)
+        MOV16   r4, RXB
+        LDI     r5, 0
+        LDI     r6, 1
+        LDI     r3, 0                   ; position 0: even
+        MOV16   r7, BASE
+        WAITP   ENV, 1
+        CSRR    r1, NOW                 ; pauses are timed rise to rise
+nxt:    ST      r1, r7, 24              ; the last pause's rise
+        LD      r0, r7, 18
+        ADD     r0, r0, r1
+        CSRW    TD, r0                  ; 4.5 halves after the last rise
+        WAITP   ENV, 0, T
+        BT      fend
+        WAITP   ENV, 1
+        CSRR    r0, NOW
+        SUB     r2, r0, r1              ; rise to rise
+        MOV     r1, r0
+        LD      r0, r7, 16
+        CMP     r2, r0
+        BNC     d2                      ; under 2.5 halves: 2
+        LD      r0, r7, 17
+        CMP     r2, r0
+        BNC     d3                      ; under 3.5 halves: 3
+        CMPI    r3, 0
+        BZ      bad                     ; even + 4: a Y after a 0
+        CALL    e0                      ; odd + 4: 0 1
+        CALL    e1
+        JMP     nxt
+d2:     CMPI    r3, 0
+        BNZ     d2o
+        CALL    e0                      ; even + 2: 0
+        JMP     nxt
+d2o:    CALL    e1                      ; odd + 2: 1
+        JMP     nxt
+d3:     XORI    r3, 1
+        BZ      d3o
+        CALL    e1                      ; even + 3: 1, now odd
+        JMP     nxt
+d3o:    CALL    e0                      ; odd + 3: 0 0, now even
+        CALL    e0
+        JMP     nxt
+bad:    WAITP   ENV, 1                  ; drop the frame: wait for a quiet line
+        LD      r0, r7, 18
+        CSRR    r1, NOW
+        ADD     r0, r0, r1
+        CSRW    TD, r0
+        WAITP   ENV, 0, T
+        BNT     bad
+        JMP     rx
+
+; fend: the frame is over. r3 even: the end's Z made the last 0, drop it.
+fend:   ST      r3, r7, 25
+        CMPI    r3, 0
+        BNZ     fe2
+        SHRI    r6, 1
+        BNZ     fe2
+        SUBI    r4, 1                   ; the 0 was a word's parity bit
+        LD      r5, r4, 0
+        MOV16   r6, 0x100
+fe2:    MOV     r0, r4
+        ANDI    r0, 63
+        CMPI    r0, 20
+        BC      rx                      ; too long: dropped
+        ST      r5, r4, 0               ; the partial word (if any)
+        LDI     r2, 0                   ; r2 = bits in the last word
+fe3:    SHRI    r6, 1
+        BZ      fe4
+        ADDI    r2, 1
+        JMP     fe3
+fe4:    CMPI    r2, 8
+        BZ      rx                      ; a whole byte with no parity: dropped
+        LD      r1, r7, 23              ; the state
+        CMPI    r1, 2
+        BZ      rx                      ; ACTIVE: silent
+        MOV16   r6, RXB
+        CMPI    r0, 0
+        BNZ     long
+        CMPI    r2, 7
+        BNZ     rx                      ; a short frame is 7 bits
+        LDI     r1, 0x26                ; REQA
+        CMP     r5, r1
+        BZ      atqa
+        LDI     r1, 0x52                ; WUPA
+        CMP     r5, r1
+        BNZ     rx
+atqa:   LDI     r1, 1
+        ST      r1, r7, 23              ; READY
+        MOV     r1, r7
+        ADDI    r1, 9                   ; ATQA: 2 bytes from bit 0
+        LDI     r0, 0
+        LDI     r5, 2
+        JMP     reply
+
+; long: r0 = whole words, r2 = bits in the last, r6 = RXB, r7 = BASE
+quiet:  JMP     rx                      ; silent: back to listening
+long:   CMPI    r1, 1
+        BNZ     quiet                   ; not READY: silent
+        MOV     r5, r0
+        LD      r3, r6, 0
+        LD      r4, r7, 0
+        CMP     r3, r4
+        BNZ     quiet                   ; not SEL 93h (with its parity)
+        CMPI    r5, 2
+        BNC     quiet
+        LD      r1, r6, 1               ; NVB with its parity bit
+        MOV     r0, r1
+        SHLI    r0, 8
+        SHRI    r0, 8
+        CALL    par
+        CMP     r0, r1
+        BNZ     quiet                   ; a parity error
+        MOV     r4, r1
+        SHLI    r4, 8
+        SHRI    r4, 8                   ; NVB
+        MOV16   r7, BASE
+        LDI     r3, 0x70
+        CMP     r4, r3
+        BZ      select
+        MOV     r3, r4
+        SHRI    r3, 4                   ; bytes, SEL and NVB included
+        ANDI    r4, 15                  ; bits
+        CMP     r3, r5
+        BNZ     quiet                   ; the frame's length is not NVB's
+        CMP     r4, r2
+        BNZ     quiet
+        CMPI    r3, 2
+        BNC     quiet
+        CMPI    r3, 7
+        BC      quiet                   ; NVB 20h .. 67h only
+        LDI     r1, 2
+acw:    CMP     r1, r3
+        BZ      acp
+        ADD     r0, r6, r1
+        LD      r5, r0, 0
+        ADD     r0, r7, r1
+        LD      r0, r0, 0
+        CMP     r5, r0
+        BNZ     quiet                   ; not this card's UID byte
+        ADDI    r1, 1
+        JMP     acw
+acp:    CMPI    r4, 0
+        BZ      acm
+        ADD     r0, r6, r3              ; the split byte: its first r4 bits
+        LD      r5, r0, 0
+        ADD     r0, r7, r3
+        LD      r0, r0, 0
+        XOR     r5, r5, r0
+        LDI     r0, 1
+        SHL     r0, r0, r4
+        SUBI    r0, 1
+        AND     r5, r5, r0
+        BNZ     quiet
+acm:    ADD     r1, r7, r3              ; the rest of UID and BCC from there
+        MOV     r0, r4
+        LDI     r5, 7
+        SUB     r5, r5, r3
+        JMP     reply
+select: CMPI    r5, 9
+        BNZ     quiet
+        CMPI    r2, 0
+        BNZ     quiet
+        LDI     r1, 0
+slw:    ADD     r0, r6, r1
+        LD      r5, r0, 0
+        ADD     r0, r7, r1
+        LD      r0, r0, 0
+        CMP     r5, r0
+        BNZ     quiet                   ; not this card, or a CRC_A error
+        ADDI    r1, 1
+        CMPI    r1, 9
+        BNZ     slw
+        LDI     r0, 2
+        ST      r0, r7, 23              ; ACTIVE
+        MOV     r1, r7
+        ADDI    r1, 11                  ; SAK and CRC_A
+        LDI     r0, 0
+        LDI     r5, 3
+
+; ------------------------------------------------------------------ reply
+; In: r1 = the first word, r0 = the first bit in it, r5 = words, r7 = BASE.
+reply:  LD      r2, r1, 0
+        SHR     r2, r2, r0
+        LDI     r3, 9
+        SUB     r3, r3, r0              ; bits left in the first word
+        LD      r0, r7, 25
+        CMPI    r0, 0                   ; the last pause: odd = X, a 1
+        LD      r4, r7, 19
+        BNZ     rp1
+        LD      r4, r7, 20
+rp1:    LD      r0, r7, 24
+        ADD     r4, r4, r0
+        CSRW    TD, r4                  ; FDT after the last rise, less the lead
+        LD      r0, r7, 21
+        LD      r4, r7, 22
+        WAITD   0
+        CSRW    TICK_FRAC, r4
+        CSRW    TICK_INT, r0            ; the grid restarts here (SEMANTICS 4)
+        SETD    0
+        SETP    LM, 1, D
+        WAITD   1                       ; the start bit's first rise
+
+; D: subcarrier in the first half (entered on its first rise), none after
+dbit:   SETP    LM, 0, D
+        WAITD   1
+        SETP    LM, 1, D
+        WAITD   1
+        SETP    LM, 0, D
+        WAITD   1
+        SETP    LM, 1, D
+        WAITD   1
+        SETP    LM, 0, D
+        WAITD   1
+        SETP    LM, 1, D
+        WAITD   1
+        SETP    LM, 0, D
+        WAITD   1                       ; tick 7: low until the bit's end
+        CMPI    r3, 0                   ; fetch the next bit into r6
+        BNZ     dfa
+        SUBI    r5, 1
+        BZ      dfe
+        ADDI    r1, 1
+        LD      r2, r1, 0
+        LDI     r3, 9
+dfa:    MOV     r6, r2
+        ANDI    r6, 1
+        SHRI    r2, 1
+        SUBI    r3, 1
+        JMP     dfd
+dfe:    LDI     r6, 2                   ; none: the end (F)
+dfd:    CMPI    r6, 1
+        BZ      dd
+        WAITD   9                       ; the next bit's start
+        JMP     nb
+dd:     SETP    LM, 1, D
+        WAITD   9                       ; a D: its first rise
+        JMP     dbit
+
+; the next bit's start, no subcarrier: an E, or the end
+nb:     CMPI    r6, 0
+        BNZ     tend
+        CMPI    r3, 0                   ; E: fetch the bit after it
+        BNZ     efa
+        SUBI    r5, 1
+        BZ      efe
+        ADDI    r1, 1
+        LD      r2, r1, 0
+        LDI     r3, 9
+efa:    MOV     r6, r2
+        ANDI    r6, 1
+        SHRI    r2, 1
+        SUBI    r3, 1
+        JMP     efd
+efe:    LDI     r6, 2
+efd:    SETP    LM, 1, D
+        WAITD   8                       ; tick 8: the second half's first rise
+        SETP    LM, 0, D
+        WAITD   1
+        SETP    LM, 1, D
+        WAITD   1
+        SETP    LM, 0, D
+        WAITD   1
+        SETP    LM, 1, D
+        WAITD   1
+        SETP    LM, 0, D
+        WAITD   1
+        SETP    LM, 1, D
+        WAITD   1
+        SETP    LM, 0, D
+        WAITD   1                       ; tick 15
+        CMPI    r6, 1
+        BZ      ed
+        WAITD   1                       ; tick 16: the next bit's start
+        JMP     nb
+ed:     SETP    LM, 1, D                ; E then D: one tick to the rise
+        WAITD   1
+        JMP     dbit
+
+tend:   LDI     r7, 0                   ; F: the line stays low
+        CSRW    TICK_FRAC, r7
+        LDI     r7, 1
+        CSRW    TICK_INT, r7            ; tick = 1 clock again
+        JMP     rx

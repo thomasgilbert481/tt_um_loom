@@ -1,0 +1,528 @@
+; nfca_reader.loom
+; An ISO/IEC 14443 Type A reader (PCD, NFC-A, 106 kbit/s) at baseband: for
+; each host word it sends REQA, reads ATQA, runs the cascade level 1
+; anticollision loop with collision detection inside a bit and bit
+; splitting, sends SELECT, checks SAK and its CRC_A, and reports the UID.
+;
+; Written on 2026-11-26, after the hardware was complete (D-032), as a
+; protocol Loom was not designed for (D-035). Nothing in Loom was built for
+; NFC. It sends with the deadline-latched pin write (`SETP ... D`, 6.10,
+; built for exact edges) on a fractional tick of a quarter bit (TICK_FRAC,
+; built for UART baud rates); it receives with the edge wait and its
+; deadline timeout (`WAITP ..., T`, built for I2C and SPI), the deadline
+; moved by `CSRW TD` to end each half-bit window; its buffers live in the
+; data memory (`LD`/`ST`, 6.11, built for device emulation). What the
+; firmware does that no hardware does: the modified Miller coder, the
+; subcarrier detector, the collision detection, the anticollision loop,
+; the odd parity and CRC_A. A dedicated reader IC (the MFRC522) detects the
+; collision in hardware and reports its position (CollReg); here it is a
+; count of subcarrier edges in each half of every bit.
+;
+; Baseband only: no 13.56 MHz carrier, no RF. TX = OUT0 is the field, high
+; = carrier, low = a pause (100 % ASK). RX = IN0 is the cards' load
+; modulation as a logic level, high = loaded, the 847.5 kHz subcarrier
+; on-off keyed onto it; two cards' load modulation adds (an OR) on RX.
+;
+; Sources (tools/protomodels/iso14443a.py cites them item by item): NXP
+; MFRC522 data sheet Rev. 3.9 (Table 4, Figure 6, Tables 48 to 50, 56);
+; Proxmark3 armsrc/iso14443a.c (sequences X, Y, Z, D, E, F; the answer
+; 1172 or 1236 carrier periods after the reader; SEL 93h, NVB, BCC, the
+; SAK cascade bit; a 1 taken at the collision position); libnfc
+; iso14443-subr.c (CRC_A).
+;
+; Sending (tick T/4 = 32/fc, the pause length; TICK_INT/TICK_FRAC from the
+; host). Every bit ends one quarter before the next starts, so each pause
+; is two staged edges: Z = low in quarter 0, X = low in quarter 2, Y = no
+; pause. Start Z; a 1 is X, a 0 is Z after a 0 (or first) and Y after a 1;
+; the end is a logic 0 then Y. Words are 9 bits (8 data bits LSB first and
+; the odd parity at bit 8); a frame is a bit count, so the 7-bit short frame
+; and the split byte of an ANTICOLLISION are its last word cut short. Every
+; frame is preceded by 10 bits of carrier (more than the 1172/fc a card
+; may need after its own answer).
+;
+; Receiving (tick 1 clock). The first subcarrier edge within TMO of the
+; end of the frame is the start bit's; the bit grid is anchored ADJ clocks
+; before it (the stamp's lag and a quarter subcarrier period of margin for
+; the drift of a whole-clock T). Each half bit is a window ended by `CSRW
+; TD`, in which `WAITP RX, 1, T` / `WAITP RX, 0, T` count the high runs of
+; the subcarrier: 4 in a half with subcarrier, 0 without. 2 or more is
+; subcarrier (the bookkeeping between two windows, 13 slots, can lose one;
+; one can leak over a boundary). Level waits, not edge waits: two cards
+; whose subcarriers are out of phase OR into a wave whose low gap can be
+; shorter than a slot loop, and a level that lasts one slot (4 clocks) is
+; never missed; two cards answering at the two ends of the +0.4 us FDT
+; window (20 clocks apart) still read as 4 runs. D (first half) = 1, E
+; (second) = 0, both = a collision (stored as 2), neither = F, the end.
+; Bits are stored one to a word.
+;
+; Anticollision: SEL 93h and NVB, then the K known bits (UID0 first, LSB
+; first, parity after each whole byte, the split byte cut short). The
+; first collision at bit j: bits below j are kept, bit j is taken as 1 and
+; the next ANTICOLLISION sends K = j + 1 bits. No collision: BCC is
+; checked, then SELECT (93h 70h UID BCC CRC_A); SAK is checked with its
+; parity and CRC_A. At most 40 rounds.
+;
+; Host words (INQ thread 0), after RUN: 1. TICK_INT and 2. TICK_FRAC of
+; T/4; 3. T and 4. T/2, in clocks; 5. TMO, clocks from the end of a frame
+; to give up on an answer. Then any word: one activation. Report (OUTQ
+; thread 0), five words: STATUS, ATQA, UID0 | UID1 << 8, UID2 | UID3 << 8,
+; SAK. STATUS 0 a card selected; 1 no ATQA (no card); 2 an ANTICOLLISION
+; answer missing, short or with a parity error; 3 BCC error; 4 no SAK, or
+; its parity or CRC_A wrong; 5 more than 40 rounds. The words after STATUS
+; hold what was read so far.
+;
+; Limits, honestly: cascade level 1 only (a SAK with the cascade bit 04h is
+; reported, not followed: no 7- or 10-byte UIDs), 106 kbit/s only, no HLTA,
+; no ISO/IEC 14443-4. The bit grid of the answer comes from a whole-clock
+; T, not from the carrier: at 45 MHz it drifts 0.2 clock a bit (10 over a
+; UID answer), inside the windows' margin.
+;
+; Memory: RXB = 0x1D0, the received bits (up to 47); TXB = 0x1C0, the frame
+; to send (up to 16 words); BASE = 0x1B0: +0..+4 UID0..3 and BCC as found,
+; +5 K, +6 ATQA, +7 SAK, +8/+9 TICK_INT/TICK_FRAC, +10 T, +11 T/2, +12 TMO,
+; +13 the frame's bit count, +14 the answer's bit count, +15 the rounds.
+
+        .imem   512                     ; the macro build: quarters of 128 words
+        .thread 0
+        .pins   RX = IN0, TX = OUT0
+
+        .tick   106                     ; T/4 at 45 MHz
+        .equ    RXB = 0x1D0
+        .equ    TXB = 0x1C0
+        .equ    BASE = 0x1B0
+        .equ    ADJ = 18                ; clocks the grid is set before the stamp
+        .equ    TH = 2                  ; 2 high runs or more of 4
+
+        SETP    TX, 1                   ; the field on
+        MOV16   r6, BASE
+        POP     r0                      ; 1. TICK_INT of T/4
+        ST      r0, r6, 8
+        POP     r0                      ; 2. TICK_FRAC of T/4
+        ST      r0, r6, 9
+        POP     r0                      ; 3. T
+        ST      r0, r6, 10
+        POP     r0                      ; 4. T/2
+        ST      r0, r6, 11
+        POP     r0                      ; 5. TMO
+        ST      r0, r6, 12
+        JMP     main
+
+; ------------------------------------------------------------------- send
+; The frame at TXB, +13 bits, after 10 bits of carrier. Registers: r0 the
+; word, r1 bits left in it, r2 the next word, r3 bits left (the end's 0
+; included), r4 the previous bit.
+send:   MOV16   r6, BASE
+        LD      r3, r6, 13
+        ADDI    r3, 1                   ; and the end's logic 0
+        MOV16   r2, TXB
+        LDI     r1, 0
+        LDI     r4, 0                   ; the start counts as a 0
+        LD      r0, r6, 8
+        LD      r7, r6, 9
+        CSRW    TICK_FRAC, r7
+        CSRW    TICK_INT, r0            ; the grid restarts here (SEMANTICS 4)
+        SETD    2
+        WAITD   38                      ; carrier to quarter 3 before the start
+        JMP     sz                      ; start of communication: Z
+nxt:    CMPI    r3, 0
+        BZ      sfin
+        SUBI    r3, 1
+        BZ      s0                      ; the end's logic 0
+        CMPI    r1, 0
+        BNZ     sb
+        LD      r0, r2, 0
+        ADDI    r2, 1
+        LDI     r1, 9
+sb:     SUBI    r1, 1
+        SHRI    r0, 1                   ; C = the bit
+        BC      sx1
+s0:     CMPI    r4, 0
+        LDI     r4, 0
+        BZ      sz                      ; a 0 after a 0: Z
+        WAITD   4                       ; a 0 after a 1: Y
+        JMP     nxt
+sx1:    LDI     r4, 1                   ; a 1: X
+        WAITD   2
+        SETP    TX, 0, D
+        WAITD   1                       ; quarter 2: the pause
+        SETP    TX, 1, D
+        WAITD   1                       ; quarter 3: carrier again
+        JMP     nxt
+sz:     SETP    TX, 0, D
+        WAITD   1                       ; quarter 0: the pause
+        SETP    TX, 1, D
+        WAITD   1
+        WAITD   2                       ; to quarter 3
+        JMP     nxt
+sfin:   WAITD   4                       ; the end's Y
+        RET
+
+; ---------------------------------------------------------------- receive
+; Bits into RXB (0, 1, 2 = a collision), their count into +14. Registers:
+; r0 bits left, r1 the pointer, r2/r3 the edge counts (+1) of the halves,
+; r4 the bit's start, r5 T/2, r6 T, r7 the window's end.
+recv:   LDI     r7, 0
+        CSRW    TICK_FRAC, r7
+        LDI     r7, 1
+        CSRW    TICK_INT, r7            ; tick = 1 clock
+        MOV16   r6, BASE
+        LD      r5, r6, 11
+        LD      r7, r6, 12
+        LD      r6, r6, 10
+        CSRR    r4, NOW
+        ADD     r7, r7, r4
+        CSRW    TD, r7                  ; TMO from the end of the frame
+        MOV16   r1, RXB
+        LDI     r0, 47
+        WAITE   RX, RISE, T             ; the start bit's first edge
+        BT      rdone                   ; no answer
+        CSRR    r4, NOW
+        SUBI    r4, ADJ                 ; the start bit's start, less a margin
+        ADD     r7, r4, r5
+        CSRW    TD, r7
+        LDI     r2, 0
+c1:     WAITP   RX, 1, T                ; first half: count the high runs
+        BT      h1e
+        ADDI    r2, 1
+        WAITP   RX, 0, T
+        BNT     c1
+h1e:    ADD     r7, r4, r6
+        CSRW    TD, r7
+        LDI     r3, 0
+c2:     WAITP   RX, 1, T                ; second half
+        BT      h2e
+        ADDI    r3, 1
+        WAITP   RX, 0, T
+        BNT     c2
+h2e:    ADD     r4, r4, r6              ; the next bit
+        ADD     r7, r4, r5
+        CSRW    TD, r7
+        CMPI    r2, TH
+        BC      h1on
+        CMPI    r3, TH
+        BNC     rdone                   ; neither half: F, the end
+        LDI     r3, 0                   ; E
+        JMP     rst
+h1on:   CMPI    r3, TH
+        LDI     r3, 1                   ; D
+        BNC     rst
+        LDI     r3, 2                   ; both halves: a collision
+rst:    ST      r3, r1, 0
+        ADDI    r1, 1
+        LDI     r2, 0
+        DJNZ    r0, c1
+rdone:  MOV16   r6, BASE
+        MOV16   r7, RXB
+        SUB     r1, r1, r7
+        ST      r1, r6, 14
+        RET
+
+; ------------------------------------------------------------ activation
+main:   POP     r0                      ; any word: one activation
+        MOV16   r6, BASE
+        LDI     r0, 0
+        ST      r0, r6, 0
+        ST      r0, r6, 1
+        ST      r0, r6, 2
+        ST      r0, r6, 3
+        ST      r0, r6, 4
+        ST      r0, r6, 5               ; K = 0
+        ST      r0, r6, 6
+        ST      r0, r6, 7
+        ST      r0, r6, 15
+        MOV16   r1, TXB
+        LDI     r0, 0x26                ; REQA, a 7-bit short frame
+        ST      r0, r1, 0
+        LDI     r0, 7
+        ST      r0, r6, 13
+        CALL    send
+        CALL    recv
+        MOV16   r6, BASE
+        LD      r0, r6, 14
+        LDI     r7, 1
+        CMPI    r0, 19                  ; the start bit and two bytes
+        BNZ     rpt                     ; no ATQA: no card
+        MOV16   r1, RXB
+        ADDI    r1, 1
+        CALL    getbyte                 ; ATQA (its collisions are no error)
+        ST      r0, r6, 6
+        CALL    getbyte
+        SHLI    r0, 8
+        LD      r5, r6, 6
+        OR      r0, r0, r5
+        ST      r0, r6, 6
+        JMP     acl
+rpt:    JMP     report
+
+; ANTICOLLISION with the K bits known
+acl:    LD      r0, r6, 15
+        ADDI    r0, 1
+        ST      r0, r6, 15
+        LDI     r7, 5
+        CMPI    r0, 41
+        BC      rpt                     ; too many rounds
+        MOV16   r1, TXB
+        LDI     r0, 0x93                ; SEL, cascade level 1
+        CALL    par
+        ST      r0, r1, 0
+        LD      r5, r6, 5
+        MOV     r0, r5
+        SHRI    r0, 3
+        ADDI    r0, 2
+        SHLI    r0, 4
+        MOV     r4, r5
+        ANDI    r4, 7
+        OR      r0, r0, r4              ; NVB: bytes << 4 | bits
+        CALL    par
+        ST      r0, r1, 1
+        LDI     r2, 0
+aw:     ADD     r7, r6, r2              ; UID bytes 0 .. K/8 (the last cut short)
+        LD      r0, r7, 0
+        CALL    par
+        ADD     r7, r1, r2
+        ST      r0, r7, 2
+        ADDI    r2, 1
+        MOV     r0, r5
+        SHRI    r0, 3
+        CMP     r0, r2
+        BC      aw
+        MOV     r0, r5
+        SHRI    r0, 3
+        ADD     r0, r0, r5
+        ADDI    r0, 18                  ; 18 + K + K/8 bits
+        ST      r0, r6, 13
+        CALL    send
+        CALL    recv
+        MOV16   r6, BASE
+        LD      r5, r6, 5               ; clear the UID bits from K up
+        MOV     r4, r5
+        SHRI    r4, 3
+        ADD     r4, r4, r6
+        LD      r0, r4, 0
+        ANDI    r5, 7
+        LDI     r7, 1
+        SHL     r7, r7, r5
+        SUBI    r7, 1
+        AND     r0, r0, r7
+        ST      r0, r4, 0
+clr:    ADDI    r4, 1
+        MOV     r7, r4
+        SUB     r7, r7, r6
+        CMPI    r7, 5
+        BC      clrd
+        LDI     r0, 0
+        ST      r0, r4, 0
+        JMP     clr
+clrd:   LD      r2, r6, 5               ; j = K
+        MOV16   r1, RXB
+        LD      r3, r6, 14
+        ADD     r3, r3, r1
+        ST      r3, r6, 13              ; the answer's end
+        ADDI    r1, 1                   ; past the start bit
+pj:     LD      r3, r6, 13
+        CMP     r1, r3
+        BC      short                   ; the answer ended early
+        LD      r0, r1, 0
+        ADDI    r1, 1
+        CMPI    r0, 2
+        BZ      coll
+        CALL    setbit
+        MOV     r4, r2
+        ANDI    r4, 7
+        CMPI    r4, 7
+        BNZ     pn                      ; not a byte's last bit
+        CMP     r1, r3
+        BC      short
+        LD      r5, r1, 0               ; its parity bit
+        ADDI    r1, 1
+        CMPI    r5, 2
+        BZ      short                   ; a collision in a parity bit
+        MOV     r4, r2
+        SHRI    r4, 3
+        ADD     r4, r4, r6
+        LD      r0, r4, 0
+        CALL    par
+        SHRI    r0, 8
+        CMP     r0, r5
+        BNZ     short                   ; a parity error
+pn:     ADDI    r2, 1
+        CMPI    r2, 40
+        BNZ     pj
+        LD      r0, r6, 0               ; all 40 bits: BCC = UID0 ^ .. ^ UID3
+        LD      r1, r6, 1
+        XOR     r0, r0, r1
+        LD      r1, r6, 2
+        XOR     r0, r0, r1
+        LD      r1, r6, 3
+        XOR     r0, r0, r1
+        LD      r1, r6, 4
+        LDI     r7, 3
+        CMP     r0, r1
+        BNZ     report
+        JMP     select
+coll:   LDI     r0, 1                   ; the first collision, at bit j: take 1
+        CALL    setbit
+        ADDI    r2, 1
+        ST      r2, r6, 5               ; K = j + 1
+        JMP     acl
+short:  LDI     r7, 2
+        JMP     report
+
+; setbit: OR the bit r0 (0 or 1) into UID bit r2 (r4, r5, r7)
+setbit: MOV     r4, r2
+        SHRI    r4, 3
+        ADD     r4, r4, r6
+        LD      r5, r4, 0
+        MOV     r7, r2
+        ANDI    r7, 7
+        SHL     r0, r0, r7
+        OR      r5, r5, r0
+        ST      r5, r4, 0
+        RET
+
+; SELECT: 93h 70h UID0..3 BCC CRC_A, then SAK and its CRC_A
+select: MOV16   r1, TXB
+        LDI     r0, 0x93
+        ST      r0, r1, 0
+        LDI     r0, 0x70
+        ST      r0, r1, 1
+        LDI     r2, 0
+scp:    ADD     r7, r6, r2
+        LD      r0, r7, 0
+        ADD     r7, r1, r2
+        ST      r0, r7, 2
+        ADDI    r2, 1
+        CMPI    r2, 5
+        BNZ     scp
+        MOV16   r3, 0x8408
+        MOV16   r2, 0x6363
+        LDI     r5, 7
+        MOV     r4, r1
+scrc:   LD      r0, r4, 0
+        MOV     r7, r4
+        CALL    crcb
+        MOV     r4, r7
+        ADDI    r4, 1
+        DJNZ    r5, scrc
+        MOV     r0, r2
+        SHLI    r0, 8
+        SHRI    r0, 8
+        ST      r0, r1, 7
+        SHRI    r2, 8
+        ST      r2, r1, 8
+        LDI     r2, 0
+spar:   ADD     r7, r1, r2              ; odd parity on all nine
+        LD      r0, r7, 0
+        CALL    par
+        ADD     r7, r1, r2
+        ST      r0, r7, 0
+        ADDI    r2, 1
+        CMPI    r2, 9
+        BNZ     spar
+        LDI     r0, 81
+        ST      r0, r6, 13
+        CALL    send
+        CALL    recv
+        MOV16   r6, BASE
+        LD      r0, r6, 14
+        LDI     r7, 4
+        CMPI    r0, 28                  ; the start bit and three bytes
+        BNZ     report
+        MOV16   r1, RXB
+        ADDI    r1, 1
+        MOV16   r6, TXB
+        CALL    getbyte                 ; SAK
+        ST      r0, r6, 10
+        ST      r2, r6, 13
+        CALL    getbyte
+        ST      r0, r6, 11
+        LD      r0, r6, 13
+        OR      r2, r2, r0
+        ST      r2, r6, 13
+        CALL    getbyte
+        ST      r0, r6, 12
+        LD      r0, r6, 13
+        OR      r7, r2, r0              ; a parity error in any of the three
+        MOV16   r3, 0x8408
+        MOV16   r2, 0x6363
+        LD      r0, r6, 10
+        CALL    crcb
+        LD      r0, r6, 11
+        CALL    crcb
+        LD      r0, r6, 12
+        CALL    crcb
+        OR      r7, r7, r2              ; CRC_A residue 0
+        MOV16   r6, BASE
+        LD      r0, r6, 10 + TXB - BASE
+        ST      r0, r6, 7
+        CMPI    r7, 0
+        LDI     r7, 4
+        BNZ     report
+        LDI     r7, 0
+
+; report: r7 = STATUS, then ATQA, the UID's two words and SAK
+report: PUSH    r7
+        MOV16   r6, BASE
+        LD      r0, r6, 6
+        PUSH    r0
+        LD      r0, r6, 0
+        LD      r1, r6, 1
+        SHLI    r1, 8
+        OR      r0, r0, r1
+        PUSH    r0
+        LD      r0, r6, 2
+        LD      r1, r6, 3
+        SHLI    r1, 8
+        OR      r0, r0, r1
+        PUSH    r0
+        LD      r0, r6, 7
+        PUSH    r0
+        JMP     main
+
+; getbyte: r0 = the byte of the 9 received bits at r1 (r1 moves on 9); r2 =
+; 0 if its parity is right and no bit collided (a collided bit reads 1)
+getbyte: LDI    r0, 0
+        LDI     r2, 0
+        LDI     r3, 1
+        LDI     r4, 8
+gb1:    LD      r5, r1, 0
+        ADDI    r1, 1
+        CMPI    r5, 2
+        BNZ     gb2
+        ORI     r2, 2                   ; a collision
+        LDI     r5, 1
+gb2:    XOR     r2, r2, r5
+        CMPI    r5, 0
+        BZ      gb3
+        OR      r0, r0, r3
+gb3:    SHLI    r3, 1
+        DJNZ    r4, gb1
+        LD      r5, r1, 0               ; the parity bit
+        ADDI    r1, 1
+        CMPI    r5, 2
+        BNZ     gb4
+        ORI     r2, 2
+        LDI     r5, 1
+gb4:    XOR     r2, r2, r5
+        XORI    r2, 1                   ; odd: bit 0 ends 1
+        RET
+
+; crcb: r2 = CRC_A updated with the byte r0, LSB first (r3 = 8408h; r4)
+crcb:   XOR     r2, r2, r0
+        LDI     r4, 8
+cb1:    SHRI    r2, 1
+        BNC     cb2
+        XOR     r2, r2, r3
+cb2:    DJNZ    r4, cb1
+        RET
+; par: r0 = the byte r0 with its odd parity at bit 8 (r3, r4, r7)
+par:    MOV     r7, r0
+        LDI     r4, 8
+        LDI     r3, 1
+p1:     SHRI    r7, 1
+        BNC     p2
+        XORI    r3, 1
+p2:     DJNZ    r4, p1
+        SHLI    r3, 8
+        OR      r0, r0, r3
+        RET
